@@ -2730,9 +2730,16 @@ impl ResourcePools {
         // allocation failure and one where no allocation ever failed report
         // identically — both silent, both zero draws lost — so the recovery
         // could not be told from never having been needed.
+        // `carved` beside `held` for the same reason `released` is here at all.
+        // Held is what the slab reserved; carved is what its blocks actually
+        // hand out. A boot pinned at the device's VRAM ceiling because the
+        // guest's working set is that large and one pinned because the slab is
+        // holding blocks it has nearly emptied report the same `held` and
+        // differ entirely in what to do about it, and the first instrumented
+        // run of this line could not tell them apart.
+        let (held, carved) = self.slab.held_bytes();
         crate::observe::fail(format!(
-            "vram_pool_reclaim_retry released={released} held_bytes={}              (an allocation was refused; emptied the recycle pools, which hold              nothing any command buffer references, and retried)",
-            self.slab.held_bytes().0,
+            "vram_pool_reclaim_retry released={released} held_bytes={held} carved_bytes={carved}              (an allocation was refused; emptied the recycle pools, which hold              nothing any command buffer references, and retried)",
         ));
         released
     }
