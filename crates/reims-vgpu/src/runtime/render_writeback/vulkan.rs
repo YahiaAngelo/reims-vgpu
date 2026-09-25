@@ -512,8 +512,18 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let readback = crate::backend::vulkan::engine::read_target(identity)
-        .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+    // Ask for the resident's own texel only where this destination can land
+    // one. `store_texel_order` is the same table the verbatim arm below checks,
+    // so the two cannot disagree: a format it does not name — `R8Unorm` is one —
+    // has no native landing and must take the narrowed frame and the CPU row
+    // converter, exactly as it did before. Asking for native there turned every
+    // deferred payment of such a target into `gvadebt_pay_lost`.
+    let destination = crate::protocol::pixel_format::store_texel_order(c0.format);
+    let readback = match destination.filter(|layout| !layout.is_four_byte_color()) {
+        Some(_) => crate::backend::vulkan::engine::read_target_native(identity),
+        None => crate::backend::vulkan::engine::read_target(identity),
+    }
+    .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
     // Two ways to land a frame, and which one is decided by what the readback
     // actually holds rather than by what this rail wishes it held.
     //
@@ -525,7 +535,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // guest-RAM import serves it instead of losing every frame of it.
     let extent = match readback.texel.native_layout() {
         Some(layout) => {
-            if crate::protocol::pixel_format::store_texel_order(c0.format) != Some(layout) {
+            if destination != Some(layout) {
                 return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
             }
             crate::runtime::drain::note_store_route("gva_flush_copied_native");
