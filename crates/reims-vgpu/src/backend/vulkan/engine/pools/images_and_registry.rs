@@ -209,6 +209,28 @@ impl ResourcePools {
                 })?
             }
             Err(e) => {
+                // The typed refusal carries the `VkResult` and the pipeline, and
+                // nothing about the two questions a reader of it has: how much was
+                // asked for, and whether this device was holding anything it could
+                // have given back. A boot that refused 26 compute dispatches this
+                // way reported only that they were refused — the pools had already
+                // released nothing (`vram_pool_reclaim_retry released=0`), which is
+                // why the retry arm above did not even run, and the line could not
+                // say so. Emitted beside the refusal rather than folded into it so
+                // the decline's own vocabulary stays a `VkCall`.
+                let (held, carved) = self.slab.held_bytes();
+                crate::observe::fail(format!(
+                    "storage_image_alloc_refused bytes={} {}x{} mips={} fmt={:?} \
+                     sampled_only={} held_bytes={held} carved_bytes={carved} vk={e:?} \
+                     (a compute dispatch is refused; the pools reclaim above it only \
+                     retries when it has something to release)",
+                    req.size,
+                    key.width.max(1),
+                    key.height.max(1),
+                    key.mip_levels.max(1),
+                    key.format,
+                    key.sampled_only,
+                ));
                 ctx.device.destroy_image(image, None);
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsAllocStorageImage,
