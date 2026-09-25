@@ -7598,12 +7598,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         //
         // These are real `ResourceKind::Texture` bindings — the synthesized kinds
         // leave this scan by the `_ => continue` arm below — that the shader
-        // statically references and the guest deliberately leaves unbound, which
-        // Metal permits: a null texture reads as zero, and the neutral substituted
-        // after the texture loop is that same answer. So a fire is *not* by itself
-        // a bind gap on this guest. What none of this establishes is whether any
-        // such draw reaches the instruction that reads the slot; settling that
-        // needs the module, per pipeline, not this count.
+        // statically references and the guest deliberately leaves unbound. So a
+        // fire is *not* by itself a bind gap on this guest.
+        //
+        // Whether a draw reaches the instruction that reads the slot was the open
+        // half of that, and the modules answer it: in the four pipelines that fire
+        // most (`p31` 194 times, `p33`, `p35`, `p39`), every use of the unbound
+        // binding sits inside an `OpBranchConditional` whose condition is computed
+        // from the shader's own inputs — data-dependent, not a function constant,
+        // so it cannot be ruled out statically. It does not have to be: the
+        // substitute pushed after the texture loop is
+        // `solid_rgba8(1, 1, &[0.0; 4])`, so a branch that *is* taken samples
+        // zeros. The reliance stays on the fail channel because the device
+        // invented the texture, not because the picture is wrong.
         // The guard below reports; its value is the population the repair after
         // the texture loop acts on. Empty on every draw that binds what it
         // samples, which is the hot path.
