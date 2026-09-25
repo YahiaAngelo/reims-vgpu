@@ -836,6 +836,24 @@ pub(crate) struct NativeUploads {
     /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
     /// assumed.
     pub float32: bool,
+    /// Upload the guest's packed ten-bit colour (`RGB10A2Unorm`,
+    /// `BGR10A2Unorm`) as the identical `A2B10G10R10` / `A2R10G10B10`
+    /// `_UNORM_PACK32` word.
+    ///
+    /// Like [`Self::block_compressed`] and [`Self::float32`] this is the
+    /// **only** rail, and for the bluntest of the reasons:
+    /// [`pixel_format::TexelLayout::has_cpu_loader_arm`] answers `false` for
+    /// both because their channels do not sit on byte boundaries at all, so
+    /// there is nothing for a byte-shaped loader to pick up and
+    /// `RowToRgba8::for_format` has no arm to decline to. A host that clears
+    /// this flag loses the surface and says so — which is what a boot serving
+    /// `RGB10A2` did before this existed, as `linear_load_row_convert_unsupported
+    /// fmt=0x5a` and the `color LOAD seed miss` behind it.
+    ///
+    /// One flag for both orders: they are the same word with the channels
+    /// exchanged, and nothing on record separates the hosts that filter one
+    /// from the hosts that filter the other.
+    pub ten_bit: bool,
 }
 
 impl NativeUploads {
@@ -846,6 +864,7 @@ impl NativeUploads {
         float16: false,
         block_compressed: false,
         float32: false,
+        ten_bit: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -862,6 +881,7 @@ impl NativeUploads {
         float16: false,
         block_compressed: false,
         float32: false,
+        ten_bit: false,
     };
 
     /// Every native layout the loaders can produce — every gate open at once.
@@ -886,6 +906,7 @@ impl NativeUploads {
         float16: true,
         block_compressed: true,
         float32: true,
+        ten_bit: true,
     };
 }
 
@@ -960,6 +981,8 @@ pub(crate) fn linear_native_upload_format(
         // and no CPU arm to fall back to either: `convert_row_to_rgba8` has no
         // arm for an integer texel and must not gain one, so a `None` here is
         // not a slower rail, it is `RowConvertUnsupported` and a lost sample.
+        SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
+        SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
         SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
         _ => return None,
     })

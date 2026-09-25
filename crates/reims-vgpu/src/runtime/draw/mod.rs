@@ -3420,15 +3420,19 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 fn seed_native_uploads(format: u16) -> NativeUploads {
     use crate::protocol::pixel_format::TexelLayout;
     match crate::protocol::pixel_format::store_texel_order(format) {
-        Some(
-            layout @ (TexelLayout::Rgba16Float | TexelLayout::Rg16Float | TexelLayout::R16Float),
-        ) => {
-            let _ = layout;
+        Some(TexelLayout::Rgba16Float | TexelLayout::Rg16Float | TexelLayout::R16Float) => {
             NativeUploads {
                 float16: true,
                 ..NativeUploads::NONE
             }
         }
+        // The packed ten-bit words, for the stronger reason: the half-float
+        // layouts have a lossy CPU arm to fall back to and these have none at
+        // all, so without this the seed is not quantized, it is lost.
+        Some(TexelLayout::Rgb10a2Unorm | TexelLayout::Bgr10a2Unorm) => NativeUploads {
+            ten_bit: true,
+            ..NativeUploads::NONE
+        },
         _ => NativeUploads::NONE,
     }
 }

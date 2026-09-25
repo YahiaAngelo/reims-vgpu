@@ -5291,6 +5291,12 @@ fn native_uploads_asking_host() -> NativeUploads {
         // filter by mandate. So this one is genuinely a per-host answer and the
         // conjunction above would hide it.
         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
+        // The conjunction, like `float16` and for the same reason: the two
+        // orders are one word with the channels exchanged. Vulkan mandates the
+        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
+        // answer is measured rather than assumed.
+        ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
         ..NativeUploads::BGRA8
     }
 }
@@ -7512,9 +7518,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // storage), so a vertex check would false-fire. Standard directly-bound
         // kinds only; ColorInput / ThreadgroupBuffer reach the shader by other
         // paths, while storage textures were declined before bind preparation.
-        // Verified non-flooding: 0 fires across a full x86 boot (desktop convergence
-        // + Safari + CSS gradients + a 23-binding compositor shader), so any fire is
-        // a genuine bind gap, not expected control flow.
+        // Not non-flooding, and the population is not what that reading assumed.
+        // The original measurement — 0 fires across a full x86 macOS 13 boot
+        // (desktop convergence + Safari + CSS gradients + a 23-binding compositor
+        // shader) — supported "any fire is a genuine bind gap". A driven macOS 26
+        // boot fires 12 436 times, and the shape says what they are: 6 318 of them
+        // report exactly one gap, always the lowest texture index the guest did not
+        // bind (`tex1` behind `provided_tex={0}` and `{0, 4}`, `tex0` behind `{3}`).
+        //
+        // These are real `ResourceKind::Texture` bindings — the synthesized kinds
+        // leave this scan by the `_ => continue` arm below — that the shader
+        // statically references and the guest deliberately leaves unbound, which
+        // Metal permits: a null texture reads as zero, and the neutral substituted
+        // after the texture loop is that same answer. So a fire is *not* by itself
+        // a bind gap on this guest. What none of this establishes is whether any
+        // such draw reaches the instruction that reads the slot; settling that
+        // needs the module, per pipeline, not this count.
         // The guard below reports; its value is the population the repair after
         // the texture loop acts on. Empty on every draw that binds what it
         // samples, which is the hot path.
