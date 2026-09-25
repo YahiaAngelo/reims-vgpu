@@ -5267,7 +5267,15 @@ fn every_ref_texture_view_reason_is_namespaced_distinct_and_log_safe() {
     const ALL: &[RefTextureViewDecline] = &[
         RefTextureViewDecline::UnsupportedDepth { depth: 0 },
         RefTextureViewDecline::Unresolved,
-        RefTextureViewDecline::FormatBpp,
+        RefTextureViewDecline::FormatBpp {
+            // A FourCC whose bytes are all printable, so the log-safety check
+            // below sees the rendered spelling and not the fallback.
+            format: 0,
+            surface_bytes_per_row: 0,
+            surface_w: 0,
+            surface_h: 0,
+            surface_format: u32::from_be_bytes(*b"2vuy"),
+        },
         RefTextureViewDecline::NoMapping,
         RefTextureViewDecline::SampleWindow {
             base_w: 0,

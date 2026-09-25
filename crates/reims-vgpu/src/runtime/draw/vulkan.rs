@@ -2059,7 +2059,22 @@ pub(super) enum RefTextureViewDecline {
     /// The mapping's page table is not resident for scanout.
     Unresolved,
     /// The view's MTLPixelFormat has no known bytes-per-pixel.
-    FormatBpp,
+    ///
+    /// Carries what the guest's own surface descriptor says, because that is
+    /// what identifies the format: `bytes_per_row / width` is its width in
+    /// bytes, and an unknown ordinal plus its declared stride is the whole of
+    /// what a reader needs to add it to `bytes_per_pixel`. Without them the
+    /// line named a number and nothing else — `fmt=0xf1` on a QuickTime
+    /// playback, which refused the compositing draw and played the film black.
+    FormatBpp {
+        format: u16,
+        surface_bytes_per_row: u32,
+        surface_w: u32,
+        surface_h: u32,
+        /// The surface's own `CVPixelFormatType`, which is a FourCC and names
+        /// the video format outright where the Metal ordinal only indexes it.
+        surface_format: u32,
+    },
     /// The mapping id has no live entry.
     NoMapping,
     /// No sample window could be derived from the device descriptor for this
@@ -2106,7 +2121,7 @@ impl crate::observe::Decline for RefTextureViewDecline {
         match self {
             Self::UnsupportedDepth { .. } => "ref_texture_view_unsupported_depth",
             Self::Unresolved => "ref_texture_view_unresolved",
-            Self::FormatBpp => "ref_texture_view_format_bpp",
+            Self::FormatBpp { .. } => "ref_texture_view_format_bpp",
             Self::NoMapping => "ref_texture_view_no_mapping",
             Self::SampleWindow { .. } => "ref_texture_view_sample_window",
             Self::Span { .. } => "ref_texture_view_span",
@@ -2176,7 +2191,28 @@ impl crate::observe::Decline for RefTextureViewDecline {
             Self::Convert { row, bpp } => {
                 vec![("row", row.to_string()), ("bpp", bpp.to_string())]
             }
-            Self::Unresolved | Self::FormatBpp | Self::NoMapping | Self::RgbaStride => Vec::new(),
+            Self::Unresolved | Self::NoMapping | Self::RgbaStride => Vec::new(),
+            Self::FormatBpp {
+                format,
+                surface_bytes_per_row,
+                surface_w,
+                surface_h,
+                surface_format,
+            } => vec![
+                ("format", format!("{format:#x}")),
+                ("surface_bpr", surface_bytes_per_row.to_string()),
+                ("surface_w", surface_w.to_string()),
+                ("surface_h", surface_h.to_string()),
+                ("surface_fmt", format!("{surface_format:#x}")),
+                ("surface_fourcc", {
+                    let b = surface_format.to_be_bytes();
+                    if b.iter().all(|c| (0x20..0x7f).contains(c)) {
+                        String::from_utf8_lossy(&b).into_owned()
+                    } else {
+                        String::from("-")
+                    }
+                }),
+            ],
         }
     }
 }
@@ -2588,7 +2624,20 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
         return fail(RefTextureViewDecline::Unresolved);
     }
     let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) else {
-        return fail(RefTextureViewDecline::FormatBpp);
+        // Read the guest's own descriptor for the decline rather than for the
+        // work: an unknown ordinal is only actionable beside the stride the
+        // surface declares for it.
+        let desc = state
+            .mappings
+            .get(&mapping_id)
+            .and_then(|m| crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc));
+        return fail(RefTextureViewDecline::FormatBpp {
+            format: view.pixel_format,
+            surface_bytes_per_row: desc.as_ref().map(|d| d.bytes_per_row).unwrap_or(0),
+            surface_w: desc.as_ref().map(|d| d.width).unwrap_or(0),
+            surface_h: desc.as_ref().map(|d| d.height).unwrap_or(0),
+            surface_format: desc.as_ref().map(|d| d.pixel_format).unwrap_or(0),
+        });
     };
     let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
