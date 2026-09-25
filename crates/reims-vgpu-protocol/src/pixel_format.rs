@@ -991,6 +991,9 @@ impl TexelLayout {
             // endorsement, and [`Self::cpu_loader_arm_is_lossy`] is where the
             // endorsement is withheld.
             Self::Rgba16Float | Self::Rg16Float | Self::R16Float => true,
+            // Ten bits a channel through an eight-bit arm, for scanout; see
+            // the variant doc on [`RowToRgba8::Rgb10a2Unorm`].
+            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => true,
             // The two sixteen-bit normalized layouts join the floats here for
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
@@ -1011,8 +1014,6 @@ impl TexelLayout {
             | Self::Rg16Uint
             | Self::Rgba32Float
             | Self::Rgba16Unorm
-            | Self::Rgb10a2Unorm
-            | Self::Bgr10a2Unorm
             | Self::Rg11b10Float => false,
             // No CPU rail can serve a BC layout, and none should be written:
             // decoding a block needs a decompressor, and a decompressed block
@@ -1048,7 +1049,11 @@ impl TexelLayout {
     /// two-channel Vulkan formats sample to identically.
     pub fn cpu_loader_arm_is_lossy(self) -> bool {
         match self {
-            Self::Rgba16Float | Self::Rg16Float | Self::R16Float => true,
+            Self::Rgba16Float
+            | Self::Rg16Float
+            | Self::R16Float
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm => true,
             Self::Rgba8
             | Self::Bgra8
             | Self::R8
@@ -1059,8 +1064,6 @@ impl TexelLayout {
             | Self::Rg16Uint
             | Self::Rgba32Float
             | Self::Rgba16Unorm
-            | Self::Rgb10a2Unorm
-            | Self::Bgr10a2Unorm
             | Self::Rg11b10Float => false,
             // Vacuously false: there is no arm, so no arm loses anything.
             // `has_cpu_loader_arm` is the question a caller should be asking
@@ -2933,6 +2936,15 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
             rgba.copy_from_slice(&src[..4]);
         }
+        MTL_FORMAT_RGB10A2_UNORM | MTL_FORMAT_BGR10A2_UNORM => {
+            let order = if format == MTL_FORMAT_RGB10A2_UNORM {
+                TenBitOrder::Rgb
+            } else {
+                TenBitOrder::Bgr
+            };
+            let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            rgba = ten_bit_word_to_rgba8(word, order);
+        }
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {
             rgba[COMPONENT_R] = src[2];
             rgba[COMPONENT_G] = src[1];
@@ -3159,6 +3171,23 @@ pub enum RowToRgba8 {
     /// this format, and without an arm every guest-memory load of one —
     /// a LOAD seed or a sampled read — was lost.
     R16Float,
+    /// The packed ten-bit words, unpacked through [`ten_bit_word_to_rgba8`].
+    ///
+    /// Lossy, and unavoidably so: ten bits a channel do not fit in eight. That
+    /// is the right answer here rather than a reluctant one — the consumer is
+    /// the scanout capture, whose destination is the host console's eight-bit
+    /// buffer, so the two bits go at the destination whatever this rail does.
+    /// Without it a `BGR10A2` mapping declined the capture outright
+    /// (`capture_convert_to_rgba format=94`) and never reached the window,
+    /// where [`Rgba8ToRow`] has carried both orders all along.
+    ///
+    /// [`texel_to_rgba8`] gains the same arm, because the two CPU rails must
+    /// answer for the same formats. What keeps a *sampled* ten-bit bind off
+    /// this arm and on the native upload is
+    /// [`TexelLayout::cpu_loader_arm_is_lossy`], which names both orders, and
+    /// the cost floor that may only decline a layout whose arm is exact.
+    Rgb10a2Unorm,
+    Bgr10a2Unorm,
 }
 
 impl RowToRgba8 {
@@ -3180,6 +3209,8 @@ impl RowToRgba8 {
             MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => Self::Bgra8,
             MTL_FORMAT_RGBA16_FLOAT => Self::Rgba16Float,
             MTL_FORMAT_RG16_FLOAT => Self::Rg16Float,
+            MTL_FORMAT_RGB10A2_UNORM => Self::Rgb10a2Unorm,
+            MTL_FORMAT_BGR10A2_UNORM => Self::Bgr10a2Unorm,
             MTL_FORMAT_R16_FLOAT => Self::R16Float,
             _ => return None,
         })
@@ -3195,7 +3226,11 @@ impl RowToRgba8 {
         match self {
             Self::A8 | Self::R8 => 1,
             Self::Rg8 | Self::R16Float => RG8_BPP,
-            Self::Rgba8 | Self::Bgra8 | Self::Rg16Float => RGBA8_BPP,
+            Self::Rgba8
+            | Self::Bgra8
+            | Self::Rg16Float
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm => RGBA8_BPP,
             Self::Rgba16Float => RGBA16F_BPP,
         }
     }
@@ -3226,6 +3261,17 @@ impl RowToRgba8 {
         // `i * bpp` would reintroduce both.
         match self {
             Self::Rgba8 => dst.copy_from_slice(src),
+            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => {
+                let order = if matches!(self, Self::Rgb10a2Unorm) {
+                    TenBitOrder::Rgb
+                } else {
+                    TenBitOrder::Bgr
+                };
+                for (texel, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+                    d.copy_from_slice(&ten_bit_word_to_rgba8(word, order));
+                }
+            }
             Self::Bgra8 => {
                 for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
                     d[COMPONENT_R] = s[2];
@@ -4992,6 +5038,44 @@ mod tests {
     /// Both endpoints are checked explicitly because the bit-replication
     /// widening exists for them: a truncating `v << 2` would map 255 to 1020 and
     /// read back as 254, so full white would darken on every round trip.
+    /// The row rail unpacks both packed ten-bit orders, and unpacks them the way
+    /// the word helpers already pack them.
+    ///
+    /// Checked against `rgba8_to_ten_bit_word` rather than against hand-written
+    /// bytes, because the pair is the property: scanout reads what the Store
+    /// wrote, and a test that agreed with neither would pass while the two
+    /// disagreed. The live counter this arm exists for
+    /// (`capture_convert_to_rgba format=94`) does not reproduce on demand, so
+    /// it is not the evidence — this is.
+    #[test]
+    fn the_row_rail_unpacks_both_ten_bit_orders_the_way_the_word_helper_packs_them() {
+        for (mtl, order) in [
+            (MTL_FORMAT_RGB10A2_UNORM, TenBitOrder::Rgb),
+            (MTL_FORMAT_BGR10A2_UNORM, TenBitOrder::Bgr),
+        ] {
+            let rail = RowToRgba8::for_format(mtl)
+                .unwrap_or_else(|| panic!("{mtl:#x} must have a row arm"));
+            assert_eq!(rail.source_bytes_per_pixel(), RGBA8_BPP);
+            // Endpoints and a middle, each channel distinct so an order slip
+            // cannot pass: a swapped red and blue would land on a different byte.
+            let pixels: [[u8; 4]; 3] = [[0, 0, 0, 0], [255, 255, 255, 255], [16, 128, 240, 85]];
+            let mut src = Vec::new();
+            for px in &pixels {
+                src.extend_from_slice(&rgba8_to_ten_bit_word(*px, order).to_le_bytes());
+            }
+            let mut dst = vec![0u8; pixels.len() * RGBA8_BPP as usize];
+            assert!(rail.convert(&src, pixels.len() as u32, &mut dst));
+            for (i, px) in pixels.iter().enumerate() {
+                let got = &dst[i * 4..i * 4 + 4];
+                // Ten bits down to eight is lossy in the low bits, so the
+                // agreement checked is the round trip's own: what the packer
+                // put in a channel is what this reads back out of it.
+                let want = ten_bit_word_to_rgba8(rgba8_to_ten_bit_word(*px, order), order);
+                assert_eq!(got, want, "{mtl:#x} texel {i} {px:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_packed_ten_bit_texel_survives_the_seed_and_readback_round_trip() {
         for r in 0u16..=255 {
