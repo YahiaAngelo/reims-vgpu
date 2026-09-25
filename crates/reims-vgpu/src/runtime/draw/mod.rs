@@ -3420,7 +3420,9 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 fn seed_native_uploads(format: u16) -> NativeUploads {
     use crate::protocol::pixel_format::TexelLayout;
     match crate::protocol::pixel_format::store_texel_order(format) {
-        Some(layout @ (TexelLayout::Rgba16Float | TexelLayout::Rg16Float)) => {
+        Some(
+            layout @ (TexelLayout::Rgba16Float | TexelLayout::Rg16Float | TexelLayout::R16Float),
+        ) => {
             let _ = layout;
             NativeUploads {
                 float16: true,

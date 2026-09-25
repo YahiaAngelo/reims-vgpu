@@ -379,6 +379,9 @@ pub enum SampledClass {
     Bgra8Unorm,
     Rgba16Float,
     Rg16Float,
+    /// Single-channel half float. macOS 26 renders shape coverage into it,
+    /// so it is sampled back as well as rendered; see [`TexelLayout::R16Float`].
+    R16Float,
     /// The packed 32-bit word `MTLPixelFormatBGR10A2Unorm` stores a texel in.
     ///
     /// Declared for the cross-check and not for a CPU upload rail. This class is
@@ -1804,6 +1807,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
+        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
         MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
@@ -2095,6 +2099,24 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
+        // Its two-channel sibling, and the member whose absence was a silent
+        // loss in both directions. macOS 26 renders its shape coverage into
+        // `RG16Float` — the glass and icon passes write the mask as this
+        // pass's secondary attachment and the next pass reads it back by
+        // `gl_FragCoord` — so the Store narrowed a coverage mask to eight bits
+        // and `seed_native_uploads` saw no layout here and let the LOAD seed be
+        // converted too. `texel_to_rgba8`'s float arm clamps to `[0, 1]` at 256
+        // levels, which is `settle_linear_texture_seed`'s
+        // `clamp_to_unit_and_256_levels` on the fail channel.
+        //
+        // Four bytes a texel but not [`TexelLayout::is_four_byte_color`], which
+        // is the predicate the Store's native-readback rail asks — that names
+        // the layouts RGBA8 can hold, and a pair of halves is not one.
+        MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
+        // And the single-channel one, for the same reason and by the same
+        // measurement: with its siblings admitted the only
+        // `sampled_texture_narrowed` left on a driven boot named this format.
+        MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         // The packed ten-bit colour word. Admitted because the byte copy is the
         // only rail that can land it without loss: the CPU converter reaches
         // [`rgba8_to_texel`], whose arm for this format requantizes each channel
@@ -3778,7 +3800,14 @@ mod tests {
             sampled_class(MTL_FORMAT_A8_UNORM),
             Some(SampledClass::A8Unorm)
         );
-        assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
+        // Single-channel half float is sampled natively rather than converted.
+        // It had no class here for as long as the CPU loader's `[0, 1]`-clamping
+        // arm was its only rail; macOS 26 renders shape coverage into it and
+        // reads it straight back, which that arm quantizes to 256 levels.
+        assert_eq!(
+            sampled_class(MTL_FORMAT_R16_FLOAT),
+            Some(SampledClass::R16Float)
+        );
         assert_eq!(
             storage_selector(MTL_FORMAT_R8_UNORM),
             Some(StorageImageSelector::R8Unorm)
@@ -4044,18 +4073,18 @@ mod tests {
                 SampledClass::Rg8Unorm => TexelLayout::Rg8,
                 SampledClass::Rgba16Float => TexelLayout::Rgba16Float,
                 SampledClass::Rg16Float => TexelLayout::Rg16Float,
+                SampledClass::R16Float => TexelLayout::R16Float,
                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
                 SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
             });
-            // Renderable, single-channel, and named by neither table above —
-            // admitted for macOS 26's blur intermediate.
-            let single_channel_float =
-                (format == MTL_FORMAT_R16_FLOAT).then_some(TexelLayout::R16Float);
+            // `R16_FLOAT` needed a third arm here for as long as neither table
+            // named it — renderable, single-channel, and admitted for macOS 26's
+            // blur intermediate. Both name it now, so the two tables carry it
+            // and this reads them alone.
             let layout = store_texel_order(format)
                 .or(from_class)
-                .or(single_channel_float)
                 .unwrap_or_else(|| panic!("{format:#x} is renderable with no layout"));
             if !from_formats.contains(&layout) {
                 from_formats.push(layout);
@@ -4899,6 +4928,8 @@ mod tests {
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
+                    TexelLayout::Rg16Float => SampledClass::Rg16Float,
+                    TexelLayout::R16Float => SampledClass::R16Float,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
                     // the admitted set was {Rgba8, Bgra8, Rgba16Float}: the next
@@ -4915,20 +4946,30 @@ mod tests {
                 "{fmt:#x} is read as one layout by the sampler and copied as another"
             );
         }
-        // A renderable format that is still not a byte-copy destination, so a
-        // further widening of the set above has to change this line to pass.
-        assert!(render_target_bpp(MTL_FORMAT_RG16_FLOAT).is_some());
-        assert!(
-            store_texel_order(MTL_FORMAT_RG16_FLOAT).is_none(),
-            "RG16_FLOAT renders but is not admitted to a copy"
-        );
-        // The widened one, named so that removing it from the rule is a test
+        // The widened ones, named so that removing one from the rule is a test
         // failure rather than a silent narrowing back to eight bits.
         assert_eq!(
             store_texel_order(MTL_FORMAT_RGBA16_FLOAT),
             Some(TexelLayout::Rgba16Float),
             "a half-float render target must reach the byte-copy rail, or its \
              frame is quantized to eight bits on the way to the guest"
+        );
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_R16_FLOAT),
+            Some(TexelLayout::R16Float),
+            "a single-channel half-float render target must reach the byte-copy \
+             rail for the same reason its wider siblings do"
+        );
+        // Its two-channel sibling, which macOS 26 renders shape coverage into.
+        // It was renderable and *not* a byte-copy destination for as long as
+        // this line asserted that, which is how a coverage mask reached the
+        // guest quantized: the Store narrowed it and `seed_native_uploads`,
+        // reading this same table, let the LOAD seed be converted back.
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RG16_FLOAT),
+            Some(TexelLayout::Rg16Float),
+            "a two-channel half-float render target must reach the byte-copy \
+             rail for the same reason its four-channel sibling does"
         );
         assert_eq!(
             store_texel_order(MTL_FORMAT_BGR10A2_UNORM),
