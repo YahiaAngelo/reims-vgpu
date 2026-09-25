@@ -134,6 +134,17 @@ pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
 /// channels the other way round in the word — `VK_FORMAT_A2R10G10B10_UNORM_PACK32`
 /// exactly, as `BGRA8Unorm` is to `RGBA8Unorm` one storage shape up.
 pub const MTL_FORMAT_BGR10A2_UNORM: u16 = 0x5e;
+
+/// `MTLPixelFormatBGRG422` — packed 4:2:2 video, one plane, two bytes a texel
+/// with the chroma pair shared across each pixel pair.
+///
+/// Recovered from the guest rather than assumed. A `QuickTime Player` playback
+/// bound a view this device could not size, and the surface behind it declares
+/// `bytes_per_row = 2560` at `width = 1280` — two bytes a texel — and a
+/// `CVPixelFormatType` of `0x32767579`, the FourCC `2vuy`, which is
+/// `kCVPixelFormatType_422YpCbCr8`. See `packed_422_expand_row` for what the
+/// name's channel order means against those bytes.
+pub const MTL_FORMAT_BGRG422: u16 = 0xf1;
 /// `MTLPixelFormatRGBA16Unorm`. Its ordinal sits between two this table
 /// already carries — `RGBA16Uint` at `0x71` and `RGBA16Float` at `0x73` — and
 /// its absence was a decode gap rather than a rail gap: `bytes_per_pixel`
@@ -1331,6 +1342,9 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         MTL_FORMAT_R16_UNORM => R16_BPP,
         MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_UINT | MTL_FORMAT_RG16_SINT => RG16_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        // Two bytes a texel, though a texel is only half a chroma sample; see
+        // [`MTL_FORMAT_BGRG422`].
+        MTL_FORMAT_BGRG422 => 2,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
         | MTL_FORMAT_RGBA8_UINT
@@ -5047,6 +5061,54 @@ mod tests {
     /// disagreed. The live counter this arm exists for
     /// (`capture_convert_to_rgba format=94`) does not reproduce on demand, so
     /// it is not the evidence — this is.
+    /// Packed 4:2:2 expands the way Metal samples it: the pair's chroma on both
+    /// pixels, each keeping its own luma, and no colour transform anywhere.
+    ///
+    /// The luma values are deliberately distinct from the chroma so a channel
+    /// slip cannot pass, and the two pixels' luma differ from each other so a
+    /// replication bug that copied pixel 0 over pixel 1 fails here.
+    #[test]
+    fn packed_422_expands_the_chroma_pair_onto_both_pixels_and_transforms_nothing() {
+        // 2vuy byte order: Cb, Y0, Cr, Y1.
+        let src = [16u8, 81, 240, 145, 128, 16, 128, 235];
+        let mut dst = [0u8; 4 * RGBA8_BPP as usize];
+        assert!(packed_422_expand_row(MTL_FORMAT_BGRG422, &src, 4, &mut dst));
+        let px = |i: usize| -> [u8; 4] {
+            let o = i * RGBA8_BPP as usize;
+            [dst[o], dst[o + 1], dst[o + 2], dst[o + 3]]
+        };
+        let expect = |cr: u8, y: u8, cb: u8| {
+            let mut t = [0u8; 4];
+            t[COMPONENT_R] = cr;
+            t[COMPONENT_G] = y;
+            t[COMPONENT_B] = cb;
+            t[COMPONENT_A] = UNORM8_MAX;
+            t
+        };
+        assert_eq!(px(0), expect(240, 81, 16), "pair 0, pixel 0");
+        assert_eq!(px(1), expect(240, 145, 16), "pair 0, pixel 1");
+        assert_eq!(px(2), expect(128, 16, 128), "pair 1, pixel 0");
+        assert_eq!(px(3), expect(128, 235, 128), "pair 1, pixel 1");
+
+        // An odd width has a trailing pixel with no pair to take chroma from.
+        assert!(!packed_422_expand_row(
+            MTL_FORMAT_BGRG422,
+            &src,
+            3,
+            &mut dst
+        ));
+        // And nothing else is a packed 4:2:2 format.
+        assert!(!is_packed_422(MTL_FORMAT_BGRA8_UNORM));
+        assert!(!packed_422_expand_row(
+            MTL_FORMAT_BGRA8_UNORM,
+            &src,
+            4,
+            &mut dst
+        ));
+        // Two bytes a texel, which is what sizes the row the expansion reads.
+        assert_eq!(bytes_per_pixel(MTL_FORMAT_BGRG422), Some(2));
+    }
+
     #[test]
     fn the_row_rail_unpacks_both_ten_bit_orders_the_way_the_word_helper_packs_them() {
         for (mtl, order) in [
@@ -6217,4 +6279,63 @@ mod every_door_agrees_with_every_other {
         }
         assert!(broken.is_empty(), "{broken:#?}");
     }
+}
+
+/// Whether `format` is a packed 4:2:2 layout, whose texels come in pairs that
+/// share one chroma sample.
+///
+/// Asked instead of [`RowToRgba8::for_format`] because a subsampled format
+/// belongs to neither CPU rail. `texel_to_rgba8` takes one texel and a lone
+/// two-byte 4:2:2 texel cannot say which luma of its pair it carries, so the
+/// pair — not the texel — is the smallest thing that converts, and
+/// `the_row_rail_and_the_texel_rail_answer_for_the_same_formats` holds those
+/// two rails to one format set on purpose. This is the third rail rather than
+/// an exception carved out of that one.
+pub fn is_packed_422(format: u16) -> bool {
+    format == MTL_FORMAT_BGRG422
+}
+
+/// Expand one row of packed 4:2:2 into RGBA8 the way Metal's hardware samples
+/// it: the pair's chroma replicated onto both pixels, each keeping its own
+/// luma.
+///
+/// **This moves no value through a colour transform.** The guest's own shader
+/// turns YCbCr into colour, exactly as it does for the biplanar planes this
+/// device binds natively, so converting here would convert twice. What the
+/// expansion does is undo the subsampling, which is the part Metal's sampler
+/// does in hardware and a Vulkan `R8G8` view cannot.
+///
+/// The channel order is the format's name. `BGRG422` is B, G, R, G across the
+/// pair, and against `2vuy`'s Cb, Y0, Cr, Y1 that makes B the shared Cb, R the
+/// shared Cr, and each G the pixel's own luma. Alpha is opaque because the
+/// format carries none and Metal reads 1.0 for a missing alpha.
+///
+/// `false` when a slice is too short, or when `pixels` is odd — a trailing
+/// pixel has no pair to take chroma from, and inventing one is not something
+/// this can do from the format alone.
+pub fn packed_422_expand_row(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
+    if !is_packed_422(format) || pixels % 2 != 0 {
+        return false;
+    }
+    let (Some(src_len), Some(dst_len)) = (
+        (pixels as usize).checked_mul(2),
+        (pixels as usize).checked_mul(RGBA8_BPP as usize),
+    ) else {
+        return false;
+    };
+    let (Some(src), Some(dst)) = (src.get(..src_len), dst_rgba.get_mut(..dst_len)) else {
+        return false;
+    };
+    for (pair, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(8)) {
+        let (cb, y0, cr, y1) = (pair[0], pair[1], pair[2], pair[3]);
+        out[COMPONENT_R] = cr;
+        out[COMPONENT_G] = y0;
+        out[COMPONENT_B] = cb;
+        out[COMPONENT_A] = UNORM8_MAX;
+        out[RGBA8_BPP as usize + COMPONENT_R] = cr;
+        out[RGBA8_BPP as usize + COMPONENT_G] = y1;
+        out[RGBA8_BPP as usize + COMPONENT_B] = cb;
+        out[RGBA8_BPP as usize + COMPONENT_A] = UNORM8_MAX;
+    }
+    true
 }

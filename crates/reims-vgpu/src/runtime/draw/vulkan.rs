@@ -2839,17 +2839,38 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             view.width,
             view.height,
         );
-        let Some(row_rail) = pixel_format::RowToRgba8::for_format(view.pixel_format) else {
-            return fail(RefTextureViewDecline::Convert { row: 0, bpp });
+        // A subsampled format converts a pair at a time and belongs to neither
+        // CPU rail; see `pixel_format::is_packed_422`. Taken before the row
+        // rail because `RowToRgba8::for_format` answers `None` for it, which
+        // this arm would otherwise report as a refusal — the black picture a
+        // QuickTime playback drew.
+        let packed_422 = pixel_format::is_packed_422(view.pixel_format);
+        let row_rail = if packed_422 {
+            None
+        } else {
+            match pixel_format::RowToRgba8::for_format(view.pixel_format) {
+                Some(rail) => Some(rail),
+                None => return fail(RefTextureViewDecline::Convert { row: 0, bpp }),
+            }
         };
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
-            if !row_rail.convert(
-                &native[src_off..src_off + tight as usize],
-                view.width,
-                &mut rgba[dst_off..dst_off + rgba_stride as usize],
-            ) {
+            let src = &native[src_off..src_off + tight as usize];
+            let dst = &mut rgba[dst_off..dst_off + rgba_stride as usize];
+            let converted = match row_rail {
+                Some(rail) => rail.convert(src, view.width, dst),
+                // A subsampled format converts a pair at a time and belongs to
+                // neither CPU rail; see `pixel_format::is_packed_422`. Without
+                // this arm `RowToRgba8::for_format` answered `None` for it and
+                // the refusal above was the whole of what a QuickTime playback
+                // got — the view failed, the fragment texture did not resolve,
+                // and the compositing draw was refused whole.
+                None => {
+                    pixel_format::packed_422_expand_row(view.pixel_format, src, view.width, dst)
+                }
+            };
+            if !converted {
                 return fail(RefTextureViewDecline::Convert { row: y, bpp });
             }
         }
