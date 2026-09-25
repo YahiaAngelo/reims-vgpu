@@ -2192,17 +2192,23 @@ pub fn reflected_storage_image_format(
         TextureFormat::R8 => ImageFormat::R8Unorm,
         TextureFormat::Rgba8 => ImageFormat::Rgba8Unorm,
         TextureFormat::R16f => ImageFormat::R16Float,
-        TextureFormat::R16ui => ImageFormat::Unsupported(16),
+        TextureFormat::R16ui => ImageFormat::Unsupported(38),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
         // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
         // surface — neither `StorageImageSelector` nor `TexelLayout` names one
         // — so the honest answer is the format's own SPIR-V ordinal carried as
         // unsupported, which round-trips through `raw`/`from_raw` unchanged.
+        //
+        // Every `Unsupported` below is that same ordinal, as the `spirv` crate's
+        // `ImageFormat` spells it: `Rgba32i` 21, `R32i` 24, `R16ui` 38. The value reaches no module — `specialized_storage_image_-
+        // format` refuses an `Unsupported` before specialization — so it is read
+        // only by the decline it is logged in, which is exactly why it has to
+        // name the right format.
         TextureFormat::Rg32f => ImageFormat::Unsupported(6),
         TextureFormat::R32f => ImageFormat::R32Float,
-        TextureFormat::R32i => ImageFormat::Unsupported(17),
+        TextureFormat::R32i => ImageFormat::Unsupported(24),
         TextureFormat::R32ui => ImageFormat::R32ui,
-        TextureFormat::Rgba32i => ImageFormat::Unsupported(18),
+        TextureFormat::Rgba32i => ImageFormat::Unsupported(21),
         TextureFormat::Rgba32ui => ImageFormat::Rgba32Uint,
         TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
         TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
