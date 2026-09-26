@@ -10938,10 +10938,35 @@ pub(crate) fn read_resident_chain(
             let texel = rb.texel;
             let landed = rb.into_rgba8();
             if landed.is_none() {
-                crate::observe::fail(format!(
+                // Not a loss when the destination has a native rail. The eager
+                // Store arm reads the same resident again through
+                // `read_target_native` whenever `store_texel_order` names a
+                // layout RGBA8 cannot hold, and lands *that* frame in the
+                // guest's pages — `gva_store_sync_native`, which a driven boot
+                // counted three of against exactly these three refusals. What
+                // fails here is the eight-bit copy the host caches take, and an
+                // integer texel has no eight-bit form for them to hold; see
+                // `TexelLayout::has_cpu_loader_arm`, which answers `false` for
+                // `Rg16Uint` on the same grounds.
+                //
+                // So the two are told apart rather than both called a lost
+                // resident: a destination with no native rail behind it is the
+                // one that really loses its pixels here.
+                let native_rail = req
+                    .colors
+                    .first()
+                    .and_then(|c0| pixel_format::store_texel_order(c0.format))
+                    .is_some_and(|layout| !layout.is_four_byte_color());
+                let line = format!(
                     "chain_resident_land_fail reason=readback_texel_not_rgba8 \
-                     target={identity:?} texel={texel:?}"
-                ));
+                     target={identity:?} texel={texel:?} native_rail={}",
+                    u8::from(native_rail)
+                );
+                if native_rail {
+                    crate::observe::line(line);
+                } else {
+                    crate::observe::fail(line);
+                }
             }
             landed
         }
