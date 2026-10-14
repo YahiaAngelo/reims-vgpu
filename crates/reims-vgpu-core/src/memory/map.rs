@@ -1,10 +1,9 @@
 //! The memory map: the guest's physical ranges, validated and sorted at init, and the
 //! translations and mappings made from them.
 
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::guest::records::APV_PAGE_SIZE;
+use crate::guest::records::GuestPages;
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::DeathKind;
 use crate::memory::descriptor::MemoryMapDescriptor;
@@ -33,6 +32,8 @@ pub struct MemoryMapRange {
 pub struct MemoryMap<P: Platform> {
     platform: Arc<P>,
     ranges: Vec<MemoryMapRange>,
+    /// The guest's pages, which a mapping's length is whole ones of.
+    pages: GuestPages,
 }
 
 impl<P: Platform> std::fmt::Debug for MemoryMap<P> {
@@ -116,8 +117,13 @@ impl Pieces {
 
 impl<P: Platform> MemoryMap<P> {
     /// The host's map: the checked adds, the sort, the validation and its logs. `None` refuses
-    /// it ("Failed to create memory map" is the device's to log). No platform call.
-    pub fn new(platform: Arc<P>, descriptor: &MemoryMapDescriptor) -> Option<Arc<Self>> {
+    /// it ("Failed to create memory map" is the device's to log). No platform call. Its mappings
+    /// are whole guest pages of `pages`.
+    pub fn new(
+        platform: Arc<P>,
+        descriptor: &MemoryMapDescriptor,
+        pages: GuestPages,
+    ) -> Option<Arc<Self>> {
         // The descriptor's ranges, in the order the host added them.
         let mut ranges = Vec::with_capacity(descriptor.ranges().len());
         for range in descriptor.ranges() {
@@ -172,7 +178,11 @@ impl<P: Platform> MemoryMap<P> {
             return None;
         }
 
-        Some(Arc::new(MemoryMap { platform, ranges }))
+        Some(Arc::new(MemoryMap {
+            platform,
+            ranges,
+            pages,
+        }))
     }
 
     /// A plain init (no validation): the same ranges.
@@ -180,7 +190,13 @@ impl<P: Platform> MemoryMap<P> {
         Arc::new(MemoryMap {
             platform: self.platform.clone(),
             ranges: self.ranges.clone(),
+            pages: self.pages,
         })
+    }
+
+    /// The guest's pages.
+    pub fn guest_pages(&self) -> GuestPages {
+        self.pages
     }
 
     /// The ranges, in stored (sorted) order.
@@ -315,7 +331,7 @@ impl<P: Platform> MemoryMap<P> {
         let vm = self.platform.vm();
         // A total length of 0 passes the assert.
         crate::fatal_unless!(
-            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,
+            total_length & self.pages.mask() == 0,
             DeathKind::MappingLengthUnaligned
         );
         let Ok(address) = vm.allocate_anywhere(total_length) else {
@@ -464,6 +480,7 @@ impl<P: Platform> MemoryMap<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::records::APV_PAGE_SIZE;
     use crate::memory::descriptor::GuestPhysicalRange;
     use crate::platform::os::vm::KernReturn;
     use crate::testkit::calllog::{Arg, Call};
@@ -526,7 +543,7 @@ mod tests {
                 .map(|r| gpr(r.physical_address, r.region.len(), r.host()))
                 .collect::<Vec<_>>(),
         );
-        let m = Map::new(p.clone(), &d).unwrap();
+        let m = Map::new(p.clone(), &d, GuestPages::HOST).unwrap();
         (ram, m)
     }
 
@@ -557,7 +574,7 @@ mod tests {
         #[test]
         fn empty_descriptor_is_an_empty_map() {
             let p = plat();
-            let m = Map::new(p.clone(), &MemoryMapDescriptor::new()).unwrap();
+            let m = Map::new(p.clone(), &MemoryMapDescriptor::new(), GuestPages::HOST).unwrap();
             assert!(m.ranges().is_empty());
             assert!(p.call_log().is_empty());
         }
@@ -570,7 +587,7 @@ mod tests {
                 gpr(0x4000, 0x4000, fake_host(0)),
                 gpr(0x8000, 0x6000, fake_host(1)),
             ]);
-            let m = Map::new(p.clone(), &d).unwrap();
+            let m = Map::new(p.clone(), &d, GuestPages::HOST).unwrap();
             let got: Vec<_> = m
                 .ranges()
                 .iter()
@@ -606,7 +623,7 @@ mod tests {
                 gpr(u64::MAX, 1, fake_host(2)),
             ]);
             let logs = crate::testkit::logs::capture();
-            assert!(Map::new(p.clone(), &d).is_none());
+            assert!(Map::new(p.clone(), &d, GuestPages::HOST).is_none());
             assert_eq!(
                 memory_lines(&logs),
                 vec![
@@ -620,9 +637,9 @@ mod tests {
         fn overflow_to_exactly_zero_is_refused_but_the_top_byte_is_not() {
             let p = plat();
             let d = desc(&[gpr(u64::MAX - 0x3fff, 0x4000, fake_host(0))]);
-            assert!(Map::new(p.clone(), &d).is_none());
+            assert!(Map::new(p.clone(), &d, GuestPages::HOST).is_none());
             let d = desc(&[gpr(u64::MAX - 0x3fff, 0x3fff, fake_host(0))]);
-            assert!(Map::new(p.clone(), &d).is_some());
+            assert!(Map::new(p.clone(), &d, GuestPages::HOST).is_some());
         }
 
         #[test]
@@ -633,7 +650,7 @@ mod tests {
                 gpr(0x4000, 0x8000, fake_host(0)),
             ]);
             let logs = crate::testkit::logs::capture();
-            assert!(Map::new(p.clone(), &d).is_none());
+            assert!(Map::new(p.clone(), &d, GuestPages::HOST).is_none());
             assert_eq!(memory_lines(&logs), vec![INTERSECTION.to_owned()]);
         }
 
@@ -650,7 +667,13 @@ mod tests {
                 gpr(0xc000, 0, HostPtr::NULL),
                 gpr(0xc000, 0, HostPtr::NULL),
             ]);
-            assert_eq!(Map::new(p.clone(), &d).unwrap().ranges().len(), 4);
+            assert_eq!(
+                Map::new(p.clone(), &d, GuestPages::HOST)
+                    .unwrap()
+                    .ranges()
+                    .len(),
+                4
+            );
         }
 
         /// Zero-length ranges sort before the range with a length that shares their start, in
@@ -668,7 +691,7 @@ mod tests {
                 ]),
             ] {
                 let p = plat();
-                let m = Map::new(p.clone(), &d).unwrap();
+                let m = Map::new(p.clone(), &d, GuestPages::HOST).unwrap();
                 assert_eq!(m.ranges()[0].physical_length, 0);
                 assert_eq!(m.ranges()[1].physical_length, 0x4000);
             }
@@ -683,7 +706,7 @@ mod tests {
                 gpr(0x8000, 0x4000, fake_host(0)),
             ]);
             let logs = crate::testkit::logs::capture();
-            assert!(Map::new(p.clone(), &d).is_none());
+            assert!(Map::new(p.clone(), &d, GuestPages::HOST).is_none());
             assert_eq!(memory_lines(&logs), vec![INTERSECTION.to_owned()]);
         }
 
@@ -702,7 +725,7 @@ mod tests {
             // Two zero-length ranges more at one start, after its range with a length.
             input.push(gpr(0x10_0000, 0, fake_host(40)));
             input.push(gpr(0x10_0000, 0, fake_host(41)));
-            let m = Map::new(p.clone(), &desc(&input)).unwrap();
+            let m = Map::new(p.clone(), &desc(&input), GuestPages::HOST).unwrap();
             let got: Vec<_> = m
                 .ranges()
                 .iter()
@@ -732,7 +755,7 @@ mod tests {
             gpr(0x8000, 0x8000, fake_host(0)),
             gpr(0x4000, 0x4000, fake_host(1)),
         ]);
-        let m = Map::new(p.clone(), &d).unwrap();
+        let m = Map::new(p.clone(), &d, GuestPages::HOST).unwrap();
         let c = m.copy();
         assert!(!Arc::ptr_eq(&m, &c));
         assert_eq!(m.ranges(), c.ranges());
@@ -750,7 +773,7 @@ mod tests {
                 gpr(0x10000, 0, fake_host(2)),
                 gpr(0x20000, 0x4000, HostPtr::NULL),
             ]);
-            Map::new(p.clone(), &d).unwrap()
+            Map::new(p.clone(), &d, GuestPages::HOST).unwrap()
         }
 
         #[test]
@@ -867,7 +890,12 @@ mod tests {
         #[test]
         fn a_near_null_source_faults_at_the_memcpy() {
             let p = plat();
-            let m = Map::new(p, &desc(&[gpr(0x4000, 0x4000, HostPtr::NULL)])).unwrap();
+            let m = Map::new(
+                p,
+                &desc(&[gpr(0x4000, 0x4000, HostPtr::NULL)]),
+                GuestPages::HOST,
+            )
+            .unwrap();
             let e = catch_death(|| {
                 let mut dst = [0u8; 4];
                 m.read(0x4010, &mut dst)
@@ -1215,7 +1243,12 @@ mod tests {
         #[test]
         fn a_null_host_range_fails_the_remap() {
             let p = plat();
-            let m = Map::new(p.clone(), &desc(&[gpr(0x4000, 0x4000, HostPtr::NULL)])).unwrap();
+            let m = Map::new(
+                p.clone(),
+                &desc(&[gpr(0x4000, 0x4000, HostPtr::NULL)]),
+                GuestPages::HOST,
+            )
+            .unwrap();
             assert!(m.new_range_mapping(&[pr(0x4000, PAGE)], PAGE, 0).is_none());
             let c = vm_calls(&p);
             assert_eq!(c[1].sel, "mach_vm_remap");

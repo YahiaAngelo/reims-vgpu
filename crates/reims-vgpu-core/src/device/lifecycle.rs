@@ -41,7 +41,6 @@ use crate::guest::abi::suspend_blob::RESUME_ERROR_INVALID_CONTENT;
 use crate::guest::abi::suspend_blob::{
     KeyValuePair, SERIALIZED_INFO_PAIRS, SuspendDeviceState, SuspendState,
 };
-use crate::guest::records::{APV_PAGE_SHIFT, APV_PAGE_SIZE};
 use crate::num::{ToUsize, Truncate};
 use crate::platform::Platform;
 use crate::platform::device::GpuDevice as _;
@@ -531,7 +530,7 @@ impl<P: Platform> DeviceCore<P> {
         for index in 0..walk {
             let offset = CHILD_NODE_FLAG.wrapping_add(index.wrapping_mul(CHILD_NODE_STRIDE));
             crate::fatal_unless!(
-                offset.wrapping_add(2) <= APV_PAGE_SIZE,
+                offset.wrapping_add(2) <= self.guest_pages.size(),
                 DeviceDeath::ResumeWalkLeftRootPage
             );
             if root_node.read_u16(offset, DeviceDeath::RootNodeFault) != 0 {
@@ -566,7 +565,7 @@ impl<P: Platform> DeviceCore<P> {
                     let mut node = [0u8; TASK_ROOT_NODE_SIZE];
                     let read = self.read_from_physical_address(
                         OnFault::Return,
-                        u64::from(task_root).wrapping_shl(APV_PAGE_SHIFT),
+                        self.guest_pages.address(task_root),
                         &mut node,
                     )?;
                     if !read {
@@ -712,6 +711,7 @@ impl<P: Platform> DeviceCore<P> {
 mod tests {
     use super::*;
     use crate::device::test_support::{Lines, Opts, TestDevice, device};
+    use crate::guest::records::APV_PAGE_SIZE;
     use crate::raise::death::DeathKind;
     use crate::raise::death::DeathSite;
     use crate::testkit::capture::catch_death;

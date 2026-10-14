@@ -139,6 +139,7 @@ fn an_iosurface_device_is_borrowed() {
         struct_size: sized::size_u32::<RvgIOSurfaceDeviceConfig>(),
         memory_map: &map,
         callbacks: std::ptr::null(),
+        guest_page_shift: 0,
     };
     let mut io = std::ptr::null_mut();
     let mut d = std::ptr::null_mut();

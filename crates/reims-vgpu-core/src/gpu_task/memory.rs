@@ -20,7 +20,8 @@ use std::sync::Arc;
 use super::service::GpuTask;
 use super::{DeathKind, RaiseKind, exception, raise_carrying, raise_caught, raise_on};
 use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
-use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
+#[cfg(test)]
+use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SIZE};
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::cursor::{Cursor, CursorRange, WritableCursor};
 use crate::memory::mapping::Mapping;
@@ -34,9 +35,12 @@ use crate::resources::host::MappedAddress;
 use crate::rt::Hold;
 use crate::{fatal, fatal_unless};
 
-/// The guest page: 16 KiB (4 KiB on x86-64).
+/// The tests' guest page, the default's: 16 KiB (4 KiB on x86-64). The task's own are
+/// [`GpuTask::pages`].
+#[cfg(test)]
 pub(super) const PAGE: u64 = APV_PAGE_SIZE;
-/// The in-page mask.
+/// The tests' in-page mask.
+#[cfg(test)]
 pub(super) const PAGE_MASK: u64 = APV_PAGE_MASK;
 
 impl<P: Platform> GpuTask<P> {
@@ -73,13 +77,13 @@ impl<P: Platform> GpuTask<P> {
                 "no page table to map task memory through",
             );
         }
-        if offset & PAGE_MASK != 0 {
+        if offset & self.pages().mask() != 0 {
             return raise_caught(
                 RaiseKind::UnalignedOffset,
                 format_args!("task offset {offset:#x} to map is not page-aligned"),
             );
         }
-        if length & PAGE_MASK != 0 {
+        if length & self.pages().mask() != 0 {
             return raise_caught(
                 RaiseKind::UnalignedLength,
                 format_args!("length {length:#x} to map is not page-aligned"),
@@ -102,20 +106,21 @@ impl<P: Platform> GpuTask<P> {
                 offset,
                 length,
                 &mut |_address, page, page_writable| {
-                    let physical = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
+                    let physical = self.pages().address(page);
                     // One read-only leaf makes the whole mapping read-only.
                     if writable && page_writable == 0 {
                         writable = false;
                     }
                     // The run's start plus one page, from an initial {0, 0}.
-                    if physical == range.physical_address.wrapping_add(PAGE) {
-                        range.physical_length = range.physical_length.wrapping_add(PAGE);
+                    if physical == range.physical_address.wrapping_add(self.pages().size()) {
+                        range.physical_length =
+                            range.physical_length.wrapping_add(self.pages().size());
                     } else {
                         if range.physical_length != 0 {
                             ranges.push(range);
                         }
                         range.physical_address = physical;
-                        range.physical_length = PAGE;
+                        range.physical_length = self.pages().size();
                     }
                     Ok(true)
                 },
@@ -142,9 +147,12 @@ impl<P: Platform> GpuTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<MappedAddress<P>> {
-        let start = offset & !PAGE_MASK;
+        let start = offset & !self.pages().mask();
         // Wrapping, unchecked
-        let end = offset.wrapping_add(length).wrapping_add(PAGE_MASK) & !PAGE_MASK;
+        let end = offset
+            .wrapping_add(length)
+            .wrapping_add(self.pages().mask())
+            & !self.pages().mask();
         let mapping =
             self.new_virtual_mapping(hold, start, end.wrapping_sub(start), need_writable)?;
         let Some(mapping) = mapping else {
@@ -163,7 +171,9 @@ impl<P: Platform> GpuTask<P> {
             );
         }
         Ok(MappedAddress {
-            address: mapping.virtual_address().wrapping_add(offset & PAGE_MASK),
+            address: mapping
+                .virtual_address()
+                .wrapping_add(offset & self.pages().mask()),
             mapping: Some(mapping),
         })
     }
@@ -195,17 +205,18 @@ impl<P: Platform> GpuTask<P> {
                 ),
             );
         }
-        let page_offset = offset & PAGE_MASK;
-        let start = offset & !PAGE_MASK;
-        let size = (end.wrapping_add(PAGE_MASK) & !PAGE_MASK).wrapping_sub(start);
+        let page_offset = offset & self.pages().mask();
+        let start = offset & !self.pages().mask();
+        let size =
+            (end.wrapping_add(self.pages().mask()) & !self.pages().mask()).wrapping_sub(start);
         let mut remaining = length;
         // Where the next page's bytes go in `dst`
         let mut current: u64 = 0;
         let map = self.map();
         if let Some(walker) = self.walker() {
             walker.visit_pages_in_range(hold, on, start, size, &mut |address, page, _flags| {
-                let mut physical = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
-                let page_end = physical.wrapping_add(PAGE);
+                let mut physical = self.pages().address(page);
+                let page_end = physical.wrapping_add(self.pages().size());
                 if address == start {
                     physical = physical.wrapping_add(page_offset);
                 }
@@ -325,11 +336,12 @@ impl<P: Platform> GpuTask<P> {
         let map = self.map();
         let walker = self.walker();
         let walked = (|| -> RaiseResult<_> {
-            let start = offset & !PAGE_MASK;
-            let size = (end.wrapping_add(PAGE_MASK) & !PAGE_MASK).wrapping_sub(start);
+            let start = offset & !self.pages().mask();
+            let size =
+                (end.wrapping_add(self.pages().mask()) & !self.pages().mask()).wrapping_sub(start);
             let mut ranges: Vec<CursorRange> = Vec::new();
             let mut range = CursorRange::default();
-            let mut page_offset = offset & PAGE_MASK;
+            let mut page_offset = offset & self.pages().mask();
             let mut length_remaining = length;
             let mut last_address = u64::MAX;
             let mut all_writable = true;
@@ -341,15 +353,19 @@ impl<P: Platform> GpuTask<P> {
                     size,
                     &mut |_address, page, page_writable| {
                         fatal_unless!(length_remaining != 0, DeathKind::CursorLength);
-                        let physical = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
+                        let physical = self.pages().address(page);
                         // NULL outside RAM, not an error: the range is used as it is
                         let host = map.as_ref().map_or(HostPtr::NULL, |m| {
-                            m.virtual_address_for_physical(physical, PAGE)
+                            m.virtual_address_for_physical(physical, self.pages().size())
                         });
-                        let length_in_page = PAGE.wrapping_sub(page_offset).min(length_remaining);
+                        let length_in_page = self
+                            .pages()
+                            .size()
+                            .wrapping_sub(page_offset)
+                            .min(length_remaining);
                         let start_address = host.wrapping_add(page_offset);
                         let host_value = host.addr().to_u64();
-                        if last_address.wrapping_add(PAGE) == host_value {
+                        if last_address.wrapping_add(self.pages().size()) == host_value {
                             range.length = range.length.wrapping_add(length_in_page);
                         } else {
                             if range.length != 0 {
@@ -405,7 +421,7 @@ impl<P: Platform> GpuTask<P> {
         length: u64,
         read_only: &mut bool,
     ) -> RaiseResult<Option<P::AddressRangeArray>> {
-        let offset = u64::from(page).wrapping_mul(PAGE);
+        let offset = self.pages().address(page);
         let task_length = self.task_length();
         let (end, overflow) = offset.overflowing_add(length);
         if overflow || end > task_length {
@@ -423,7 +439,7 @@ impl<P: Platform> GpuTask<P> {
                 "no page table to map task memory through",
             );
         }
-        if length & PAGE_MASK != 0 {
+        if length & self.pages().mask() != 0 {
             return raise_caught(
                 RaiseKind::UnalignedLength,
                 format_args!("length {length:#x} to map is not page-aligned"),
@@ -446,27 +462,27 @@ impl<P: Platform> GpuTask<P> {
                 offset,
                 length,
                 &mut |_address, guest_page, page_writable| {
-                    let physical = u64::from(guest_page).wrapping_shl(APV_PAGE_SHIFT);
+                    let physical = self.pages().address(guest_page);
                     if writable && page_writable == 0 {
                         writable = false;
                     }
                     let host = map
                         .as_ref()
                         .map_or(HostPtr::NULL, |m| {
-                            m.virtual_address_for_physical(physical, PAGE)
+                            m.virtual_address_for_physical(physical, self.pages().size())
                         })
                         .addr()
                         .to_u64();
                     // The run's start plus one page: runs are cut at two pages.
-                    if range.address.wrapping_add(PAGE) == host {
-                        range.length = range.length.wrapping_add(PAGE);
+                    if range.address.wrapping_add(self.pages().size()) == host {
+                        range.length = range.length.wrapping_add(self.pages().size());
                     } else {
                         if range.length != 0 {
                             ranges.push(range);
                         }
                         range = ResourceAddressRange {
                             address: host,
-                            length: PAGE,
+                            length: self.pages().size(),
                         };
                     }
                     Ok(true)
@@ -489,12 +505,7 @@ impl<P: Platform> GpuTask<P> {
         page: u32,
         length: u64,
     ) -> RaiseResult<P::Buffer> {
-        let mapping = self.new_virtual_mapping(
-            hold,
-            u64::from(page).wrapping_shl(APV_PAGE_SHIFT),
-            length,
-            false,
-        )?;
+        let mapping = self.new_virtual_mapping(hold, self.pages().address(page), length, false)?;
         let Some(mapping) = mapping else {
             return raise_caught(
                 RaiseKind::NoBufferMapping,
@@ -848,7 +859,7 @@ mod tests {
     fn failed_read_logs_where_it_would_have_gone() {
         // page 1 of the task names a page outside guest RAM
         let mut entries = rw_pages(4);
-        entries[1] = ((RAM_PA + RAM_LEN) >> APV_PAGE_SHIFT) as u32 | W;
+        entries[1] = ((RAM_PA + RAM_LEN) >> crate::guest::records::APV_PAGE_SHIFT) as u32 | W;
         let tx = ready(&entries);
         let lines = Lines::capture();
         let mut dst = vec![0u8; (PAGE + 0x10).to_usize()];

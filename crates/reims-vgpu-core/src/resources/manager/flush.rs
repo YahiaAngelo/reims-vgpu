@@ -176,6 +176,7 @@ mod tests {
         let fx = Fx::new(&entries3(), Placement::Off);
         let r = crate::resources::icb::IcbResource::new(
             Arc::downgrade(&fx.task_dyn),
+            crate::guest::records::GuestPages::HOST,
             &[0; 12],
             None,
             Default::default(),

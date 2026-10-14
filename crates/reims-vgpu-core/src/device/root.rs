@@ -32,14 +32,12 @@
 //!
 //! [`FirstFitVa`]: crate::collections::FirstFitVa
 
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::device::{DeviceCore, DeviceDeath, DeviceRaise, MappingSink, ROOT_TASK_SIZE};
 use crate::fifo::Fifo;
 use crate::guest::GuestPtr;
-use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::mapping::{Mapping, Teardown};
 use crate::num::{ToU64, ToUsize, Truncate};
@@ -54,10 +52,6 @@ pub const ROOT_FIFO_MAX_LENGTH: u32 = 0x2_0000;
 pub const ROOT_FIFO_START_ALIGN_MASK: u32 = 0x3ff;
 /// A healthy FIFO's fault offset.
 pub const NOT_FAULTED: u32 = u32::MAX;
-/// The most a physical read reads: one guest page.
-pub const PHYSICAL_READ_PAGE: u64 = APV_PAGE_SIZE;
-/// A physical address's offset in its guest page.
-const PHYSICAL_PAGE_MASK: u64 = APV_PAGE_MASK;
 
 /// A call whose raise no frame above it catches: the process dies at the raise's site, under a
 /// handler or not.
@@ -66,11 +60,6 @@ pub(crate) fn or_die<T, E: Into<Raise>>(r: Result<T, E>) -> T {
         Ok(v) => v,
         Err(e) => e.into().fatal(),
     }
-}
-
-/// A page number's guest-physical address: a 32-bit page reaches 2^46 bytes (2^44 on x86-64).
-fn page_address(page: u32) -> u64 {
-    u64::from(page).wrapping_mul(APV_PAGE_SIZE)
 }
 
 impl<P: Platform> DeviceCore<P> {
@@ -105,7 +94,7 @@ impl<P: Platform> DeviceCore<P> {
                 rt.root_task_base.store(base.addr(), Ordering::Relaxed);
                 rt.root_task.store(task.addr(), Ordering::Relaxed);
             }
-            let mapping = self.new_contiguous_mapping(root_page, APV_PAGE_SIZE);
+            let mapping = self.new_contiguous_mapping(root_page, self.guest_pages.size());
             match mapping {
                 Some(mapping) => {
                     node.root_node = Some(GuestPtr::new(mapping.virtual_address()));
@@ -231,7 +220,7 @@ impl<P: Platform> DeviceCore<P> {
         self.interrupt_fault_mask.store(0, Ordering::SeqCst);
     }
 
-    /// Validates the staged registers, maps `[basePage·APV_PAGE_SIZE, +length)`, and makes the root
+    /// Validates the staged registers, maps `[basePage·page size, +length)`, and makes the root
     /// FIFO; every refusal only logs (0x1000 keeps reading 0).
     ///
     /// Its callers have no handler (the host's MMIO write and a resume): a raise making the
@@ -253,7 +242,7 @@ impl<P: Platform> DeviceCore<P> {
             return;
         }
         // Length 0 passes.
-        if u64::from(length) % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } != 0 {
+        if u64::from(length) & self.guest_pages.mask() != 0 {
             log::warn!("root FIFO not created: its length {length:#x} is not whole pages");
             return;
         }
@@ -389,7 +378,7 @@ impl<P: Platform> DeviceCore<P> {
         self.mapping_sink.unmap_range(virtual_address, length);
     }
 
-    /// `[page·APV_PAGE_SIZE, +length)` read-write: from the memory map, or a range of the root task
+    /// `[page·page size, +length)` read-write: from the memory map, or a range of the root task
     /// the host maps. `None` when it cannot be made.
     pub fn new_contiguous_mapping(&self, page: u32, length: u64) -> Option<Arc<Mapping<P>>> {
         crate::fatal_unless!(
@@ -397,7 +386,8 @@ impl<P: Platform> DeviceCore<P> {
             DeviceDeath::MappingWhileLeavingSuspend
         );
         let range = PhysRange {
-            physical_address: page_address(page),
+            // A 32-bit page reaches 2^46 bytes of 16 KiB pages, 2^44 of 4 KiB ones.
+            physical_address: self.guest_pages.address(page),
             physical_length: length,
         };
         let map = self.memory_map.lock().clone();
@@ -421,7 +411,7 @@ impl<P: Platform> DeviceCore<P> {
             DeviceDeath::MappingWhileLeavingSuspend
         );
         crate::fatal_unless!(
-            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,
+            total_length & self.guest_pages.mask() == 0,
             DeviceDeath::UnalignedRangeMapping
         );
         let map = self.memory_map.lock().clone();
@@ -477,8 +467,11 @@ impl<P: Platform> DeviceCore<P> {
         dst: &mut [u8],
     ) -> RaiseResult<bool> {
         let length = dst.len().low_u32();
-        if u64::from(length) > PHYSICAL_READ_PAGE
-            || (address & PHYSICAL_PAGE_MASK).wrapping_add(u64::from(length)) > PHYSICAL_READ_PAGE
+        // The most a physical read reads: one guest page.
+        let page_size = self.guest_pages.size();
+        let page_mask = self.guest_pages.mask();
+        if u64::from(length) > page_size
+            || (address & page_mask).wrapping_add(u64::from(length)) > page_size
         {
             crate::raise!(on => DeviceRaise::ReadPastPage,
                 format_args!("read of {length:#x} bytes at {address:#x} runs past its page")
@@ -493,12 +486,12 @@ impl<P: Platform> DeviceCore<P> {
             return Ok(read(address, u64::from(length), destination));
         }
         // The page number truncated to 32 bits.
-        let page = address.wrapping_shr(APV_PAGE_SHIFT).low_u32();
-        let Some(mapping) = self.new_contiguous_mapping(page, PHYSICAL_READ_PAGE) else {
+        let page = address.wrapping_shr(self.guest_pages.shift()).low_u32();
+        let Some(mapping) = self.new_contiguous_mapping(page, page_size) else {
             return Ok(false);
         };
         GuestPtr::new(mapping.virtual_address()).copy_to(
-            address & PHYSICAL_PAGE_MASK,
+            address & page_mask,
             dst,
             DeviceDeath::PhysicalReadCopy,
         );
@@ -646,6 +639,7 @@ mod tests {
     use super::*;
     use crate::device::RunState;
     use crate::device::test_support::Lines;
+    use crate::guest::records::APV_PAGE_SIZE;
     use crate::raise::RaiseId;
     use crate::testkit::calllog::Arg;
     use crate::testkit::capture::catch_death;

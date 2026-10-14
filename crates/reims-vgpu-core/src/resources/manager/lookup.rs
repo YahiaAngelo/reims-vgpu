@@ -25,7 +25,7 @@ use std::sync::{Arc, Weak};
 use crate::deserializer::texture_descriptor::{
     SerializedTextureDescriptor, SerializedTextureDescriptor2,
 };
-use crate::guest::records::{APV_PAGE_SIZE, ObjectEntry};
+use crate::guest::records::ObjectEntry;
 use crate::memory::cursor::{Cursor, WritableCursor};
 use crate::platform::Platform;
 use crate::raise::Raise;
@@ -409,9 +409,11 @@ impl<P: Platform> ResourceManager<P> {
             }
         };
         // The flags are ignored: a private buffer's reply goes to its guest pages
-        let virtual_offset = u64::from(page).wrapping_mul(APV_PAGE_SIZE);
         let cursor = match self.task.upgrade() {
-            Some(task) => task.writable_cursor_from_virtual_offset(hold, virtual_offset, length)?,
+            Some(task) => {
+                let virtual_offset = task.guest_pages().address(page);
+                task.writable_cursor_from_virtual_offset(hold, virtual_offset, length)?
+            }
             None => None,
         };
         Ok(cursor.ok_or_else(|| "no writable cursor over the buffer's guest pages".to_owned()))
@@ -422,6 +424,7 @@ impl<P: Platform> ResourceManager<P> {
 mod tests {
     use super::super::fixture::*;
     use super::*;
+    use crate::guest::records::APV_PAGE_SIZE;
     use crate::platform::Handle;
     use crate::raise::RaiseId;
     use crate::rt::Pool;

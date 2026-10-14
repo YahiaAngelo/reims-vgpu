@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::guest::records::GuestPages;
 use crate::host::HostBlocks;
 use crate::memory::descriptor::MemoryMapDescriptor;
 use crate::platform::Platform;
@@ -51,6 +52,9 @@ pub struct DeviceConfig<P: Platform> {
     pub device_feature_level: u64,
     /// `displayPortConnectionTypes`.
     pub display_port_connection_types: u32,
+    /// The guest's pages (ours): [`GuestPages::HOST`] unless the host's guest is of another
+    /// architecture than the build.
+    pub guest_pages: GuestPages,
 }
 
 impl<P: Platform> Default for DeviceConfig<P> {
@@ -68,6 +72,7 @@ impl<P: Platform> Default for DeviceConfig<P> {
             enable_protected_content: false,
             device_feature_level: 0,
             display_port_connection_types: 0,
+            guest_pages: GuestPages::HOST,
         }
     }
 }
@@ -105,6 +110,7 @@ mod tests {
         assert!(!c.process_isolation_follows_guest);
         assert!(!c.using_iosurface_mapper);
         assert_eq!(c.display_port_connection_types, 0);
+        assert_eq!(c.guest_pages, GuestPages::HOST);
         assert!(c.memory_map_descriptor.is_none());
         assert!(c.blocks.raise_interrupt.is_none() && c.blocks.add_trace_range.is_none());
     }

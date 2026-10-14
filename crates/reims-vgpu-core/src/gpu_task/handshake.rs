@@ -14,11 +14,11 @@ use super::service::GpuTask;
 use crate::deserializer::Deserializer;
 use crate::fatal_unless;
 use crate::guest::GuestPtr;
-use crate::guest::records::{APV_PAGE_SHIFT, APV_PAGE_SIZE, GuestFeatures, TaskRoot2};
+use crate::guest::records::{GuestFeatures, TaskRoot2};
 use crate::host::PhysRange;
 use crate::memory::map::MemoryMap;
 use crate::memory::mapping::Mapping;
-use crate::memory::page_table::{INDEX_BITS, PageTableRead, PageTableWalker, host_error_log};
+use crate::memory::page_table::{PageTableRead, PageTableWalker, host_error_log, index_bits};
 use crate::num;
 use crate::platform::device::GpuDevice;
 use crate::platform::{Handle, Platform};
@@ -29,9 +29,6 @@ use crate::rt::Hold;
 use crate::tasks::object_lists::{ObjectListKind, ObjectLists};
 use crate::tasks::shared::{TaskCore, TaskParts};
 use crate::tasks::wire::{Reply, TaskConfiguration};
-
-/// The task root: one guest page.
-const TASK_ROOT_LENGTH: u64 = APV_PAGE_SIZE;
 
 /// The task root's fields, as byte offsets into its page (packed).
 const ROOT_PAGE_TABLE_ROOT: u64 = num::const_u64(std::mem::offset_of!(TaskRoot2, page_table_root));
@@ -71,6 +68,8 @@ impl<P: Platform> GpuTask<P> {
         let p = &*self.platform;
         let _lock = self.handshake_lock.lock();
         let pid = std::process::id().cast_signed();
+        // A second handshake keeps the first's pages, as it keeps its core.
+        let _ = self.pages.set(configuration.guest_pages);
         let device = p.open_device(configuration.registry_id).map(Arc::new);
         *self.device.lock() = device.as_deref().map(Handle::clone_ref);
         if device.is_none() {
@@ -146,6 +145,7 @@ impl<P: Platform> GpuTask<P> {
                         task_size,
                         list_argument_buffers,
                         host.clone(),
+                        self.pages(),
                     );
                     *slot = Some(Arc::clone(&lists));
                     lists
@@ -209,7 +209,7 @@ impl<P: Platform> GpuTask<P> {
     /// or with no memory map.
     fn new_contiguous_mapping(&self, page: u32, length: u64) -> Option<Arc<Mapping<P>>> {
         let range = PhysRange {
-            physical_address: u64::from(page).wrapping_shl(APV_PAGE_SHIFT),
+            physical_address: self.pages().address(page),
             physical_length: length,
         };
         self.map()?.new_range_mapping(&[range], length, 0)
@@ -221,7 +221,9 @@ impl<P: Platform> GpuTask<P> {
     pub(super) fn setup_task_root(&self, task_root: u32) -> bool {
         // The handshake refuses 0 before
         fatal_unless!(task_root != 0, DeathKind::ZeroTaskRoot);
-        let mapping = self.new_contiguous_mapping(task_root, TASK_ROOT_LENGTH);
+        // The task root: one guest page.
+        let pages = self.pages();
+        let mapping = self.new_contiguous_mapping(task_root, pages.size());
         *self.root_mapping.lock() = mapping.clone();
         let Some(mapping) = mapping else {
             return false;
@@ -235,12 +237,12 @@ impl<P: Platform> GpuTask<P> {
         }
         let page_table_root = root.read_u32(ROOT_PAGE_TABLE_ROOT, DeathKind::NullTaskRoot);
         let task_length = self.task_length();
-        // A table of depth d covers ENTRIES^d pages
+        // A table of depth d covers entries^d pages
         let mut entries: u64 = 1;
         for _ in 0..depth {
-            entries = entries.wrapping_shl(INDEX_BITS);
+            entries = entries.wrapping_shl(index_bits(pages));
         }
-        if task_length > entries.wrapping_shl(APV_PAGE_SHIFT) {
+        if task_length > entries.wrapping_shl(pages.shift()) {
             log::warn!(
                 "task root refused: {task_length:#x} bytes are more than a page table of depth \
                  {depth} covers"
@@ -257,6 +259,7 @@ impl<P: Platform> GpuTask<P> {
         );
         // Holes refused; never nil
         let walker = PageTableWalker::new(
+            pages,
             page_table_root,
             depth,
             false,
@@ -368,7 +371,8 @@ mod tests {
             ]
         );
         // depth 1 covers ENTRIES pages: one byte more fails
-        let covered = crate::memory::page_table::ENTRIES << APV_PAGE_SHIFT;
+        let covered = crate::memory::page_table::entries(crate::guest::records::GuestPages::HOST)
+            << crate::guest::records::APV_PAGE_SHIFT;
         let tx = fixture(1, &rw_pages(4));
         assert_eq!(
             handshake_with(&tx, ROOT_PAGE, covered + 1, FAKE_REGISTRY_ID, true),
