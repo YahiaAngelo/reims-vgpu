@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 
 use reims_vgpu_core::collections::BucketOrderMap;
 use reims_vgpu_core::collections::ListOrderMap;
+use reims_vgpu_core::guest::records::GuestPages;
 use reims_vgpu_core::host::PhysRange;
 use reims_vgpu_core::memory::cursor::{Cursor, CursorRange, WritableCursor};
 use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
@@ -66,7 +67,7 @@ fn map_in_order(p: &Arc<FakePlatform>, ram: &GuestRam, order: &[usize]) -> Arc<M
             host_address: r.host(),
         });
     }
-    Map::new(p.clone(), &d).unwrap()
+    Map::new(p.clone(), &d, GuestPages::HOST).unwrap()
 }
 
 /// The descriptor's order is not the map's: init sorts by start, then length, and every later
@@ -156,7 +157,7 @@ fn a_page_table_walk_over_the_map_feeds_mappings_the_tracker_and_a_cursor() {
         },
     );
     let log: PageTableLog = Arc::new(|_, _| {});
-    let walker = PageTableWalker::new(root, 1, false, read, log);
+    let walker = PageTableWalker::new(GuestPages::HOST, root, 1, false, read, log);
 
     let mut visits: Vec<(u64, u32, u32)> = Vec::new();
     walker
@@ -183,7 +184,7 @@ fn a_page_table_walk_over_the_map_feeds_mappings_the_tracker_and_a_cursor() {
     );
 
     // Map each visited page (virtual pages 0, 1 and 3 first), tracking what is mapped.
-    let tracker = RangeTracker::new();
+    let tracker = RangeTracker::new(GuestPages::HOST);
     let mut by_page: Vec<Arc<Mapping<FakePlatform>>> = Vec::new();
     for &(off, page, _) in &visits {
         let mp = m

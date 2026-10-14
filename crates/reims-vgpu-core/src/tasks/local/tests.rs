@@ -9,7 +9,7 @@ use super::memory::check_task_range;
 use super::new::page_table_coverage;
 use super::*;
 use crate::device::test_support::{Opts, TestDevice, device};
-use crate::guest::records::APV_PAGE_SIZE;
+use crate::guest::records::{APV_PAGE_SIZE, GuestPages};
 use crate::platform::device::GpuDevice;
 use crate::raise::{Origin, Raise};
 use crate::resources::buffer::BufferResourceDescriptor;
@@ -31,16 +31,23 @@ fn raised(t: &Raise, kind: RaiseKind) {
 }
 
 /// Each level multiplies what the level below covers by a page of 4-byte entries: 64 MiB,
-/// 256 GiB and 1 PiB on a 16 KiB guest page.
+/// 256 GiB and 1 PiB on a 16 KiB guest page; 4 MiB, 4 GiB and 4 TiB on a 4 KiB one, whatever the
+/// build's own page
 #[test]
 fn coverage_per_depth() {
-    let entries = APV_PAGE_SIZE / 4;
-    assert_eq!(page_table_coverage(1), entries * APV_PAGE_SIZE);
-    assert_eq!(page_table_coverage(2), entries * entries * APV_PAGE_SIZE);
-    assert_eq!(
-        page_table_coverage(3),
-        entries * entries * entries * APV_PAGE_SIZE
-    );
+    for (pages, entries, size) in [
+        (GuestPages::ARM64, 4096u64, 0x4000u64),
+        (GuestPages::X86_64, 1024, 0x1000),
+    ] {
+        assert_eq!(page_table_coverage(pages, 1), entries * size);
+        assert_eq!(page_table_coverage(pages, 2), entries * entries * size);
+        assert_eq!(
+            page_table_coverage(pages, 3),
+            entries * entries * entries * size
+        );
+    }
+    assert_eq!(page_table_coverage(GuestPages::ARM64, 3), 1 << 50);
+    assert_eq!(page_table_coverage(GuestPages::X86_64, 3), 1 << 42);
 }
 
 #[test]

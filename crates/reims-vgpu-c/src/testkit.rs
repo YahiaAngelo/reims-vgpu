@@ -218,6 +218,7 @@ pub(crate) fn config(ports: u32, table: &RvgHostCallbacks) -> RvgDeviceConfig {
         callbacks: table,
         memory_files: std::ptr::null(),
         process_isolation_follows_guest: false,
+        guest_page_shift: 0,
     }
 }
 

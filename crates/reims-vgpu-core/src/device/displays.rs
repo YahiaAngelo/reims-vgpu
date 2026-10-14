@@ -577,7 +577,7 @@ impl<P: Platform> DeviceCore<P> {
         let views = self.displays.atomics();
         if enabled != 0 {
             if !views.has_efi_display() {
-                let efi = EfiDisplay::new(&self.platform, self.weak_self.clone());
+                let efi = EfiDisplay::new(&self.platform, self.weak_self.clone(), self.guest_pages);
                 // Stored with no lock and no release of what the slot held (none, unless another
                 // thread stored one meanwhile: that one is kept for good, and its timer keeps
                 // firing).

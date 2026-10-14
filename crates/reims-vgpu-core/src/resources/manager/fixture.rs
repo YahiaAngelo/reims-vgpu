@@ -74,6 +74,7 @@ impl Fx {
             TASK_LEN,
             placement != Placement::Off,
             Arc::downgrade(&task_dyn),
+            crate::guest::records::GuestPages::HOST,
         );
         for (i, (t, len, off)) in entries.iter().enumerate() {
             let e = ObjectEntry {

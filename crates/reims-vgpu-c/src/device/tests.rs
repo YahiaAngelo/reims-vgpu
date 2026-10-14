@@ -1,4 +1,4 @@
-use reims_vgpu_core::guest::records::APV_PAGE_SHIFT;
+use reims_vgpu_core::guest::records::{APV_PAGE_SHIFT, GuestPages};
 use reims_vgpu_core::testkit::GuestRam;
 use reims_vgpu_core::testkit::host::FakeHost;
 
@@ -245,9 +245,13 @@ fn host_calls(p: &reims_vgpu_core::testkit::FakePlatform) -> Vec<&'static str> {
 /// The device info pairs the guest reads in page `page`, where it asked for them, up to their
 /// terminator: 8 bytes each, the key low and the value high.
 fn device_info_pairs(rig: &Rig, page: u32) -> Vec<(u32, u32)> {
+    device_info_pairs_at(rig, u64::from(page) << APV_PAGE_SHIFT)
+}
+
+/// The device info pairs at guest physical address `at`, up to their terminator.
+fn device_info_pairs_at(rig: &Rig, at: u64) -> Vec<(u32, u32)> {
     // What the device wrote through its mapping of the page, in the guest's RAM.
     rig.p.fake_vm().sync();
-    let at = u64::from(page) << APV_PAGE_SHIFT;
     let mut pairs = Vec::new();
     for i in 0..64 {
         let w = rig._host.ram().read_u64(at + 8 * i).unwrap();
@@ -308,7 +312,7 @@ fn the_feature_level_reaches_the_guest() {
 }
 
 /// The config's first version ends at `callbacks`, 48 bytes; `memory_files` makes it 56, and
-/// `process_isolation_follows_guest` 64
+/// `process_isolation_follows_guest` and `guest_page_shift` 64 with their padding
 #[test]
 fn a_first_version_device_config_is_48_bytes() {
     assert_eq!(<RvgDeviceConfig as HostStruct>::V1_SIZE, 48);
@@ -317,6 +321,8 @@ fn a_first_version_device_config_is_48_bytes() {
         std::mem::offset_of!(RvgDeviceConfig, process_isolation_follows_guest),
         56
     );
+    assert_eq!(std::mem::offset_of!(RvgDeviceConfig, guest_page_shift), 60);
+    assert_eq!(DEVICE_CONFIG_V2_SIZE, 60);
     assert_eq!(size_of::<RvgDeviceConfig>(), 64);
     assert_eq!(size_of::<RvgMemoryRangeFile>(), 16);
     assert_eq!(std::mem::offset_of!(RvgMemoryRangeFile, flags), 4);
@@ -584,4 +590,65 @@ fn memory_files_are_duplicated() {
     assert_eq!(open_fds(), fds + 1);
     drop(copy);
     assert_eq!(open_fds(), fds);
+}
+
+/// `guest_page_shift`: 0 is the build's pages, and 12 and 14 an x86-64 and an arm64 guest's
+/// whatever the build; a host built against the second version passes 56 bytes and gets the
+/// build's pages, whatever follows its config
+#[test]
+fn the_guest_page_shift_names_the_device_s_pages() {
+    for (shift, pages) in [
+        (0, GuestPages::HOST),
+        (12, GuestPages::X86_64),
+        (14, GuestPages::ARM64),
+    ] {
+        let rig = Rig::with(1, |c| c.guest_page_shift = shift);
+        // SAFETY: the rig's live device.
+        let core = unsafe { &*rig.device }.device.core();
+        assert_eq!(core.guest_pages(), pages, "{shift}");
+    }
+    let rig = Rig::with(1, |c| {
+        c.struct_size = 56;
+        c.guest_page_shift = 13;
+    });
+    // SAFETY: the rig's live device.
+    let core = unsafe { &*rig.device }.device.core();
+    assert_eq!(core.guest_pages(), GuestPages::HOST);
+}
+
+/// A shift other than 0, 12 and 14 is an invalid argument, and the table's destroy runs
+#[test]
+fn another_guest_page_shift_is_refused() {
+    let _p = test_platform();
+    for shift in [1, 13, 16] {
+        let rec = Rec::new();
+        let table = only_destroy(&rec);
+        let mut c = config(1, &table);
+        c.guest_page_shift = shift;
+        assert_eq!(create(&c).0, RVG_ERR_INVALID_ARGUMENT, "{shift}");
+        assert_eq!(rec.destroys().len(), 1);
+    }
+}
+
+/// With 16 KiB guest pages the guest's page numbers count 16 KiB, whatever the build's own page:
+/// the device info for guest page 0x20 lands at 0x8_0000 (0x2_0000 with 4 KiB pages), the same
+/// pairs either way
+#[test]
+fn page_numbers_count_the_guest_s_pages() {
+    let mut pairs = Vec::new();
+    for (shift, at) in [(14, 0x8_0000), (12, 0x2_0000)] {
+        let rig = Rig::with(1, |c| c.guest_page_shift = shift);
+        // SAFETY: the rig's live device: the version, then a root node for the mapping.
+        unsafe {
+            rvg_device_mmio_write(rig.device, 0x1034, 0xf5);
+            rvg_device_mmio_write(rig.device, 0x101c, 1);
+        }
+        // SAFETY: as above.
+        let core = unsafe { &*rig.device }.device.core();
+        core.get_device_info(45, 46, 0x20).unwrap();
+        let got = device_info_pairs_at(&rig, at);
+        assert!(got.len() > 1, "{shift}: {got:?}");
+        pairs.push(got);
+    }
+    assert_eq!(pairs[0], pairs[1]);
 }

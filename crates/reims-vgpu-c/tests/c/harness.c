@@ -526,7 +526,7 @@ static void check_iosurface(void) {
     cb.ctx = &iosurface_destroyed;
     cb.destroy = on_iosurface_destroy;
     cb.raise_interrupt = on_raise;
-    RvgIOSurfaceDeviceConfig c = {sizeof c, NULL, &cb};
+    RvgIOSurfaceDeviceConfig c = {sizeof c, NULL, &cb, 0};
     RvgIOSurfaceDevice *d = NULL;
     iosurface_destroyed = 0;
     CHECK_STATUS(rvg_iosurface_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);

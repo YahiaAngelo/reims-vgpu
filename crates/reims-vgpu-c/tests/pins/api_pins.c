@@ -453,7 +453,7 @@ static void destroys(void) {
     RvgMemoryRange r = {0, sizeof page, page};
     RvgMemoryMap m = {&r, 1};
     RvgIOSurfaceCallbacks icb = {sizeof icb, "idestroy", named_destroy, on_raise};
-    RvgIOSurfaceDeviceConfig ic = {sizeof ic, NULL, &icb};
+    RvgIOSurfaceDeviceConfig ic = {sizeof ic, NULL, &icb, 0};
     RvgIOSurfaceDevice *io = NULL;
     log_reset();
     s = rvg_iosurface_device_create(&ic, &io);

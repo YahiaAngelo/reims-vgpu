@@ -13,7 +13,7 @@ use super::{DeathKind, RaiseKind, error_text, exception, raise_caught, unraised}
 use crate::fatal;
 use crate::fifo::wire::Records;
 use crate::guest::GuestPtr;
-use crate::guest::records::{APV_PAGE_MASK, CmdExecIndirectCmdBuffer, CmdExecIndirectResource3};
+use crate::guest::records::{CmdExecIndirectCmdBuffer, CmdExecIndirectResource3};
 use crate::memory::cursor::Cursor;
 use crate::num::{ToU64, ToUsize, Truncate};
 use crate::platform::command::{CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo};
@@ -37,9 +37,8 @@ const INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
 const INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// One compute-info entry: a `u32` key, then a `u32` value.
 const COMPUTE_INFO_ENTRY_SIZE: u64 = 8;
-/// The heap texture reply's bounds: 16 bytes to a guest page less one.
+/// The heap texture reply's bounds: 16 bytes to a guest page less one (the task's page mask).
 const HEAP_REPLY_MIN: u64 = 16;
-const HEAP_REPLY_MAX: u64 = APV_PAGE_MASK;
 /// The record sizes of an exec's payload.
 const RESOURCE3_SIZE: u64 = crate::num::const_u64(size_of::<CmdExecIndirectResource3>());
 const CMD_BUFFER_SIZE: u64 = crate::num::const_u64(size_of::<CmdExecIndirectCmdBuffer>());
@@ -542,12 +541,13 @@ impl<P: Platform> GpuTask<P> {
             let status = (|| -> RaiseResult<_> {
                 let wrote = Held::raising(|held| {
                     let hold = Hold::of(held);
-                    if !(HEAP_REPLY_MIN..=HEAP_REPLY_MAX).contains(&reply_length) {
+                    let heap_reply_max = this.pages().mask();
+                    if !(HEAP_REPLY_MIN..=heap_reply_max).contains(&reply_length) {
                         return raise_caught(
                             RaiseKind::ReplyLength,
                             format_args!(
                                 "reply of {reply_length:#x} bytes is not {HEAP_REPLY_MIN:#x} to \
-                                 {HEAP_REPLY_MAX:#x}"
+                                 {heap_reply_max:#x}"
                             ),
                         );
                     }

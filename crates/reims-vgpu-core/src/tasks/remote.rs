@@ -54,8 +54,8 @@ use parking_lot::Mutex;
 
 use crate::fifo::wire::Records;
 use crate::guest::records::{
-    APV_MAX_FIFOS, APV_PAGE_SIZE, CmdExecIndirectCmdBuffer, CmdExecIndirectResource,
-    CmdExecIndirectResource3,
+    APV_MAX_FIFOS, CmdExecIndirectCmdBuffer, CmdExecIndirectResource, CmdExecIndirectResource3,
+    GuestPages,
 };
 use crate::memory::map::MemoryMap;
 use crate::num::{self, ToU64, ToUsize, Truncate};
@@ -268,6 +268,9 @@ impl<P: Platform> RemoteTask<P> {
             supports_argument_buffers: device
                 .as_ref()
                 .is_some_and(|d| d.supports_argument_buffers()),
+            guest_pages: device
+                .as_ref()
+                .map_or(GuestPages::HOST, |d| d.guest_pages()),
         };
         let token = task.endpoint.completions().issue();
         // Reading a gone device's features is a NULL dereference (the device's own calls never
@@ -457,10 +460,10 @@ impl<P: Platform> Drop for RemoteTask<P> {
 /// address that is page-aligned and not NULL. The service reads guest RAM through these same host
 /// ranges.
 fn whole_pages<P: Platform>(map: &MemoryMap<P>) -> bool {
-    const IN_PAGE: u64 = APV_PAGE_SIZE - 1;
+    let in_page = map.guest_pages().mask();
     map.ranges().iter().all(|r| {
         let host = r.virtual_address.addr().to_u64();
-        host != 0 && r.physical_length != 0 && (host | r.physical_length) & IN_PAGE == 0
+        host != 0 && r.physical_length != 0 && (host | r.physical_length) & in_page == 0
     })
 }
 
@@ -1151,7 +1154,7 @@ mod tests {
                 host_address: HostPtr::from_addr(va),
             });
         }
-        h.td.set_memory_map(MemoryMap::new(h.platform.clone(), &d));
+        h.td.set_memory_map(MemoryMap::new(h.platform.clone(), &d, GuestPages::HOST));
     }
 
     /// Resources then command buffers, contiguous, as the FIFO's payload holds them.
@@ -1350,7 +1353,8 @@ mod tests {
         #[test]
         fn a_map_that_is_not_whole_pages_makes_no_task() {
             // A guest page and half of one: 0x4000 and 0x2000 on a 16 KiB guest page.
-            let (page, half) = (APV_PAGE_SIZE, APV_PAGE_SIZE / 2);
+            let page = crate::guest::records::APV_PAGE_SIZE;
+            let half = page / 2;
             for bad in [
                 (0, page + half, 0x10_0000),
                 (0, page, 0x10_0000 + half as usize),
