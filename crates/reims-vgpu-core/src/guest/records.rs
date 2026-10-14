@@ -16,19 +16,75 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::num::Truncate;
 
-/// The guest page shift: 14 for an arm64 guest's 16 KiB pages, 12 for an x86-64 guest's 4 KiB
-/// ones, the build's architecture's. QEMU offers the device only to guests of its host's own
-/// architecture, those HVF or KVM runs there, so the guest's is the build's: an arm64 build
-/// serves arm64 guests, an x86-64 build x86-64 ones (core's tests also run as x86-64 under
-/// Rosetta on a Mac). Every page number the guest hands the device counts these pages. Name is
-/// ours: the shift of `APV_PAGE_SIZE`.
+/// The guest page shift of a device whose host names none: 14 for an arm64 guest's 16 KiB pages,
+/// 12 for an x86-64 guest's 4 KiB ones, the build's architecture's. QEMU under HVF or KVM offers
+/// the device only to guests of its host's own architecture, so there the guest's is the build's
+/// (core's tests also run as x86-64 under Rosetta on a Mac). A host whose guest is of another
+/// architecture, an arm64 guest under TCG on an x86-64 host, names the guest's in its device
+/// config ([`GuestPages`]). Name is ours: the shift of `APV_PAGE_SIZE`.
 pub const APV_PAGE_SHIFT: u32 = if cfg!(target_arch = "x86_64") { 12 } else { 14 };
 
-/// `APV_PAGE_SIZE`: the guest page size, 16 KiB (4 KiB on x86-64).
+/// `APV_PAGE_SIZE`: the default guest page size, 16 KiB (4 KiB on x86-64).
 pub const APV_PAGE_SIZE: u64 = 1_u64.wrapping_shl(APV_PAGE_SHIFT);
 
-/// A guest address's offset in its page. Name is ours: the mask of `APV_PAGE_SIZE`.
+/// A guest address's offset in its default page. Name is ours: the mask of `APV_PAGE_SIZE`.
 pub const APV_PAGE_MASK: u64 = APV_PAGE_SIZE.wrapping_sub(1);
+
+/// A device's guest pages: every page number the guest hands the device counts them, and every
+/// length it must give in whole pages is of them. Fixed at the device's creation from its config,
+/// [`GuestPages::HOST`] by default; the device's tasks, FIFOs, displays and walks take them from
+/// the device. Name is ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuestPages {
+    shift: u32,
+}
+
+impl GuestPages {
+    /// The build's architecture's pages ([`APV_PAGE_SHIFT`]).
+    pub const HOST: GuestPages = GuestPages {
+        shift: APV_PAGE_SHIFT,
+    };
+    /// An arm64 guest's 16 KiB pages.
+    pub const ARM64: GuestPages = GuestPages { shift: 14 };
+    /// An x86-64 guest's 4 KiB pages.
+    pub const X86_64: GuestPages = GuestPages { shift: 12 };
+
+    /// The pages of `shift`: 12 or 14, the two the guest drivers run with; `None` for any other.
+    pub const fn from_shift(shift: u32) -> Option<GuestPages> {
+        match shift {
+            12 => Some(GuestPages::X86_64),
+            14 => Some(GuestPages::ARM64),
+            _ => None,
+        }
+    }
+
+    /// The page shift.
+    pub const fn shift(self) -> u32 {
+        self.shift
+    }
+
+    /// The page size in bytes.
+    pub const fn size(self) -> u64 {
+        1_u64.wrapping_shl(self.shift)
+    }
+
+    /// A guest address's offset in its page.
+    pub const fn mask(self) -> u64 {
+        self.size().wrapping_sub(1)
+    }
+
+    /// The address of page `page`'s first byte, in a physical or task address space.
+    pub fn address(self, page: u32) -> u64 {
+        u64::from(page).wrapping_shl(self.shift)
+    }
+}
+
+impl Default for GuestPages {
+    /// [`GuestPages::HOST`].
+    fn default() -> GuestPages {
+        GuestPages::HOST
+    }
+}
 
 /// `APV_MAX_FIFOS`: the FIFOs a guest may stamp through, the root included.
 pub const APV_MAX_FIFOS: u32 = 64;
@@ -521,40 +577,51 @@ mod tests {
         assert_eq!(APV_MAX_FIFOS, 64);
     }
 
-    /// On arm64 every guest-page constant derived from `APV_PAGE_SHIFT` keeps the value its
-    /// 16 KiB literal had
-    #[cfg(target_arch = "aarch64")]
+    /// The default pages are the build's architecture's, as the guest-page constants were
     #[test]
-    fn guest_page_constants_keep_their_16k_values_on_aarch64() {
-        use crate::{device::root, display, fifo::ring, memory::page_table};
-        assert_eq!(APV_PAGE_SHIFT, 14);
-        assert_eq!(APV_PAGE_SIZE, 0x4000);
-        assert_eq!(APV_PAGE_MASK, 0x3fff);
-        // The range tracker's rounding.
-        assert_eq!(APV_PAGE_SIZE - 2, 0x3ffe);
-        assert_eq!(page_table::INDEX_BITS, 12);
-        assert_eq!(page_table::ENTRIES, 4096);
-        assert_eq!(ring::PAGE_LIST_ENTRIES, 4096);
-        assert_eq!(display::efi::PAGE_MASK, 0x3fff);
-        assert_eq!(root::PHYSICAL_READ_PAGE, 0x4000);
-        assert_eq!(display::page::PAGE_LENGTH, 0x4000);
+    fn the_default_guest_pages_are_the_build_s() {
+        assert_eq!(GuestPages::default(), GuestPages::HOST);
+        assert_eq!(GuestPages::HOST.shift(), APV_PAGE_SHIFT);
+        assert_eq!(GuestPages::HOST.size(), APV_PAGE_SIZE);
+        assert_eq!(GuestPages::HOST.mask(), APV_PAGE_MASK);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(GuestPages::HOST, GuestPages::X86_64);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(GuestPages::HOST, GuestPages::ARM64);
     }
 
-    /// On x86-64 the guest's pages are 4 KiB: a page table is 1024 entries of 4 KiB page numbers,
-    /// and the display state page's mapping is one of them
-    #[cfg(target_arch = "x86_64")]
+    /// Only 12 and 14 name pages
     #[test]
-    fn guest_page_constants_are_4k_on_x86_64() {
-        use crate::{device::root, display, fifo::ring, memory::page_table};
-        assert_eq!(APV_PAGE_SHIFT, 12);
-        assert_eq!(APV_PAGE_SIZE, 0x1000);
-        assert_eq!(APV_PAGE_MASK, 0xfff);
-        assert_eq!(APV_PAGE_SIZE - 2, 0xffe);
-        assert_eq!(page_table::INDEX_BITS, 10);
-        assert_eq!(page_table::ENTRIES, 1024);
-        assert_eq!(ring::PAGE_LIST_ENTRIES, 1024);
-        assert_eq!(display::efi::PAGE_MASK, 0xfff);
-        assert_eq!(root::PHYSICAL_READ_PAGE, 0x1000);
-        assert_eq!(display::page::PAGE_LENGTH, 0x1000);
+    fn guest_pages_from_shift() {
+        assert_eq!(GuestPages::from_shift(12), Some(GuestPages::X86_64));
+        assert_eq!(GuestPages::from_shift(14), Some(GuestPages::ARM64));
+        for shift in [0, 1, 11, 13, 15, 16, 32, 64, u32::MAX] {
+            assert_eq!(GuestPages::from_shift(shift), None, "{shift}");
+        }
+    }
+
+    /// Every guest-page value derived from a device's pages keeps the value its literal had on
+    /// the build of that page size, whatever this build's: 16 KiB pages as on arm64, 4 KiB as
+    /// on x86-64
+    #[test]
+    fn guest_page_values_follow_the_device_s_pages() {
+        use crate::{fifo::ring, memory::page_table};
+        let a = GuestPages::ARM64;
+        assert_eq!((a.shift(), a.size(), a.mask()), (14, 0x4000, 0x3fff));
+        // The range tracker's rounding.
+        assert_eq!(a.size() - 2, 0x3ffe);
+        assert_eq!(page_table::index_bits(a), 12);
+        assert_eq!(page_table::entries(a), 4096);
+        assert_eq!(ring::page_list_entries(a), 4096);
+        assert_eq!(a.address(3), 0xc000);
+        assert_eq!(a.address(u32::MAX), u64::from(u32::MAX) << 14);
+        let x = GuestPages::X86_64;
+        assert_eq!((x.shift(), x.size(), x.mask()), (12, 0x1000, 0xfff));
+        assert_eq!(x.size() - 2, 0xffe);
+        assert_eq!(page_table::index_bits(x), 10);
+        assert_eq!(page_table::entries(x), 1024);
+        assert_eq!(ring::page_list_entries(x), 1024);
+        assert_eq!(x.address(3), 0x3000);
+        assert_eq!(x.address(u32::MAX), u64::from(u32::MAX) << 12);
     }
 }

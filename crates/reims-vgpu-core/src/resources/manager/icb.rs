@@ -321,7 +321,8 @@ impl<P: Platform> ManagerOps<P> for ResourceManager<P> {
         let Some(task) = self.task() else {
             crate::fatal!(DeathKind::TaskGone)
         };
-        IcbResource::new(Arc::downgrade(&task), descriptor, icb, layout, flags)
+        let pages = task.guest_pages();
+        IcbResource::new(Arc::downgrade(&task), pages, descriptor, icb, layout, flags)
     }
 }
 

@@ -872,6 +872,7 @@ mod tests {
         };
         let icb = IcbResource::new(
             env.task(),
+            crate::guest::records::GuestPages::HOST,
             &[0; 12],
             None,
             IndirectCommandLayout::default(),

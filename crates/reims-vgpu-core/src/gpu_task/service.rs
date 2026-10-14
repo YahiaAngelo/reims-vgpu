@@ -18,7 +18,7 @@ use crate::deserializer::Deserializer;
 use crate::fatal;
 use crate::fifo::wire::Records;
 use crate::guest::GuestPtr;
-use crate::guest::records::{FeaturesRef, SharedFeatures};
+use crate::guest::records::{FeaturesRef, GuestPages, SharedFeatures};
 use crate::memory::cursor::{Cursor, WritableCursor};
 use crate::memory::map::MemoryMap;
 use crate::memory::mapping::Mapping;
@@ -88,6 +88,8 @@ pub struct GpuTask<P: Platform> {
     pub(super) me: Weak<GpuTask<P>>,
     /// The task's length.
     pub(super) length: AtomicU64,
+    /// The device's guest pages, as the first handshake gave them.
+    pub(super) pages: OnceLock<GuestPages>,
     /// The task lock until the handshake has built the core (module doc).
     pub(super) handshake_lock: Mutex<()>,
     /// The object lists, built by the handshake whether or not it found a device. The core's
@@ -155,9 +157,15 @@ impl<P: Platform> GpuTask<P> {
             fifos: Mutex::new(LookupMap::new()),
             me: me.clone(),
             length: AtomicU64::new(0),
+            pages: OnceLock::new(),
             handshake_lock: Mutex::new(()),
             object_lists: Mutex::new(None),
         })
+    }
+
+    /// The device's guest pages: the default's until a handshake gives them.
+    pub(super) fn pages(&self) -> GuestPages {
+        self.pages.get().copied().unwrap_or_default()
     }
 
     /// The task's length.
@@ -684,6 +692,10 @@ impl<P: Platform> Drop for GpuTask<P> {
 }
 
 impl<P: Platform> ResourceHost<P> for GpuTask<P> {
+    fn guest_pages(&self) -> GuestPages {
+        self.pages()
+    }
+
     fn new_buffer_for_virtual_page(
         &self,
         hold: Hold<'_>,

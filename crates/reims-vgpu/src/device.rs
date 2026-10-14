@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use reims_vgpu_core::device::Device as CoreDevice;
 use reims_vgpu_core::device::config::DeviceConfig as CoreDeviceConfig;
+use reims_vgpu_core::guest::records::GuestPages;
 use reims_vgpu_core::host::{
     AddTraceRange, CreateTask, DestroyTask, HostBlocks, HostPtr, MapMemory, RaiseInterrupt,
     ReadMemory, RemoveTraceRange, UnmapMemory,
@@ -212,6 +213,12 @@ pub struct DeviceConfig {
     pub argument_buffers: bool,
     /// The callbacks.
     pub callbacks: HostCallbacks,
+    /// The guest's page shift: 14 for an arm64 guest's 16 KiB pages, 12 for an x86-64 guest's
+    /// 4 KiB ones, and 0, the default, for the build's architecture's (12 on x86-64, 14 on
+    /// arm64). Every page number the guest hands the device counts these pages. A host whose
+    /// guest is of another architecture than its own (an arm64 guest under TCG on an x86-64
+    /// host) names it; any other value is refused ([`Error::InvalidArgument`]).
+    pub guest_page_shift: u32,
 }
 
 impl Default for DeviceConfig {
@@ -227,13 +234,24 @@ impl Default for DeviceConfig {
             process_isolation_follows_guest: false,
             argument_buffers: true,
             callbacks: HostCallbacks::default(),
+            guest_page_shift: 0,
         }
     }
 }
 
 impl DeviceConfig {
-    /// Core's config over `device`: the same closures, the map's ranges copied.
-    fn into_core<P: Platform>(self, device: Option<P::Device>) -> CoreDeviceConfig<P> {
+    /// The guest's pages ([`guest_pages_of`]).
+    fn guest_pages(&self) -> Option<GuestPages> {
+        guest_pages_of(self.guest_page_shift)
+    }
+
+    /// Core's config over `device` and `guest_pages`: the same closures, the map's ranges
+    /// copied.
+    fn into_core<P: Platform>(
+        self,
+        device: Option<P::Device>,
+        guest_pages: GuestPages,
+    ) -> CoreDeviceConfig<P> {
         CoreDeviceConfig {
             device,
             display_port_count: self.display_port_count,
@@ -245,8 +263,18 @@ impl DeviceConfig {
             process_isolation_follows_guest: self.process_isolation_follows_guest,
             device_feature_level: self.feature_level,
             display_port_connection_types: self.display_port_connection_types,
+            guest_pages,
             ..CoreDeviceConfig::default()
         }
+    }
+}
+
+/// The guest's pages of a config's `guest_page_shift`: the build's for 0, `None` for a shift
+/// neither 12 nor 14.
+pub(crate) fn guest_pages_of(shift: u32) -> Option<GuestPages> {
+    match shift {
+        0 => Some(GuestPages::HOST),
+        shift => GuestPages::from_shift(shift),
     }
 }
 
@@ -282,7 +310,9 @@ impl Device {
 }
 
 impl<P: ApiPlatform> Device<P> {
-    /// A new device on `platform`. Refusals, in core's order: [`Error::DisplayPortCount`],
+    /// A new device on `platform`. A `guest_page_shift` other than 0, 12 and 14 is refused first
+    /// ([`Error::InvalidArgument`]), before anything is made. Then core's refusals, in its order:
+    /// [`Error::DisplayPortCount`],
     /// [`Error::NoMetalDevice`], [`Error::MemoryConflict`], [`Error::MemoryMap`],
     /// [`Error::InvalidArgument`] (`add_trace_range` without `remove_trace_range`),
     /// [`Error::Metal`], [`Error::IsolationWithoutMap`]. The first device given a Metal device
@@ -294,6 +324,9 @@ impl<P: ApiPlatform> Device<P> {
     /// drops it before it returns.
     pub fn with_platform(platform: Arc<P>, config: DeviceConfig) -> Result<Device<P>, Error> {
         entry::run(|_| {
+            let Some(guest_pages) = config.guest_pages() else {
+                return Err(Error::InvalidArgument);
+            };
             let metal = platform.metal_device(config.metal_registry_id);
             if let Some(metal) = &metal {
                 drop(api_state(&platform).frame_queue(metal));
@@ -302,7 +335,7 @@ impl<P: ApiPlatform> Device<P> {
                 .memory_map
                 .as_ref()
                 .map(|map| Arc::from(platform.guest_memory(map)));
-            let core = config.into_core::<P>(metal);
+            let core = config.into_core::<P>(metal, guest_pages);
             match CoreDevice::new(platform.clone(), core) {
                 Ok(handle) => Ok(Device {
                     handle: Ours::new(handle),
@@ -512,8 +545,10 @@ mod tests {
         assert!(!c.process_isolation_follows_guest);
         assert_eq!((c.feature_level, c.display_port_connection_types), (0, 0));
         assert!(c.metal_registry_id.is_none() && c.memory_map.is_none());
-        let core = c.into_core::<FakePlatform>(None);
+        assert_eq!(c.guest_page_shift, 0);
+        let core = c.into_core::<FakePlatform>(None, GuestPages::HOST);
         let want = CoreDeviceConfig::<FakePlatform>::default();
+        assert_eq!(core.guest_pages, want.guest_pages);
         assert_eq!(core.display_port_count, want.display_port_count);
         assert_eq!(core.enable_argument_buffers, want.enable_argument_buffers);
         assert_eq!(core.mmio_length, want.mmio_length);
@@ -592,6 +627,30 @@ mod tests {
             Device::with_platform(p, c).err(),
             Some(Error::IsolationWithoutMap)
         );
+    }
+
+    /// The guest page shift: 0 is the build's pages, 12 and 14 an x86-64 and an arm64 guest's
+    /// whatever the build, and any other value is refused before anything is made
+    #[test]
+    fn guest_page_shift() {
+        let device = |shift: u32| {
+            let p = Arc::new(FakePlatform::new());
+            let host = FakeHost::new(&p, GuestRam::with_range(0, 0x40_0000).unwrap());
+            let c = DeviceConfig {
+                callbacks: callbacks(&host),
+                guest_page_shift: shift,
+                ..DeviceConfig::default()
+            };
+            Device::with_platform(p, c)
+        };
+        let pages = |shift| device(shift).unwrap().core().guest_pages();
+        assert_eq!(pages(0), GuestPages::HOST);
+        assert_eq!(pages(12), GuestPages::X86_64);
+        assert_eq!(pages(14), GuestPages::ARM64);
+        assert_eq!(GuestPages::ARM64.size(), 0x4000);
+        for shift in [1, 11, 13, 15, 16, 64] {
+            assert_eq!(device(shift).err(), Some(Error::InvalidArgument), "{shift}");
+        }
     }
 
     /// The API answers what core answers, and a write reaches the device; clone_ref is another

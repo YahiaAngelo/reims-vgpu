@@ -6,14 +6,14 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use super::{
-    Backend, DeathKind, LocalTask, PAGE, ROOT_OBJECT_LIST_LENGTH, ROOT_OBJECT_LIST_OFFSET,
+    Backend, DeathKind, LocalTask, ROOT_OBJECT_LIST_LENGTH, ROOT_OBJECT_LIST_OFFSET,
     ROOT_PAGE_TABLE_DEPTH, ROOT_PAGE_TABLE_ROOT, ROOT_TASK_LENGTH,
 };
 use crate::deserializer::Deserializer;
 use crate::device::DeviceCore;
 use crate::guest::GuestPtr;
-use crate::guest::records::APV_PAGE_SHIFT;
-use crate::memory::page_table::{INDEX_BITS, PageTableRead, PageTableWalker, host_error_log};
+use crate::guest::records::GuestPages;
+use crate::memory::page_table::{PageTableRead, PageTableWalker, host_error_log, index_bits};
 use crate::memory::tracker::RangeTracker;
 use crate::platform::Platform;
 use crate::platform::device::GpuDevice;
@@ -39,16 +39,16 @@ enum Built {
     Raised(Raise),
 }
 
-/// The guest memory a page table of `depth` levels covers: [`ENTRIES`] entries a level, of guest
-/// pages (4096 of 16 KiB, 1024 of 4 KiB on x86-64).
+/// The guest memory a page table of `depth` levels covers: a page of entries a level
+/// ([`entries`]), of guest pages (4096 of 16 KiB, 1024 of 4 KiB).
 ///
-/// [`ENTRIES`]: crate::memory::page_table::ENTRIES
-pub(super) fn page_table_coverage(depth: u32) -> u64 {
+/// [`entries`]: crate::memory::page_table::entries
+pub(super) fn page_table_coverage(guest_pages: GuestPages, depth: u32) -> u64 {
     let mut pages: u64 = 1;
     for _ in 0..depth {
-        pages = pages.wrapping_shl(INDEX_BITS);
+        pages = pages.wrapping_shl(index_bits(guest_pages));
     }
-    pages.wrapping_shl(APV_PAGE_SHIFT)
+    pages.wrapping_shl(guest_pages.shift())
 }
 
 impl<P: Platform> LocalTask<P> {
@@ -137,8 +137,9 @@ impl<P: Platform> LocalTask<P> {
             task_id: 0,
             task_info: TaskInfo::default(),
             backend: Backend::Blocks {
-                mapped: RangeTracker::new(),
+                mapped: RangeTracker::new(dev.guest_pages()),
             },
+            pages: dev.guest_pages(),
             task_root_mapping: None,
             task_root: GuestPtr::default(),
             walker: None,
@@ -159,6 +160,7 @@ impl<P: Platform> LocalTask<P> {
                 me.length,
                 false,
                 host.clone(),
+                me.pages,
             );
             if !dev.create_task(length, &mut me.task_info) {
                 *built = Built::Refused;
@@ -167,7 +169,13 @@ impl<P: Platform> LocalTask<P> {
             lists
         } else {
             me.backend = Backend::MemoryMap;
-            ObjectLists::new(ObjectListKind::MemoryMap, me.length, false, host.clone())
+            ObjectLists::new(
+                ObjectListKind::MemoryMap,
+                me.length,
+                false,
+                host.clone(),
+                me.pages,
+            )
         };
         // No GPU addresses registered
         let resource_manager = ResourceManager::new(
@@ -236,7 +244,7 @@ impl<P: Platform> LocalTask<P> {
     /// task's length into the root. `false` where it refuses: a nil mapping (no log), or a page
     /// table whose depth is not 1 to 3 or which covers less than the task (a log).
     fn setup_task_root(&mut self, dev: &DeviceCore<P>, task_root: u32) -> bool {
-        let Some(mapping) = dev.new_contiguous_mapping(task_root, PAGE) else {
+        let Some(mapping) = dev.new_contiguous_mapping(task_root, self.pages.size()) else {
             return false;
         };
         self.task_root = GuestPtr::new(mapping.virtual_address());
@@ -258,7 +266,7 @@ impl<P: Platform> LocalTask<P> {
         let root = self
             .task_root
             .read_u32(ROOT_PAGE_TABLE_ROOT, TasksDeath::NullTaskRoot);
-        if self.length > page_table_coverage(depth) {
+        if self.length > page_table_coverage(self.pages, depth) {
             log::warn!(
                 "task refused: {:#x} bytes are more than a page table of depth {depth} covers",
                 self.length
@@ -285,6 +293,7 @@ impl<P: Platform> LocalTask<P> {
         );
         // No holes allowed; the walker's construction never fails
         self.walker = Some(PageTableWalker::new(
+            self.pages,
             root,
             depth,
             false,

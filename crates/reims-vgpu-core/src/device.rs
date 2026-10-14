@@ -58,7 +58,7 @@ use crate::display::guest_display::GuestDisplay;
 use crate::fifo::Fifo;
 use crate::guest::GuestPtr;
 use crate::guest::abi::device_info::DeviceInfoSnapshot;
-use crate::guest::records::SharedFeatures;
+use crate::guest::records::{GuestPages, SharedFeatures};
 use crate::host::{HostBlocks, HostCallbacks, HostPtr, HostTask};
 use crate::iosurface::HostDeviceCore;
 use crate::memory::map::MemoryMap;
@@ -1007,6 +1007,8 @@ pub struct DeviceCore<P: Platform> {
     exec_queue: Option<P::CommandQueue>,
     /// The displays' cores by the host reference's identity: a leaf lock, apart from `displays`.
     display_cores: DisplayRegistry<P>,
+    /// The guest's pages, from the descriptor.
+    guest_pages: GuestPages,
     /// What the device's mappings unmap through. Declared last of the fields the explicit
     /// `Drop` leaves: it outlives every other field.
     mapping_sink: Arc<MappingSink<P>>,
@@ -1074,7 +1076,9 @@ impl<P: Platform> DeviceCore<P> {
                 );
                 return Err(DeviceRefusal::MemoryConflict);
             }
-            let Some(map) = MemoryMap::new(platform.clone(), map_descriptor) else {
+            let Some(map) =
+                MemoryMap::new(platform.clone(), map_descriptor, descriptor.guest_pages)
+            else {
                 log::warn!("device refused: its memory map descriptor is not valid");
                 release!(
                     blocks,
@@ -1128,6 +1132,7 @@ impl<P: Platform> DeviceCore<P> {
         }
         let root_task_allocator = FirstFitVa::new(ROOT_TASK_VA_LAST, ROOT_TASK_VA_GRANULE);
         let using_mapper_service = descriptor.using_iosurface_mapper;
+        let guest_pages = descriptor.guest_pages;
         let pipelines = setup_blit_pipelines(p, &mtl_device);
         let blit_in = pipelines.blit_in;
         let blit_out = pipelines.blit_out;
@@ -1302,6 +1307,7 @@ impl<P: Platform> DeviceCore<P> {
                     mtl_device,
                     exec_queue,
                     display_cores: DisplayRegistry::new(),
+                    guest_pages,
                     mapping_sink: Arc::new(MappingSink {
                         blocks: sink_blocks,
                         memory_map,
@@ -1323,6 +1329,11 @@ impl<P: Platform> DeviceCore<P> {
     /// its drop shuts the device down on that thread.
     pub fn retain_self(&self) -> Option<Device<P>> {
         self.handle.upgrade().map(Device)
+    }
+
+    /// The guest's pages, fixed at creation.
+    pub fn guest_pages(&self) -> GuestPages {
+        self.guest_pages
     }
 
     /// Whether the shutdown has started (the last [`Handle`] has gone).
@@ -1588,6 +1599,7 @@ mod seam_impls {
                 key,
                 length,
                 destination_page,
+                self.guest_pages.size(),
                 |page, len| Ok(DeviceCore::new_contiguous_mapping(self, page, len)),
                 |mapping: &Arc<Mapping<P>>, max_key, max_count| {
                     let base = GuestPtr::new(mapping.virtual_address());
@@ -1791,7 +1803,6 @@ pub(crate) mod test_support {
     use crate::device::DeviceCore;
     use crate::device::config::DeviceConfig;
     use crate::guest::GuestPtr;
-    use crate::guest::records::APV_PAGE_SIZE;
     use crate::rt::Hold;
     use crate::testkit::guest_ram::RawRegion;
     use crate::testkit::host::FakeHost;
@@ -1865,6 +1876,7 @@ pub(crate) mod test_support {
         pub max_fifo_count: u32,
         pub using_mapper_service: bool,
         pub connection_types: u32,
+        pub guest_pages: crate::guest::records::GuestPages,
     }
 
     impl Default for Opts {
@@ -1874,6 +1886,7 @@ pub(crate) mod test_support {
                 max_fifo_count: 64,
                 using_mapper_service: false,
                 connection_types: 0,
+                guest_pages: crate::guest::records::GuestPages::HOST,
             }
         }
     }
@@ -1887,6 +1900,7 @@ pub(crate) mod test_support {
         c.blocks = host.blocks();
         c.using_iosurface_mapper = opts.using_mapper_service;
         c.display_port_connection_types = opts.connection_types;
+        c.guest_pages = opts.guest_pages;
         let device = DeviceCore::create(platform.clone(), c).expect("device");
         let mut f = device.features.load();
         f.max_fifo_count = opts.max_fifo_count;
@@ -1959,7 +1973,7 @@ pub(crate) mod test_support {
             self.platform.fake_vm().sync();
             self.host
                 .ram()
-                .read_u32(u64::from(ROOT_PAGE) * APV_PAGE_SIZE + i * 4)
+                .read_u32(self.device.guest_pages.address(ROOT_PAGE) + i * 4)
                 .expect("root word")
         }
 
@@ -1969,14 +1983,14 @@ pub(crate) mod test_support {
             assert!(
                 self.host
                     .ram()
-                    .write_u32(u64::from(ROOT_PAGE) * APV_PAGE_SIZE + i * 4, v)
+                    .write_u32(self.device.guest_pages.address(ROOT_PAGE) + i * 4, v)
             );
             self.platform.fake_vm().sync();
         }
 
         /// A task root node in guest page `page`: page-table depth 1 and `length` at +0x14.
         pub(crate) fn task_root_node(&self, page: u32, length: u64) {
-            let pa = u64::from(page) * APV_PAGE_SIZE;
+            let pa = self.device.guest_pages.address(page);
             self.platform.fake_vm().sync();
             assert!(self.host.ram().write_u32(pa + 4, 1));
             assert!(self.host.ram().write_u64(pa + 0x14, length));

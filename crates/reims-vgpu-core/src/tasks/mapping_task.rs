@@ -4,7 +4,6 @@
 use crate::num::ToUsize;
 use std::sync::Arc;
 
-use crate::guest::records::APV_PAGE_SIZE;
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::map::MemoryMap;
 use crate::platform::Platform;
@@ -32,7 +31,10 @@ impl<P: Platform> MappingTask<P> {
     /// either call fails (a reservation made is freed by the drop). A size that is not a whole
     /// number of pages ends the process first.
     pub fn new(platform: Arc<P>, size: u64, memory_map: Arc<MemoryMap<P>>) -> Option<Arc<Self>> {
-        crate::fatal_unless!(aligned_to(size, APV_PAGE_SIZE), DeathKind::MappingSize);
+        crate::fatal_unless!(
+            aligned_to(size, memory_map.guest_pages().size()),
+            DeathKind::MappingSize
+        );
         let mut task = MappingTask {
             size,
             base_address: HostPtr::NULL,
@@ -139,7 +141,7 @@ mod tests {
                 host_address: r.host(),
             });
         }
-        let m = MemoryMap::new(p.clone(), &d).unwrap();
+        let m = MemoryMap::new(p.clone(), &d, crate::guest::records::GuestPages::HOST).unwrap();
         (ram, m)
     }
 
