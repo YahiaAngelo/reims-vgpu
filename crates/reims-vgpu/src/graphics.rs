@@ -63,6 +63,7 @@ use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
     Screen,
 };
+use reims_vgpu_core::guest::records::GuestPages;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
@@ -253,8 +254,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // made through the map, so it outlives the last of them.
             if let Some(map) = &config.memory_map {
                 let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map, None));
-                let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
-                    .ok_or(Error::InvalidArgument)?;
+                // The graphics device serves x86-64 guests alone: 4 KiB pages.
+                let memory =
+                    CoreMemoryMap::new(Arc::clone(&platform), &map.to_core(), GuestPages::X86_64)
+                        .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks, and

@@ -3,11 +3,9 @@
 
 use std::sync::Arc;
 
-use super::{
-    Backend, LocalTask, PAGE, PAGE_MASK, RaiseKind, page_address, raise_carrying, raise_caught,
-    raise_on,
-};
+use super::{Backend, LocalTask, RaiseKind, raise_carrying, raise_caught, raise_on};
 use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
+use crate::guest::records::GuestPages;
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::cursor::Cursor;
 use crate::memory::mapping::Mapping;
@@ -38,7 +36,13 @@ pub(super) fn check_task_range(offset: u64, length: u64, task_length: u64) -> Ra
 
 /// The checks both setups make before mapping `offset..offset + length` page by page, in order:
 /// the range, a page table, the offset's and the length's alignment, a length.
-fn check_mappable(offset: u64, length: u64, task_length: u64, has_root: bool) -> RaiseResult<()> {
+fn check_mappable(
+    pages: GuestPages,
+    offset: u64,
+    length: u64,
+    task_length: u64,
+    has_root: bool,
+) -> RaiseResult<()> {
     check_task_range(offset, length, task_length)?;
     if !has_root {
         return raise_caught(
@@ -46,13 +50,13 @@ fn check_mappable(offset: u64, length: u64, task_length: u64, has_root: bool) ->
             "no page table to map task memory through",
         );
     }
-    if offset & PAGE_MASK != 0 {
+    if offset & pages.mask() != 0 {
         return raise_caught(
             RaiseKind::UnalignedOffset,
             format_args!("task offset {offset:#x} to map is not page-aligned"),
         );
     }
-    if length & PAGE_MASK != 0 {
+    if length & pages.mask() != 0 {
         return raise_caught(
             RaiseKind::UnalignedLength,
             format_args!("length {length:#x} to map is not page-aligned"),
@@ -95,7 +99,13 @@ impl<P: Platform> LocalTask<P> {
         offset: u64,
         length: u64,
     ) -> RaiseResult<()> {
-        check_mappable(offset, length, self.length, !self.task_root.is_null())?;
+        check_mappable(
+            self.pages,
+            offset,
+            length,
+            self.length,
+            !self.task_root.is_null(),
+        )?;
         let task = self.task_info.task;
         let device = self.device.upgrade();
         // With the device gone nothing maps
@@ -114,13 +124,14 @@ impl<P: Platform> LocalTask<P> {
                 offset,
                 length,
                 &mut |address, page, page_writable| {
-                    let physical = page_address(page);
+                    let physical = self.pages.address(page);
                     // The run grows only from its start page (so at most 2 pages), and the `{0, 0}`
                     // start matches a read-only first leaf at guest page 1.
-                    if physical == range.physical_address.wrapping_add(PAGE)
+                    if physical == range.physical_address.wrapping_add(self.pages.size())
                         && page_writable == u32::from(writable)
                     {
-                        range.physical_length = range.physical_length.wrapping_add(PAGE);
+                        range.physical_length =
+                            range.physical_length.wrapping_add(self.pages.size());
                     } else {
                         // The flushed run takes the next page's writability.
                         if range.physical_length != 0
@@ -133,7 +144,7 @@ impl<P: Platform> LocalTask<P> {
                         }
                         range = PhysRange {
                             physical_address: physical,
-                            physical_length: PAGE,
+                            physical_length: self.pages.size(),
                         };
                         range_start = address;
                         writable = page_writable != 0;
@@ -200,7 +211,13 @@ impl<P: Platform> LocalTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
-        check_mappable(offset, length, self.length, !self.task_root.is_null())?;
+        check_mappable(
+            self.pages,
+            offset,
+            length,
+            self.length,
+            !self.task_root.is_null(),
+        )?;
         let mut ranges: Vec<PhysRange> = Vec::new();
         let mut writable = true;
         let mut range = PhysRange::default();
@@ -211,22 +228,23 @@ impl<P: Platform> LocalTask<P> {
                 offset,
                 length,
                 &mut |_address, page, page_writable| {
-                    let physical = page_address(page);
+                    let physical = self.pages.address(page);
                     // One read-only leaf makes the whole mapping read-only.
                     if page_writable == 0 {
                         writable = false;
                     }
                     // Runs are cut at 2 pages; a first leaf at guest page 1 extends the empty run into
                     // one at physical 0.
-                    if physical == range.physical_address.wrapping_add(PAGE) {
-                        range.physical_length = range.physical_length.wrapping_add(PAGE);
+                    if physical == range.physical_address.wrapping_add(self.pages.size()) {
+                        range.physical_length =
+                            range.physical_length.wrapping_add(self.pages.size());
                     } else {
                         if range.physical_length != 0 {
                             ranges.push(range);
                         }
                         range = PhysRange {
                             physical_address: physical,
-                            physical_length: PAGE,
+                            physical_length: self.pages.size(),
                         };
                     }
                     Ok(true)
@@ -259,8 +277,9 @@ impl<P: Platform> LocalTask<P> {
     ) -> RaiseResult<MappedAddress<P>> {
         check_task_range(offset, length, self.length)?;
         let Backend::Blocks { mapped } = &self.backend else {
-            let start = offset & !PAGE_MASK;
-            let end = offset.wrapping_add(length).wrapping_add(PAGE_MASK) & !PAGE_MASK;
+            let start = offset & !self.pages.mask();
+            let end =
+                offset.wrapping_add(length).wrapping_add(self.pages.mask()) & !self.pages.mask();
             let Some(mapping) =
                 self.virtual_mapping(hold, start, end.wrapping_sub(start), need_writable)?
             else {
@@ -279,7 +298,9 @@ impl<P: Platform> LocalTask<P> {
                 );
             }
             return Ok(MappedAddress {
-                address: mapping.virtual_address().wrapping_add(offset & PAGE_MASK),
+                address: mapping
+                    .virtual_address()
+                    .wrapping_add(offset & self.pages.mask()),
                 mapping: Some(mapping),
             });
         };
@@ -309,7 +330,7 @@ impl<P: Platform> LocalTask<P> {
         let buffer = if let Backend::Blocks { .. } = self.backend {
             // The blocks setup: the host's task maps it, and no mapping comes back.
             let pointer = self
-                .mapped_address(hold, page_address(page), length, false)?
+                .mapped_address(hold, self.pages.address(page), length, false)?
                 .address;
             if pointer.is_null() {
                 return raise_caught(
@@ -334,7 +355,8 @@ impl<P: Platform> LocalTask<P> {
                 None => None,
             }
         } else {
-            let Some(mapping) = self.virtual_mapping(hold, page_address(page), length, false)?
+            let Some(mapping) =
+                self.virtual_mapping(hold, self.pages.address(page), length, false)?
             else {
                 return raise_caught(
                     RaiseKind::NullAddress,
@@ -419,9 +441,9 @@ impl<P: Platform> LocalTask<P> {
         end: u64,
         dst: &mut [u8],
     ) -> RaiseResult<()> {
-        let page_offset = offset & PAGE_MASK;
-        let start = offset & !PAGE_MASK;
-        let size = (end.wrapping_add(PAGE_MASK) & !PAGE_MASK).wrapping_sub(start);
+        let page_offset = offset & self.pages.mask();
+        let start = offset & !self.pages.mask();
+        let size = (end.wrapping_add(self.pages.mask()) & !self.pages.mask()).wrapping_sub(start);
         let mut remaining = dst.len().to_u64();
         let mut current: usize = 0;
         let device = self.device.upgrade();
@@ -429,8 +451,8 @@ impl<P: Platform> LocalTask<P> {
             return Ok(());
         };
         walker.visit_pages_in_range(hold, on, start, size, &mut |address, page, _flags| {
-            let mut physical = page_address(page);
-            let page_end = physical.wrapping_add(PAGE);
+            let mut physical = self.pages.address(page);
+            let page_end = physical.wrapping_add(self.pages.size());
             if address == start {
                 physical = physical.wrapping_add(page_offset);
             }

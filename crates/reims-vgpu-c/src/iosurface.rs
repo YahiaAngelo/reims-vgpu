@@ -52,10 +52,26 @@ pub struct RvgIOSurfaceDeviceConfig {
     pub memory_map: *const RvgMemoryMap,
     /// NULL is a table with every callback absent.
     pub callbacks: *const RvgIOSurfaceCallbacks,
+    /// The guest's page shift, as RvgDeviceConfig's: 14 for an arm64 guest's 16 KiB pages, 12
+    /// for an x86-64 guest's 4 KiB ones, 0 for the library's own architecture's (12 on x86-64,
+    /// 14 on arm64). The descriptor table, the descriptor pages, the surfaces' page tables and
+    /// the ring count these pages; give it the graphics device's. Any other value is
+    /// RVG_ERR_INVALID_ARGUMENT.
+    pub guest_page_shift: u32,
 }
 
-// SAFETY: repr(C), a u32 first; pointers.
-unsafe impl HostStruct for RvgIOSurfaceDeviceConfig {}
+// SAFETY: repr(C), a u32 first; pointers and an integer.
+unsafe impl HostStruct for RvgIOSurfaceDeviceConfig {
+    /// The first version ends at `callbacks`: a host built against it passes 24, and gets the
+    /// library's own architecture's pages (`guest_page_shift` 0).
+    const V1_SIZE: usize = 24;
+}
+
+const _: () = assert!(
+    std::mem::offset_of!(RvgIOSurfaceDeviceConfig, guest_page_shift)
+        == RvgIOSurfaceDeviceConfig::V1_SIZE
+);
+const _: () = assert!(size_of::<RvgIOSurfaceDeviceConfig>() == 32);
 
 /// The IOSurface device: vmapple's second MMIO region.
 pub struct RvgIOSurfaceDevice {
@@ -76,7 +92,8 @@ unsafe fn live<'a>(
 
 /// A new IOSurface device, the process's latest (a device with `use_iosurface_mapper` finds
 /// it at its first use). Refusals, checked in this order: RVG_ERR_INVALID_ARGUMENT,
-/// RVG_ERR_UNSUPPORTED, RVG_ERR_NO_MEMORY_MAP, RVG_ERR_MEMORY_MAP. Calls back: never.
+/// RVG_ERR_UNSUPPORTED, RVG_ERR_INVALID_ARGUMENT for a `guest_page_shift` other than 0, 12 and
+/// 14, RVG_ERR_NO_MEMORY_MAP, RVG_ERR_MEMORY_MAP. Calls back: never.
 ///
 /// # Safety
 /// `config` is NULL or a live config; `device` is NULL or writable.
@@ -122,6 +139,7 @@ pub unsafe extern "C" fn rvg_iosurface_device_create(
         let config = IoSurfaceDeviceConfig {
             memory_map,
             raise_interrupt,
+            guest_page_shift: c.guest_page_shift,
         };
         match IoSurfaceDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
             Ok(d) => {

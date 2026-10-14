@@ -18,7 +18,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::fifo::{DeathKind, Fifo, NO_FAULT_OFFSET};
 use crate::guest::GuestPtr;
-use crate::guest::records::APV_PAGE_SIZE;
+use crate::guest::records::GuestPages;
 use crate::host::PhysRange;
 use crate::num::{self, ToU64, ToUsize, Truncate};
 use crate::platform::Platform;
@@ -32,8 +32,11 @@ pub(crate) const NODE_STAMP_INDEX: u64 = 0xc;
 pub(crate) const NODE_RUNNING: u64 = 0xe;
 pub(crate) const NODE_PAGE_LIST_PAGE: u64 = 0x10;
 
-/// The page list's entries: one guest page of `u32` page numbers (4096, 1024 on x86-64).
-pub(crate) const PAGE_LIST_ENTRIES: u64 = APV_PAGE_SIZE.wrapping_shr(2);
+/// The page list's entries: one guest page of `u32` page numbers (4096 of 16 KiB pages, 1024 of
+/// 4 KiB ones).
+pub(crate) const fn page_list_entries(pages: GuestPages) -> u64 {
+    pages.size().wrapping_shr(2)
+}
 
 /// A FIFO's ring, by kind.
 #[derive(Debug)]
@@ -389,17 +392,18 @@ impl<P: Platform> Fifo<P> {
         let device = self.device.upgrade();
         // The node's page list is read again at every start.
         let list_page = c.node.read_u32(NODE_PAGE_LIST_PAGE, DeathKind::NodeNull);
-        let list_mapping = device
-            .as_ref()
-            .and_then(|d| d.new_contiguous_mapping(list_page, APV_PAGE_SIZE));
-        let Some(list_mapping) = list_mapping else {
+        let Some(device) = device else {
+            return false;
+        };
+        let pages = device.guest_pages();
+        let Some(list_mapping) = device.new_contiguous_mapping(list_page, pages.size()) else {
             return false;
         };
         let list = GuestPtr::new(list_mapping.virtual_address());
         let entry =
             |index: u16| list.read_u32(u64::from(index).wrapping_mul(4), DeathKind::PageListNull);
         let mut page_count: u16 = 0;
-        while u64::from(page_count) < PAGE_LIST_ENTRIES {
+        while u64::from(page_count) < page_list_entries(pages) {
             if entry(page_count) == 0 {
                 break;
             }
@@ -412,15 +416,13 @@ impl<P: Platform> Fifo<P> {
         // The page numbers are read from guest memory again
         let ranges: Vec<PhysRange> = (0..page_count)
             .map(|index| PhysRange {
-                physical_address: u64::from(entry(index)).wrapping_mul(APV_PAGE_SIZE),
-                physical_length: APV_PAGE_SIZE,
+                physical_address: pages.address(entry(index)),
+                physical_length: pages.size(),
             })
             .collect();
         drop(list_mapping);
-        let length = u64::from(page_count).wrapping_mul(APV_PAGE_SIZE).low_u32();
-        let mapping = device
-            .as_ref()
-            .and_then(|d| d.new_range_mapping(&ranges, u64::from(length), false));
+        let length = u64::from(page_count).wrapping_mul(pages.size()).low_u32();
+        let mapping = device.new_range_mapping(&ranges, u64::from(length), false);
         drop(ranges);
         let base = mapping
             .as_ref()

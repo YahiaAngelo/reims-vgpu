@@ -67,8 +67,7 @@ use crate::device::DeviceCore;
 use crate::fifo::wire::Records;
 use crate::guest::GuestPtr;
 use crate::guest::records::{
-    APV_PAGE_SHIFT, APV_PAGE_SIZE, CmdExecIndirectResource, CmdExecIndirectResource3, FeaturesRef,
-    TaskRoot2,
+    CmdExecIndirectResource, CmdExecIndirectResource3, FeaturesRef, GuestPages, TaskRoot2,
 };
 use crate::memory::cursor::{Cursor, WritableCursor};
 use crate::memory::mapping::Mapping;
@@ -93,11 +92,6 @@ use crate::tasks::{
     Unsupported,
 };
 
-/// The guest page: 16 KiB (4 KiB on x86-64).
-const PAGE: u64 = APV_PAGE_SIZE;
-/// The offset of an address within its page.
-const PAGE_MASK: u64 = PAGE - 1;
-
 /// The task root's page-table root (a guest page number).
 const ROOT_PAGE_TABLE_ROOT: u64 = num::const_u64(offset_of!(TaskRoot2, page_table_root));
 /// The task root's page-table depth.
@@ -108,11 +102,6 @@ const ROOT_OBJECT_LIST_OFFSET: u64 = num::const_u64(offset_of!(TaskRoot2, object
 const ROOT_OBJECT_LIST_LENGTH: u64 = num::const_u64(offset_of!(TaskRoot2, object_list_length));
 /// The task root's task length, which the task writes.
 const ROOT_TASK_LENGTH: u64 = num::const_u64(offset_of!(TaskRoot2, task_length));
-
-/// The host address of guest page `page`'s first byte in a physical or task address space.
-fn page_address(page: u32) -> u64 {
-    u64::from(page).wrapping_shl(APV_PAGE_SHIFT)
-}
 
 /// The local task's raises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,6 +314,8 @@ pub struct LocalTask<P: Platform> {
     task_info: TaskInfo,
     /// How the task reaches its memory.
     backend: Backend,
+    /// The device's guest pages: what the task's page table and offsets count.
+    pages: GuestPages,
     /// The task root page's mapping, released first when the task goes.
     task_root_mapping: Option<Arc<Mapping<P>>>,
     /// The mapped task root page: NULL when the task has none.
@@ -728,6 +719,10 @@ impl<P: Platform> LocalTask<P> {
 }
 
 impl<P: Platform> ResourceHost<P> for LocalTask<P> {
+    fn guest_pages(&self) -> GuestPages {
+        self.pages
+    }
+
     fn new_buffer_for_virtual_page(
         &self,
         hold: Hold<'_>,

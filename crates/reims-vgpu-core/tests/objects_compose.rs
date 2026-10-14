@@ -27,7 +27,9 @@ use reims_vgpu_core::deserializer::records::{
     CmdUseResources, SegmentHeader,
 };
 use reims_vgpu_core::guest::GuestPtr;
-use reims_vgpu_core::guest::records::{APV_PAGE_SIZE, FeaturesRef, ObjectEntry, SharedFeatures};
+use reims_vgpu_core::guest::records::{
+    APV_PAGE_SIZE, FeaturesRef, GuestPages, ObjectEntry, SharedFeatures,
+};
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::cursor::{Cursor, CursorRange, WritableCursor};
 use reims_vgpu_core::memory::mapping::{Mapping, Teardown};
@@ -130,6 +132,10 @@ impl Task {
 }
 
 impl ResourceHost<P> for Task {
+    fn guest_pages(&self) -> GuestPages {
+        GuestPages::HOST
+    }
+
     fn new_buffer_for_virtual_page(
         &self,
         _hold: Hold<'_>,
@@ -359,6 +365,7 @@ impl World {
             TASK_LEN,
             false,
             Arc::downgrade(&dyn_task),
+            GuestPages::HOST,
         );
         assert!(olm.set_object_list(
             Hold::NONE,
