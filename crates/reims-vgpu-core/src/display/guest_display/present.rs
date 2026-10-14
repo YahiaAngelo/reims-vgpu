@@ -65,7 +65,7 @@ impl PageColorMatrix {
 
 impl ColorMatrix for PageColorMatrix {
     fn at(&self, row: u8, col: u8) -> f32 {
-        color_matrix_access!(self.index, row, col, 4);
+        color_matrix_access!(self.page, self.index, row, col, 4);
         self.page.rf32(sp::color_matrix(self.index, row, col))
     }
 
@@ -73,7 +73,7 @@ impl ColorMatrix for PageColorMatrix {
     /// aligned at `0xa10 + 48 * index`), so a guest's 64-bit store to it is seen whole or not at
     /// all. Little-endian: `matrix[row][col]` is the low half.
     fn pair(&self, row: u8, col: u8) -> (f32, f32) {
-        color_matrix_access!(self.index, row, col, 8);
+        color_matrix_access!(self.page, self.index, row, col, 8);
         let v = self.page.r64(sp::color_matrix(self.index, row, col));
         (
             f32::from_bits(v.low_u32()),
@@ -532,7 +532,7 @@ impl<P: Platform> GuestDisplay<P> {
                 // 48 bytes at the guest's write index; a matrix that leaves the page dies before
                 // any of them is written.
                 let w = p.r8(sp::COLOR_MATRIX_WRITE_INDEX);
-                color_matrix_access!(w, 0, 0, sp::COLOR_MATRIX_SIZE);
+                color_matrix_access!(p, w, 0, 0, sp::COLOR_MATRIX_SIZE);
                 let bytes = value.as_bytes();
                 let n = sp::COLOR_MATRIX_SIZE.to_usize();
                 p.at().copy_from(

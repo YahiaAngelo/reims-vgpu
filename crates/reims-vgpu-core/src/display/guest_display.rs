@@ -38,23 +38,23 @@
 //!   core before it calls a host handler, so a handler's last release runs the display's end inside
 //!   the call (`handler_releases_the_display::cursor_show_handler`).
 
-/// Dies unless the `width` bytes at `colorMatrices[matrix][row][col]` lie inside the page
-/// ([`page::color_matrix_in_page`](crate::display::page::color_matrix_in_page)): on x86-64 an
-/// access past the 4 KiB page ends the process at that access, before it is made.
-#[cfg(target_arch = "x86_64")]
+/// Dies unless the `width` bytes at `colorMatrices[matrix][row][col]` lie inside `page`, one guest
+/// page ([`page::color_matrix_in_page`](crate::display::page::color_matrix_in_page)): an access
+/// past a 4 KiB page ends the process at that access, before it is made. A 16 KiB page holds
+/// every matrix, so no access leaves it.
 macro_rules! color_matrix_access {
-    ($matrix:expr, $row:expr, $col:expr, $width:expr) => {
+    ($page:expr, $matrix:expr, $row:expr, $col:expr, $width:expr) => {
         $crate::fatal_unless!(
-            $crate::display::page::color_matrix_in_page($matrix, $row, $col, $width),
+            $crate::display::page::color_matrix_in_page(
+                $page.length(),
+                $matrix,
+                $row,
+                $col,
+                $width
+            ),
             $crate::display::guest_display::DeathKind::ColorMatrixOutsidePage
         )
     };
-}
-
-/// Nothing on arm64: the 16 KiB page holds every matrix, so no access leaves it.
-#[cfg(not(target_arch = "x86_64"))]
-macro_rules! color_matrix_access {
-    ($matrix:expr, $row:expr, $col:expr, $width:expr) => {};
 }
 
 mod cursor;
@@ -222,8 +222,7 @@ pub enum DeathKind {
     /// A restore finished that was not begun.
     FinishRestoreUnexpected,
     /// A colour-matrix access past the page: the guest's matrix index is past the matrices a
-    /// 4 KiB page holds. x86-64 only: a 16 KiB page holds every index.
-    #[cfg(target_arch = "x86_64")]
+    /// 4 KiB page holds. A 16 KiB page holds every index.
     ColorMatrixOutsidePage,
 }
 
@@ -253,7 +252,6 @@ impl DeathKind {
             DeathKind::UnpauseRunning => "guest_display.unpause.running",
             DeathKind::WillRestoreTwice => "guest_display.restore.twice",
             DeathKind::FinishRestoreUnexpected => "guest_display.restore.unexpected",
-            #[cfg(target_arch = "x86_64")]
             DeathKind::ColorMatrixOutsidePage => "guest_display.color_matrix.outside_page",
         }
     }
@@ -269,7 +267,6 @@ impl DeathKind {
             DeathKind::ShowHandlerGone
             | DeathKind::MoveHandlerGone
             | DeathKind::GlyphHandlerGone => K::NilBlock,
-            #[cfg(target_arch = "x86_64")]
             DeathKind::ColorMatrixOutsidePage => K::OutOfBounds,
             _ => K::Assert,
         }
@@ -349,19 +346,26 @@ pub struct GuestDisplay<P: Platform> {
     pub(crate) port: u64,
     /// The page, mapped for the guest display's life.
     page: GuestPage,
+    /// The page's length: one of the device's guest pages.
+    page_length: u64,
     /// The state `guest_display_mutex` guards.
     pub(crate) guest_display_mutex: Mutex<GuestDisplayLocked<P>>,
     /// What is read without it.
     pub(crate) unlocked: GuestDisplayUnlocked<P>,
 }
 
-/// The shared page, each access one volatile or atomic access of the field's width (D18).
+/// The shared page and its length, each access one volatile or atomic access of the field's
+/// width (D18).
 #[derive(Debug, Clone, Copy)]
-struct Page(GuestPage);
+struct Page(GuestPage, u64);
 
 impl Page {
     fn at(self) -> GuestPtr {
         self.0.base()
+    }
+    /// The page's length: one guest page.
+    fn length(self) -> u64 {
+        self.1
     }
     fn r8(self, off: u64) -> u8 {
         self.at().read_u8(off, DeathKind::NullPage)
@@ -427,10 +431,13 @@ impl<P: Platform> GuestDisplay<P> {
         port: u64,
         shared_state_page: u32,
     ) -> RaiseResult<Arc<Self>> {
-        // A gone device, or no mapping, gives a NULL address.
-        let mapping = match device.upgrade() {
-            Some(d) => d.new_contiguous_mapping(shared_state_page, sp::PAGE_LENGTH),
-            None => None,
+        // A gone device, or no mapping, gives a NULL address. The page is one guest page.
+        let (mapping, page_length) = match device.upgrade() {
+            Some(d) => {
+                let length = d.guest_pages().size();
+                (d.new_contiguous_mapping(shared_state_page, length), length)
+            }
+            None => (None, 0),
         };
         let va = mapping
             .as_ref()
@@ -459,6 +466,7 @@ impl<P: Platform> GuestDisplay<P> {
             device,
             port,
             page,
+            page_length,
             guest_display_mutex: Mutex::new(GuestDisplayLocked {
                 mapping,
                 mode_list: None,
@@ -489,11 +497,11 @@ impl<P: Platform> GuestDisplay<P> {
             // Only the diagonal of the matrix at the guest's write index (read once, any byte),
             // then dirty. Each store past the page dies there, after the ones before it.
             let w = p.r8(sp::COLOR_MATRIX_WRITE_INDEX);
-            color_matrix_access!(w, 0, 0, 4);
+            color_matrix_access!(p, w, 0, 0, 4);
             p.wf32(sp::color_matrix(w, 0, 0), 1.0);
-            color_matrix_access!(w, 1, 1, 4);
+            color_matrix_access!(p, w, 1, 1, 4);
             p.wf32(sp::color_matrix(w, 1, 1), 1.0);
-            color_matrix_access!(w, 2, 2, 4);
+            color_matrix_access!(p, w, 2, 2, 4);
             p.wf32(sp::color_matrix(w, 2, 2), 1.0);
             p.w8(sp::COLOR_MATRIX_DIRTY, 1);
         }
@@ -503,13 +511,13 @@ impl<P: Platform> GuestDisplay<P> {
     /// The page, from a method that holds `guest_display_mutex`: dies while paused.
     fn page(&self, l: &GuestDisplayLocked<P>) -> Page {
         crate::fatal_unless!(!l.paused, DeathKind::PageWhilePaused);
-        Page(self.page)
+        Page(self.page, self.page_length)
     }
 
     /// The page with no paused check (the protection options, the colour space, the ICC
     /// profile).
     fn raw_page(&self) -> Page {
-        Page(self.page)
+        Page(self.page, self.page_length)
     }
 
     /// The page from where no lock is held: dies while paused.
@@ -518,7 +526,7 @@ impl<P: Platform> GuestDisplay<P> {
             !self.unlocked.paused.load(Ordering::SeqCst),
             DeathKind::PageWhilePaused
         );
-        Page(self.page)
+        Page(self.page, self.page_length)
     }
 
     /// Dies unless the guest display is running: a display command's first check.

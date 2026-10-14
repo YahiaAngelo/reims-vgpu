@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::guest::records::APV_PAGE_SHIFT;
+use crate::guest::records::GuestPages;
 use crate::platform::{Handle, Platform};
 use crate::raise::RaiseResult;
 use crate::resources::manager::icb::{
@@ -97,7 +97,7 @@ pub struct IcbResource<P: Platform> {
     /// Unretained.
     task: TaskRef<P>,
     length: u64,
-    /// The page, as a task VA offset (`page << APV_PAGE_SHIFT`).
+    /// The page, as a task VA offset (`page << page shift`).
     virtual_offset: u64,
     /// `None` when Metal made none, which the factory does not check without a resource ID.
     icb: Option<P::Icb>,
@@ -114,6 +114,7 @@ impl<P: Platform> IcbResource<P> {
     )]
     pub fn new(
         task: TaskRef<P>,
+        pages: GuestPages,
         descriptor: &[u8],
         icb: Option<P::Icb>,
         layout: IndirectCommandLayout,
@@ -124,7 +125,7 @@ impl<P: Platform> IcbResource<P> {
         Ok(Some(Resource::new(ResourceKind::Icb(IcbResource {
             task,
             length,
-            virtual_offset: u64::from(page).wrapping_shl(APV_PAGE_SHIFT),
+            virtual_offset: pages.address(page),
             icb,
             layout,
             flags,
@@ -318,6 +319,7 @@ impl<P: Platform> ResourceClass<P> for IcbResource<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::records::APV_PAGE_SHIFT;
     use crate::memory::cursor::{Cursor, WritableCursor};
     use crate::raise::OnFault;
     use crate::resources::resource::test_support::kind as raised;
@@ -353,6 +355,7 @@ mod tests {
     fn make(e: &Env, icb: Option<Fk<kind::Icb>>) -> Arc<Resource<P>> {
         IcbResource::new(
             Arc::downgrade(&e.host),
+            crate::guest::records::GuestPages::HOST,
             &record(0x200, 3),
             icb,
             IndirectCommandLayout {
@@ -474,6 +477,7 @@ mod tests {
             // A nil ICB, and the largest page (no overflow).
             let r = IcbResource::<P>::new(
                 Arc::downgrade(&e.host),
+                crate::guest::records::GuestPages::HOST,
                 &record(1, u32::MAX),
                 None,
                 IndirectCommandLayout::default(),
@@ -495,6 +499,7 @@ mod tests {
         rec.extend_from_slice(&[0xff; 4]);
         let r = IcbResource::<P>::new(
             Arc::downgrade(&e.host),
+            crate::guest::records::GuestPages::HOST,
             &rec,
             None,
             IndirectCommandLayout::default(),
@@ -582,6 +587,7 @@ mod tests {
         };
         let r = IcbResource::new(
             gone,
+            crate::guest::records::GuestPages::HOST,
             &record(0x200, 3),
             Some(icb(&e)),
             IndirectCommandLayout::default(),
@@ -786,6 +792,7 @@ mod tests {
             0x10000,
             false,
             Arc::downgrade(&e.host),
+            crate::guest::records::GuestPages::HOST,
         );
         let m = ResourceManager::new(
             e.p.clone(),
@@ -832,6 +839,7 @@ mod tests {
             0x10000,
             false,
             Arc::downgrade(&e.host),
+            crate::guest::records::GuestPages::HOST,
         );
         let m = ResourceManager::new(
             e.p.clone(),
@@ -862,6 +870,7 @@ mod tests {
         command[8..0x40].copy_from_slice(draw.as_bytes());
         let r = IcbResource::new(
             Arc::downgrade(&e.host),
+            crate::guest::records::GuestPages::HOST,
             &record(0x40, 3),
             Some(sized_icb(&e, 1)),
             IndirectCommandLayout {

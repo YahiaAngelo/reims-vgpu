@@ -5,7 +5,6 @@
 
 use crate::fifo::RaiseKind;
 use crate::fifo::commands::{Command, KERNEL_ONLY, UNSUPPORTED, mul_add_overflows};
-use crate::guest::records::APV_PAGE_SHIFT;
 use crate::num::ToUsize;
 use crate::platform::Platform;
 use crate::raise;
@@ -27,8 +26,6 @@ const DEFINE_TASK: u32 = 16;
 const GET_COMPUTE_INFO: u32 = 24;
 const HEAP_TEXTURE_SIZE_AND_ALIGN: u32 = 24;
 const SET_OBJECT_AND_PLACEMENT_LIST: u32 = 28;
-/// The object list's page, as a byte offset: a guest page number.
-const OBJECT_LIST_PAGE_SHIFT: u32 = APV_PAGE_SHIFT;
 
 /// 32: deletes a task.
 pub(super) fn delete_task<P: Platform>(c: &mut Command<'_, P>) {
@@ -89,14 +86,9 @@ pub(super) fn set_object_list<P: Platform>(c: &mut Command<'_, P>) {
         c.check_size(SET_OBJECT_LIST)?;
         let p = c.payload;
         let task = c.task(p.u32(0))?;
-        task.set_object_list_offset(
-            hold,
-            u64::from(p.u32(4)).wrapping_shl(OBJECT_LIST_PAGE_SHIFT),
-            p.u32(8),
-            0,
-            0,
-            c.completion(),
-        )
+        // The object list's page, as a byte offset: a guest page number.
+        let offset = c.device().guest_pages().address(p.u32(4));
+        task.set_object_list_offset(hold, offset, p.u32(8), 0, 0, c.completion())
     });
 }
 

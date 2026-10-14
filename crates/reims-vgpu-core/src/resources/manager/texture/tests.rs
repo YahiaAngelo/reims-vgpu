@@ -1991,6 +1991,7 @@ fn manager(e: &TestEnv) -> Arc<ResourceManager<Fp>> {
         0x10000,
         true,
         Arc::downgrade(&task),
+        crate::guest::records::GuestPages::HOST,
     );
     ResourceManager::new(
         e.p.clone(),

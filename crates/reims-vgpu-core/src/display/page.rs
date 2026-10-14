@@ -11,13 +11,11 @@
 // Guest data flows through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-use crate::guest::records::APV_PAGE_SIZE;
-
-/// The page's length: the guest display maps one guest page from the page's number, 16 KiB on
-/// arm64 and 4 KiB on x86-64. Every field ends by 0xfd8, inside either. The colour matrices at the
-/// guest's index reach 0x3a10 ([`color_matrix`]): inside a 16 KiB page, and past a 4 KiB one
-/// from index 31, where each access to them is checked ([`color_matrix_in_page`]).
-pub const PAGE_LENGTH: u64 = APV_PAGE_SIZE;
+// The page's length: the guest display maps one of the device's guest pages from the page's
+// number, 16 KiB for an arm64 guest and 4 KiB for an x86-64 one. Every field ends by 0xfd8,
+// inside either. The colour matrices at the guest's index reach 0x3a10 ([`color_matrix`]):
+// inside a 16 KiB page, and past a 4 KiB one from index 31, where each access to them is checked
+// ([`color_matrix_in_page`]).
 
 /// `kAppleParavirtGPUDisplayMaxModes` — the one constant the image names (the assert in
 /// `-testUpdateModeList:` spells it).
@@ -187,14 +185,15 @@ pub fn color_matrix(matrix: u8, row: u8, col: u8) -> u64 {
         .wrapping_add(r.wrapping_add(c))
 }
 
-/// Whether the `width` bytes at `colorMatrices[matrix][row][col]` lie inside the page. Always on
-/// arm64, where matrix 255 ends at 0x3a10; on x86-64 every access of matrices 0-30 (matrix 30
-/// ends at 0xfe0), and of matrix 31 those that end by 0x1000 (its rows 0 and 1).
+/// Whether the `width` bytes at `colorMatrices[matrix][row][col]` lie inside the page of
+/// `page_length` bytes. Always in a 16 KiB page, where matrix 255 ends at 0x3a10; in a 4 KiB one
+/// every access of matrices 0-30 (matrix 30 ends at 0xfe0), and of matrix 31 those that end by
+/// 0x1000 (its rows 0 and 1).
 #[inline]
-pub fn color_matrix_in_page(matrix: u8, row: u8, col: u8, width: u64) -> bool {
+pub fn color_matrix_in_page(page_length: u64, matrix: u8, row: u8, col: u8, width: u64) -> bool {
     color_matrix(matrix, row, col)
         .checked_add(width)
-        .is_some_and(|end| end <= PAGE_LENGTH)
+        .is_some_and(|end| end <= page_length)
 }
 
 #[cfg(test)]
@@ -222,11 +221,6 @@ mod tests {
         assert_eq!(GUEST_ICC_PROFILE_VIRTUAL_OFFSET, 0xfc8);
         assert_eq!(GUEST_ICC_PROFILE_LENGTH, 0xfd0);
         assert_eq!(MODE_ENTRY_SIZE, 16);
-        assert_eq!(PAGE_LENGTH, crate::guest::records::APV_PAGE_SIZE);
-        #[cfg(not(target_arch = "x86_64"))]
-        assert_eq!(PAGE_LENGTH, 0x4000);
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(PAGE_LENGTH, 0x1000);
     }
 
     /// The fields that follow a fixed-size array end where the next begins
@@ -264,37 +258,43 @@ mod tests {
         assert_eq!(color_matrix(255, 2, 3) + 4, 0x3a10);
     }
 
-    /// A 16 KiB page holds every matrix: every access is inside
-    #[cfg(not(target_arch = "x86_64"))]
+    /// A 16 KiB page holds every matrix: every access is inside, whatever the build
     #[test]
     fn every_color_matrix_is_in_a_16k_page() {
-        assert!(color_matrix(255, 2, 3) + 4 <= PAGE_LENGTH);
+        const PAGE: u64 = 0x4000;
+        assert!(color_matrix(255, 2, 3) + 4 <= PAGE);
         for w in 0..=255u8 {
-            assert!(color_matrix_in_page(w, 0, 0, COLOR_MATRIX_SIZE), "{w}");
-            assert!(color_matrix_in_page(w, 2, 3, 4), "{w}");
+            assert!(
+                color_matrix_in_page(PAGE, w, 0, 0, COLOR_MATRIX_SIZE),
+                "{w}"
+            );
+            assert!(color_matrix_in_page(PAGE, w, 2, 3, 4), "{w}");
         }
     }
 
     /// A 4 KiB page holds matrices 0-30 whole and the first 32 bytes of matrix 31 (its rows 0
     /// and 1); every access past those is outside
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_4k_page_ends_in_matrix_31() {
+        const PAGE: u64 = 0x1000;
         assert_eq!(color_matrix(30, 2, 3) + 4, 0xfe0);
         assert_eq!(color_matrix(31, 0, 0), 0xfe0);
         for w in 0..=30u8 {
-            assert!(color_matrix_in_page(w, 0, 0, COLOR_MATRIX_SIZE), "{w}");
-            assert!(color_matrix_in_page(w, 2, 3, 4), "{w}");
+            assert!(
+                color_matrix_in_page(PAGE, w, 0, 0, COLOR_MATRIX_SIZE),
+                "{w}"
+            );
+            assert!(color_matrix_in_page(PAGE, w, 2, 3, 4), "{w}");
         }
-        assert!(color_matrix_in_page(31, 0, 0, 4));
-        assert!(color_matrix_in_page(31, 1, 1, 4));
-        assert!(color_matrix_in_page(31, 1, 2, 8));
-        assert!(color_matrix_in_page(31, 1, 3, 4));
-        assert!(!color_matrix_in_page(31, 2, 0, 4));
-        assert!(!color_matrix_in_page(31, 2, 2, 4));
-        assert!(!color_matrix_in_page(31, 0, 0, COLOR_MATRIX_SIZE));
+        assert!(color_matrix_in_page(PAGE, 31, 0, 0, 4));
+        assert!(color_matrix_in_page(PAGE, 31, 1, 1, 4));
+        assert!(color_matrix_in_page(PAGE, 31, 1, 2, 8));
+        assert!(color_matrix_in_page(PAGE, 31, 1, 3, 4));
+        assert!(!color_matrix_in_page(PAGE, 31, 2, 0, 4));
+        assert!(!color_matrix_in_page(PAGE, 31, 2, 2, 4));
+        assert!(!color_matrix_in_page(PAGE, 31, 0, 0, COLOR_MATRIX_SIZE));
         for w in 32..=255u8 {
-            assert!(!color_matrix_in_page(w, 0, 0, 4), "{w}");
+            assert!(!color_matrix_in_page(PAGE, w, 0, 0, 4), "{w}");
         }
     }
 }

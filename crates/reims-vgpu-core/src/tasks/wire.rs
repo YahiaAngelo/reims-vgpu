@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::guest::records::GuestFeatures;
+use crate::guest::records::{GuestFeatures, GuestPages};
 use crate::memory::map::MemoryMap;
 use crate::platform::Platform;
 use crate::platform::types::NsErrorText;
@@ -52,6 +52,8 @@ pub struct TaskConfiguration {
     pub registry_id: u64,
     /// `supportsArgumentBuffers`.
     pub supports_argument_buffers: bool,
+    /// The device's guest pages (ours: Apple's service took its build's).
+    pub guest_pages: GuestPages,
 }
 
 /// Host to service.

@@ -20,7 +20,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::guest::GuestPtr;
-use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SIZE, ObjectEntry, TaskRoot2};
+use crate::guest::records::{GuestPages, ObjectEntry, TaskRoot2};
 use crate::host::HostPtr;
 use crate::memory::mapping::Mapping;
 use crate::num::{self, ToUsize, Truncate};
@@ -144,8 +144,6 @@ impl<P: Platform> Lists<P> {
 const OBJECT_ENTRY_SIZE: u32 = 12;
 /// A placement entry's size: the placement list's stride.
 const OBJECT_PLACEMENT_SIZE: u64 = 16;
-/// The guest page mask both lists' offsets are tested against and their lengths rounded to.
-const LIST_PAGE_MASK: u64 = APV_PAGE_MASK;
 
 /// The task root's list fields, as byte offsets into the task root (packed).
 const ROOT_OBJECT_LIST_OFFSET: u64 = num::const_u64(offset_of!(TaskRoot2, object_list_offset));
@@ -174,13 +172,11 @@ fn load_object_entry(entry: GuestPtr) -> ObjectEntry {
     }
 }
 
-/// A list's mapped length: its end rounded up to a page, less its offset, in wrapping `u64`.
-fn mapped_length(end: u64, offset: u64) -> u64 {
-    (end.wrapping_add(LIST_PAGE_MASK) & !LIST_PAGE_MASK).wrapping_sub(offset)
+/// A list's mapped length: its end rounded up to a page of `page_mask`, less its offset, in
+/// wrapping `u64`.
+fn mapped_length(end: u64, offset: u64, page_mask: u64) -> u64 {
+    (end.wrapping_add(page_mask) & !page_mask).wrapping_sub(offset)
 }
-
-/// The placement-list copy's chunk: one guest page (see `copy_placement_list`).
-const COPY_CHUNK: u64 = APV_PAGE_SIZE;
 
 /// Both getters' range error.
 fn out_of_range(index: u32, count: u32) -> String {
@@ -197,16 +193,20 @@ pub struct ObjectLists<P: Platform> {
     task: Weak<dyn ResourceHost<P>>,
     task_length: u64,
     supports_argument_buffers: bool,
+    /// The guest's pages: both lists' offsets are tested against their mask and their lengths
+    /// rounded to them.
+    pages: GuestPages,
 }
 
 impl<P: Platform> ObjectLists<P> {
     /// Lists with nothing set: both unmapped, every offset, length and count 0 (the legacy
-    /// kind's caller passes it unmapped).
+    /// kind's caller passes it unmapped). `pages` are the task's guest pages.
     pub fn new(
         kind: ObjectListKind,
         task_length: u64,
         supports_argument_buffers: bool,
         task: Weak<dyn ResourceHost<P>>,
+        pages: GuestPages,
     ) -> Arc<Self> {
         Arc::new(ObjectLists {
             mutex: Mutex::new(()),
@@ -219,6 +219,7 @@ impl<P: Platform> ObjectLists<P> {
             task,
             task_length,
             supports_argument_buffers,
+            pages,
         })
     }
 
@@ -262,9 +263,9 @@ impl<P: Platform> ObjectLists<P> {
     /// through the new list is read back through the old one, so the data repeats with the lists'
     /// distance as its period. It is not a snapshot copy. Both mappings start on a guest page,
     /// the alias granule, so the copy goes a page at a time (`alias_tests` compares it with
-    /// `memcpy` over real aliases).
-    fn copy_placement_list(dst: GuestPtr, src: GuestPtr, n: u64) {
-        let mut chunk = vec![0u8; n.min(COPY_CHUNK).to_usize()];
+    /// `memcpy` over real aliases). `page` is the guest page, the copy's chunk.
+    fn copy_placement_list(dst: GuestPtr, src: GuestPtr, n: u64, page: u64) {
+        let mut chunk = vec![0u8; n.min(page).to_usize()];
         num::forward_copy(
             n,
             &mut chunk,
@@ -357,8 +358,8 @@ impl<P: Platform> ObjectLists<P> {
             || ol_end >= self.task_length
             || pl_end >= self.task_length
             // The alignment test is on the members, the previous offsets (testing.md 7.1).
-            || st.objects.offset & LIST_PAGE_MASK != 0
-            || st.placements.offset & LIST_PAGE_MASK != 0
+            || st.objects.offset & self.pages.mask() != 0
+            || st.placements.offset & self.pages.mask() != 0
             || (new_pl_off != 0 && required_pl_len > u64::from(new_pl_len));
         if refused {
             log::warn!(
@@ -386,7 +387,7 @@ impl<P: Platform> ObjectLists<P> {
         }
         st.objects.offset = new_ol_off;
         st.objects.length = new_ol_len;
-        st.objects.mapped_length = mapped_length(ol_end, new_ol_off);
+        st.objects.mapped_length = mapped_length(ol_end, new_ol_off, self.pages.mask());
         if !self.supports_argument_buffers {
             drop(st);
             drop(old_pl_mapping);
@@ -394,7 +395,7 @@ impl<P: Platform> ObjectLists<P> {
         }
         st.placements.offset = new_pl_off;
         st.placements.length = new_pl_len;
-        st.placements.mapped_length = mapped_length(pl_end, new_pl_off);
+        st.placements.mapped_length = mapped_length(pl_end, new_pl_off, self.pages.mask());
         let mut old_pl_address = st.placements.address;
         let released = st.placements.unmap();
         let legacy = st.is_legacy();
@@ -432,7 +433,7 @@ impl<P: Platform> ObjectLists<P> {
         }
         if !old_pl_address.is_null() && !new_pl_address.is_null() {
             let n = u64::from(old_pl_len.min(new_pl_len));
-            Self::copy_placement_list(new_pl_address, old_pl_address, n);
+            Self::copy_placement_list(new_pl_address, old_pl_address, n, self.pages.size());
         }
         // The old placement mapping goes after the copy
         drop(old_pl_mapping);
@@ -629,6 +630,7 @@ impl<P: Platform> Drop for ObjectLists<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::records::{APV_PAGE_SIZE, GuestPages};
     use crate::host::HostPtr;
     use crate::memory::mapping::Teardown;
     use crate::testkit::calllog::{Arg, Call};
@@ -670,7 +672,7 @@ mod tests {
     impl Fx {
         fn mgr(&self, kind: ObjectListKind, sab: bool) -> Arc<Mgr> {
             let t: Arc<dyn ResourceHost<P>> = self.rec.clone();
-            Mgr::new(kind, TASK_LEN, sab, Arc::downgrade(&t))
+            Mgr::new(kind, TASK_LEN, sab, Arc::downgrade(&t), GuestPages::HOST)
         }
         fn root(&self) -> GuestPtr {
             GuestPtr::new(self.root.addr())
@@ -1321,6 +1323,7 @@ mod tests {
                     TASK_LEN,
                     true,
                     Arc::downgrade(&t),
+                    GuestPages::HOST,
                 )
             };
             assert!(m.set_object_list(Hold::NONE, 0, 24, 0x4000, 0x20, f.root()));
@@ -1701,6 +1704,7 @@ mod alias_tests {
             0x10_0000,
             true,
             Arc::downgrade(&t),
+            GuestPages::HOST,
         );
         let root = RawRegion::new(0x4000).unwrap();
         p.script().push(

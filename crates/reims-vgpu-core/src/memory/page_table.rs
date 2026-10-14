@@ -1,10 +1,10 @@
 //! A task's guest page table, walked at use time: 1-3 levels of one guest page of `u32` entries
-//! each ([`ENTRIES`]: 4096, 1024 on x86-64), each a guest page number with the writable bit on
-//! top.
+//! each ([`entries`]: 4096 of 16 KiB pages, 1024 of 4 KiB ones), each a guest page number with
+//! the writable bit on top.
 
 use std::sync::Arc;
 
-use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
+use crate::guest::records::GuestPages;
 use crate::memory::{DeathKind, RaiseKind};
 use crate::num::{ToUsize, Truncate};
 use crate::platform::Platform;
@@ -45,6 +45,8 @@ pub fn host_error_log<P: Platform>(_platform: Arc<P>) -> PageTableLog {
 
 /// A walk of a task's page table (1-3 levels) from its root, reading the tables at use time.
 pub struct PageTableWalker {
+    /// The guest's pages: the tables' and the leaves' size.
+    pages: GuestPages,
     root: u64,
     depth: u32,
     allow_holes: bool,
@@ -63,7 +65,7 @@ impl std::fmt::Debug for PageTableWalker {
     }
 }
 
-/// One level of the walk. `entries` holds the table's [`ENTRIES`] little-endian `u32`s as the read
+/// One level of the walk. `entries` holds the table's [`entries`] little-endian `u32`s as the read
 /// block fills them. They start zeroed, so an entry the block writes nothing into reads as 0, a
 /// hole.
 struct Level {
@@ -73,18 +75,24 @@ struct Level {
     base: u64,
 }
 
-/// A table's index bits: a table is one guest page of `u32` entries.
-pub(crate) const INDEX_BITS: u32 = APV_PAGE_SHIFT.wrapping_sub(2);
-/// Entries per table: 4096 (1024 on x86-64).
-pub(crate) const ENTRIES: u64 = 1_u64.wrapping_shl(INDEX_BITS);
+/// A table's index bits: a table is one guest page of `u32` entries (12 of 16 KiB pages, 10 of
+/// 4 KiB ones).
+pub(crate) const fn index_bits(pages: GuestPages) -> u32 {
+    pages.shift().wrapping_sub(2)
+}
+/// Entries per table: 4096 of 16 KiB pages, 1024 of 4 KiB ones.
+pub(crate) const fn entries(pages: GuestPages) -> u64 {
+    1_u64.wrapping_shl(index_bits(pages))
+}
 
 impl Level {
-    /// Entry `offset`. An offset past the table's last only arises from the stale index of a walk
-    /// that allows holes or from level indices truncated to 32 bits; the walk dies there.
-    fn entry(&self, offset: u64) -> u32 {
+    /// Entry `offset` of the table's `entries`. An offset past the table's last only arises from
+    /// the stale index of a walk that allows holes or from level indices truncated to 32 bits;
+    /// the walk dies there.
+    fn entry(&self, offset: u64, entries: u64) -> u32 {
         let at = offset.to_usize().wrapping_mul(4);
         match self.entries.get(at..at.wrapping_add(4)) {
-            Some(&[a, b, c, d]) if offset < ENTRIES => u32::from_le_bytes([a, b, c, d]),
+            Some(&[a, b, c, d]) if offset < entries => u32::from_le_bytes([a, b, c, d]),
             _ => crate::fatal!(DeathKind::WalkEntryPastTable),
         }
     }
@@ -110,6 +118,7 @@ fn read_range(
     on: OnFault,
     read: &PageTableRead,
     log: &PageTableLog,
+    pages: GuestPages,
     pa: u32,
     level: &mut Level,
     start: u64,
@@ -117,18 +126,19 @@ fn read_range(
 ) -> RaiseResult<bool> {
     // A zero page (a task root of 0) dies here, at the first walk.
     crate::fatal_unless!(pa != 0, DeathKind::WalkZeroTable);
-    let address = u64::from(pa).wrapping_shl(APV_PAGE_SHIFT);
-    if start >= ENTRIES {
+    let address = pages.address(pa);
+    let entries = entries(pages);
+    if start >= entries {
         log(WalkLog::StartOutOfTable, start);
         return Ok(false);
     }
-    if start.wrapping_add(count) > ENTRIES {
+    if start.wrapping_add(count) > entries {
         log(WalkLog::CountOutOfTable, count);
         return Ok(false);
     }
     let from = start.wrapping_shl(2).to_usize();
     let to = start.wrapping_add(count).wrapping_shl(2).to_usize();
-    // `start + count` can only wrap below `ENTRIES` with a count that would copy past the table;
+    // `start + count` can only wrap below `entries` with a count that would copy past the table;
     // the walk dies at the copy instead.
     let Some(dst) = level.entries.get_mut(from..to) else {
         crate::fatal!(DeathKind::WalkReadPastTable)
@@ -139,10 +149,11 @@ fn read_range(
 }
 
 impl PageTableWalker {
-    /// A walker of the table at guest page `root`, `depth` levels deep. No validation: root 0
-    /// and depth 0 are accepted. `log` is where the walk's error lines go (normally
-    /// [`host_error_log`]).
+    /// A walker of the table at guest page `root` of `pages`, `depth` levels deep. No
+    /// validation: root 0 and depth 0 are accepted. `log` is where the walk's error lines go
+    /// (normally [`host_error_log`]).
     pub fn new(
+        pages: GuestPages,
         root: u32,
         depth: u32,
         allow_holes: bool,
@@ -150,7 +161,8 @@ impl PageTableWalker {
         log: PageTableLog,
     ) -> PageTableWalker {
         PageTableWalker {
-            root: u64::from(root).wrapping_shl(APV_PAGE_SHIFT),
+            pages,
+            root: pages.address(root),
             depth,
             allow_holes,
             read,
@@ -171,12 +183,14 @@ impl PageTableWalker {
         length: u64,
         visitor: &mut dyn FnMut(u64, u32, u32) -> RaiseResult<bool>,
     ) -> RaiseResult<()> {
-        if start & APV_PAGE_MASK != 0 {
+        let pages = self.pages;
+        let (index_bits, entries) = (index_bits(pages), entries(pages));
+        if start & pages.mask() != 0 {
             // No guest reaches this raise: every caller passes a page-aligned start.
             return Err(RaiseKind::WalkMisalignedStart
                 .raise(on, &format!("start {start:#x} is not page aligned")));
         }
-        if length & APV_PAGE_MASK != 0 {
+        if length & pages.mask() != 0 {
             return Err(RaiseKind::WalkMisalignedLength
                 .raise(on, &format!("length {length:#x} is not whole pages")));
         }
@@ -191,14 +205,14 @@ impl PageTableWalker {
                 &format!("range at {start:#x} of {length:#x} bytes overflows"),
             ));
         }
-        let start_page = start.wrapping_shr(APV_PAGE_SHIFT);
-        let end_page = end.wrapping_shr(APV_PAGE_SHIFT);
+        let start_page = start.wrapping_shr(pages.shift());
+        let end_page = end.wrapping_shr(pages.shift());
         let mut levels: Vec<Level> = (0..self.depth)
             .map(|i| {
-                let shift = INDEX_BITS.wrapping_mul(self.depth.wrapping_sub(1).wrapping_sub(i));
+                let shift = index_bits.wrapping_mul(self.depth.wrapping_sub(1).wrapping_sub(i));
                 // Both indices are truncated to 32 bits.
                 Level {
-                    entries: vec![0; APV_PAGE_SIZE.to_usize()],
+                    entries: vec![0; pages.size().to_usize()],
                     index: u64::from(start_page.wrapping_shr(shift).low_u32()),
                     end: u64::from(end_page.wrapping_shr(shift).low_u32()),
                     base: 0,
@@ -216,7 +230,8 @@ impl PageTableWalker {
             on,
             &self.read,
             &self.log,
-            self.root.wrapping_shr(APV_PAGE_SHIFT).low_u32(),
+            pages,
+            self.root.wrapping_shr(pages.shift()).low_u32(),
             root_level,
             first,
             last.wrapping_sub(first).wrapping_add(1),
@@ -228,7 +243,7 @@ impl PageTableWalker {
         let mut base: u64 = 0;
         loop {
             let offset = index.wrapping_sub(base);
-            let entry = level_mut(&mut levels, level).entry(offset);
+            let entry = level_mut(&mut levels, level).entry(offset, entries);
             let pa = entry & 0x7fff_ffff;
             if pa == 0 {
                 if !self.allow_holes {
@@ -239,17 +254,19 @@ impl PageTableWalker {
                 let current = level_mut(&mut levels, level);
                 current.index = index;
                 current.base = base;
-                base = index.wrapping_shl(INDEX_BITS);
+                base = index.wrapping_shl(index_bits);
                 level = level.wrapping_add(1);
                 let child = level_mut(&mut levels, level);
                 index = child.index;
                 // The result is ignored; the child table is re-read on every entry.
-                let _ = read_range(hold, on, &self.read, &self.log, pa, child, 0, ENTRIES)?;
+                let _ = read_range(
+                    hold, on, &self.read, &self.log, pages, pa, child, 0, entries,
+                )?;
                 continue;
             } else {
                 // The visitor's result is ignored.
                 let _ = visitor(
-                    index.wrapping_shl(APV_PAGE_SHIFT),
+                    index.wrapping_shl(pages.shift()),
                     pa,
                     entry.wrapping_shr(31),
                 )?;
@@ -259,7 +276,7 @@ impl PageTableWalker {
                 break;
             }
             // Tested on the old offset.
-            if offset.wrapping_add(1) >= ENTRIES {
+            if offset.wrapping_add(1) >= entries {
                 loop {
                     if level == 0 {
                         return Ok(());
@@ -269,7 +286,7 @@ impl PageTableWalker {
                     let parent = level_mut(&mut levels, level);
                     index = parent.index.wrapping_add(1);
                     base = parent.base;
-                    if index.wrapping_sub(base) < ENTRIES {
+                    if index.wrapping_sub(base) < entries {
                         break;
                     }
                 }
@@ -285,6 +302,11 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
+
+    /// The host default's index bits and entries, which these tests walk.
+    const INDEX_BITS: u32 = index_bits(GuestPages::HOST);
+    const ENTRIES: u64 = entries(GuestPages::HOST);
     use crate::raise::Raise;
     use crate::testkit::capture::catch_death;
 
@@ -388,7 +410,7 @@ mod tests {
     #[test]
     fn new_holds_the_read_block_until_dropped() {
         let g = Arc::new(Guest::default());
-        let w = PageTableWalker::new(7, 2, true, g.read_fn(), no_log());
+        let w = PageTableWalker::new(GuestPages::HOST, 7, 2, true, g.read_fn(), no_log());
         assert_eq!(w.root, 7 << APV_PAGE_SHIFT);
         assert_eq!(w.depth, 2);
         assert!(w.allow_holes);
@@ -403,7 +425,7 @@ mod tests {
         drop(w); // the read block's release
         assert_eq!(Arc::strong_count(&g), 1);
         // No validation: root 0 and depth 0 are accepted.
-        let _ = PageTableWalker::new(0, 0, false, g.read_fn(), no_log());
+        let _ = PageTableWalker::new(GuestPages::HOST, 0, 0, false, g.read_fn(), no_log());
     }
 
     mod visit_pages_in_range {
@@ -413,7 +435,7 @@ mod tests {
         fn refusals_in_order() {
             let g = Arc::new(Guest::default());
             // Root 0: the checks come before the root assert.
-            let w = PageTableWalker::new(0, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 0, 1, false, g.read_fn(), no_log());
             thrown_at(
                 &walk(&w, 1, 3).unwrap_err(),
                 RaiseKind::WalkMisalignedStart,
@@ -448,7 +470,14 @@ mod tests {
             let p = Arc::new(FakePlatform::new());
             let logs = crate::testkit::logs::capture();
             let g = Arc::new(Guest::default());
-            let w = PageTableWalker::new(1, 1, false, g.read_fn(), host_error_log(p.clone()));
+            let w = PageTableWalker::new(
+                GuestPages::HOST,
+                1,
+                1,
+                false,
+                g.read_fn(),
+                host_error_log(p.clone()),
+            );
             thrown_at(
                 &walk(&w, ENTRIES * PAGE, PAGE).unwrap_err(),
                 RaiseKind::WalkRootUnread,
@@ -464,7 +493,14 @@ mod tests {
             );
             assert!(g.reads.lock().is_empty());
             // Depth 1 over pages [LAST, LAST + 2): the count runs past the table.
-            let w = PageTableWalker::new(1, 1, false, g.read_fn(), host_error_log(p.clone()));
+            let w = PageTableWalker::new(
+                GuestPages::HOST,
+                1,
+                1,
+                false,
+                g.read_fn(),
+                host_error_log(p.clone()),
+            );
             thrown_at(
                 &walk(&w, LAST * PAGE, 2 * PAGE).unwrap_err(),
                 RaiseKind::WalkRootUnread,
@@ -480,7 +516,7 @@ mod tests {
         fn a_zero_root_dies_at_the_first_walk() {
             // testing.md 7.4 `smoke_crash`, `tasks_service_crash`.
             let g = Arc::new(Guest::default());
-            let w = PageTableWalker::new(0, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 0, 1, false, g.read_fn(), no_log());
             let d = catch_death(|| walk(&w, 0, PAGE)).unwrap_err();
             assert_eq!(d, DeathKind::WalkZeroTable.site());
         }
@@ -491,7 +527,7 @@ mod tests {
             let mut g = Guest::default();
             g.table(9, &[(3, 0x8000_0011), (4, 0x12), (5, 0x13)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, false, g.read_fn(), no_log());
             let v = walk(&w, 3 * PAGE, 3 * PAGE).unwrap();
             assert_eq!(
                 v,
@@ -509,7 +545,7 @@ mod tests {
             let mut g = Guest::default();
             g.table(9, &[]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, false, g.read_fn(), no_log());
             // start index ENTRIES (logged "Out of bounds start index")
             thrown_at(
                 &walk(&w, ENTRIES * PAGE, PAGE).unwrap_err(),
@@ -534,7 +570,7 @@ mod tests {
             g.table(20, &[(last - 1, 0x100), (last, 0x8000_0101)]);
             g.table(21, &[(0, 0x200), (1, 0x201)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 2, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 2, false, g.read_fn(), no_log());
             let v = walk(&w, (LAST - 1) * PAGE, 4 * PAGE).unwrap();
             assert_eq!(
                 v,
@@ -565,7 +601,7 @@ mod tests {
             g.table(30, &[(2, 40)]);
             g.table(40, &[(3, 0x8000_0555)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 3, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 3, false, g.read_fn(), no_log());
             let page = (1 << (2 * INDEX_BITS)) | (2 << INDEX_BITS) | 3;
             let v = walk(&w, page * PAGE, PAGE).unwrap();
             assert_eq!(v, vec![(page * PAGE, 0x555, 1)]);
@@ -576,7 +612,7 @@ mod tests {
             let mut g = Guest::default();
             g.table(9, &[(0, 0x10), (2, 0x12)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, false, g.read_fn(), no_log());
             let mut visits = Vec::new();
             let e = caught(|hold| {
                 w.visit_pages_in_range(hold, OnFault::Return, 0, 3 * PAGE, &mut |va, ppn, _| {
@@ -594,7 +630,7 @@ mod tests {
             let mut g = Guest::default();
             g.table(9, &[(0, 0x10), (2, 0x12)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 1, true, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, true, g.read_fn(), no_log());
             let v = walk(&w, 0, 3 * PAGE).unwrap();
             assert_eq!(v, vec![(0, 0x10, 0), (2 * PAGE, 0x12, 0)]);
         }
@@ -606,7 +642,7 @@ mod tests {
             g.table(9, &[(1, 20)]);
             g.table(20, &[(0, 0x10)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 2, true, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 2, true, g.read_fn(), no_log());
             let d = catch_death(|| walk(&w, 0, (ENTRIES + 1) * PAGE)).unwrap_err();
             assert_eq!(d, DeathKind::WalkEntryPastTable.site());
         }
@@ -614,7 +650,7 @@ mod tests {
         #[test]
         fn depth_zero_dies() {
             let g = Arc::new(Guest::default());
-            let w = PageTableWalker::new(9, 0, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 0, false, g.read_fn(), no_log());
             let d = catch_death(|| walk(&w, 0, PAGE)).unwrap_err();
             assert_eq!(d, DeathKind::WalkNoLevels.site());
         }
@@ -626,14 +662,14 @@ mod tests {
             g.table(20, &[(0, 0x10), (1, 0x11)]);
             g.raise_on = Some(20 << APV_PAGE_SHIFT);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 2, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 2, false, g.read_fn(), no_log());
             let e = walk(&w, 0, PAGE).unwrap_err();
             assert_eq!(e.detail().unwrap_or_default(), "Read past end of page");
 
             let mut g2 = Guest::default();
             g2.table(9, &[(0, 0x10), (1, 0x11)]);
             let g2 = Arc::new(g2);
-            let w = PageTableWalker::new(9, 1, false, g2.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, false, g2.read_fn(), no_log());
             let mut n = 0;
             let e = caught(|hold| {
                 w.visit_pages_in_range(hold, OnFault::Return, 0, 2 * PAGE, &mut |_, _, _| {
@@ -656,7 +692,7 @@ mod tests {
             let mut g = Guest::default();
             g.table(9, &[(3, 0x77)]);
             let g = Arc::new(g);
-            let w = PageTableWalker::new(9, 1, false, g.read_fn(), no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 1, false, g.read_fn(), no_log());
             let va = ((1u64 << 32) + 3) * PAGE;
             let v = walk(&w, va, PAGE).unwrap();
             assert_eq!(v, vec![(3 * PAGE, 0x77, 0)]);
@@ -700,7 +736,7 @@ mod tests {
                     },
                 )
             };
-            let w = PageTableWalker::new(9, 2, false, read, no_log());
+            let w = PageTableWalker::new(GuestPages::HOST, 9, 2, false, read, no_log());
             // The device goes while the walk is at VA page LAST. The descent into root entry 1
             // re-reads table 21 through nil, so the child level still holds table 20, and its
             // entries 0 and 1 are visited as table 21's.
@@ -765,10 +801,20 @@ mod tests {
             base: 0,
         };
         assert!(
-            caught(|hold| read_range(hold, OnFault::Return, &read, &log, 5, &mut level, 10, 2))
-                .unwrap()
+            caught(|hold| read_range(
+                hold,
+                OnFault::Return,
+                &read,
+                &log,
+                GuestPages::HOST,
+                5,
+                &mut level,
+                10,
+                2
+            ))
+            .unwrap()
         );
-        assert_eq!(level.entry(10), 0xabc);
+        assert_eq!(level.entry(10, ENTRIES), 0xabc);
         assert_eq!(*g.reads.lock(), vec![((5 << APV_PAGE_SHIFT) + 40, 8)]);
         assert!(
             !caught(|hold| read_range(
@@ -776,6 +822,7 @@ mod tests {
                 OnFault::Return,
                 &read,
                 &log,
+                GuestPages::HOST,
                 5,
                 &mut level,
                 ENTRIES,
@@ -784,8 +831,18 @@ mod tests {
             .unwrap()
         );
         assert!(
-            !caught(|hold| read_range(hold, OnFault::Return, &read, &log, 5, &mut level, LAST, 2))
-                .unwrap()
+            !caught(|hold| read_range(
+                hold,
+                OnFault::Return,
+                &read,
+                &log,
+                GuestPages::HOST,
+                5,
+                &mut level,
+                LAST,
+                2
+            ))
+            .unwrap()
         );
         assert!(
             caught(|hold| read_range(
@@ -793,6 +850,7 @@ mod tests {
                 OnFault::Return,
                 &read,
                 &log,
+                GuestPages::HOST,
                 5,
                 &mut level,
                 0,
@@ -808,9 +866,46 @@ mod tests {
                 (WalkLog::CountOutOfTable, 2)
             ]
         );
-        let d =
-            catch_death(|| read_range(Hold::NONE, OnFault::Die, &read, &log, 0, &mut level, 0, 1))
-                .unwrap_err();
+        let d = catch_death(|| {
+            read_range(
+                Hold::NONE,
+                OnFault::Die,
+                &read,
+                &log,
+                GuestPages::HOST,
+                0,
+                &mut level,
+                0,
+                1,
+            )
+        })
+        .unwrap_err();
         assert_eq!(d, DeathKind::WalkZeroTable.site());
+    }
+
+    /// A walk counts the walker's pages, whatever the build's: the root is read at its page's
+    /// address, the leaves' offsets step by a page, and a table holds a page of entries (4096 of
+    /// 16 KiB pages, 1024 of 4 KiB ones), so a start one table past the root is refused
+    #[test]
+    fn a_walk_counts_the_walker_s_pages() {
+        for pages in [GuestPages::ARM64, GuestPages::X86_64] {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let r2 = reads.clone();
+            // Every entry read is guest page 100 on, writable.
+            let read: PageTableRead = Arc::new(move |_, _, address, dst: &mut [u8]| {
+                r2.lock().push((address, dst.len()));
+                for (i, c) in dst.chunks_mut(4).enumerate() {
+                    c.copy_from_slice(&(0x8000_0000u32 | (100 + i as u32)).to_le_bytes());
+                }
+                Ok(true)
+            });
+            let w = PageTableWalker::new(pages, 9, 1, false, read, no_log());
+            let size = pages.size();
+            let visits = walk(&w, 2 * size, 2 * size).unwrap();
+            assert_eq!(*reads.lock(), vec![(pages.address(9) + 8, 8)]);
+            assert_eq!(visits, vec![(2 * size, 100, 1), (3 * size, 101, 1)]);
+            assert!(walk(&w, entries(pages) * size, size).is_err());
+            assert!(walk(&w, (entries(pages) - 1) * size, size).is_ok());
+        }
     }
 }

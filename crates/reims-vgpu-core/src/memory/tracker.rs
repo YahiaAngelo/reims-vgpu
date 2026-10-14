@@ -7,7 +7,7 @@
 //! forward from it. Every `u32` sum wraps; the searches are an `i32` loop, never
 //! `slice::binary_search`.
 
-use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
+use crate::guest::records::GuestPages;
 use crate::memory::{DeathKind, RaiseKind};
 use crate::num::{ToUsize, Truncate};
 use crate::raise::RaiseResult;
@@ -173,11 +173,11 @@ impl Run {
         }
     }
 
-    /// `(offset, length)` in bytes.
-    pub fn get_range(&self) -> (u64, u64) {
+    /// `(offset, length)` in bytes, of `pages`.
+    pub fn get_range(&self, pages: GuestPages) -> (u64, u64) {
         (
-            u64::from(self.page_offset).wrapping_shl(APV_PAGE_SHIFT),
-            u64::from(self.page_length).wrapping_shl(APV_PAGE_SHIFT),
+            pages.address(self.page_offset),
+            pages.address(self.page_length),
         )
     }
 
@@ -761,35 +761,41 @@ pub struct BlockSnapshot {
 /// Which task pages are host-mapped (blocks setup). The blocks sit behind a writer-preferring
 /// lock: written by adds and removes, read by tests and the visit's scan; the visitor runs with
 /// the lock released, since it re-enters the tracker. Dropping it drops the blocks, with no lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RangeTracker {
     blocks: WriterPrefRwLock<Blocks>,
+    /// The task's guest pages, the runs' unit.
+    pages: GuestPages,
 }
 
 impl RangeTracker {
-    /// No blocks.
-    pub fn new() -> RangeTracker {
-        RangeTracker::default()
+    /// No blocks, over runs of `pages`.
+    pub fn new(pages: GuestPages) -> RangeTracker {
+        RangeTracker {
+            blocks: WriterPrefRwLock::default(),
+            pages,
+        }
     }
 
     /// The pages of `[offset, offset + length)`, which must be whole pages: raises for a length
     /// of 0 or not whole pages, then for an offset not page-aligned.
     pub fn calculate_page_run_aligned(&self, offset: u64, length: u64) -> RaiseResult<Run> {
-        if length == 0 || (length & APV_PAGE_MASK) != 0 {
+        let (shift, mask) = (self.pages.shift(), self.pages.mask());
+        if length == 0 || (length & mask) != 0 {
             crate::raise!(
                 RaiseKind::TrackerAlignedLength,
                 format_args!("length {length:#x} is 0 or not whole pages")
             );
         }
-        if (offset & APV_PAGE_MASK) != 0 {
+        if (offset & mask) != 0 {
             crate::raise!(
                 RaiseKind::TrackerAlignedOffset,
                 format_args!("offset {offset:#x} is not page aligned")
             );
         }
         Ok(Run {
-            page_offset: offset.wrapping_shr(APV_PAGE_SHIFT).low_u32(),
-            page_length: length.wrapping_shr(APV_PAGE_SHIFT).low_u32(),
+            page_offset: offset.wrapping_shr(shift).low_u32(),
+            page_length: length.wrapping_shr(shift).low_u32(),
         })
     }
 
@@ -798,15 +804,16 @@ impl RangeTracker {
         if length == 0 {
             crate::raise!(RaiseKind::TrackerZeroLength, "length 0");
         }
-        // Rounds with a page less 2 (0x3ffe), the page start subtracted last: one page short for
-        // a range ending one byte into a page.
+        // Rounds with a page less 2 (0x3ffe of 16 KiB pages), the page start subtracted last:
+        // one page short for a range ending one byte into a page.
+        let (shift, mask) = (self.pages.shift(), self.pages.mask());
         let sum = offset
             .wrapping_add(length)
-            .wrapping_add(APV_PAGE_SIZE.wrapping_sub(2))
-            .wrapping_sub(offset & !APV_PAGE_MASK);
+            .wrapping_add(self.pages.size().wrapping_sub(2))
+            .wrapping_sub(offset & !mask);
         Ok(Run {
-            page_offset: offset.wrapping_shr(APV_PAGE_SHIFT).low_u32(),
-            page_length: sum.wrapping_shr(APV_PAGE_SHIFT).low_u32(),
+            page_offset: offset.wrapping_shr(shift).low_u32(),
+            page_length: sum.wrapping_shr(shift).low_u32(),
         })
     }
 
@@ -882,7 +889,7 @@ impl RangeTracker {
     ) -> RaiseResult<()> {
         let (unmapped, count) = self.unmapped_runs(offset, length)?;
         for run in unmapped.iter().take(count) {
-            let (range_offset, range_length) = run.get_range();
+            let (range_offset, range_length) = run.get_range(self.pages);
             // A raise leaves the loop.
             if !visitor(range_offset, range_length)? {
                 break;
@@ -997,6 +1004,7 @@ mod tests {
     #![allow(clippy::vec_box)]
 
     use super::*;
+    use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
 
     use crate::raise::death::DeathSite;
     use crate::raise::{Raise, RaiseId};
@@ -1070,7 +1078,7 @@ mod tests {
     }
 
     fn tracker_with(blocks: Vec<Box<RunBlock>>) -> RangeTracker {
-        let t = RangeTracker::new();
+        let t = RangeTracker::new(GuestPages::HOST);
         {
             let mut b = t.blocks.write();
             b.count = blocks.len() as u32;
@@ -1213,9 +1221,9 @@ mod tests {
 
     #[test]
     fn run_get_range() {
-        assert_eq!(r(3, 2).get_range(), (3 * PAGE, 2 * PAGE));
+        assert_eq!(r(3, 2).get_range(GuestPages::HOST), (3 * PAGE, 2 * PAGE));
         assert_eq!(
-            r(u32::MAX, u32::MAX).get_range(),
+            r(u32::MAX, u32::MAX).get_range(GuestPages::HOST),
             (
                 u64::from(u32::MAX) << APV_PAGE_SHIFT,
                 u64::from(u32::MAX) << APV_PAGE_SHIFT
@@ -1610,7 +1618,7 @@ mod tests {
 
     #[test]
     fn calculate_page_run_aligned() {
-        let t = RangeTracker::new();
+        let t = RangeTracker::new(GuestPages::HOST);
         assert_eq!(
             caught(|| t.calculate_page_run_aligned(3 * PAGE, 2 * PAGE)).unwrap(),
             r(3, 2)
@@ -1639,7 +1647,7 @@ mod tests {
 
     #[test]
     fn calculate_page_run_unaligned() {
-        let t = RangeTracker::new();
+        let t = RangeTracker::new(GuestPages::HOST);
         let e = caught(|| t.calculate_page_run_unaligned(5, 0)).unwrap_err();
         raised_at(&e, RaiseKind::TrackerZeroLength, "length 0");
         let run = |o, l| caught(|| t.calculate_page_run_unaligned(o, l)).unwrap();
@@ -1658,7 +1666,7 @@ mod tests {
 
     #[test]
     fn tracker_new_and_drop() {
-        let t = RangeTracker::new();
+        let t = RangeTracker::new(GuestPages::HOST);
         assert!(t.snapshot().is_empty());
         add_pages(&t, 1, 1);
         drop(t); // the blocks drop with it
@@ -1669,7 +1677,7 @@ mod tests {
 
         #[test]
         fn first_run_makes_the_first_block() {
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             add_pages(&t, 4, 2);
             assert_eq!(
                 t.snapshot(),
@@ -1682,7 +1690,7 @@ mod tests {
 
         #[test]
         fn refusals_precede_the_lock_and_change_nothing() {
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             let e = caught(|| t.add_to_range(0, 0)).unwrap_err();
             raised_at(
                 &e,
@@ -1712,7 +1720,7 @@ mod tests {
         #[test]
         fn a_full_last_block_opens_a_new_block() {
             // testing.md 7.1 `mutgap_mem_tracker_full_last_block`
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             for i in 0..240 {
                 add_pages(&t, 2 * i, 1);
             }
@@ -1731,7 +1739,7 @@ mod tests {
         #[test]
         fn a_full_block_in_the_middle_splits() {
             // testing.md 7.4 `mutgap2_res_tracker_split_adjacent` (the even control).
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             for i in 0..240 {
                 add_pages(&t, 2 * i, 1);
             }
@@ -1749,7 +1757,7 @@ mod tests {
         fn an_odd_full_block_dies_at_the_split() {
             // testing.md 7.4 `mutgap2_res_tracker_split_odd_death`: 239 single-page runs and a
             // three-page run, an unmap inside it (241 runs), then a map into the block.
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             for i in 0..239 {
                 add_pages(&t, 4 * i, 1);
             }
@@ -1923,7 +1931,7 @@ mod tests {
         drop(b);
         let d = catch_death(|| t.blocks.write().remove_at_index(5)).unwrap_err();
         assert_eq!(d, DeathKind::TrackerRemoveEmptySlot.site());
-        let empty = RangeTracker::new();
+        let empty = RangeTracker::new(GuestPages::HOST);
         empty.blocks.write().blocks[0] = Some(RunBlock::new());
         let d = catch_death(|| empty.blocks.write().remove_at_index(0)).unwrap_err();
         assert_eq!(d, DeathKind::TrackerRemoveNoBlocks.site());
@@ -2013,7 +2021,7 @@ mod tests {
 
         #[test]
         fn refusals_precede_the_lock() {
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             let e = caught(|| t.remove_from_range(0, 5)).unwrap_err();
             raised_at(
                 &e,
@@ -2050,7 +2058,7 @@ mod tests {
             assert!(!tested(&t, 12, 5)); // LessOverlap: test leaves [16,17)
             // A range spanning both blocks.
             assert!(!tested(&t, 0, 16));
-            assert!(!tested(&RangeTracker::new(), 0, 1));
+            assert!(!tested(&RangeTracker::new(GuestPages::HOST), 0, 1));
         }
 
         #[test]
@@ -2059,7 +2067,7 @@ mod tests {
             // A byte range within page 0.
             assert!(caught(|| t.test_range(10, 100)).unwrap());
             // One byte at a page start is 0 pages: tested true even with nothing mapped.
-            assert!(caught(|| RangeTracker::new().test_range(PAGE, 1)).unwrap());
+            assert!(caught(|| RangeTracker::new(GuestPages::HOST).test_range(PAGE, 1)).unwrap());
             let e = caught(|| t.test_range(0, 0)).unwrap_err();
             raised_at(&e, RaiseKind::TrackerZeroLength, "length 0");
         }
@@ -2085,7 +2093,10 @@ mod tests {
             assert_eq!(holes(&t, 0, 10), vec![(0, 2), (4, 2), (7, 3)]);
             assert_eq!(holes(&t, 2, 2), vec![]); // Equal
             assert_eq!(holes(&t, 3, 4), vec![(4, 2)]); // InsideEdge then GreaterOverlap
-            assert_eq!(holes(&RangeTracker::new(), 5, 1), vec![(5, 1)]);
+            assert_eq!(
+                holes(&RangeTracker::new(GuestPages::HOST), 5, 1),
+                vec![(5, 1)]
+            );
         }
 
         #[test]
@@ -2158,7 +2169,7 @@ mod tests {
         fn a_raise_from_the_visitor_leaves_the_loop() {
             // With the lazy map's visitor, whose mapping raises: the raise leaves the loop and the
             // third run is never visited.
-            let t = RangeTracker::new();
+            let t = RangeTracker::new(GuestPages::HOST);
             add_pages(&t, 0, 1);
             add_pages(&t, 2, 1);
             add_pages(&t, 4, 1);
@@ -2187,7 +2198,8 @@ mod tests {
         #[test]
         fn invalid_length_throws() {
             let e = caught_visit(|| {
-                RangeTracker::new().visit_unmapped_ranges(0, 0, &mut |_, _| Ok(true))
+                RangeTracker::new(GuestPages::HOST)
+                    .visit_unmapped_ranges(0, 0, &mut |_, _| Ok(true))
             })
             .unwrap_err();
             thrown_at(&e, RaiseKind::TrackerZeroLength, "length 0");
@@ -2203,7 +2215,7 @@ mod tests {
     /// (`DeathKind::TrackerAddUnordered`).
     #[test]
     fn tasks_map_tracker_multiblock() {
-        let t = RangeTracker::new();
+        let t = RangeTracker::new(GuestPages::HOST);
         for i in 0..481 {
             add_pages(&t, 2 * i, 1);
         }
@@ -2215,5 +2227,29 @@ mod tests {
         assert_eq!(holes(&t, 0, 1010), vec![(1000, 10)]);
         let d = catch_death(|| add_pages(&t, 1000, 10)).unwrap_err();
         assert_eq!(d, DeathKind::TrackerAddUnordered.site());
+    }
+
+    /// Runs count the tracker's pages, whatever the build's: 16 KiB for an arm64 guest, 4 KiB
+    /// for an x86-64 one
+    #[test]
+    fn runs_count_the_tracker_s_pages() {
+        let t = RangeTracker::new(GuestPages::ARM64);
+        assert_eq!(
+            caught(|| t.calculate_page_run_aligned(3 * 0x4000, 2 * 0x4000)).unwrap(),
+            r(3, 2)
+        );
+        assert!(caught(|| t.calculate_page_run_aligned(0x1000, 0x4000)).is_err());
+        assert!(caught(|| t.calculate_page_run_aligned(0, 0x1000)).is_err());
+        assert_eq!(
+            caught(|| t.calculate_page_run_unaligned(0x10, 0x4000)).unwrap(),
+            r(0, 2)
+        );
+        assert_eq!(r(3, 2).get_range(GuestPages::ARM64), (0xc000, 0x8000));
+        let t = RangeTracker::new(GuestPages::X86_64);
+        assert_eq!(
+            caught(|| t.calculate_page_run_aligned(0x3000, 0x2000)).unwrap(),
+            r(3, 2)
+        );
+        assert_eq!(r(3, 2).get_range(GuestPages::X86_64), (0x3000, 0x2000));
     }
 }

@@ -1255,6 +1255,7 @@ pub(super) mod tests {
         RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
+    use reims_vgpu_core::guest::records::GuestPages;
     use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
     use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
@@ -1296,7 +1297,7 @@ pub(super) mod tests {
                 host_address: r.host(),
             });
         }
-        let map = MemoryMap::new(Arc::clone(&p), &desc).unwrap();
+        let map = MemoryMap::new(Arc::clone(&p), &desc, GuestPages::X86_64).unwrap();
         dec.set_guest_memory(map, Arc::new(()));
         Rig {
             p,

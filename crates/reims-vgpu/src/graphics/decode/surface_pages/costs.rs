@@ -57,6 +57,7 @@ use reims_graphics::wire::{
     RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun,
     RgfxSurfacePages,
 };
+use reims_vgpu_core::guest::records::GuestPages;
 use reims_vgpu_core::host::PhysRange;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
@@ -317,7 +318,12 @@ fn measure<P: ApiPlatform>(label: &str) {
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
     let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
-    let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+    let core = CoreMemoryMap::new(
+        Arc::clone(&platform),
+        &ram.map.to_core(),
+        GuestPages::X86_64,
+    )
+    .expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
     let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
     let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
@@ -511,8 +517,12 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
         // Fresh RAM, a lease and a decoder of their own an order, as a booted guest's.
         let ram = guest_ram(ram_bytes, false);
         let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
-        let core =
-            CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+        let core = CoreMemoryMap::new(
+            Arc::clone(&platform),
+            &ram.map.to_core(),
+            GuestPages::X86_64,
+        )
+        .expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
         let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
@@ -661,8 +671,12 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
         }
         let ram = guest_ram(ram_bytes, false);
         let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
-        let core =
-            CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+        let core = CoreMemoryMap::new(
+            Arc::clone(&platform),
+            &ram.map.to_core(),
+            GuestPages::X86_64,
+        )
+        .expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
         let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
@@ -753,7 +767,12 @@ fn map_only<P: ApiPlatform>(label: &str) {
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
     let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
-    let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+    let core = CoreMemoryMap::new(
+        Arc::clone(&platform),
+        &ram.map.to_core(),
+        GuestPages::X86_64,
+    )
+    .expect("a memory map");
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
     for case in cases(page) {
         if only

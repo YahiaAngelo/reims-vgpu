@@ -251,7 +251,7 @@ impl<P: Platform> HostDeviceCore<P> {
             return status;
         }
         // The cause of a refusal has its own line.
-        let Some(spec) = surface_spec(&*self.platform, descriptor, slot) else {
+        let Some(spec) = surface_spec(self.page_size(), descriptor, slot) else {
             log::debug!("map: surface {mapping_id}'s properties were refused");
             return IoReturn::NoMemory;
         };
@@ -854,5 +854,126 @@ mod tests {
                 (log::Level::Debug, "released 2 surfaces".to_owned()),
             ]
         );
+    }
+
+    /// An arm64 guest's 16 KiB pages on a device that names them, whatever the build's own
+    /// page: the table, the descriptor pages, the page tables and the ring count 16 KiB pages,
+    /// and each surface page is one 16 KiB range of the host's address space
+    mod sixteen_k_pages {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::guest::records::GuestPages;
+        use crate::iosurface::descriptor::IoSurfaceHostDeviceDescriptor;
+        use crate::iosurface::device::HostDeviceHandle;
+        use crate::iosurface::regs::{
+            REG_DESC_ENABLE, REG_DESCRIPTOR_BASE, REG_RING_BASE, REG_RING_SIZE,
+        };
+        use crate::testkit::GuestRam;
+
+        const P16: u64 = 0x4000;
+        const RING: u64 = B;
+        const TABLE: u64 = B + P16;
+        const DPAGE: u64 = B + 2 * P16;
+        const ROOT: u64 = B + 3 * P16;
+        const SURF: u64 = B + 4 * P16;
+
+        /// An entry naming `pa` in 16 KiB pages.
+        fn pte16(pa: u64) -> u32 {
+            (((pa >> 14) as u32) << 2) | 1
+        }
+
+        /// A device of 16 KiB guest pages over eight of them at `B`, the ring and the table set,
+        /// in the second form.
+        fn rig16() -> (Arc<FakePlatform>, GuestRam, HostDeviceHandle<FakePlatform>) {
+            let p = Arc::new(FakePlatform::new());
+            let ram = GuestRam::with_range(B, 8 * P16).unwrap();
+            p.fake_vm().adopt(&ram);
+            let mut d = IoSurfaceHostDeviceDescriptor::new();
+            d.memory_map_descriptor = Some(map_descriptor(&ram));
+            d.guest_pages = GuestPages::ARM64;
+            let dev = Dev::new(&p, &d).unwrap();
+            ram.write_u32(TABLE, pte16(DPAGE));
+            dev.mmio_write(REG_DESC_ENABLE, 1);
+            dev.mmio_write(REG_RING_BASE, RING);
+            // 1024 commands: one 16 KiB page.
+            dev.mmio_write(REG_RING_SIZE, 1024);
+            dev.mmio_write(REG_DESCRIPTOR_BASE, TABLE);
+            (p, ram, dev)
+        }
+
+        /// The geometry is the guest page's: a table of 4096 entries, 16 second-form and 32
+        /// first-form descriptors a page; an entry's page number counts 16 KiB
+        #[test]
+        fn geometry_and_entries() {
+            let (_p, _ram, dev) = rig16();
+            {
+                let st = dev.state.lock();
+                assert_eq!(st.table_len, 4096);
+                assert_eq!(st.descriptors_per_page, 16);
+                assert!(st.ring.is_some() && st.table.is_some());
+            }
+            dev.mmio_write(REG_DESC_ENABLE, 0);
+            assert_eq!(dev.state.lock().descriptors_per_page, 32);
+            assert_eq!((dev.page_size(), dev.page_shift()), (P16, 14));
+            assert_eq!(Entry(pte16(SURF)).address(14), SURF);
+            assert_eq!(Entry(pte16(SURF)).address(12), SURF >> 2);
+        }
+
+        /// A surface of 0x4001 bytes is two 16 KiB pages, each one range of 16 KiB at the host
+        /// address of its guest page; the descriptor in the second slot of the one descriptor
+        /// page is found
+        #[test]
+        fn a_surface_maps_whole_16k_pages() {
+            let (p, ram, dev) = rig16();
+            ram.write_u32(ROOT, pte16(SURF));
+            ram.write_u32(ROOT + 4, pte16(SURF + P16));
+            let mut d = v2(1, ROOT);
+            d.base.word0 = pte16(ROOT);
+            d.base.alloc_size = P16 + 1;
+            assert!(ram.write(DPAGE + 15 * 0x400, d.as_bytes()));
+            p.fake_vm().sync();
+            assert_eq!(dev.map(&mut dev.state.lock(), 15), IoReturn::Success);
+            let host = |pa: u64| ram.host_addr(pa).unwrap().addr() as u64;
+            {
+                let st = dev.state.lock();
+                let h = &st.slots[15];
+                assert_eq!(h.page_count, 2);
+                assert_eq!(h.pages, vec![host(SURF), host(SURF + P16)]);
+            }
+            let ranges = vec![
+                PhysicalMemoryRange {
+                    physical_address: host(SURF),
+                    physical_length: P16,
+                },
+                PhysicalMemoryRange {
+                    physical_address: host(SURF + P16),
+                    physical_length: P16,
+                },
+            ];
+            let created: Vec<Arg> = p
+                .call_log()
+                .calls_to("IOSurfaceCreate")
+                .into_iter()
+                .map(|c| c.args[0].clone())
+                .collect();
+            assert_eq!(created, vec![Arg::val(&spec_for(&d, Some(ranges)))]);
+        }
+
+        /// A host-only surface of one byte counts one 16 KiB page against the host-only total
+        #[test]
+        fn host_only_counts_16k_pages() {
+            let (p, ram, dev) = rig16();
+            let mut d = v2(1, HOLE);
+            d.base.word0 = pte16(HOLE);
+            d.base.alloc_size = 1;
+            d.base.bits41 = 2;
+            assert!(ram.write(DPAGE + 2 * 0x400, d.as_bytes()));
+            p.fake_vm().sync();
+            assert_eq!(dev.map(&mut dev.state.lock(), 2), IoReturn::Success);
+            assert_eq!(dev.state.lock().host_only_bytes, P16);
+            assert_eq!(dev.unmap(&mut dev.state.lock(), 2), IoReturn::Success);
+            assert_eq!(dev.state.lock().host_only_bytes, 0);
+        }
     }
 }

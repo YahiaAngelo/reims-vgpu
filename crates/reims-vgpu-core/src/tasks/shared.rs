@@ -1333,6 +1333,7 @@ mod tests {
             let t = tx();
             let icb = crate::resources::icb::IcbResource::new(
                 Arc::downgrade(&t.fx.task_dyn),
+                crate::guest::records::GuestPages::HOST,
                 &[0; 12],
                 None,
                 Default::default(),

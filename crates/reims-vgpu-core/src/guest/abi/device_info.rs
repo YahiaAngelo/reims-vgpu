@@ -20,7 +20,7 @@
 use crate::deserializer::DESERIALIZER_VERSION;
 use crate::guest::GuestDeath;
 use crate::guest::abi::suspend_blob::KeyValuePair;
-use crate::guest::records::{APV_PAGE_SIZE, GuestFeatures};
+use crate::guest::records::GuestFeatures;
 use crate::num::{ToUsize, Truncate};
 use crate::platform::caps::{self, DeviceCaps};
 use crate::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -580,13 +580,11 @@ pub fn check_capabilities(
     Ok(true)
 }
 
-/// The length a device info request maps at the guest's page: one guest page.
-const DEVICE_INFO_MAPPING_LENGTH: u64 = APV_PAGE_SIZE;
-
 /// A guest's device info request (opcode 58): maps the guest's page, writes the host's pairs
 /// into it, unmaps it, and stores the requested max key.
 ///
-/// `new_contiguous_mapping(page, length)` maps the page (a new mapping, or none);
+/// `new_contiguous_mapping(page, length)` maps the page, `page_size` bytes: one guest page (a
+/// new mapping, or none);
 /// `write(&mapping, max_key, max_count)` is [`write_device_info`] into it; dropping the mapping
 /// unmaps it; `store_max_key(max_key)` stores the requested key, whatever the guest wrote. No
 /// mapping raises.
@@ -597,12 +595,12 @@ pub fn get_device_info<M>(
     max_key: u32,
     max_count: u32,
     destination_page: u32,
+    page_size: u64,
     new_contiguous_mapping: impl FnOnce(u32, u64) -> RaiseResult<Option<M>>,
     write: impl FnOnce(&M, u32, u32) -> RaiseResult<()>,
     store_max_key: impl FnOnce(u32),
 ) -> RaiseResult<()> {
-    let Some(mapping) = new_contiguous_mapping(destination_page, DEVICE_INFO_MAPPING_LENGTH)?
-    else {
+    let Some(mapping) = new_contiguous_mapping(destination_page, page_size)? else {
         crate::raise!(
             crate::device::DeviceRaise::DeviceInfoNotMapped,
             format_args!("device info page {destination_page:#x} not mapped")
@@ -624,6 +622,7 @@ mod tests {
     mod request {
         use super::*;
         use crate::device::DeviceRaise;
+        use crate::guest::records::APV_PAGE_SIZE;
         use crate::raise::RaiseId;
         use crate::raise::death::DeathKind;
         use crate::raise::death::DeathSite;
@@ -647,6 +646,7 @@ mod tests {
                 0xffff_ffff,
                 46,
                 7,
+                APV_PAGE_SIZE,
                 |page, len| {
                     l1.lock().push(format!("map {page} {len:#x}"));
                     Ok(Some(Map(l1.clone())))
@@ -662,7 +662,7 @@ mod tests {
             assert_eq!(
                 *log.lock(),
                 [
-                    format!("map 7 {DEVICE_INFO_MAPPING_LENGTH:#x}"),
+                    format!("map 7 {APV_PAGE_SIZE:#x}"),
                     "write 0xffffffff 46".to_owned(),
                     "release".to_owned(),
                     "store 0xffffffff".to_owned()
@@ -678,6 +678,7 @@ mod tests {
                 45,
                 46,
                 0,
+                APV_PAGE_SIZE,
                 |_, _| Ok(None),
                 |_, _, _| {
                     log.lock().push("write");
@@ -699,8 +700,16 @@ mod tests {
         /// would
         #[test]
         fn nil_mapping_raise_names_the_throw() {
-            let r = get_device_info::<Map>(45, 46, 0, |_, _| Ok(None), |_, _, _| Ok(()), |_| ())
-                .unwrap_err();
+            let r = get_device_info::<Map>(
+                45,
+                46,
+                0,
+                APV_PAGE_SIZE,
+                |_, _| Ok(None),
+                |_, _, _| Ok(()),
+                |_| (),
+            )
+            .unwrap_err();
             assert_eq!(r.id(), RaiseId::Device(DeviceRaise::DeviceInfoNotMapped));
             assert_eq!(
                 r.site(),
@@ -721,6 +730,7 @@ mod tests {
                 45,
                 46,
                 3,
+                APV_PAGE_SIZE,
                 |_, _| Ok(Some(Map(l1.clone()))),
                 |_, _, _| {
                     Err(crate::testkit::capture::foreign(
@@ -744,6 +754,7 @@ mod tests {
                 45,
                 46,
                 3,
+                APV_PAGE_SIZE,
                 |_, _| {
                     Err(crate::testkit::capture::foreign(
                         OnFault::Return,

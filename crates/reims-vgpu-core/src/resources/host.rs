@@ -64,6 +64,9 @@ impl<T> std::fmt::Debug for CallBorrow<'_, T> {
 pub trait ResourceHost<P: Platform>: Send + Sync {
     // ---- What a resource asks.
 
+    /// The guest's pages, which the guest's page numbers count.
+    fn guest_pages(&self) -> crate::guest::records::GuestPages;
+
     /// A +1 no-copy buffer over the guest's pages. Raises when the pages or the buffer cannot
     /// be had; never `None` from a live task.
     fn new_buffer_for_virtual_page(

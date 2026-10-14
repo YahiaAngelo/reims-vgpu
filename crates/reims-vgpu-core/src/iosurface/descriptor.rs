@@ -9,6 +9,7 @@ use std::num::NonZeroU64;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::guest::records::GuestPages;
 use crate::host::{PhysicalMemoryRange, RaiseInterrupt};
 use crate::iosurface::table::SurfaceSlot;
 use crate::memory::descriptor::MemoryMapDescriptor;
@@ -30,15 +31,20 @@ pub struct IoSurfaceHostDeviceDescriptor {
     pub raise_interrupt: Option<RaiseInterrupt>,
     /// The guest's memory; without one the device is refused.
     pub memory_map_descriptor: Option<MemoryMapDescriptor>,
+    /// The guest's pages (ours): what its descriptor table, descriptor pages, page tables and
+    /// ring count. [`GuestPages::HOST`] unless the guest is of another architecture than the
+    /// build.
+    pub guest_pages: GuestPages,
 }
 
 impl IoSurfaceHostDeviceDescriptor {
-    /// `mmio_length` 16384, no interrupt block, no memory map.
+    /// `mmio_length` 16384, no interrupt block, no memory map, the build's guest pages.
     pub fn new() -> IoSurfaceHostDeviceDescriptor {
         IoSurfaceHostDeviceDescriptor {
             mmio_length: DEFAULT_MMIO_LENGTH,
             raise_interrupt: None,
             memory_map_descriptor: None,
+            guest_pages: GuestPages::HOST,
         }
     }
 }
@@ -94,7 +100,7 @@ impl IoSurfaceDescriptorPageTableEntry {
     }
 
     /// The guest physical address of the page the entry names: its page number shifted by the
-    /// VM page shift, in 64 bits.
+    /// guest's page shift, in 64 bits.
     pub(super) fn address(self, page_shift: u32) -> u64 {
         u64::from(self.0.wrapping_shr(2)).wrapping_shl(page_shift)
     }
@@ -444,10 +450,12 @@ pub(super) fn plane_specs(
 }
 
 /// The IOSurface properties of `descriptor`, and the slot's base offset. A guest-backed surface
-/// lists each of its pages as a client address range; a host-only one lists none. The
-/// surface-level compression type goes under the plane key, as the device has always sent it.
+/// lists each of its guest pages (`page` bytes, contiguous in the host's address space) as a
+/// client address range: a 16 KiB guest page on a host of 4 KiB pages is one range of four host
+/// pages. A host-only one lists none. The surface-level compression type goes under the plane
+/// key, as the device has always sent it.
 pub(super) fn surface_spec<P: Platform>(
-    p: &P,
+    page: u64,
     descriptor: &IoSurfaceDeviceDescriptor2,
     slot: &mut SurfaceSlot<P>,
 ) -> Option<SurfaceSpec> {
@@ -498,7 +506,6 @@ pub(super) fn surface_spec<P: Platform>(
         log::debug!("the surface is host-only");
         return Some(spec);
     }
-    let page = p.vm().page_size();
     spec.client_address_ranges = Some(
         slot.pages
             .iter()
