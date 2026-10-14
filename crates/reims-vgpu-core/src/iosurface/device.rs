@@ -29,6 +29,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use crate::guest::GuestPtr;
+use crate::guest::records::GuestPages;
 use crate::host::{HostPtr, RaiseInterrupt};
 use crate::iosurface::DeathKind;
 use crate::iosurface::descriptor::{Form, IoSurfaceHostDeviceDescriptor};
@@ -219,8 +220,11 @@ pub struct HostDeviceCore<P: Platform> {
     pub(super) state: Mutex<QueueState<P>>,
     /// What the teardown releases. Taken after `state`, never before.
     pub(super) maps: Mutex<Mappings<P>>,
-    /// The platform (the VM page size, IOSurfaces, logs).
+    /// The platform (IOSurfaces, logs).
     pub(super) platform: Arc<P>,
+    /// The guest's pages, from the descriptor: the table's, the descriptor pages', the page
+    /// tables' and the surfaces' unit. The host VM's own pages are the memory map's business.
+    pages: GuestPages,
     /// This state's own `Weak`, for the blocks the device queues: a block owns what it uses and
     /// holds the state, never the host's device.
     weak_core: Weak<HostDeviceCore<P>>,
@@ -275,7 +279,9 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
         platform: &Arc<P>,
         descriptor: &IoSurfaceHostDeviceDescriptor,
     ) -> Result<HostDeviceHandle<P>, IoSurfaceRefusal> {
-        let page = platform.vm().page_size();
+        // The table, its entries and the descriptor pages are the guest's pages.
+        let pages = descriptor.guest_pages;
+        let page = pages.size();
         let table_len = page / const { NonZeroU64::new(TABLE_ENTRY_SIZE).unwrap() };
         let descriptors_per_page = page / Form::First.size();
         let mmio_length = descriptor.mmio_length;
@@ -283,7 +289,7 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
             log::warn!("host device refused: no memory map descriptor");
             return Err(IoSurfaceRefusal::NoMemoryMap);
         };
-        let Some(memory_map) = MemoryMap::new(platform.clone(), map_descriptor) else {
+        let Some(memory_map) = MemoryMap::new(platform.clone(), map_descriptor, pages) else {
             log::warn!("host device refused: the memory map refused its descriptor");
             return Err(IoSurfaceRefusal::MemoryMap);
         };
@@ -318,6 +324,7 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
                 unmapped: Vec::new(),
             }),
             platform: platform.clone(),
+            pages,
             weak_core: weak_core.clone(),
         });
         let target: Arc<dyn Executor> = Arc::new(queue);
@@ -378,14 +385,14 @@ impl<P: Platform> HostDeviceCore<P> {
             })
     }
 
-    /// The VM page size.
+    /// The guest's page size.
     pub(super) fn page_size(&self) -> u64 {
-        self.platform.vm().page_size()
+        self.pages.size()
     }
 
-    /// The VM page shift.
+    /// The guest's page shift.
     pub(super) fn page_shift(&self) -> u32 {
-        self.platform.vm().page_shift()
+        self.pages.shift()
     }
 
     /// Another reference to the IOSurface mapped at `mapping_id`, made on the device's queue;

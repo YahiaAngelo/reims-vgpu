@@ -314,17 +314,31 @@ pub struct RvgDeviceConfig {
     /// argument-buffer answer follows the same rule, read when the guest asks, since only
     /// isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
     pub process_isolation_follows_guest: bool,
+    /// The guest's page shift: 14 for an arm64 guest's 16 KiB pages, 12 for an x86-64 guest's
+    /// 4 KiB ones, 0 for the library's own architecture's (12 on x86-64, 14 on arm64). Every
+    /// page number the guest hands the device counts these pages: a host whose guest is of
+    /// another architecture than its own (an arm64 guest under TCG on an x86-64 host) sets it.
+    /// Any other value is RVG_ERR_INVALID_ARGUMENT, before anything is made.
+    pub guest_page_shift: u32,
 }
 
 // SAFETY: repr(C), a u32 first; integers, bools and pointers.
 unsafe impl HostStruct for RvgDeviceConfig {
     /// The first version ends at `callbacks`: a host built against it passes 48, and has no
-    /// `memory_files`.
+    /// `memory_files`. The second ends at `memory_files`, 56 bytes, and a host built against it
+    /// has the build's guest pages (`guest_page_shift` 0).
     const V1_SIZE: usize = 48;
 }
 
+/// The offset of `guest_page_shift` (vphone-linux), in the padding after
+/// `process_isolation_follows_guest`: a host passing fewer bytes has the build's guest pages.
+pub(crate) const DEVICE_CONFIG_V2_SIZE: usize = 60;
+
 const _: () =
     assert!(std::mem::offset_of!(RvgDeviceConfig, memory_files) == RvgDeviceConfig::V1_SIZE);
+const _: () =
+    assert!(std::mem::offset_of!(RvgDeviceConfig, guest_page_shift) == DEVICE_CONFIG_V2_SIZE);
+const _: () = assert!(size_of::<RvgDeviceConfig>() == 64);
 
 /// The device: one paravirtualized GPU and its display ports.
 pub struct RvgDevice {
@@ -653,6 +667,7 @@ pub unsafe extern "C" fn rvg_device_create(
             process_isolation_follows_guest: c.process_isolation_follows_guest,
             argument_buffers: !c.disable_argument_buffers,
             callbacks: host_callbacks(&table, &callbacks),
+            guest_page_shift: c.guest_page_shift,
         };
         match Device::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
             Ok(d) => {

@@ -58,7 +58,7 @@ use parking_lot::Mutex;
 
 use crate::device::DeviceCore;
 use crate::display::{DeathKind, Display, DisplayHandle, GammaTableArgs};
-use crate::guest::records::APV_PAGE_SHIFT;
+use crate::guest::records::GuestPages;
 use crate::host::{HostPtr, HostTask, HostTraceRange, PhysRange, TraceRangeHandler};
 use crate::memory::mapping::Mapping;
 use crate::num::{self, ToUsize, Truncate};
@@ -83,11 +83,6 @@ const MTL_PIXEL_FORMAT_BGRA8_UNORM: u64 = 80;
 const MTL_TEXTURE_USAGE_SHADER_READ: u64 = 1;
 /// `'BGRA'`, the IOSurface pixel format of every EFI present.
 const IOSURFACE_PIXEL_FORMAT_BGRA: u32 = 0x4247_5241;
-/// The framebuffer page shift: the start register counts guest pages (16 KiB, 4 KiB on x86-64,
-/// as the option ROM writes it).
-const PAGE_SHIFT: u32 = APV_PAGE_SHIFT;
-/// The page mask a length must clear.
-pub(crate) const PAGE_MASK: u32 = num::bit32(PAGE_SHIFT).wrapping_sub(1);
 /// The largest framebuffer length, 64 MiB.
 const MAX_FRAMEBUFFER_LENGTH: u32 = 0x400_0000;
 /// The only depth that presents.
@@ -189,6 +184,9 @@ pub struct EfiDisplay<P: Platform> {
     /// Its last release cancels it and drops what is pending (never cancelled otherwise).
     pub(crate) source: CoalescingSignal,
     platform: Arc<P>,
+    /// The device's guest pages: the start register counts them (4 KiB as the option ROM
+    /// writes it to an x86-64 guest), and a length is whole ones.
+    pages: GuestPages,
 }
 
 /// A send's or a present's value. No handler is live on any path into the EFI display (module
@@ -203,7 +201,7 @@ fn unraised<T, E: Into<Raise>>(r: Result<T, E>) -> T {
 
 impl<P: Platform> EfiDisplay<P> {
     /// The EFI display of `device`: its present queue and source made, its state zero.
-    pub fn new(platform: &Arc<P>, device: Weak<DeviceCore<P>>) -> Arc<Self> {
+    pub fn new(platform: &Arc<P>, device: Weak<DeviceCore<P>>, pages: GuestPages) -> Arc<Self> {
         Arc::new_cyclic(|this: &Weak<EfiDisplay<P>>| {
             let present_queue = SerialQueue::new(platform.threads(), PRESENT_QUEUE_LABEL);
             let target: Arc<dyn Executor> = Arc::new(present_queue.clone());
@@ -215,6 +213,7 @@ impl<P: Platform> EfiDisplay<P> {
                 state: Mutex::new(EfiState::new()),
                 source,
                 platform: platform.clone(),
+                pages,
             }
         })
     }
@@ -230,6 +229,11 @@ impl<P: Platform> EfiDisplay<P> {
             let platform = Arc::clone(&s.platform);
             release_off_thread(platform.threads(), s);
         }
+    }
+
+    /// The page mask a length must clear, as the registers' width.
+    pub(crate) fn page_mask(&self) -> u32 {
+        self.pages.mask().low_u32()
     }
 
     /// The device, while it lives.
@@ -290,7 +294,7 @@ impl<P: Platform> EfiDisplay<P> {
         if start_page == 0 || length == 0 {
             return;
         }
-        if length & PAGE_MASK != 0 {
+        if length & self.page_mask() != 0 {
             log::warn!("EFI framebuffer length {length:#x} is not page aligned");
             return;
         }
@@ -345,7 +349,7 @@ impl<P: Platform> EfiDisplay<P> {
             return;
         }
         let range = PhysRange {
-            physical_address: u64::from(regs.start_page).wrapping_shl(PAGE_SHIFT),
+            physical_address: self.pages.address(regs.start_page),
             physical_length: u64::from(regs.length),
         };
         // With a stale task, through the NULL task.
@@ -380,7 +384,7 @@ impl<P: Platform> EfiDisplay<P> {
                 );
                 return;
             }
-            let total = total.wrapping_add(PAGE_MASK) & !PAGE_MASK;
+            let total = total.wrapping_add(self.page_mask()) & !self.page_mask();
             s.total_size = total;
             (s.height, total)
         };
@@ -438,7 +442,7 @@ impl<P: Platform> EfiDisplay<P> {
         let range = {
             let s = self.state.lock();
             PhysRange {
-                physical_address: u64::from(s.regs.start_page).wrapping_shl(PAGE_SHIFT),
+                physical_address: self.pages.address(s.regs.start_page),
                 physical_length: u64::from(s.total_size),
             }
         };

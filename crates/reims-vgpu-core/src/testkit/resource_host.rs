@@ -157,6 +157,10 @@ impl FakeResourceHost {
 }
 
 impl ResourceHost<P> for FakeResourceHost {
+    fn guest_pages(&self) -> crate::guest::records::GuestPages {
+        crate::guest::records::GuestPages::HOST
+    }
+
     fn new_buffer_for_virtual_page(
         &self,
         _hold: Hold<'_>,

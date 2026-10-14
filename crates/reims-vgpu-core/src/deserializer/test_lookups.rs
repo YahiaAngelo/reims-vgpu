@@ -51,6 +51,7 @@ impl Lookups {
             0x4_0000,
             false,
             Arc::downgrade(&task_dyn),
+            crate::guest::records::GuestPages::HOST,
         );
         let manager = ResourceManager::new(
             p.clone(),
@@ -82,6 +83,7 @@ impl Lookups {
             {
                 let r = IcbResource::new(
                     Arc::downgrade(&self.task_dyn),
+                    crate::guest::records::GuestPages::HOST,
                     &[0; 12],
                     Some(i),
                     IndirectCommandLayout::default(),

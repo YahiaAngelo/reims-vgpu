@@ -424,7 +424,7 @@ mod testing {
                 host_address: r.host(),
             });
         }
-        let map = MemoryMap::new(p.clone(), &d).unwrap();
+        let map = MemoryMap::new(p.clone(), &d, crate::guest::records::GuestPages::HOST).unwrap();
         ram.write_u32(page_pa(ROOT_PAGE), PT_PAGE);
         ram.write_u32(page_pa(ROOT_PAGE) + 4, depth);
         // one object list entry at task offset 0 (the handshake's set-object-list)
@@ -475,6 +475,7 @@ mod testing {
             configuration: TaskConfiguration {
                 registry_id: registry,
                 supports_argument_buffers: false,
+                guest_pages: crate::guest::records::GuestPages::HOST,
             },
             features: GuestFeatures::default(),
             memory_map: map.then(|| tx.map.clone()),

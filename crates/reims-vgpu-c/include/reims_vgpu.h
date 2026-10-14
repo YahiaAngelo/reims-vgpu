@@ -447,6 +447,12 @@ typedef struct {
   // argument-buffer answer follows the same rule, read when the guest asks, since only
   // isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
   bool process_isolation_follows_guest;
+  // The guest's page shift: 14 for an arm64 guest's 16 KiB pages, 12 for an x86-64 guest's
+  // 4 KiB ones, 0 for the library's own architecture's (12 on x86-64, 14 on arm64). Every
+  // page number the guest hands the device counts these pages: a host whose guest is of
+  // another architecture than its own (an arm64 guest under TCG on an x86-64 host) sets it.
+  // Any other value is RVG_ERR_INVALID_ARGUMENT, before anything is made.
+  uint32_t guest_page_shift;
 } RvgDeviceConfig;
 
 // Bytes the library allocated; free them with rvg_bytes_free.
@@ -740,6 +746,12 @@ typedef struct {
   const RvgMemoryMap *memory_map;
   // NULL is a table with every callback absent.
   const RvgIOSurfaceCallbacks *callbacks;
+  // The guest's page shift, as RvgDeviceConfig's: 14 for an arm64 guest's 16 KiB pages, 12
+  // for an x86-64 guest's 4 KiB ones, 0 for the library's own architecture's (12 on x86-64,
+  // 14 on arm64). The descriptor table, the descriptor pages, the surfaces' page tables and
+  // the ring count these pages; give it the graphics device's. Any other value is
+  // RVG_ERR_INVALID_ARGUMENT.
+  uint32_t guest_page_shift;
 } RvgIOSurfaceDeviceConfig;
 
 #ifdef __cplusplus
@@ -1015,7 +1027,8 @@ void rvg_frame_release(RvgFrame *frame);
 
 // A new IOSurface device, the process's latest (a device with `use_iosurface_mapper` finds
 // it at its first use). Refusals, checked in this order: RVG_ERR_INVALID_ARGUMENT,
-// RVG_ERR_UNSUPPORTED, RVG_ERR_NO_MEMORY_MAP, RVG_ERR_MEMORY_MAP. Calls back: never.
+// RVG_ERR_UNSUPPORTED, RVG_ERR_INVALID_ARGUMENT for a `guest_page_shift` other than 0, 12 and
+// 14, RVG_ERR_NO_MEMORY_MAP, RVG_ERR_MEMORY_MAP. Calls back: never.
 //
 // # Safety
 // `config` is NULL or a live config; `device` is NULL or writable.

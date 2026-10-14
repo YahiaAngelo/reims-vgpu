@@ -10,6 +10,7 @@ use crate::display::descriptor::DisplayDescriptor;
 use crate::display::host_calls::CursorGlyph;
 use crate::display::{ColorMatrix, DisplayCoord};
 use crate::fifo::wire::Records;
+use crate::guest::records::GuestPages;
 use crate::platform::Handle;
 use crate::raise::death::DeathSite;
 use crate::rt::Hold;
@@ -57,7 +58,16 @@ struct Fx {
 
 /// A device with its root task and a kernel task (task 0, local, over guest page 0x55).
 fn guest_display_device() -> TestDevice {
-    let td = device(Opts::default()).with_root_page();
+    guest_display_device_with(GuestPages::HOST)
+}
+
+/// The device as a display host, its guest's pages `pages`.
+fn guest_display_device_with(pages: GuestPages) -> TestDevice {
+    let td = device(Opts {
+        guest_pages: pages,
+        ..Opts::default()
+    })
+    .with_root_page();
     td.task_root_node(0x55, 0x4000);
     {
         {
@@ -180,7 +190,12 @@ fn shared_state(guest_display: &GuestDisplay<Fp>) -> GuestPage {
 
 impl Fx {
     fn with_port(port: u64) -> Fx {
-        let td = guest_display_device();
+        Fx::with(port, GuestPages::HOST)
+    }
+
+    /// A guest display on `port` of a device whose guest's pages are `pages`.
+    fn with(port: u64, pages: GuestPages) -> Fx {
+        let td = guest_display_device_with(pages);
         let p = td.platform.clone();
         let host = host_of(&td);
         let guest_display =
@@ -1827,10 +1842,9 @@ mod color_matrix_late_read {
     }
 }
 
-/// On x86-64 the page is 4 KiB: matrices 0-30 lie inside it, matrix 31's first two rows end at its
-/// end, and every access past it ends the process there, before it is made. Each test sets only
-/// bytes inside the page.
-#[cfg(target_arch = "x86_64")]
+/// With an x86-64 guest's 4 KiB pages, whatever the build: matrices 0-30 lie inside the page,
+/// matrix 31's first two rows end at its end, and every access past it ends the process there,
+/// before it is made. Each test sets only bytes inside the page.
 mod color_matrix_outside_page {
     use super::*;
 
@@ -1840,10 +1854,10 @@ mod color_matrix_outside_page {
     /// [2][2] (0x1008) dies, and dirty is never set.
     #[test]
     fn init_dies_at_the_store_past_the_page() {
-        let td = guest_display_device();
+        let td = guest_display_device_with(GuestPages::X86_64);
         let p = td.platform.clone();
         let host = host_of(&td);
-        let pa = u64::from(PAGE) * crate::guest::records::APV_PAGE_SIZE;
+        let pa = GuestPages::X86_64.address(PAGE);
         assert!(
             td.host
                 .ram()
@@ -1862,10 +1876,10 @@ mod color_matrix_outside_page {
     /// Init at write index 32: its first store is past the page, so nothing is stored.
     #[test]
     fn init_past_the_page_stores_nothing() {
-        let td = guest_display_device();
+        let td = guest_display_device_with(GuestPages::X86_64);
         let p = td.platform.clone();
         let host = host_of(&td);
-        let pa = u64::from(PAGE) * crate::guest::records::APV_PAGE_SIZE;
+        let pa = GuestPages::X86_64.address(PAGE);
         assert!(
             td.host
                 .ram()
@@ -1880,10 +1894,10 @@ mod color_matrix_outside_page {
     /// Init at write index 30, the last whole matrix: the diagonal as at any other index.
     #[test]
     fn init_at_the_last_whole_matrix_writes_it() {
-        let td = guest_display_device();
+        let td = guest_display_device_with(GuestPages::X86_64);
         let p = td.platform.clone();
         let host = host_of(&td);
-        let pa = u64::from(PAGE) * crate::guest::records::APV_PAGE_SIZE;
+        let pa = GuestPages::X86_64.address(PAGE);
         assert!(
             td.host
                 .ram()
@@ -1903,7 +1917,7 @@ mod color_matrix_outside_page {
     /// 48 bytes is written, and dirty stays as it was.
     #[test]
     fn property_write_dies_before_writing() {
-        let fx = Fx::new();
+        let fx = Fx::with(0, GuestPages::X86_64);
         fx.w8(sp::COLOR_MATRIX_WRITE_INDEX, 31);
         fx.w8(sp::COLOR_MATRIX_DIRTY, 0);
         let b: Vec<u8> = (0..12u32)
@@ -1921,7 +1935,7 @@ mod color_matrix_outside_page {
     /// Property 0 at write index 30 lands whole.
     #[test]
     fn property_write_at_the_last_whole_matrix_lands() {
-        let fx = Fx::new();
+        let fx = Fx::with(0, GuestPages::X86_64);
         fx.w8(sp::COLOR_MATRIX_WRITE_INDEX, 30);
         let b: Vec<u8> = (0..12u32)
             .flat_map(|i| (i as f32 + 0.5).to_bits().to_le_bytes())
@@ -1937,7 +1951,7 @@ mod color_matrix_outside_page {
     /// and the first read of row 2 dies.
     #[test]
     fn read_dies_at_the_first_access_past_the_page() {
-        let fx = Fx::new();
+        let fx = Fx::with(0, GuestPages::X86_64);
         fx.w8(sp::COLOR_MATRIX_WRITE_INDEX, 31);
         fx.w8(sp::COLOR_MATRIX_DIRTY, 1);
         let l = fx.guest_display.guest_display_mutex.lock();
@@ -1949,6 +1963,63 @@ mod color_matrix_outside_page {
         assert_eq!(m.pair(1, 2), (0.0, 7.0));
         assert_eq!(catch_death(|| m.at(2, 0)).err(), Some(SITE.site()));
         assert_eq!(catch_death(|| m.pair(2, 0)).err(), Some(SITE.site()));
+        drop(l);
+    }
+}
+
+/// With an arm64 guest's 16 KiB pages, whatever the build: the page holds every matrix, so no
+/// index the guest writes leaves it
+mod color_matrix_in_a_16k_page {
+    use super::*;
+
+    /// Init at write index 255, the last: the diagonal as at any other index, and dirty set.
+    #[test]
+    fn init_at_the_last_index_writes_it() {
+        let td = guest_display_device_with(GuestPages::ARM64);
+        let p = td.platform.clone();
+        let host = host_of(&td);
+        let pa = GuestPages::ARM64.address(PAGE);
+        assert!(
+            td.host
+                .ram()
+                .write(pa + sp::COLOR_MATRIX_WRITE_INDEX, &[255])
+        );
+        td.platform.fake_vm().sync();
+        let _guest_display = GuestDisplay::new(p.clone(), Arc::downgrade(&host), 0, PAGE).unwrap();
+        let u32_at =
+            |off: u64| u32::from_le_bytes(guest_bytes(&td, pa + off, 4).try_into().unwrap());
+        for i in 0..3u8 {
+            assert_eq!(u32_at(sp::color_matrix(255, i, i)), 1.0f32.to_bits());
+        }
+        assert_eq!(guest_bytes(&td, pa + sp::COLOR_MATRIX_DIRTY, 1), vec![1]);
+    }
+
+    /// Property 0 at write index 31, past a 4 KiB page, lands whole.
+    #[test]
+    fn property_write_past_4k_lands() {
+        let fx = Fx::with(0, GuestPages::ARM64);
+        fx.w8(sp::COLOR_MATRIX_WRITE_INDEX, 31);
+        let b: Vec<u8> = (0..12u32)
+            .flat_map(|i| (i as f32 + 0.5).to_bits().to_le_bytes())
+            .collect();
+        fx.guest_display
+            .set_property(0, Records::new(&b, 12).unwrap())
+            .unwrap();
+        assert_eq!(fx.rf32(sp::color_matrix(31, 0, 0)), 0.5);
+        assert_eq!(fx.rf32(sp::color_matrix(31, 2, 3)), 11.5);
+    }
+
+    /// A dirty matrix at write index 31 reads its row 2, past a 4 KiB page.
+    #[test]
+    fn read_past_4k_reads() {
+        let fx = Fx::with(0, GuestPages::ARM64);
+        fx.w8(sp::COLOR_MATRIX_WRITE_INDEX, 31);
+        fx.w8(sp::COLOR_MATRIX_DIRTY, 1);
+        let l = fx.guest_display.guest_display_mutex.lock();
+        let m = fx.guest_display.take_dirty_color_matrix(&l).unwrap();
+        fx.wf32(sp::color_matrix(31, 2, 1), 9.0);
+        assert_eq!(m.at(2, 1), 9.0);
+        assert_eq!(m.pair(2, 0), (0.0, 9.0));
         drop(l);
     }
 }

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{DeathKind, LocalTask, PAGE, RaiseKind, kernel_task, raise_caught};
+use super::{DeathKind, LocalTask, RaiseKind, kernel_task, raise_caught};
 use crate::guest::GuestPtr;
 use crate::guest::records::CmdExecIndirectResource3;
 use crate::num::Truncate;
@@ -184,7 +184,7 @@ impl<P: Platform> LocalTask<P> {
         let _lock = self.base.mutex.write();
         let computed = Held::raising(|held| {
             let hold = Hold::of(held);
-            if !(16..PAGE).contains(&reply_length) {
+            if !(16..self.pages.size()).contains(&reply_length) {
                 return raise_caught(
                     RaiseKind::ReplyLength,
                     format_args!("reply of {reply_length:#x} bytes is not 0x10 to below a page"),
