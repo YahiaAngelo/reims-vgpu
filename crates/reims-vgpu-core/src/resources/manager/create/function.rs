@@ -49,6 +49,14 @@ fn new_function_with_ir<P: Platform, M: ManagerOps<P>>(
         }
         Err(error) => {
             log::warn!("Metal refused the function's IR: {error}");
+            // Diagnostic: keep the refused IR for inspection.
+            if let Some(dir) = std::env::var_os("REIMS_VGPU_DUMP_IR") {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::path::Path::new(&dir)
+                    .join(format!("ir-{}-{n}.bin", std::process::id()));
+                let _ = std::fs::write(path, data);
+            }
             return Ok(Err(format!(
                 "Metal made no library of the function's IR: {}",
                 error.description

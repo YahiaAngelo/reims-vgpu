@@ -120,3 +120,8 @@ debug-assertions = true
 # suite's `checked` pass leaves them off, and release has none at all (D36).
 [profile.checked.package.objc2]
 debug-assertions = false
+
+# vphone-linux: metal2vulkan with iOS metallib fixes (../metal2vulkan)
+[patch."https://github.com/steelbrain/metal2vulkan"]
+metal2vulkan = { path = "../metal2vulkan/crates/metal2vulkan" }
+metal2vulkan-runtime = { path = "../metal2vulkan/crates/metal2vulkan-runtime" }
