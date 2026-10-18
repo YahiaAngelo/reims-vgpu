@@ -657,12 +657,185 @@ fn buffer_copy_shape(
     )
 }
 
+thread_local! {
+    /// Set while the copy of decoded ASTC texels is encoded, so it is not decoded again.
+    static ASTC_DECODED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// Each command but `endEncoding` is a first use of Metal's device
     /// ([`FirstUse::BlitCommand`]: measured for fills and copies, taken alike for the rest), and
     /// a reset or copy of an indirect command buffer is work for Metal's tiler
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+        // ASTC blocks blitted into an RGBA8 stand-in: decoded, and copied as texels from a
+        // buffer of the decoded rows (`gpu::astc`).
+        if let BlitCmd::CopyBufferToTexture {
+            source_buffer,
+            source_offset,
+            source_bytes_per_row,
+            source_size,
+            destination_texture,
+            destination_slice,
+            destination_level,
+            destination_origin,
+            ..
+        } = cmd
+            && !ASTC_DECODED.get()
+            && let Some(fp) = plain(|| destination_texture.raw.astc_blocks())
+        {
+            astc_deferred(
+                self,
+                _on,
+                destination_texture,
+                source_buffer,
+                source_offset,
+                source_bytes_per_row,
+                source_size,
+                fp,
+                (destination_level, destination_slice),
+                destination_origin,
+            )?;
+            return Ok(());
+        }
+        if let BlitCmd::CopyBufferToTextureOptions {
+            source_buffer: Some(source_buffer),
+            source_offset,
+            source_bytes_per_row,
+            source_size,
+            destination_texture: Some(destination_texture),
+            destination_slice,
+            destination_level,
+            destination_origin,
+            options: 0,
+            ..
+        } = cmd
+            && !ASTC_DECODED.get()
+            && let Some(fp) = plain(|| destination_texture.raw.astc_blocks())
+        {
+            astc_deferred(
+                self,
+                _on,
+                destination_texture,
+                source_buffer,
+                source_offset,
+                source_bytes_per_row,
+                source_size,
+                fp,
+                (destination_level, destination_slice),
+                destination_origin,
+            )?;
+            return Ok(());
+        }
+        // Blocks read back from an ASTC stand-in: the blocks kept of it, copied from a buffer of
+        // them a row of blocks at a time (`gpu::astc`).
+        let readback = match cmd {
+            BlitCmd::CopyTextureToBuffer {
+                source_texture,
+                source_slice,
+                source_level,
+                source_origin,
+                source_size,
+                destination_buffer,
+                destination_offset,
+                destination_bytes_per_row,
+                ..
+            }
+            | BlitCmd::CopyTextureToBufferOptions {
+                source_texture: Some(source_texture),
+                source_slice,
+                source_level,
+                source_origin,
+                source_size,
+                destination_buffer: Some(destination_buffer),
+                destination_offset,
+                destination_bytes_per_row,
+                options: 0,
+                ..
+            } => plain(|| source_texture.raw.astc_blocks()).map(|fp| {
+                (
+                    source_texture,
+                    (source_level, source_slice),
+                    (source_origin, source_size),
+                    fp,
+                    destination_buffer,
+                    destination_offset,
+                    destination_bytes_per_row,
+                )
+            }),
+            _ => None,
+        };
+        if let Some((texture, at, (origin, size), fp, dest, offset, dest_row)) = readback {
+            let (blocks, row) = plain(|| {
+                crate::gpu::astc::kept(
+                    &texture.raw,
+                    at,
+                    fp,
+                    ([origin.x, origin.y], [size.width, size.height]),
+                )
+            });
+            let Some(src) = shared_buffer(texture, &blocks)? else {
+                return Ok(());
+            };
+            let rows = blocks.len().checked_div(row).unwrap_or(0);
+            let runs: Vec<(u64, u64, u64)> = if dest_row == row as u64 {
+                vec![(0, offset, blocks.len() as u64)]
+            } else {
+                (0..rows as u64)
+                    .map(|r| (r * row as u64, offset + r * dest_row, row as u64))
+                    .collect()
+            };
+            for (from, to, size) in runs {
+                self.encode(
+                    _on,
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(&src),
+                        source_offset: from,
+                        destination_buffer: Some(dest),
+                        destination_offset: to,
+                        size,
+                    },
+                )?;
+            }
+            keep_until_complete(self, src);
+            return Ok(());
+        }
+        // Blocks copied between ASTC stand-ins: the texels on the GPU, the kept blocks here.
+        if let BlitCmd::CopyTextureRegion {
+            source_texture,
+            source_slice,
+            source_level,
+            source_origin,
+            source_size,
+            destination_texture,
+            destination_slice,
+            destination_level,
+            destination_origin,
+        } = cmd
+            && let (Some(fp), Some(_)) = plain(|| {
+                (source_texture.raw.astc_blocks(), destination_texture.raw.astc_blocks())
+            })
+        {
+            plain(|| {
+                let (blocks, row) = crate::gpu::astc::kept(
+                    &source_texture.raw,
+                    (source_level, source_slice),
+                    fp,
+                    ([source_origin.x, source_origin.y], [source_size.width, source_size.height]),
+                );
+                crate::gpu::astc::keep(
+                    &destination_texture.raw,
+                    (destination_level, destination_slice),
+                    fp,
+                    (
+                        [destination_origin.x, destination_origin.y],
+                        [source_size.width, source_size.height],
+                    ),
+                    &blocks,
+                    row,
+                );
+            });
+        }
         let sel = cmd.selector();
         for (buffer, bytes) in named_buffers(&cmd) {
             if let Some(buffer) = buffer {
@@ -1131,6 +1304,216 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             BlitCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             BlitCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
         }
+    }
+}
+
+/// A new Shared buffer of `bytes`, made on `texture`'s device; `None`, logged, if none is made.
+fn shared_buffer(
+    texture: &VulkanTexture,
+    texels: &[u8],
+) -> RaiseResult<Option<crate::gpu::resource::VulkanBuffer>> {
+    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+    let Some(buffer) = texture.device.new_buffer(BufferDesc {
+        length: texels.len() as u64,
+        options: vec![OptionSet::StorageMode(0)],
+        pinned_gpu_address: None,
+        contents: None,
+        no_copy: false,
+        deallocator: None,
+    })?
+    else {
+        log::warn!("ASTC blit: no buffer of {} bytes for the decoded texels", texels.len());
+        return Ok(None);
+    };
+    let to = buffer.contents();
+    // SAFETY: the new Shared buffer's `texels.len()` bytes, written before any command reads them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(texels.as_ptr(), to.as_ptr::<u8>(), texels.len());
+    }
+    Ok(Some(buffer))
+}
+
+/// ASTC blocks blitted from `source` into an RGBA8 stand-in, decoded once the GPU has written
+/// them (`gpu::astc`): the blocks are copied into a Shared staging buffer in the command
+/// buffer's order (iOS encodes ASTC on the GPU, into the very buffer it then blits from), and,
+/// when the command buffer completes, decoded on the CPU, kept in the texture's block shadow and
+/// blitted into the texture from a queue of the runtime's own. Until then the texture holds what
+/// it held: a pass later in the same command buffer reads the old texels.
+#[allow(clippy::too_many_arguments)]
+fn astc_deferred(
+    encoder: &VulkanBlitEncoder,
+    on: OnFault,
+    texture: &VulkanTexture,
+    source: &crate::gpu::resource::VulkanBuffer,
+    offset: u64,
+    bytes_per_row: u64,
+    size: MtlSize,
+    fp: [u32; 2],
+    (level, slice): (u64, u64),
+    origin: MtlOrigin,
+) -> RaiseResult<()> {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    let (bw, bh) = (u64::from(fp[0]), u64::from(fp[1]));
+    let rows = size.height.div_ceil(bh).max(1);
+    let row_bytes = size.width.div_ceil(bw) * 16;
+    let available = source.length().saturating_sub(offset);
+    let length = (bytes_per_row * (rows - 1) + row_bytes).min(available);
+    if length == 0 {
+        return Ok(());
+    }
+    // Blocks the CPU sees already (a file's bytes, the guest's writes) decode now, in the
+    // command buffer's order, so the next draw reads them; blocks a command may still write
+    // (all zero now) decode once the command buffer completed.
+    let head = source.contents();
+    if !head.is_null() {
+        // SAFETY: the source's `length` Shared bytes from `offset`, inside the buffer, read here.
+        let now = unsafe {
+            std::slice::from_raw_parts(head.as_ptr::<u8>().add(offset as usize), length as usize)
+        };
+        if now.iter().any(|&b| b != 0) {
+            plain(|| {
+                crate::gpu::astc::keep(
+                    &texture.raw,
+                    (level, slice),
+                    fp,
+                    ([origin.x, origin.y], [size.width, size.height]),
+                    now,
+                    bytes_per_row as usize,
+                )
+            });
+            let (w, h) = (size.width as u32, size.height as u32);
+            let texels = crate::gpu::astc::decode(now, bytes_per_row as usize, fp, w, h);
+            let Some(decoded) = shared_buffer(texture, &texels)? else {
+                return Ok(());
+            };
+            let row = size.width * 4;
+            ASTC_DECODED.set(true);
+            let done = encoder.encode(
+                on,
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer: &decoded,
+                    source_offset: 0,
+                    source_bytes_per_row: row,
+                    source_bytes_per_image: row * size.height,
+                    source_size: size,
+                    destination_texture: texture,
+                    destination_slice: slice,
+                    destination_level: level,
+                    destination_origin: origin,
+                },
+            );
+            ASTC_DECODED.set(false);
+            keep_until_complete(encoder, decoded);
+            return done;
+        }
+    }
+    let Some(staging) = shared_buffer(texture, &vec![0u8; length as usize])? else {
+        return Ok(());
+    };
+    ASTC_DECODED.set(true);
+    let copied = encoder.encode(
+        on,
+        BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(source),
+            source_offset: offset,
+            destination_buffer: Some(&staging),
+            destination_offset: 0,
+            size: length,
+        },
+    );
+    ASTC_DECODED.set(false);
+    copied?;
+    let Some(command_buffer) = encoder.command_buffer() else {
+        return Ok(());
+    };
+    let blocks = staging.raw.clone();
+    let target = texture.raw.clone();
+    let handler: rt::Handler = Box::new(move |_| {
+        astc_complete(&blocks, length, &target, bytes_per_row, size, fp, (level, slice), origin);
+        drop(staging);
+    });
+    if let Err(e) = command_buffer.raw.add_completed_handler(handler) {
+        log::warn!("ASTC blit: no completion handler for its decode: {e}");
+    }
+    Ok(())
+}
+
+/// The decode of a deferred ASTC blit ([`astc_deferred`]), once its command buffer completed.
+#[allow(clippy::too_many_arguments)]
+fn astc_complete(
+    blocks: &rt::Buffer,
+    length: u64,
+    texture: &rt::Texture,
+    bytes_per_row: u64,
+    size: MtlSize,
+    fp: [u32; 2],
+    (level, slice): (u64, u64),
+    origin: MtlOrigin,
+) {
+    let Some(at) = blocks.contents() else {
+        log::warn!("ASTC blit: its staging buffer has no CPU view");
+        return;
+    };
+    // SAFETY: the staging buffer's `length` Shared bytes, which its completed command buffer
+    // wrote and nothing writes again.
+    let bytes = unsafe { std::slice::from_raw_parts(at.as_ptr(), length as usize) };
+    crate::gpu::astc::keep(
+        texture,
+        (level, slice),
+        fp,
+        ([origin.x, origin.y], [size.width, size.height]),
+        bytes,
+        bytes_per_row as usize,
+    );
+    let (w, h) = (size.width as u32, size.height as u32);
+    let texels = crate::gpu::astc::decode(bytes, bytes_per_row as usize, fp, w, h);
+    let upload = || -> Result<(), rt::Error> {
+        let device = texture.device();
+        let buffer = device.new_buffer(texels.len() as u64, rt::ResourceOptions::shared())?;
+        if let Some(to) = buffer.contents() {
+            // SAFETY: the new Shared buffer's `texels.len()` bytes, before any command reads them.
+            unsafe { std::ptr::copy_nonoverlapping(texels.as_ptr(), to.as_ptr(), texels.len()) };
+        }
+        let queue = device.new_command_queue()?;
+        let command_buffer = queue.command_buffer()?;
+        let mut blit = command_buffer.blit_command_encoder()?;
+        let row = u64::from(w) * 4;
+        blit.copy_from_buffer_to_texture(
+            &buffer,
+            0,
+            row,
+            row * u64::from(h),
+            crate::gpu::size(size),
+            texture,
+            slice,
+            level,
+            crate::gpu::origin(origin),
+            rt::BlitOption::None,
+        )?;
+        blit.end_encoding()?;
+        let held = buffer.clone();
+        command_buffer.add_completed_handler(Box::new(move |_| drop(held)))?;
+        command_buffer.commit()
+    };
+    if let Err(e) = upload() {
+        log::warn!("ASTC blit: the upload of its decoded texels failed: {e}");
+    }
+}
+
+/// Holds `held` (a temporary buffer a command of `encoder`'s command buffer reads or writes) until
+/// that command buffer completed: the guest's command buffers need not retain what they use, and
+/// a temporary's memory freed before the GPU ran the command faults the device (vphone-linux).
+fn keep_until_complete<T: Send + 'static>(encoder: &VulkanBlitEncoder, held: T) {
+    match encoder.command_buffer() {
+        Some(cb) => {
+            let handler: rt::Handler = Box::new(move |_| drop(held));
+            if let Err(e) = cb.raw.add_completed_handler(handler) {
+                log::warn!("a temporary buffer of a blit is not held to its completion: {e}");
+            }
+        }
+        None => log::warn!("a temporary buffer of a blit has no command buffer to be held by"),
     }
 }
 
@@ -1672,3 +2055,4 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod metal_tests;
 }
+

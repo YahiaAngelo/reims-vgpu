@@ -420,6 +420,7 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
         rt::Error::MetalError(m) => m.code,
         _ => return None,
     };
+    log::warn!("a pipeline state answered an NSError (code {code}): {e}");
     Some(NsErrorText {
         code,
         ..error_text(e)

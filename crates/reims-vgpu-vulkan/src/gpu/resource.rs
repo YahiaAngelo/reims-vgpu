@@ -1609,7 +1609,17 @@ impl Texture<VulkanPlatform> for VulkanTexture {
 
     /// The surface the texture (or the texture it views) was made on, +1; `None` for any other.
     fn iosurface(&self) -> Option<OsSurface> {
-        plain(|| self.surface.as_deref().map(Handle::clone_ref))
+        plain(|| {
+            self.surface
+                .as_deref()
+                .or_else(|| {
+                    self.raw
+                        .consumer_data()
+                        .and_then(|d| d.downcast_ref::<Arc<OsSurface>>())
+                        .map(|s| &**s)
+                })
+                .map(Handle::clone_ref)
+        })
     }
 
     fn is_shareable(&self) -> bool {
@@ -1757,9 +1767,15 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         })
     }
 
-    /// The runtime's.
+    /// The runtime's; an ASTC stand-in answers the ASTC format it stands for (`gpu::astc`), whose
+    /// blocks core pages in, and which the guest made.
     fn pixel_format(&self) -> u64 {
-        u64::from(plain(|| self.raw.pixel_format()).as_raw())
+        let pf = plain(|| match (self.raw.reported_format(), self.raw.astc_blocks()) {
+            (Some(pf), _) => pf,
+            (None, Some(fp)) => crate::gpu::astc::original(fp, self.raw.pixel_format()),
+            (None, None) => self.raw.pixel_format(),
+        });
+        u64::from(pf.as_raw())
     }
 
     fn protection_options(&self) -> u64 {
@@ -1790,6 +1806,33 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
+        }
+        // ASTC blocks into an RGBA8 stand-in: decoded here, written as texels (`gpu::astc`).
+        if let Some(fp) = raw.astc_blocks() {
+            let (w, h) = (region.size.width as u32, region.size.height as u32);
+            crate::gpu::astc::keep(
+                raw,
+                (level, slice),
+                fp,
+                (
+                    [region.origin.x, region.origin.y],
+                    [region.size.width, region.size.height],
+                ),
+                &bytes,
+                bytes_per_row as usize,
+            );
+            let texels = crate::gpu::astc::decode(&bytes, bytes_per_row as usize, fp, w, h);
+            let row = u64::from(w) * 4;
+            return send(sel, Policy::Dies, || {
+                raw.replace_region(
+                    crate::gpu::region(region),
+                    level,
+                    slice,
+                    &texels,
+                    row,
+                    row * u64::from(h),
+                )
+            });
         }
         send(sel, Policy::Dies, || {
             raw.replace_region(

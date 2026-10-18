@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "astc-decode"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6058e6202e20b7fa445692ec4b77ca8eb02508091fcd479ea753d9f60e376b"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -221,7 +227,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e#61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -232,7 +237,6 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e#61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e"
 dependencies = [
  "sha2",
 ]
@@ -240,7 +244,6 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e#61a2efc7d355ed2b0c80d108ee4a3d4f11ca405e"
 dependencies = [
  "ash",
  "libc",
@@ -517,6 +520,7 @@ name = "reims-vgpu-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "astc-decode",
  "libc",
  "log",
  "metal2vulkan",

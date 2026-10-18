@@ -221,6 +221,14 @@ pub struct PagedTexture<P: Platform> {
     pub(crate) transfer_buffer: Mutex<Option<P::Buffer>>,
 }
 
+impl<P: Platform> Drop for PagedTexture<P> {
+    /// The transfer buffer is retired, not dropped (`resources::retire`): a paging copy into it
+    /// may still be in flight when the texture's last reference goes (vphone-linux).
+    fn drop(&mut self) {
+        crate::resources::retire(self.transfer_buffer.get_mut().take());
+    }
+}
+
 /// The five layouts of a paged texture.
 pub enum TextureLayout<P: Platform> {
     /// One plane, paged by blits (object types 2 and 3).
@@ -401,7 +409,7 @@ impl<P: Platform> PagedTexture<P> {
 
     /// Drops the guest pages and makes the texture volatile; host-valid is kept.
     pub(crate) fn discard(&self, state: &ResourceState) -> RaiseResult<()> {
-        drop(self.transfer_buffer.lock().take());
+        crate::resources::retire(self.transfer_buffer.lock().take());
         self.texture.set_purgeable_state(PURGEABLE_VOLATILE)?;
         state.set_is_volatile(true);
         Ok(())

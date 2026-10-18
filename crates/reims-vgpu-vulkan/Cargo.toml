@@ -16,6 +16,8 @@ log.workspace = true
 # A display window's swapchain (`swapchain.rs`) and the window system's extensions
 # (`os/wsi.rs`), through ash, on either OS.
 ash.workspace = true
+# ASTC blocks decoded on the CPU for a device without ASTC (gpu/astc.rs, vphone-linux).
+astc-decode = "0.3"
 
 # On macOS the OS services are the metal crate's (threads, clock, Mach VM, the autorelease pool and
 # IOSurface, `os/macos.rs`), with Metal's system default device, whose registryID the runtime's

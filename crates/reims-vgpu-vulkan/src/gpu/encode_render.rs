@@ -2437,6 +2437,31 @@ impl VulkanRenderEncoder {
         send(sel, Policy::Dies, || self.encoder.with(sel, |e| call(e)))
     }
 
+    /// [`Self::run`] for a draw (vphone-linux): a draw the runtime refuses as unsupported is
+    /// skipped, logged, instead of the VM's death, so one element goes missing where the guest
+    /// uses a feature the runtime does not hold.
+    fn run_skipping(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
+        send(sel, Policy::Dies, || {
+            match self.encoder.with(sel, |e| call(e)) {
+                Err(
+                    e @ (rt::Error::Unsupported(_)
+                    | rt::Error::Bind(_)
+                    | rt::Error::NotImplemented(_)
+                    | rt::Error::AppleOnly(_)
+                    | rt::Error::Compile(_)),
+                ) => {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                        log::warn!("{sel}: draw skipped, the runtime refused it: {e}");
+                    }
+                    Ok(())
+                }
+                done => done,
+            }
+        })
+    }
+
     /// Dies at `sel`, a draw or an execution of indirect commands that is not empty, in a pass
     /// of a rate map of no layers: Metal's rasterizes it by what earlier maps left, which no call
     /// tells, where the runtime's draws nothing ([`crate::gpu::rate_map`]). In a pass of a map
@@ -2512,7 +2537,7 @@ impl VulkanRenderEncoder {
     /// past the bound ([`half_apart`]). An execution's commands announce it at the commit,
     /// outside the call.
     fn binds(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
-        let (drawn, heard) = crate::answer::hearing(|| self.run(sel, call));
+        let (drawn, heard) = crate::answer::hearing(|| self.run_skipping(sel, call));
         if heard.contains(&rt::Degradation::HalfOutputPrecision)
             && let Some(apart) = plain(|| self.marks.lock().half_apart)
         {

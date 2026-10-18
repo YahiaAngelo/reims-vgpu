@@ -19,6 +19,7 @@
 //! typed values here: a value the runtime's type cannot hold dies at the selector that took it
 //! ([`crate::answer::unrepresentable`]).
 
+pub mod astc;
 pub mod backing;
 pub mod caps;
 pub mod command;

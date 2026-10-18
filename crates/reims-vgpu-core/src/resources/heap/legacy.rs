@@ -234,7 +234,7 @@ impl<P: Platform> ResourceClass<P> for LegacyHeapResource<P> {
 
     fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
         let old = self.transfer_buffer.lock().take();
-        drop(old);
+        crate::resources::retire(old);
         // Metal first, then the flag (the private buffer's order is the opposite).
         self.heap
             .as_ref()
@@ -257,7 +257,7 @@ impl<P: Platform> Drop for LegacyHeapResource<P> {
     fn drop(&mut self) {
         // The heap, the transfer buffer, the heap's buffer.
         drop(self.heap.take());
-        drop(self.transfer_buffer.get_mut().take());
+        crate::resources::retire(self.transfer_buffer.get_mut().take());
         drop(self.transfer_heap_buffer.take());
     }
 }

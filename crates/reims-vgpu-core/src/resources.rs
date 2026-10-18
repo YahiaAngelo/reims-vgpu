@@ -253,3 +253,41 @@ pub(crate) fn raised_kind(t: &Raise) -> Option<RaiseKind> {
         _ => None,
     }
 }
+
+/// How long a retired object outlives its last use by core ([`retire`]).
+const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Objects core let go of whose last use may still be in flight on the GPU, each with when it
+/// was retired ([`retire`]).
+static RETIRED: crate::sync::Mutex<
+    std::collections::VecDeque<(std::time::Instant, Box<dyn std::any::Any + Send>)>,
+> = crate::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Lets `object` go [`RETIRE_GRACE`] from now, not at once (vphone-linux). A transfer buffer core
+/// drops at a discard may still be the destination of a paging copy a submitted command buffer
+/// has not run: Metal's command buffer keeps it alive, the Vulkan runtime's does not where the
+/// copy reaches it through a texture over its bytes, and its pages freed under the copy fault the
+/// device (NVIDIA Xid 31, a copy engine write). Older retired objects are dropped here, outside
+/// the queue's lock.
+pub(crate) fn retire<T: Send + 'static>(object: Option<T>) {
+    let Some(object) = object else { return };
+    // The unit tests check the releases core makes, at once.
+    if cfg!(test) {
+        drop(object);
+        return;
+    }
+    // Host time, not the `Clock`: the grace is a margin past the GPU's work, which no test
+    // observes (they release at once, above).
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::Instant::now();
+    let expired: Vec<_> = {
+        let mut queue = RETIRED.lock();
+        queue.push_back((now, Box::new(object)));
+        let mut out = Vec::new();
+        while queue.front().is_some_and(|(at, _)| now.duration_since(*at) >= RETIRE_GRACE) {
+            out.extend(queue.pop_front());
+        }
+        out
+    };
+    drop(expired);
+}

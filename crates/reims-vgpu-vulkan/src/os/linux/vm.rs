@@ -452,27 +452,25 @@ impl HostVm for LinuxVm {
         page_size().trailing_zeros()
     }
 
-    /// Anonymous memory anywhere; a length of 0 answers address 0, as Mach's does.
+    /// Fresh zero-filled memory anywhere, a shared mapping of a new file (vphone-linux): Mach's
+    /// memory can always be aliased later (an iOS guest's heaps over task memory remap it),
+    /// and Linux's anonymous memory cannot. A length of 0 answers address 0, as Mach's does.
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn> {
-        let Some((_, length)) = pages(HostAddr::NULL, len) else {
-            return Err(NO_SPACE);
-        };
-        if length == 0 {
-            return Ok(HostAddr::NULL);
-        }
-        let at = anonymous(None, length, "allocate_anywhere")?;
-        files::forget(at, length);
-        Ok(HostAddr::from_addr(at.to_usize()))
+        allocate_aliasable(len)
     }
 
-    /// Fresh anonymous memory over the pages of the range, which then shows no file.
+    /// Fresh zero-filled memory over the pages of the range, a shared mapping of a new file
+    /// that a view can be made of (as [`Self::allocate_anywhere`]).
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
         let (first, length) = pages(addr, len).ok_or(NO_SPACE)?;
         if length == 0 {
             return Ok(());
         }
-        anonymous(Some(first), length, "allocate_fixed_overwrite")?;
-        files::forget(first, length);
+        budget::admit(1, "a range a view can be made of");
+        let backing = Backing { fd: memfd(length), offset: 0 };
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        file(Some(first), length, &backing, prot)?;
+        files::record(first, length, backing, prot);
         Ok(())
     }
 

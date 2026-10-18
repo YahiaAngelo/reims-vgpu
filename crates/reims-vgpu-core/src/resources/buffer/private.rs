@@ -149,7 +149,7 @@ impl<P: Platform> Drop for PrivateBufferResource<P> {
     fn drop(&mut self) {
         // The private buffer, then the transfer buffer.
         drop(self.buffer.take());
-        drop(self.transfer_buffer.get_mut().take());
+        crate::resources::retire(self.transfer_buffer.get_mut().take());
     }
 }
 
@@ -208,7 +208,7 @@ impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
 
     fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
         let old = self.transfer_buffer.lock().take();
-        drop(old);
+        crate::resources::retire(old);
         // The flag first, then Metal (the legacy heap's order is the opposite). The previous
         // state is ignored.
         this.state.set_is_volatile(true);

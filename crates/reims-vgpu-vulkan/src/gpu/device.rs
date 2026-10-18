@@ -1286,10 +1286,25 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let space = Arc::new(metal_space::texture(kind));
         let token: rt::RangeToken = Box::new(Arc::clone(&space));
+        // An ASTC format the runtime refuses is held as RGBA8 texels (`gpu::astc`).
+        let stand_in = crate::gpu::astc::substitute(&desc);
+        let mut astc_blocks = None;
         let made = create(sel, Policy::Dies, Nil::Memory, || {
-            (self.raw.new_texture_with_range_token(&desc, token))
-                .map_err(|e| format_refused(sel, "a texture of", raw, e))
+            match (self.raw.new_texture_with_range_token(&desc, token), stand_in.as_ref()) {
+                (Err(_), Some((rgba, blocks))) => {
+                    let token: rt::RangeToken = Box::new(Arc::clone(&space));
+                    astc_blocks = Some(*blocks);
+                    self.raw
+                        .new_texture_with_range_token(rgba, token)
+                        .map_err(|e| format_refused(sel, "a texture of", raw, e))
+                }
+                (made, _) => made.map_err(|e| format_refused(sel, "a texture of", raw, e)),
+            }
         })?;
+        if let (Some(texture), Some([bw, bh])) = (&made, astc_blocks) {
+            texture.set_astc_blocks(bw, bh);
+            crate::gpu::astc::note_made(desc.pixel_format, desc.width, desc.height);
+        }
         if made.is_some() {
             fields.made_unprotected(sel);
         }
@@ -1385,8 +1400,18 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let format = fields.raw_pixel_format();
         let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (buffer.new_texture_with_iosurface_plane(&desc, plane))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
+            match buffer.new_texture_with_iosurface_plane(&desc, plane) {
+                // vphone-linux: a texture over a surface layout or format the runtime does
+                // not convert (an iOS private OSType) is nil, not the VM's death.
+                Err(rt::Error::Unsupported(u)) => {
+                    log::warn!("{sel}: format {format}: {u:?}; answered nil");
+                    Err(rt::Error::Nil(rt::Nil::new(
+                        "new_texture_with_iosurface_plane",
+                        rt::Problem::StorageMode,
+                    )))
+                }
+                made => made.map_err(|e| format_refused(sel, "a texture of", format, e)),
+            }
         })?
         else {
             return Ok(None);
