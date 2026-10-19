@@ -418,6 +418,11 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
             RuntimeInput::DynamicSymbol { .. } | RuntimeInput::DynamicLibrary { .. },
         )) => UNDEFINED_SYMBOLS,
         rt::Error::MetalError(m) => m.code,
+        // vphone-linux: a feature the runtime does not implement fails the creation with
+        // Metal's refusal, so the app (not the VM) meets it.
+        rt::Error::Unsupported(_) | rt::Error::NotImplemented(_) | rt::Error::AppleOnly(_) => {
+            METAL_REFUSES
+        }
         _ => return None,
     };
     log::warn!("a pipeline state answered an NSError (code {code}): {e}");
