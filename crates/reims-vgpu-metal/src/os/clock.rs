@@ -26,6 +26,12 @@ unsafe extern "C" {
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
 }
 
+/// The trace's clock (`reims_vgpu_core::trace`): the monotonic clock's nanoseconds.
+pub fn trace_clock() -> u64 {
+    // SAFETY: a libSystem call with a valid clock id; it cannot fail for this clock.
+    unsafe { clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) }
+}
+
 /// The host's clocks and timed waits.
 #[derive(Debug, Default)]
 pub struct MetalClock;

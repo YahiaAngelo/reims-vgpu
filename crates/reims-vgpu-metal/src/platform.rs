@@ -209,6 +209,9 @@ impl MetalPlatform {
     /// `ProcessState` is the process-wide state (D17).
     pub fn new(launcher: Box<dyn TaskLauncher<MetalPlatform>>) -> MetalPlatform {
         crate::os::autorelease::install();
+        if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
+            reims_vgpu_core::trace::set_clock(crate::os::clock::trace_clock);
+        }
         MetalPlatform {
             surfaces: MetalSurfaces::new(),
             vm: MetalVm::new(),
