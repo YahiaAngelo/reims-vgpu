@@ -426,6 +426,9 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
         _ => return None,
     };
     log::warn!("a pipeline state answered an NSError (code {code}): {e}");
+    if std::env::var_os("VPHONE_PIPELINE_BT").is_some() {
+        eprintln!("pipeline_error backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+    }
     Some(NsErrorText {
         code,
         ..error_text(e)
@@ -531,7 +534,26 @@ fn made(
             Ok(Ok(Some(made)))
         }
         Err(e) => match pipeline_error(&e) {
-            Some(error) => Ok(Err(error)),
+            Some(error) => {
+                // vphone-linux diagnostic: the refused render descriptor, once per text.
+                if let RenderDescriptor::Tile(d) = &descriptor {
+                    eprintln!("refused tile render pipeline: {e}; {d:?}");
+                }
+                if let RenderDescriptor::Render(d) = &descriptor {
+                    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                    let text = format!("{e}");
+                    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+                    if !seen.contains(&text) {
+                        seen.push(text);
+                        log::warn!(
+                            "refused render pipeline: {e}; color attachments {:?}; depth {:?} stencil {:?} samples {:?}",
+                            d.color_attachments, d.depth_format,
+                            d.stencil_format, d.raster_sample_count
+                        );
+                    }
+                }
+                Ok(Err(error))
+            }
             None => match &e {
                 rt::Error::Unproven(unproven) => {
                     self::unproven(sel, unproven, &e, &formats(&descriptor))

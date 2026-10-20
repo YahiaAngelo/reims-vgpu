@@ -232,6 +232,7 @@ static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::n
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
 /// placement of degradations ([`crate::answer::native::device_made`]).
 pub fn adopt(sel: &'static str, raw: rt::Device) -> VulkanDevice {
+    start_work_counts_log();
     crate::platform::answered_at(sel, raw.properties().metal_level);
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -247,6 +248,63 @@ pub fn adopt(sel: &'static str, raw: rt::Device) -> VulkanDevice {
     });
     devices.push((id, made.clone_ref()));
     made
+}
+
+/// vphone-linux diagnostic: with `REIMS_VGPU_WORK_COUNTS` set, a thread writes to stderr, each
+/// second, every counter of each adopted device's `rt::Device::work_counts` that changed, as
+/// `reims-vgpu work <registry id>: <name> +<delta> ...` (gauges such as `host_imports_live` as
+/// `<name> =<value>`). Reads counters only: nothing the guest or the host sees changes.
+fn start_work_counts_log() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("REIMS_VGPU_WORK_COUNTS").is_none() {
+        return;
+    }
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("reims-vgpu.wcount".into())
+            .spawn(|| {
+                let mut last: Vec<(u64, Vec<(String, u64)>)> = Vec::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let devices: Vec<(u64, VulkanDevice)> =
+                        DEVICES.lock().iter().map(|(id, d)| (*id, d.clone_ref())).collect();
+                    for (id, device) in devices {
+                        let text = format!("{:?}", device.raw.work_counts());
+                        let now: Vec<(String, u64)> = text
+                            .split(|c| c == '{' || c == '}' || c == ',')
+                            .filter_map(|f| {
+                                let (k, v) = f.split_once(':')?;
+                                Some((k.trim().to_owned(), v.trim().parse().ok()?))
+                            })
+                            .collect();
+                        let before = last.iter().find(|(at, _)| *at == id).map(|(_, v)| v.clone());
+                        let mut line = String::new();
+                        for (k, v) in &now {
+                            let was = before
+                                .as_ref()
+                                .and_then(|b| b.iter().find(|(bk, _)| bk == k).map(|(_, bv)| *bv))
+                                .unwrap_or(0);
+                            if *v == was {
+                                continue;
+                            }
+                            let gauge = k.ends_with("_live") || k.ends_with("_most") || k.contains("allocated")
+                                || k.contains("parked") || k.contains("waiting") || k.ends_with("_resident");
+                            if gauge {
+                                line.push_str(&format!(" {k} ={v}"));
+                            } else {
+                                line.push_str(&format!(" {k} +{}", v.wrapping_sub(was)));
+                            }
+                        }
+                        if !line.is_empty() {
+                            eprintln!("reims-vgpu work {id:x}:{line}");
+                        }
+                        last.retain(|(at, _)| *at != id);
+                        last.push((id, now));
+                    }
+                }
+            });
+        drop(spawned);
+    });
 }
 
 /// Tells every device made in the process that the pages under the `length` host bytes at
