@@ -37,12 +37,13 @@
 //! - **A nil entry of `useResources:count:usage:`, `useHeaps:count:` or
 //!   `memoryBarrierWithResources:count:`** is skipped, as Metal skips it
 //!   (`compute_err_resource_lists`: a pipeline's ref and an unknown one are nil and the pass
-//!   runs), but in a concurrent encoder's residency it dies: Metal ends the process at a nil
-//!   resource there (`interplay_decodewalk_26`), and a nil heap there is not measured. A barrier
+//!   runs), but a nil resource in a concurrent encoder's residency dies: Metal ends the process at
+//!   one there (`interplay_decodewalk_26`). A nil heap is skipped in a concurrent encoder too, as
+//!   Metal's skips it (measured on an M3 Max under macOS 27.0.1, without API validation). A barrier
 //!   of nil entries alone is a barrier over buffers and textures, as the runtime's barrier of
 //!   resources is.
-//! - **What the runtime has no form for dies**: a nil pipeline, indirect buffer or heap, an index
-//!   past `u32`, a slice of another length than its range, a scope or usage no Metal value is,
+//! - **What the runtime has no form for dies**: a nil pipeline or indirect buffer, an index past
+//!   `u32`, a slice of another length than its range, a scope or usage no Metal value is,
 //!   and a command after `endEncoding`. A rotated texture bound to the kernel is the runtime's,
 //!   which reads it as Metal's functions do ([`crate::gpu::resource::TextureObject::texels`]).
 
@@ -535,12 +536,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
-                if heaps.iter().any(Option::is_none) && self.concurrent(sel) {
-                    unrepresentable(
-                        sel,
-                        "a nil heap in a concurrent encoder, which Metal is not measured at",
-                    );
-                }
                 for heap in heaps.iter().flatten() {
                     heap.made_resident(sel);
                 }
@@ -876,9 +871,9 @@ mod tests {
 
     /// A nil entry of useResources:count:usage:, useHeaps:count: and
     /// memoryBarrierWithResources:count: is skipped, and a buffer offset at a slot of no buffer,
-    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil entry in
-    /// useResources:count:usage: of a concurrent encoder, which ends Metal's process, dies at its
-    /// selector
+    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil heap is
+    /// skipped in a concurrent encoder too, and a nil entry in useResources:count:usage: of one,
+    /// which ends Metal's process, dies at its selector
     #[test]
     fn nil_resources_are_skipped_but_in_a_concurrent_encoders_residency() {
         let add = pipeline(ADD, "add_one");
@@ -921,6 +916,8 @@ mod tests {
                 dispatch_type: Some(1),
             })
             .unwrap()
+            .unwrap();
+        e.encode(OnFault::Return, ComputeCmd::UseHeaps { heaps: &[None] })
             .unwrap();
         let site = catch_death(|| {
             e.encode(

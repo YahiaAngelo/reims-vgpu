@@ -163,8 +163,10 @@
 //!   `useResources:count:usage:stages:` is skipped, as Metal goes on past one
 //!   (`interplay_decodewalk_6`: an entry naming the render pipeline is nil, and the walk runs on;
 //!   `interplay_lifetime_emptied_resource_render`: a ref past the object list is nil to the
-//!   stages form, and the triangle after it draws as without it). A nil heap, which nothing
-//!   measured, dies.
+//!   stages form, and the triangle after it draws as without it). A nil entry of
+//!   `useHeaps:count:` or `useHeaps:count:stages:` is skipped too: Metal's encoder goes on past
+//!   one and the draw after it runs (measured on an M3 Max under macOS 27.0.1, without API
+//!   validation, which asserts at it).
 //! - **Executing an indirect command buffer** runs its draws, with the encoder's render state, as
 //!   their records stand when the command buffer is committed, or, for a buffer the GPU may have
 //!   written (a blit wrote it, or an encoder made it resident for writing), once the work before
@@ -191,7 +193,7 @@
 //!   map's tiles' exact lines, where Metal's are its fixed-point ones: a draw and an execution of
 //!   indirect commands that is not empty die there, and so does a tile dispatch.
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
-//!   Metal enumerator is, a slice shorter than its range, a nil heap or resource (but in
+//!   Metal enumerator is, a slice shorter than its range, a nil resource (but in
 //!   `useResources:count:usage:`), and a command after `endEncoding`. A rotated texture is the
 //!   runtime's, as an attachment, a resolve texture and bound to a stage
 //!   ([`crate::gpu::resource::TextureObject::texels`]), and so are its refusals.
@@ -2043,16 +2045,13 @@ fn resource<'a>(r: &'a ResourceRef<'a, VulkanPlatform>) -> rt::ResourceRef<'a> {
     }
 }
 
-/// Core's heaps, as the runtime's: a nil one dies. Each is made resident
-/// ([`crate::gpu::resource::HeapObject::made_resident`]).
+/// Core's heaps, as the runtime's: a nil one is skipped, as Metal's encoder skips it. Each is
+/// made resident ([`crate::gpu::resource::HeapObject::made_resident`]).
 fn heaps<'a>(
     sel: &'static str,
     list: &[Option<&'a crate::gpu::resource::VulkanHeap>],
 ) -> Vec<&'a rt::Heap> {
-    let list: Vec<&crate::gpu::resource::VulkanHeap> = list
-        .iter()
-        .map(|h| h.unwrap_or_else(|| unrepresentable(sel, "a nil heap")))
-        .collect();
+    let list: Vec<&crate::gpu::resource::VulkanHeap> = list.iter().flatten().copied().collect();
     for heap in &list {
         heap.made_resident(sel);
     }
@@ -7104,6 +7103,23 @@ pub(crate) mod tests {
             matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
             "{refused:?}"
         );
+    }
+
+    /// A nil entry of useHeaps:count: or of useHeaps:count:stages: is skipped and the pass runs,
+    /// as on Metal
+    #[test]
+    fn a_nil_heap_is_skipped_where_metal_goes_on() {
+        let (e, _dst) = open_encoder();
+        e.encode(OnFault::Die, RenderCmd::UseHeaps { heaps: &[None] }).unwrap();
+        e.encode(
+            OnFault::Die,
+            RenderCmd::UseHeapsStages {
+                heaps: &[None],
+                stages: 3,
+            },
+        )
+        .unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
     /// A nil entry of useResources:count:usage: or of useResources:count:usage:stages: is skipped
