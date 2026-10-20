@@ -7110,7 +7110,8 @@ pub(crate) mod tests {
     #[test]
     fn a_nil_heap_is_skipped_where_metal_goes_on() {
         let (e, _dst) = open_encoder();
-        e.encode(OnFault::Die, RenderCmd::UseHeaps { heaps: &[None] }).unwrap();
+        e.encode(OnFault::Die, RenderCmd::UseHeaps { heaps: &[None] })
+            .unwrap();
         e.encode(
             OnFault::Die,
             RenderCmd::UseHeapsStages {
