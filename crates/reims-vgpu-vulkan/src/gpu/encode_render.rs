@@ -231,7 +231,7 @@ use crate::gpu::resource::{
     Named, RenderDescriptor, VulkanBuffer, VulkanRenderPipeline, VulkanTexture, reach,
 };
 use crate::gpu::writes::{
-    FRAGMENT, Kept, Memory, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
+    Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
 use crate::gpu::{metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
@@ -1499,12 +1499,12 @@ fn answers_nil(d: &rt::RenderPassDescriptor) -> bool {
 /// which a draw may write through ([`Reach`]).
 enum Bind {
     /// Buffers bound to a stage ([`VERTEX`], [`FRAGMENT`], [`TILE`]) from a slot.
-    Buffers(usize, u64, Vec<Memory>),
+    Buffers(usize, u64, Vec<Bound>),
     /// Textures bound to a stage from a slot.
-    Textures(usize, u64, Vec<Memory>),
+    Textures(usize, u64, Vec<Bound>),
     /// The textures among resources made resident, the buffers among them, and whether they
     /// were made resident with write usage, with any of them lying in any memory.
-    Used(Vec<Memory>, Vec<Memory>, bool),
+    Used(Vec<Bound>, Vec<Bound>, bool),
 }
 
 /// The buffers `cmd` names, each with the bytes it reaches where they are exact
@@ -1628,9 +1628,10 @@ pub(crate) fn indices(index_type: u64, offset: u64, count: u64) -> Option<std::o
 
 /// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
 fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
-    use crate::gpu::writes::{buffer_memory, texture_memory};
-    let texture = |t: &Option<&VulkanTexture>| t.map(|t| texture_memory(t)).unwrap_or_default();
-    let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_memory(b)).unwrap_or_default();
+    use crate::gpu::writes::{buffer_bound, texture_memory};
+    let texture =
+        |t: &Option<&VulkanTexture>| t.map(|t| texture_memory(t).bound()).unwrap_or_default();
+    let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_bound(b)).unwrap_or_default();
     let buffers = |list: &[Option<&VulkanBuffer>]| list.iter().map(buffer).collect();
     let textures = |list: &[Option<&VulkanTexture>]| list.iter().map(texture).collect();
     Some(match cmd {
@@ -1680,26 +1681,20 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
             resources, usage, ..
         } => {
             let write = *usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
-            let any = (resources.iter().flatten()).any(|r| match r {
-                ResourceRef::Texture(t) => !texture_memory(t).is_empty(),
-                ResourceRef::Buffer(b) => !buffer_memory(b).is_empty(),
-                ResourceRef::Icb(_) => false,
-            });
-            Bind::Used(
-                (resources.iter().flatten())
-                    .filter_map(|r| match r {
-                        ResourceRef::Texture(t) => Some(texture_memory(t)),
-                        _ => None,
-                    })
-                    .collect(),
-                (resources.iter().flatten())
-                    .filter_map(|r| match r {
-                        ResourceRef::Buffer(b) => Some(buffer_memory(b)),
-                        _ => None,
-                    })
-                    .collect(),
-                write && any,
-            )
+            let textures: Vec<_> = (resources.iter().flatten())
+                .filter_map(|r| match r {
+                    ResourceRef::Texture(t) => Some(texture_memory(t).bound()),
+                    _ => None,
+                })
+                .collect();
+            let buffers: Vec<_> = (resources.iter().flatten())
+                .filter_map(|r| match r {
+                    ResourceRef::Buffer(b) => Some(buffer_bound(b)),
+                    _ => None,
+                })
+                .collect();
+            let any = textures.iter().chain(&buffers).any(|m| m.meets);
+            Bind::Used(textures, buffers, write && any)
         }
         _ => return None,
     })
@@ -1712,13 +1707,13 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
 #[derive(Debug, Default)]
 struct Reach {
     /// Each stage's buffers by slot, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order.
-    buffers: [BTreeMap<u64, Memory>; 3],
+    buffers: [BTreeMap<u64, Bound>; 3],
     /// Each stage's textures by slot.
-    textures: [BTreeMap<u64, Memory>; 3],
+    textures: [BTreeMap<u64, Bound>; 3],
     /// The textures made resident with write usage.
-    used_textures: Vec<Memory>,
+    used_textures: Vec<Bound>,
     /// The buffers made resident with write usage.
-    used_buffers: Vec<Memory>,
+    used_buffers: Vec<Bound>,
     /// Whether the pass's visibility result buffer lies over memory the runtime imports through
     /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
     /// a result at its offset, a draw after it or not ([`crate::gpu::writes::kept_write`]).
@@ -1733,14 +1728,14 @@ struct Reach {
 impl Reach {
     /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
     /// slots from `first`.
-    fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Memory>) {
+    fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Bound>) {
         let slots = if buffers {
             &mut self.buffers[stage]
         } else {
             &mut self.textures[stage]
         };
         for (slot, m) in (first..).zip(memory) {
-            if m.is_empty() {
+            if !m.meets {
                 slots.remove(&slot);
             } else {
                 slots.insert(slot, m);
@@ -1778,7 +1773,7 @@ impl Reach {
     /// slots the pipeline state's functions write, the textures made resident with write usage,
     /// and, but for an execution, whose commands run no tile function, the buffers bound at the
     /// slots the tile function writes.
-    fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Memory)> {
+    fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
         let mut written: Vec<_> = (self.used_textures.iter())
             .map(|m| (Whether::Writes, m.clone()))
             .collect();
@@ -1824,7 +1819,7 @@ impl Reach {
     /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
     /// state; an execution that inherits a state made without it, of such a function, faults
     /// its command buffer (`PageFault`), the texture bound unwritten.
-    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Memory)> {
+    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let state = match inherits {
             Some(i) if !i.pipeline => None,

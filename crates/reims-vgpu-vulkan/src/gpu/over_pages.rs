@@ -158,6 +158,14 @@ impl Seen {
         (!paged.zeroed && !paged.pages.is_empty()).then(|| crate::os::in_runs(&paged.pages, bytes))
     }
 
+    /// Whether [`Seen::in_pages`] finds any memory of `bytes`, read as it reads it, with nothing
+    /// collected; `None` where it answers `None`.
+    pub(crate) fn meets_pages(&self, bytes: &Range<u64>) -> Option<bool> {
+        let paged = self.paged.lock();
+        (!paged.zeroed && !paged.pages.is_empty())
+            .then(|| crate::os::runs_meet(&paged.pages, bytes))
+    }
+
     /// Whether a detach left the object in no memory since its last replace.
     pub(crate) fn zeroed(&self) -> bool {
         self.paged.lock().zeroed
@@ -692,6 +700,43 @@ mod tests {
     }
 
     const PAGE: u64 = 0x4000;
+
+    /// Whether an object's bytes meet its pages is what its memory there answers: none over memory
+    /// of its own, whether any of them lie in its pages, and none once a detach zeroes it, until
+    /// a replace gives it pages again
+    #[test]
+    fn meeting_pages_is_whether_the_bytes_lie_in_them() {
+        let seen = Arc::new(Seen::default());
+        let all = [
+            0..0,
+            0..1,
+            0..PAGE,
+            PAGE - 1..PAGE + 1,
+            2 * PAGE..3 * PAGE,
+            3 * PAGE..4 * PAGE,
+        ];
+        let agree = |seen: &Seen| {
+            for bytes in &all {
+                let memory = seen.in_pages(bytes).map(|ranges| !ranges.is_empty());
+                assert_eq!(seen.meets_pages(bytes), memory, "{bytes:x?}");
+            }
+        };
+        agree(&seen);
+        assert_eq!(seen.meets_pages(&(0..PAGE)), None);
+        seen.set_pages(vec![
+            0x10_0000..0x10_0000 + PAGE,
+            0x30_0000..0x30_0000 + 2 * PAGE,
+        ]);
+        agree(&seen);
+        assert_eq!(seen.meets_pages(&(PAGE - 1..PAGE + 1)), Some(true));
+        assert_eq!(seen.meets_pages(&(3 * PAGE..4 * PAGE)), Some(false));
+        seen.zero();
+        agree(&seen);
+        assert_eq!(seen.meets_pages(&(0..PAGE)), None);
+        seen.set_pages(vec![0x50_0000..0x50_0000 + PAGE]);
+        agree(&seen);
+        assert_eq!(seen.meets_pages(&(0..1)), Some(true));
+    }
 
     /// A texture kept apart in a heap over memory of its own, as core makes its detached heaps,
     /// meets nothing until the replace that gives it the guest's pages, where a texture over a

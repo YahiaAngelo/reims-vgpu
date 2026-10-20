@@ -135,6 +135,42 @@ impl Memory {
             kept,
         }
     }
+
+    /// What a bind keeps of it ([`Bound`]).
+    pub fn bound(self) -> Bound {
+        Bound {
+            meets: !self.is_empty(),
+            dropped: self.dropped,
+            refused: self.refused,
+            kept: self.kept,
+        }
+    }
+}
+
+/// What a bind or a residency keeps of an object's [`Memory`]: whether it lies in any, and what
+/// the GPU's writes through it do there. What work encoded later may write is decided from these
+/// alone (`crate::gpu::encode_render`'s `Reach`), never from the ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bound {
+    /// Whether it lies in any memory: [`Memory::is_empty`] answers `false`.
+    pub meets: bool,
+    /// [`Memory::dropped`].
+    pub dropped: bool,
+    /// [`Memory::refused`].
+    pub refused: Option<PixelFormat>,
+    /// [`Memory::kept`].
+    pub kept: Kept,
+}
+
+impl Bound {
+    /// [`Memory::over`]'s, of memory it lies in where `meets`.
+    fn over(meets: bool, kept: Kept) -> Bound {
+        Bound {
+            meets,
+            kept,
+            ..Bound::default()
+        }
+    }
 }
 
 /// Whether the runtime imports the memory of an object made on `surface` through a writable
@@ -264,6 +300,31 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
             .collect()
     });
     Memory::over(contents.unwrap_or_default(), kept)
+}
+
+/// What a bind keeps of `b`'s memory: [`buffer_memory`]'s [`Bound`], read as it reads it, but
+/// without collecting the ranges of its bytes in the guest's pages, one a page run, as each draw
+/// binds its buffers anew.
+pub fn buffer_bound(b: &BufferObject) -> Bound {
+    let bytes = 0..plain(|| b.raw.length());
+    if b.surface.is_some() {
+        return buffer_bytes_memory(b, bytes).bound();
+    }
+    if let Some(h) = &b.heap {
+        // As `buffer_bytes_memory`'s: its bytes at its place in its heap's.
+        let at = plain(|| b.raw.gpu_address().0.saturating_sub(h.raw.gpu_address().0));
+        let bytes = at.saturating_add(bytes.start)..at.saturating_add(bytes.end);
+        return Bound::over(
+            h.backing.meets_pages(&bytes).unwrap_or(false),
+            h.backing.kept(),
+        );
+    }
+    let kept = b.backing.kept();
+    let paged = b.backing.meets_pages(&bytes);
+    if paged.is_some() || b.backing.kept_contents().is_some() {
+        return Bound::over(paged.unwrap_or(false), kept);
+    }
+    Bound::over(plain(|| b.raw.contents()).is_some(), kept)
 }
 
 /// The host memory of `h`'s bytes `bytes`, a first byte and an end: in the guest's pages it was

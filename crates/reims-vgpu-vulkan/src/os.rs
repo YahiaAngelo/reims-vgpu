@@ -44,7 +44,7 @@ pub use wsi::{add_window_extensions, present_fences};
 
 pub(crate) use surface::{
     MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, in_runs,
-    memory_kind, over_guest_pages, page_runs, plane, plane_facts, surface_alias,
+    memory_kind, over_guest_pages, page_runs, plane, plane_facts, runs_meet, surface_alias,
     surface_bytes_memory, surface_memory, surface_offset, write_surface_bytes, ycbcr_facts,
 };
 

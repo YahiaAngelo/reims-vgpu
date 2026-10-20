@@ -465,6 +465,12 @@ impl Backing {
         self.seen.in_pages(bytes)
     }
 
+    /// Whether [`Backing::in_pages`] finds any memory of `bytes`, with nothing collected
+    /// ([`Seen::meets_pages`]).
+    pub(crate) fn meets_pages(&self, bytes: &std::ops::Range<u64>) -> Option<bool> {
+        self.seen.meets_pages(bytes)
+    }
+
     /// Whether a detach detaches the object: a buffer not placed in a heap, or a heap made over
     /// address ranges; not one [`Backing::fixed`] made.
     pub(crate) fn detaches(&self) -> bool {
