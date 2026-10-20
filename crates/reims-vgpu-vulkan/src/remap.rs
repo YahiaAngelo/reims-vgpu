@@ -210,7 +210,9 @@ impl GuestMappings {
     }
 
     /// `memory`'s ranges named by the memory map's addresses where they lie in a mapping, each
-    /// cut where a run starts or ends; any other byte as it is.
+    /// cut where a run starts or ends; any other byte as it is. Each range takes one lookup, of
+    /// the run holding its first byte, and then walks the runs after it in order: a surface over
+    /// scattered guest pages meets a run a page.
     fn named(&self, memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
         if self.0.is_empty() {
             return memory;
@@ -218,20 +220,28 @@ impl GuestMappings {
         let mut named = Vec::with_capacity(memory.len());
         for range in memory {
             let mut at = range.start;
-            while at < range.end {
-                match self.holding(at) {
-                    Some((first, end, source)) => {
-                        let to = end.min(range.end);
-                        named.push(source + (at - first)..source + (to - first));
-                        at = to;
-                    }
-                    None => {
-                        let next = self.0.range(at..).next().map(|(&first, _)| first);
-                        let to = next.unwrap_or(u64::MAX).min(range.end);
-                        named.push(at..to);
-                        at = to;
-                    }
+            if at >= range.end {
+                continue;
+            }
+            if let Some((first, end, source)) = self.holding(at) {
+                let to = end.min(range.end);
+                named.push(source + (at - first)..source + (to - first));
+                at = to;
+            }
+            for (&first, &(end, source)) in self.0.range(at..) {
+                if at >= range.end || first >= range.end {
+                    break;
                 }
+                if at < first {
+                    named.push(at..first);
+                    at = first;
+                }
+                let to = end.min(range.end);
+                named.push(source + (at - first)..source + (to - first));
+                at = to;
+            }
+            if at < range.end {
+                named.push(at..range.end);
             }
         }
         named
@@ -641,6 +651,65 @@ mod tests {
         m.unmapped(0, u64::MAX);
         assert_eq!(m.named(vec![0x10_1000..0x10_1010]), [0x10_1000..0x10_1010]);
         assert!(m.0.is_empty());
+    }
+
+    /// A walk of the runs names each range as a lookup of the run at each byte does, over runs a
+    /// page apart and adjacent, with gaps, and ranges that start, end or lie inside a run or a
+    /// gap
+    #[test]
+    fn guest_mappings_name_by_one_walk_as_by_lookups() {
+        /// `memory` named by a lookup at each byte, as `named` once did.
+        fn looked_up(m: &GuestMappings, memory: &[Range<u64>]) -> Vec<Range<u64>> {
+            let mut named = Vec::new();
+            for range in memory {
+                let mut at = range.start;
+                while at < range.end {
+                    match m.holding(at) {
+                        Some((first, end, source)) => {
+                            let to = end.min(range.end);
+                            named.push(source + (at - first)..source + (to - first));
+                            at = to;
+                        }
+                        None => {
+                            let next = m.0.range(at..).next().map(|(&first, _)| first);
+                            let to = next.unwrap_or(u64::MAX).min(range.end);
+                            named.push(at..to);
+                            at = to;
+                        }
+                    }
+                }
+            }
+            named
+        }
+        let page = 0x4000;
+        let mut m = GuestMappings::new();
+        // 64 pages, each its own run, sources scattered; every eighth page unmapped.
+        for i in 0..64u64 {
+            if i % 8 != 7 {
+                let at = 0x100_0000 + i * page;
+                m.mapped(at, at + page, 0x900_0000 + ((i * 37) % 64) * page);
+            }
+        }
+        let mut ranges = vec![0x100_0000..0x100_0000 + 64 * page, 0xff_0000..0x101_0000];
+        for (start, length) in [
+            (0, 1),
+            (0x10, 0x30),
+            (page - 1, 2),
+            (7 * page, page),
+            (6 * page + 1, 3 * page),
+        ] {
+            ranges.push(0x100_0000 + start..0x100_0000 + start + length);
+        }
+        ranges.push(0x100_0000 + 70 * page..0x100_0000 + 71 * page);
+        ranges.push(0x100_0000 + 5..0x100_0000 + 5);
+        for range in &ranges {
+            assert_eq!(
+                m.named(vec![range.clone()]),
+                looked_up(&m, std::slice::from_ref(range)),
+                "{range:x?}"
+            );
+        }
+        assert_eq!(m.named(ranges.clone()), looked_up(&m, &ranges));
     }
 
     /// The platform's remap names its range by the source's pages from the remap, and a
