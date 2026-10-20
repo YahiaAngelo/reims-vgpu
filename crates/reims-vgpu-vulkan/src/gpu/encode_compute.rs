@@ -22,14 +22,17 @@
 //!   is a direct dispatch, which dies at its call ([`dispatchable`]), and an execution's
 //!   commands: where they inherit the encoder's pipeline, the execution dies at its call, as a
 //!   dispatch; where they name their own, the commit reads their records and dies there at a
-//!   command whose pipeline can, or names one released since
+//!   command whose pipeline can, or names one released since, or, for records the GPU may have
+//!   written, the runtime's host step asks them and dies there
 //!   ([`crate::gpu::command::executions`]). A render encoder's functions die alike
 //!   ([`crate::gpu::encode_render`]). A dispatch of such a pipeline, and every execution, whose
 //!   commands' pipelines (their own or the encoder's) nothing here reads, opens on each buffer
 //!   the encoder made resident for writing a span in which the GPU may write its records
 //!   ([`may_write_resident`]), which decides the pipeline state a record names
-//!   ([`crate::gpu::icb`]); where the pipeline can encode, its records are written for good,
-//!   which a later execution's check at its commit reads (`executions::gpu_writes`).
+//!   ([`crate::gpu::icb`]); the encoder's making the buffer resident for writing marks the
+//!   runtime's buffer written for good (`gpu_written`), so a later execution's commands are asked
+//!   at the runtime's host step, and where the pipeline can encode, a command buffer that
+//!   executes the buffer as its commit read it dies at the write (`executions::gpu_writes`).
 //! - **Command predication** (`encodeStart*`, `encodeEnd*`) is the adapter's ([`predication`]):
 //!   every command passes it
 //!   first, and the dispatches and executions are sent through it. The runtime's own
@@ -47,6 +50,7 @@
 //!   and a command after `endEncoding`. A rotated texture bound to the kernel is the runtime's,
 //!   which reads it as Metal's functions do ([`crate::gpu::resource::TextureObject::texels`]).
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
@@ -391,6 +395,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     buffer: &indirect_range_buffer.raw,
                     offset: indirect_buffer_offset,
                     inherits: indirect_commandbuffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);
@@ -414,6 +419,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     icb: &indirect_command_buffer.raw,
                     range,
                     inherits: indirect_command_buffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);

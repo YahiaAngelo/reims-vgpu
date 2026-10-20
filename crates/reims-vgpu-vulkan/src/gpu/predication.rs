@@ -115,6 +115,7 @@
 //! - **Residency.** The guest's buffers a step reads are bound to the step, which makes them
 //!   resident as any bound buffer is.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Weak};
@@ -1728,7 +1729,8 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
 
 /// A dispatch or an indirect command buffer execution, in the runtime's terms: each variant's
 /// fields are its selector's arguments, and an execution's what its buffer's commands take of
-/// the encoder.
+/// the encoder and the check its host step runs on them, which the one send takes
+/// (`crate::gpu::command::executions::Execution::host_step_check`).
 #[expect(missing_docs, reason = "the fields are the selector's arguments")]
 pub enum Work<'a> {
     /// `dispatchThreadgroups:threadsPerThreadgroup:`.
@@ -1751,6 +1753,7 @@ pub enum Work<'a> {
         icb: &'a rt::IndirectCommandBuffer,
         range: Range<u64>,
         inherits: Inherits,
+        check: Cell<Option<rt::IndirectCommandCheck>>,
     },
     /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
     ExecuteIndirect {
@@ -1758,6 +1761,7 @@ pub enum Work<'a> {
         buffer: &'a rt::Buffer,
         offset: u64,
         inherits: Inherits,
+        check: Cell<Option<rt::IndirectCommandCheck>>,
     },
 }
 
@@ -1845,15 +1849,27 @@ impl Work<'_> {
                 e.dispatch_threads(size(threads), size(per_group))
             }
             Work::ThreadsIndirect { buffer, offset } => e.dispatch_threads_indirect(buffer, offset),
-            Work::Execute { icb, ref range, .. } => {
-                e.execute_commands_in_buffer(icb, range.clone())
-            }
+            Work::Execute {
+                icb,
+                ref range,
+                ref check,
+                ..
+            } => match check.take() {
+                Some(check) => e.execute_commands_in_buffer_checked(icb, range.clone(), check),
+                None => e.execute_commands_in_buffer(icb, range.clone()),
+            },
             Work::ExecuteIndirect {
                 icb,
                 buffer,
                 offset,
+                ref check,
                 ..
-            } => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
+            } => match check.take() {
+                Some(check) => {
+                    e.execute_commands_in_buffer_indirect_checked(icb, buffer, offset, check)
+                }
+                None => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
+            },
         }
     }
 
@@ -1929,8 +1945,13 @@ impl Work<'_> {
             Work::Threads { .. } | Work::ThreadsIndirect { .. } => {
                 e.dispatch_threads_indirect(chunk, at)
             }
-            Work::Execute { icb, .. } | Work::ExecuteIndirect { icb, .. } => {
-                e.execute_commands_in_buffer_indirect(icb, chunk, at)
+            Work::Execute { icb, ref check, .. } | Work::ExecuteIndirect { icb, ref check, .. } => {
+                match check.take() {
+                    Some(check) => {
+                        e.execute_commands_in_buffer_indirect_checked(icb, chunk, at, check)
+                    }
+                    None => e.execute_commands_in_buffer_indirect(icb, chunk, at),
+                }
             }
         }
     }

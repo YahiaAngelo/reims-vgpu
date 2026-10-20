@@ -102,8 +102,9 @@
 //!     and so does an execution's, at the commit, which reads its commands' records as the
 //!     runtime runs them: under a state its commands inherit, or each command's own
 //!     ([`crate::gpu::states::points_sized`]), or one released since. An execution of a buffer
-//!     whose records the GPU may have written dies there whatever its draws, as the runtime
-//!     reads those only once the work before it completed ([`crate::gpu::command::executions`]).
+//!     whose records the GPU may have written is asked where the runtime reads them, once the
+//!     work before it completed, and its draws of points die there
+//!     ([`crate::gpu::command::executions`]).
 //!   - `setLineWidth:` of anything but 1 (0, 0.5 to 8, -1, NaN) widens line and line-strip
 //!     draws, and triangles filled as lines; points and filled triangles are unchanged. No line
 //!     drawn here is wider than 1, so those draws, and executions, die after another width.
@@ -3113,14 +3114,24 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let checked = self.executable(sel, (indirect_commandbuffer, None), false);
+                let mut check = checked.as_ref().and_then(Execution::host_step_check);
                 let progress = self.encoder.progress(sel);
                 indirect_commandbuffer.executed(sel, None, progress.as_ref());
                 encoded(&mut |e| {
-                    e.execute_commands_in_buffer_indirect(
-                        &indirect_commandbuffer.raw,
-                        &indirect_range_buffer.raw,
-                        indirect_buffer_offset,
-                    )
+                    let (icb, buffer) = (&indirect_commandbuffer.raw, &indirect_range_buffer.raw);
+                    match check.take() {
+                        Some(check) => e.execute_commands_in_buffer_indirect_checked(
+                            icb,
+                            buffer,
+                            indirect_buffer_offset,
+                            check,
+                        ),
+                        None => e.execute_commands_in_buffer_indirect(
+                            icb,
+                            buffer,
+                            indirect_buffer_offset,
+                        ),
+                    }
                 })?;
                 self.checked_at_commit(checked);
                 if let Some(progress) = progress {
@@ -3138,6 +3149,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     (indirect_command_buffer, Some(range.clone())),
                     range.is_empty(),
                 );
+                let mut check = checked.as_ref().and_then(Execution::host_step_check);
                 let progress = self.encoder.progress(sel);
                 indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
                 // An empty range runs nothing, as Metal's does under any pipeline state
@@ -3147,7 +3159,13 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     self.encoder.nothing(sel)?;
                 } else {
                     encoded(&mut |e| {
-                        e.execute_commands_in_buffer(&indirect_command_buffer.raw, range.clone())
+                        let icb = &indirect_command_buffer.raw;
+                        match check.take() {
+                            Some(check) => {
+                                e.execute_commands_in_buffer_checked(icb, range.clone(), check)
+                            }
+                            None => e.execute_commands_in_buffer(icb, range.clone()),
+                        }
                     })?;
                     self.checked_at_commit(checked);
                 }

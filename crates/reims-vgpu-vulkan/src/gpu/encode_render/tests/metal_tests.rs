@@ -1036,11 +1036,12 @@ fn commit_dies(cmds: Vec<RenderCmd<'_, VulkanPlatform>>) -> String {
 /// An execution's draws of points die at the commit where a direct draw's die, its commands'
 /// records read as they stand then: under a state of its own that writes no `[[point_size]]`
 /// outside the point input primitive topology class, or under such a state of the encoder's
-/// that its commands inherit; and an execution of a buffer whose records the GPU may have
-/// written (a blit's reset of another of its commands) dies there too, as its commands are not
-/// read before they run. A draw of no points, and one under a state of the point class or one
-/// that writes its point size, own or inherited, draw as the direct draws do, which are Metal's
-/// ([`points_die_where_metal_sizes_none`]). A command buffer committed while a command buffer
+/// that its commands inherit. An execution of a buffer whose records the GPU may have written (a
+/// blit's reset of another of its commands) is asked at the runtime's host step instead, as its
+/// commands run (`gpu_written_points_die_at_the_host_step`). A draw of no points, and one under a
+/// state of the point class or one that writes its point size, own or inherited, draw as the
+/// direct draws do, which are Metal's ([`points_die_where_metal_sizes_none`]), the GPU-written
+/// buffer's included. A command buffer committed while a command buffer
 /// executes the buffer as its commit read it, and before it ends, dies at a blit's reset of
 /// the buffer's commands
 #[test]
@@ -1094,11 +1095,7 @@ fn executed_points_die_where_metal_sizes_none() {
     }
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
-    let line = commit_dies(execute_first(&written, None));
-    assert!(
-        line.contains("whose records the GPU may have written"),
-        "{line}"
-    );
+    assert_eq!(pass_pixels(&p, &d, execute_first(&written, None)), lit);
     // A reset while an execution that read the records waits.
     let read = points_icb(&d, Some(&classed), 3);
     let (_, pass) = pass_of(&p, &d, (16, 16));
@@ -1137,6 +1134,49 @@ fn executed_points_die_where_metal_sizes_none() {
     };
     blit.encode(OnFault::Die, reset).unwrap();
 }
+
+reims_vgpu_core::death_test!(
+    /// An execution of a buffer whose records the GPU may have written (a blit's reset of another
+    /// of its commands) is asked at the runtime's host step, once the work before it completed:
+    /// its draw of points under a state of its own that writes no `[[point_size]]` outside the
+    /// point input primitive topology class dies there, at `commit`, as a commit that read the
+    /// records dies at it ([`executed_points_die_where_metal_sizes_none`])
+    gpu_written_points_die_at_the_host_step,
+    |_child| {
+        let (p, d) = (platform(), dev());
+        let unsizing = classed_state(
+            &d,
+            ("point_vertex", true),
+            PrimitiveTopologyClass::Unspecified,
+        );
+        let written = points_icb(&d, Some(&unsizing), 3);
+        let cb = (d.new_command_queue().unwrap())
+            .command_buffer(OnFault::Die)
+            .unwrap()
+            .unwrap();
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let reset = BlitCmd::ResetCommandsInBuffer {
+            buffer: &written,
+            range: NsRange::new(1, 1),
+        };
+        for cmd in [reset, BlitCmd::EndEncoding] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        pass_pixels(&p, &d, execute_first(&written, None));
+    },
+    |report| {
+        use reims_vgpu_core::raise::death::{DeathId, DeathKind};
+        report.assert_died(
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call: "commit",
+            }
+            .site(),
+        );
+    }
+);
 
 /// A draw of points, and an execution of commands that inherit the encoder's state, under a
 /// state of the point class whose vertex function can encode indirect commands die in an encoder that made resident for writing

@@ -31,9 +31,10 @@
 //!   Metal sizes none of; a command whose state can encode indirect commands in an encoder that
 //!   made resident for writing a buffer whose ID is not the runtime's) are read at the commit, as
 //!   the runtime runs them, and die there naming the execution and the command; an execution of a
-//!   buffer whose records the GPU may have written dies there whatever they hold, as the runtime
-//!   reads them only once the work before it completed ([`executions`]). An encoder the
-//!   command buffer's failure runs nothing of is not asked.
+//!   buffer whose records the GPU may have written is asked at the runtime's host step instead,
+//!   which reads them once the work before it completed, and dies there, at `commit`, at a
+//!   command that decides a death ([`executions`]). An encoder the command buffer's failure runs
+//!   nothing of is not asked.
 //! - **A draw's or dispatch's pipeline the driver did not make**, which the runtime makes while
 //!   the command goes on and reports as the command buffer's failure
 //!   (`CommandBufferError::PipelineCreation`), dies
