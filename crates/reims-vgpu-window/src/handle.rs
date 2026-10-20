@@ -42,10 +42,16 @@ pub const TITLE: &str = "Reims vGPU";
 /// The title of the window of the display on `port`: [`TITLE`], then " (port N)" for a port N
 /// other than 0. The display's name is not in it.
 pub fn title(port: u64) -> String {
+    // vphone-linux: `REIMS_VGPU_WINDOW_TITLE` names the window where set (run-vphone.sh sets
+    // "vphone-linux").
+    let base = std::env::var("REIMS_VGPU_WINDOW_TITLE")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| TITLE.to_owned());
     if port == 0 {
-        TITLE.to_owned()
+        base
     } else {
-        format!("{TITLE} (port {port})")
+        format!("{base} (port {port})")
     }
 }
 
