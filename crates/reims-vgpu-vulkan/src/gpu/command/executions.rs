@@ -144,14 +144,23 @@ impl Execution {
     /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
     /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
     /// nothing into the runtime. A death test's child runs without that capture, as production.
-    pub(crate) fn host_step_check(&self) -> Option<rt::IndirectCommandCheck> {
+    /// With it, what the check looks for: draws of points where a state sizes them, and commands
+    /// under states that may encode where `guest_id` names their writes. An execution of a range
+    /// whose buffer's records rule out every kind it names may run on the GPU alone, unchecked;
+    /// one of a range the GPU reads looks for every kind.
+    pub(crate) fn host_step_check(
+        &self,
+    ) -> Option<(rt::IndirectCommandCheck, rt::IndirectCommandCheckNeeds)> {
         if !self.decides() {
             return None;
         }
         let (execution, points, guest_id) = (self.sel, self.points, self.guest_id);
-        Some(Box::new(move |index, command| {
+        let needs =
+            rt::IndirectCommandCheckNeeds::new(points != Points::Unasked, guest_id.is_some());
+        let check: rt::IndirectCommandCheck = Box::new(move |index, command| {
             ask(execution, index, command, (points, guest_id), false);
-        }))
+        });
+        Some((check, needs))
     }
 }
 
