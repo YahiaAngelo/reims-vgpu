@@ -45,6 +45,7 @@ use crate::deserializer::records::{
     CmdSetSamplerStates, CmdSetSamplerStatesLODClamp, CmdSetSamplerStatesLODClampEntry,
     CmdSetTextures, CmdSetThreadgroupMemoryLength, CmdUseHeaps, CmdUseResources, SegmentHeader,
 };
+use crate::deserializer::short_list::ShortList;
 use crate::deserializer::walk::{RECORD_HEADER_SIZE, next_record};
 use crate::deserializer::{Deserializer, RaiseKind, upgrade};
 use crate::memory::cursor::Cursor;
@@ -456,8 +457,8 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut buffers = Vec::with_capacity(count);
-        let mut offsets = Vec::with_capacity(count);
+        let mut buffers = ShortList::with_capacity(count);
+        let mut offsets = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetBufferEntry = cursor.read_or_raise(OnFault::Return)?;
             buffers.push(
@@ -467,7 +468,7 @@ impl<P: Platform> ComputeDecoder<P> {
             );
             offsets.push(entry.offset);
         }
-        let buffers: Vec<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
+        let buffers: ShortList<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetBuffers {
             buffers: &buffers,
             offsets: &offsets,
@@ -497,9 +498,9 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut buffers = Vec::with_capacity(count);
-        let mut offsets = Vec::with_capacity(count);
-        let mut strides = Vec::with_capacity(count);
+        let mut buffers = ShortList::with_capacity(count);
+        let mut offsets = ShortList::with_capacity(count);
+        let mut strides = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetBufferEntryWithStride = cursor.read_or_raise(OnFault::Return)?;
             buffers.push(
@@ -518,7 +519,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 "the device does not support dynamic attribute strides"
             );
         }
-        let buffers: Vec<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
+        let buffers: ShortList<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetBuffersAttributeStrides {
             buffers: &buffers,
             offsets: &offsets,
@@ -544,7 +545,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 )
             );
         }
-        let mut samplers = Vec::with_capacity(command.range_length.to_usize());
+        let mut samplers = ShortList::with_capacity(command.range_length.to_usize());
         for _ in 0..command.range_length {
             let reference: u32 = cursor.read_or_raise(OnFault::Return)?;
             samplers.push(
@@ -553,7 +554,8 @@ impl<P: Platform> ComputeDecoder<P> {
                     .get_sampler_state(hold, reference)?,
             );
         }
-        let samplers: Vec<Option<&P::SamplerState>> = samplers.iter().map(Option::as_ref).collect();
+        let samplers: ShortList<Option<&P::SamplerState>> =
+            samplers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetSamplerStates {
             samplers: &samplers,
             range,
@@ -582,9 +584,9 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut samplers = Vec::with_capacity(count);
-        let mut lod_min_clamps = Vec::with_capacity(count);
-        let mut lod_max_clamps = Vec::with_capacity(count);
+        let mut samplers = ShortList::with_capacity(count);
+        let mut lod_min_clamps = ShortList::with_capacity(count);
+        let mut lod_max_clamps = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetSamplerStatesLODClampEntry = cursor.read_or_raise(OnFault::Return)?;
             samplers.push(
@@ -595,7 +597,8 @@ impl<P: Platform> ComputeDecoder<P> {
             lod_min_clamps.push(entry.lod_min_clamp);
             lod_max_clamps.push(entry.lod_max_clamp);
         }
-        let samplers: Vec<Option<&P::SamplerState>> = samplers.iter().map(Option::as_ref).collect();
+        let samplers: ShortList<Option<&P::SamplerState>> =
+            samplers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetSamplerStatesLodClamps {
             samplers: &samplers,
             lod_min_clamps: &lod_min_clamps,
@@ -621,7 +624,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 )
             );
         }
-        let mut textures = Vec::with_capacity(command.range_length.to_usize());
+        let mut textures = ShortList::with_capacity(command.range_length.to_usize());
         for _ in 0..command.range_length {
             let reference: u32 = cursor.read_or_raise(OnFault::Return)?;
             textures.push(
@@ -630,7 +633,8 @@ impl<P: Platform> ComputeDecoder<P> {
                     .get_texture(hold, reference)?,
             );
         }
-        let textures: Vec<Option<&P::Texture>> = textures.iter().map(Option::as_ref).collect();
+        let textures: ShortList<Option<&P::Texture>> =
+            textures.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetTextures {
             textures: &textures,
             range,

@@ -38,6 +38,7 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use crate::deserializer::records::SegmentHeader;
+use crate::deserializer::short_list::ShortList;
 use crate::deserializer::walk::next_record;
 use crate::deserializer::{Deserializer, upgrade};
 use crate::memory::cursor::Cursor;
@@ -431,7 +432,7 @@ impl<P: Platform> RenderDecoder<P> {
 }
 
 /// `Option<X>` elements as the `Option<&X>` slice a list send takes.
-fn refs<T>(v: &[Option<T>]) -> Vec<Option<&T>> {
+fn refs<T>(v: &[Option<T>]) -> ShortList<Option<&T>> {
     v.iter().map(Option::as_ref).collect()
 }
 
