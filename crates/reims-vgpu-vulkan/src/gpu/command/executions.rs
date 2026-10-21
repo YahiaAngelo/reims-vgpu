@@ -141,20 +141,16 @@ impl Execution {
     /// The check the runtime's host step runs on each command it records of this execution,
     /// where its commit reads nothing (the module docs); `None` where no death could ask of its
     /// commands, which leaves the runtime its other paths. It dies where [`Execution::check`]
-    /// would, at `commit`, on the scheduler's thread; it never unwinds into the runtime.
+    /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
+    /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
+    /// nothing into the runtime. A death test's child runs without that capture, as production.
     pub(crate) fn host_step_check(&self) -> Option<rt::IndirectCommandCheck> {
         if !self.decides() {
             return None;
         }
         let (execution, points, guest_id) = (self.sel, self.points, self.guest_id);
         Some(Box::new(move |index, command| {
-            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ask(execution, index, command, (points, guest_id), false);
-            }));
-            // A death unwinds only under the tests' capture; the runtime is not unwound through.
-            if asked.is_err() {
-                std::process::abort();
-            }
+            ask(execution, index, command, (points, guest_id), false);
         }))
     }
 }
