@@ -34,6 +34,7 @@ pub mod draw;
 pub mod pass;
 pub mod state;
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
@@ -195,6 +196,10 @@ pub struct RenderDecoder<P: Platform> {
     pipeline: Option<P::RenderPipeline>,
     /// The highest colour attachment index a pass described with a texture.
     max_color_attachment_index: u32,
+    /// The device's capabilities, read at a segment's first limit or flag (none for a task
+    /// without a device) and kept to its end: each record would read them again otherwise,
+    /// which on the Metal platform is a send and a lock.
+    caps: OnceCell<Option<Arc<DeviceCaps>>>,
 }
 
 impl<P: Platform> RenderDecoder<P> {
@@ -209,6 +214,7 @@ impl<P: Platform> RenderDecoder<P> {
             command_buffer,
             pipeline: None,
             max_color_attachment_index: 0,
+            caps: OnceCell::new(),
         }
     }
 
@@ -224,6 +230,7 @@ impl<P: Platform> RenderDecoder<P> {
         header: &SegmentHeader,
         mut segment: Cursor,
     ) -> RaiseResult<()> {
+        self.caps = OnceCell::new();
         let mut decoded = self.decode_segment(hold, header, &mut segment);
         if decoded.is_err() {
             // Outside the handler: a raise from the fault goes on in place of this one, which
@@ -391,18 +398,21 @@ impl<P: Platform> RenderDecoder<P> {
         }
     }
 
+    /// The device's capabilities, as the segment first read them; none for a task without a
+    /// device.
+    fn caps(&self) -> Option<&DeviceCaps> {
+        let read = || self.deserializer().device().map(|device| device.caps());
+        self.caps.get_or_init(read).as_deref()
+    }
+
     /// A limit from the device's capabilities; a task without a device answers 0.
     fn device_limit(&self, limit: impl FnOnce(&DeviceCaps) -> u64) -> u64 {
-        self.deserializer()
-            .device()
-            .map_or(0, |device| limit(&device.caps()))
+        self.caps().map_or(0, limit)
     }
 
     /// A flag from the device's capabilities; a task without a device answers `false`.
     fn device_supports(&self, flag: impl FnOnce(&Flags) -> bool) -> bool {
-        self.deserializer()
-            .device()
-            .is_some_and(|device| flag(&device.caps().flags))
+        self.caps().is_some_and(|caps| flag(&caps.flags))
     }
 
     /// The buffer `reference` names, if any (the delegate's nullable lookup).
