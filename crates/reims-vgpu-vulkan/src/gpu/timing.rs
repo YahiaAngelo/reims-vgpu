@@ -344,6 +344,9 @@ fn work_counts(cb: &rt::CommandBuffer) {
             c.dispatch_pipelines_pooled,
             c.creation_pipelines_made,
             c.kept_backings_made,
+            c.gpu_pool_blocks_made,
+            c.gpu_pool_blocks_released,
+            c.gpu_pool_leases_peak,
             DRAWS.load(Ordering::Relaxed),
         ],
     );

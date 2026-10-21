@@ -1580,10 +1580,9 @@ fn texture_writes_round_as_metals_at_the_modes_they_decode() {
 /// first blend and under source and destination factor one is made, and the runtime notes it
 /// `extended-range-float-blend-source`, which it announces at each draw that binds
 /// the state's variant: a draw of it over an attachment a pass clears dies there, naming the
-/// kind ([`crate::answer::DIES`]), where Metal draws it. One into `RGB10A8_2P_XR10_sRGB`
-/// under source and destination factor one, whose blend in the `_sRGB` form the runtime has
-/// not fitted, dies as the state is made, naming its refusal,
-/// `ExtendedRangeBlend(FloatOutput)`, where Metal makes it
+/// kind ([`crate::answer::DIES`]), where Metal draws it. So does one into
+/// `RGB10A8_2P_XR10_sRGB` under source and destination factor one, whose blend the runtime
+/// computes in the `_sRGB` form as in the linear one, which Metal's lanes measured equal
 #[test]
 fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
     use reims_vgpu_core::platform::resource::Library as _;
@@ -1655,7 +1654,6 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
     }
-    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device();
@@ -1667,11 +1665,7 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         ((("fetch_half_fragment", 550), (4, 5)), DRAW, half_source),
         ((("fetch_float_fragment", 550), (0, 5)), DRAW, float_source),
         ((("fetch_float_fragment", 550), (1, 1)), DRAW, float_source),
-        (
-            (("fetch_float_fragment", 551), (1, 1)),
-            STATE,
-            "ExtendedRangeBlend(FloatOutput)",
-        ),
+        ((("fetch_float_fragment", 551), (1, 1)), DRAW, float_source),
     ];
     for ((fragment, blend), sel, named) in dies {
         *crate::answer::LAST_LINE.lock() = None;
