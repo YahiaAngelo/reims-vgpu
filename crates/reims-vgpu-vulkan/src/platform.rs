@@ -196,6 +196,39 @@ fn made_devices(
     made
 }
 
+/// The creator [`Platform::open_device`] stands for, which its deaths name.
+const OPEN_DEVICE: &str = "MTLCopyAllDevices()";
+
+/// The device of registry ID `registry_id` ([`device::registry_id`]) that an open answers
+/// ([`Platform::open_device`]): the device of that ID the process adopted, where there is one,
+/// with no runtime call; else the runtime's system default device, of those `default` makes
+/// (none where the runtime refuses it, whose refusal `every` then decides), where its ID is
+/// `registry_id`; else the one of that ID among those `every` makes, the runtime's
+/// `Device::all_with`, which makes a device of every physical device there is. Each found is
+/// adopted ([`device::adopt`]).
+///
+/// So `every` runs only for an ID that is neither the default device's nor any adopted one's. A
+/// guest's every task opens its device at its handshake (`gpu_task/handshake.rs`), and a device of
+/// the runtime's lives only while a handle to it does: each open through `Device::all_with` made,
+/// primed and tore down a device on every GPU the process does not use (on a host of two GPUs,
+/// once per guest task), and died there when one of those refused, at an open of the GPU it uses.
+fn opened(
+    registry_id: u64,
+    default: impl FnOnce() -> Vec<rt::Device>,
+    every: impl FnOnce() -> Vec<rt::Device>,
+) -> Option<VulkanDevice> {
+    if let Some(kept) = device::kept(registry_id) {
+        return Some(kept);
+    }
+    let of_id = |made: Vec<rt::Device>| {
+        made.into_iter()
+            .find(|d| device::registry_id(d) == registry_id)
+    };
+    of_id(default())
+        .or_else(|| of_id(every()))
+        .map(|raw| device::adopt(OPEN_DEVICE, raw))
+}
+
 /// Whether the runtime announced that its devices answer as a release below the host's
 /// (`MetalLevelBelowHost`, [`made_devices`]): the host's release is not one it measured.
 static BELOW_HOST: AtomicBool = AtomicBool::new(false);
@@ -598,21 +631,20 @@ impl Platform for VulkanPlatform {
     /// The device of the runtime's `Device::all_with` (`MTLCopyAllDevices`) whose registry ID, as
     /// this platform answers it ([`device::registry_id`]: Metal's for the default device), is
     /// `registry_id` (+1), or `None`, as where there is no Vulkan loader. In one process it is the
-    /// object every other handle to that device is ([`device::adopt`]). A device made before is
-    /// that object, answered with no enumeration ([`device::kept`]): `Device::all_with` makes a
-    /// device of every other physical device it lists that no handle holds (another GPU, waking
-    /// it, or a CPU implementation such as lavapipe), each torn down as the call returns, and
-    /// every guest task's handshake opens its device here.
+    /// object every other handle to that device is ([`device::adopt`]), asked for no further than
+    /// it must be ([`opened`]): a device made before is that object, answered with no runtime call
+    /// ([`device::kept`]).
     fn open_device(&self, registry_id: u64) -> Option<VulkanDevice> {
-        if let Some(kept) = device::kept(registry_id) {
-            return Some(kept);
-        }
-        let all = made_devices("MTLCopyAllDevices()", || {
-            rt::Device::all_with(device_options())
-        });
-        all.into_iter()
-            .find(|d| device::registry_id(d) == registry_id)
-            .map(|raw| device::adopt("MTLCopyAllDevices()", raw))
+        opened(
+            registry_id,
+            || {
+                made_devices(OPEN_DEVICE, || {
+                    let default = rt::Device::system_default_with(device_options());
+                    Ok(default.ok().into_iter().collect())
+                })
+            },
+            || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
+        )
     }
 
     fn surfaces(&self) -> &dyn IoSurfaces<VulkanPlatform> {
@@ -960,6 +992,36 @@ pub(crate) mod tests {
         assert_eq!(d.registry_id, id);
         assert!(p.open_device(id ^ 0xdead_beef).is_none());
         assert_eq!(p.open_device(own).is_some(), id == own);
+    }
+
+    /// An open of the default device, or of a device the process adopted, asks the runtime for
+    /// no other device: every device, one of each GPU, is asked for only for another ID. The
+    /// default device found is adopted, so an open of it again makes no runtime call at all
+    #[test]
+    fn an_open_of_the_default_device_makes_no_other() {
+        let raw = rt::Device::system_default_with(device_options()).unwrap();
+        let id = device::registry_id(&raw);
+        let every = || -> Vec<rt::Device> { panic!("every device was asked for") };
+        let default = || {
+            made_devices(OPEN_DEVICE, || {
+                Ok(rt::Device::system_default_with(device_options())
+                    .ok()
+                    .into_iter()
+                    .collect())
+            })
+        };
+        let found = opened(id, default, every).unwrap();
+        let nothing = || -> Vec<rt::Device> { panic!("the runtime was asked") };
+        let again = opened(id, nothing, every).unwrap();
+        assert_eq!(again.id(), found.id());
+        assert_eq!(found.id(), dev().id());
+        let mut asked = false;
+        let other = opened(id ^ 0xdead_beef, default, || {
+            asked = true;
+            Vec::new()
+        });
+        assert!(other.is_none() && asked);
+        drop(raw);
     }
 
     /// The library's shader cache holds the runtime's default of 25 GiB, sized for a macOS 26
