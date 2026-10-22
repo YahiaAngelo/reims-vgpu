@@ -595,7 +595,9 @@ mod tests {
     }
 
     /// A surface made with the ID of one gone, which IOSurface hands out again at once, answers
-    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`
+    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`. Another
+    /// process's surface can take the freed ID first: with 8 tries, 2 of 5 runs alone found no
+    /// ID handed out again on the M3 Max (macOS 27.0.1), and 0 of 40 with 64
     #[test]
     fn a_surface_taking_the_id_of_one_gone_takes_none_of_its_record() {
         use reims_vgpu_core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
@@ -616,7 +618,7 @@ mod tests {
             VulkanSurfaces::new().create_backing(&backing).unwrap()
         }];
         for make in makers {
-            let reused = (0..8).any(|_| {
+            let reused = (0..64).any(|_| {
                 let (gone, pages, length) = bgra_surface_over_at(16, 16, 0x100);
                 let id = key(&gone);
                 drop(gone);
