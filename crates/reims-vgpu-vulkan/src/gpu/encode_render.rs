@@ -1283,7 +1283,7 @@ pub(crate) fn open(
     if let Ok(Some(e)) = &made {
         e.undecided_dropped(&sources);
         let visibility = (sources.visibility.as_ref())
-            .map_or(Kept::No, |b| crate::gpu::writes::buffer_memory(b).kept);
+            .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
         plain(|| e.reach.lock().visibility = visibility);
     }
     made
@@ -1635,9 +1635,8 @@ pub(crate) fn indices(index_type: u64, offset: u64, count: u64) -> Option<std::o
 
 /// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
 fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
-    use crate::gpu::writes::{buffer_bound, texture_memory};
-    let texture =
-        |t: &Option<&VulkanTexture>| t.map(|t| texture_memory(t).bound()).unwrap_or_default();
+    use crate::gpu::writes::{buffer_bound, texture_bound};
+    let texture = |t: &Option<&VulkanTexture>| t.map(|t| texture_bound(t)).unwrap_or_default();
     let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_bound(b)).unwrap_or_default();
     let buffers = |list: &[Option<&VulkanBuffer>]| list.iter().map(buffer).collect();
     let textures = |list: &[Option<&VulkanTexture>]| list.iter().map(texture).collect();
@@ -1690,7 +1689,7 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
             let write = *usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
             let textures: Vec<_> = (resources.iter().flatten())
                 .filter_map(|r| match r {
-                    ResourceRef::Texture(t) => Some(texture_memory(t).bound()),
+                    ResourceRef::Texture(t) => Some(texture_bound(t)),
                     _ => None,
                 })
                 .collect();

@@ -473,12 +473,13 @@ fn named_buffers<'a>(cmd: &BlitCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
     }
 }
 
-/// The memory a blit `cmd` writes: its destination's ([`crate::gpu::writes::Memory`]).
-fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Memory {
-    use crate::gpu::writes::{buffer_memory, texture_memory};
-    let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_memory(t)).unwrap_or_default();
+/// What a blit `cmd` writes: its destination's memory, as a bind keeps it
+/// ([`crate::gpu::writes::Bound`]).
+fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Bound {
+    use crate::gpu::writes::{buffer_bound, texture_bound};
+    let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bound(t)).unwrap_or_default();
     let buffer = |b: Option<&crate::gpu::resource::VulkanBuffer>| {
-        b.map(|b| buffer_memory(b)).unwrap_or_default()
+        b.map(|b| buffer_bound(b)).unwrap_or_default()
     };
     match cmd {
         BlitCmd::CopyBufferToTexture {
