@@ -125,7 +125,8 @@ use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
-    Policy, Unfollowed, get, hang, metal_aborts, plain, send, unfollowed, unrepresentable,
+    Policy, Unfollowed, decide, get, hang, metal_aborts, plain, send, unfollowed, unrepresentable,
+    unstopped_at,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -489,18 +490,25 @@ impl Pool {
 /// docs). Its refusal of one it is given dies.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
     // The space stays held until the runtime has the reservation too, so no creation comes
-    // between the two ([`IcbObject::reaches_its_records`]).
+    // between the two ([`IcbObject::reaches_its_records`]); no stop of an ended task comes between
+    // them either, which would leave the space's reservation without the runtime's for every
+    // later creation of the process.
     let (reservation, _space) = plain(|| reserve_in(&SPACE, ids));
+    #[cfg(test)]
+    if let Some(amid) = AMID_RESERVATION.take() {
+        amid();
+    }
     match reservation {
         Reservation::Ignored => Ok(()),
         Reservation::Taken if ids.iter().any(|&id| id >= RECORDS_ID_LIMIT) => Ok(()),
         Reservation::Taken => {
             let ids: Vec<rt::ResourceId> = ids.iter().map(|&id| rt::ResourceId(id)).collect();
-            send(sel, Policy::Dies, || {
+            unstopped_at(sel, || {
                 device
                     .raw
                     .reserve_resource_ids(rt::ResourceIdKind::IndirectCommandBuffer, &ids)
             })
+            .or_else(|e| decide(sel, Policy::Dies, e))
         }
         // `reserve_in` parked this thread before it could answer this.
         Reservation::Hangs => hang(),
@@ -512,6 +520,13 @@ pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> 
             "Metal takes a reservation after one of 0 alone, then hands out IDs twice",
         ),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test runs in [`reserve`] on this thread once the space took the reservation, before
+    /// the runtime takes it.
+    static AMID_RESERVATION: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 /// What Metal does with `ids` reserved in `space` ([`Space::reserve`]), and `space`, still held.
@@ -2696,6 +2711,30 @@ mod tests {
         let reach: Vec<bool> = [&c, &p, &e].map(|b| b.reaches_its_records()).to_vec();
         assert_eq!(seen, [(1, 1), (3, 3), (1, 1), (9, 9), (3, 3)]);
         assert_eq!(reach, [true, true, true]);
+    }
+
+    /// An isolated task that ends while its reservation is under way, once the space took it,
+    /// still gives it to the runtime, which then hands out what the space does to the process's
+    /// later buffers: 1 then 3, 2 reserved
+    #[test]
+    fn a_task_that_ends_amid_its_reservation_leaves_the_runtimes_ids_metals() {
+        use reims_vgpu_core::tasks::isolation::life::TaskLife;
+
+        let d = dev();
+        let life = TaskLife::new();
+        AMID_RESERVATION.set(Some(|| {
+            assert!(TaskLife::current().unwrap().exit());
+        }));
+        let reserved = life.run(|| d.reserve_resource_indices(5, &[2]));
+        assert!(matches!(reserved, Some(Ok(()))), "{reserved:?}");
+        let made: Vec<VulkanIcb> = (0..2)
+            .map(|_| make::<VulkanPlatform>(&d, &compute_desc(), 1))
+            .collect();
+        let seen: Vec<(u64, u64)> = made
+            .iter()
+            .map(|b| (b.gpu_resource_id(), b.raw.gpu_resource_id().0))
+            .collect();
+        assert_eq!(seen, [(1, 1), (3, 3)]);
     }
 
     /// A device the host releases and opens again is the one runtime device, whose IDs go on with
