@@ -4726,10 +4726,9 @@ pub(crate) mod tests {
     /// A draw of no primitive draws nothing whatever the private setters left, as on Metal: of
     /// too few vertices or indices for one, and an execution of no command, after a restart, a
     /// line width of 2, triangles filled as lines and the last vertex provoking under a state
-    /// that reads a flat input; one of a primitive dies. Where the device lacks the last vertex,
-    /// the runtime announces a line drawn from its last vertex to its first at a draw of lines
-    /// of one vertex or index, which makes none: it dies there in strict mode
-    /// (`provoking-vertex-lines`), and by default draws nothing, relayed
+    /// that reads a flat input; one of a primitive dies. The runtime announces nothing at such a
+    /// draw, so a draw of lines of one vertex or index goes on in strict mode too, where the
+    /// device lacks the last vertex
     #[test]
     fn empty_draws_go_on_after_the_private_setters() {
         use reims_vgpu_core::platform::values::IcbDesc;
@@ -4770,13 +4769,10 @@ pub(crate) mod tests {
                 RenderCmd::SetProvokingVertexMode { mode: 1 },
             ],
         );
-        let announced = !last_vertex_native();
         let mut empty = vec![drawn(0, 0), indexed(0, 0)];
         for (primitive_type, least) in [(1, 2), (2, 2), (3, 3), (STRIP, 3)] {
             for count in 0..least {
-                if !(announced && least == 2 && count == 1) {
-                    empty.extend([drawn(primitive_type, count), indexed(primitive_type, count)]);
-                }
+                empty.extend([drawn(primitive_type, count), indexed(primitive_type, count)]);
             }
         }
         empty.push(RenderCmd::ExecuteCommandsInBuffer {
@@ -4784,18 +4780,6 @@ pub(crate) mod tests {
             execution_range: NsRange::new(0, 0),
         });
         send_all(&e, empty);
-        if announced {
-            let lines = || [drawn(1, 1), indexed(1, 1), drawn(2, 1), indexed(2, 1)];
-            let kind = rt::Degradation::ProvokingVertexLines;
-            for cmd in lines() {
-                let sel = cmd.selector();
-                let site = crate::answer::dies_of(kind, || e.encode(OnFault::Return, cmd));
-                assert_eq!(site.file, sel);
-            }
-            let before = relayed_kind(kind);
-            crate::answer::relaxed(|| send_all(&e, lines().into()));
-            assert_eq!(relayed_kind(kind), before + 4);
-        }
         let draw = "drawPrimitives:vertexStart:vertexCount:";
         assert_eq!(dies_at(&e, drawn(1, 2)), draw);
         assert_eq!(dies_at(&e, drawn(3, 3)), draw);
