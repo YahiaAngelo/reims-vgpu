@@ -27,7 +27,7 @@
 //! - **Store actions** Metal goes on with: a late one equal to the descriptor's known action, or
 //!   of an attachment without a texture, encodes nothing; another over a known one dies, as its
 //!   effect is not measured; one the descriptor left `Unknown` and nothing decided stores nothing
-//!   or resolves at `endEncoding`, as on Metal (`DontCare`, its resolve target cleared).
+//!   and resolves nothing at `endEncoding`, as on Metal, as the runtime ends the pass.
 //! - **A wait for a fence the encoder updated** goes to the runtime, which waits for the update
 //!   before the encoder, as Metal completes it. **A barrier after the fragment stage and before
 //!   the vertex stage** encodes nothing: this GPU runs a pass's vertex stages first, and Metal's
@@ -175,9 +175,8 @@
 //!   reaches them. The runtime's refusal of the records dies naming the execution, at the commit
 //!   or as the command buffer completes ([`crate::gpu::command`]); a refusal at the call (a range
 //!   past the buffer's size, which Metal runs without validation) dies there. An empty range
-//!   within the size runs nothing and encodes nothing, as Metal's does under any pipeline state
-//!   (`render_draw_icb`: one made without `supportIndirectCommandBuffers`, which the runtime
-//!   refuses for a buffer that inherits it).
+//!   within the size runs nothing, as Metal's does under any pipeline state (`render_draw_icb`:
+//!   one made without `supportIndirectCommandBuffers` too), as the runtime runs it.
 //! - **The pass's rate map** is taken as it is at the encoder's creation, where Metal's pass reads
 //!   it as the GPU runs it: a reset in between dies ([`crate::gpu::rate_map`]). A pass of a
 //!   mutable map not yet reset rasterizes nothing, as on Metal: its vertex functions run and no
@@ -649,17 +648,23 @@ fn may_resolve(store: rt::StoreAction) -> bool {
     )
 }
 
-/// `d` without the depth and stencil resolve textures its store actions leave unused: Metal
-/// resolves nothing into them and stores the attachment as its action says
-/// (`render_pass_memoryless`'s unused resolve textures on depth and stencil), where the runtime
-/// refuses the pass. A colour attachment's goes to the runtime, which leaves it untouched, as
-/// Metal does. Nothing else of the pass reads them: what Metal aborts at reads a depth or stencil
-/// resolve texture only under a store action that resolves ([`metal_aborts_at`]).
+/// `d` without the depth and stencil resolve textures of an attachment without a texture whose
+/// store action leaves them unused: Metal resolves nothing into them (`render_pass_memoryless`'s
+/// unused resolve textures on depth and stencil), where the runtime refuses a resolve texture of
+/// an attachment without a texture as unmeasured. One beside a texture goes to the runtime,
+/// which leaves it untouched and stores the attachment as its action says, as Metal does
+/// (`unused_depth_and_stencil_resolves_leave_their_textures`), and so does a colour
+/// attachment's. Nothing else of the pass reads them: what Metal aborts at reads a depth or
+/// stencil resolve texture only under a store action that resolves ([`metal_aborts_at`]).
 fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
-    if !may_resolve(d.depth_attachment.store_action) {
+    let unused = |a: &Option<rt::Texture>, store| a.is_none() && !may_resolve(store);
+    if unused(&d.depth_attachment.texture, d.depth_attachment.store_action) {
         d.depth_attachment.resolve_texture = None;
     }
-    if !may_resolve(d.stencil_attachment.store_action) {
+    if unused(
+        &d.stencil_attachment.texture,
+        d.stencil_attachment.store_action,
+    ) {
         d.stencil_attachment.resolve_texture = None;
     }
     d
@@ -3154,25 +3159,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             RenderCmd::EndEncoding => {
                 // A store action left `Unknown` stores nothing and resolves nothing, as on Metal
                 // (`render_pass_unknown_store`; `mutgap2_rdec_depth_stencil_resolve`: a depth
-                // left `Unknown` over a resolve texture resolves nothing): the attachment's
-                // resolve target is cleared, as the runtime refuses `DontCare` over one, then it
-                // stores `DontCare`. Both are set while the encoder is in its handle, so a thread
-                // that stops or dies there leaves it untouched; the end takes it after the one
-                // check of the task's end ([`EncoderObject::end`]).
-                for (a, ..) in plain(|| std::mem::take(&mut *self.undecided.lock())) {
-                    let dont_care = rt::StoreAction::DontCare;
-                    self.run(sel, &mut |e| match a {
-                        Attachment::Color(i) => e
-                            .set_color_resolve_target(None, i)
-                            .and_then(|()| e.set_color_store_action(dont_care, i)),
-                        Attachment::Depth => e
-                            .set_depth_resolve_target(None)
-                            .and_then(|()| e.set_depth_store_action(dont_care)),
-                        Attachment::Stencil => e
-                            .set_stencil_resolve_target(None)
-                            .and_then(|()| e.set_stencil_store_action(dont_care)),
-                    })?;
-                }
+                // left `Unknown` over a resolve texture resolves nothing), as the runtime's end
+                // settles it (`unknown_stores_over_resolves_resolve_nothing`).
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
@@ -3233,25 +3221,17 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let progress = self.encoder.progress(sel);
                 indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
                 // An empty range runs nothing, as Metal's does under any pipeline state
-                // (`render_draw_icb`), where the runtime refuses an inherited state made without
-                // `supportIndirectCommandBuffers` first: it is not asked. One past the size is.
-                if range.is_empty() && range.end <= indirect_command_buffer.size() {
-                    self.encoder.nothing(sel)?;
-                } else {
-                    encoded(&mut |e| {
-                        let icb = &indirect_command_buffer.raw;
-                        match check.take() {
-                            Some((check, needs)) => e.execute_commands_in_buffer_checked(
-                                icb,
-                                range.clone(),
-                                check,
-                                needs,
-                            ),
-                            None => e.execute_commands_in_buffer(icb, range.clone()),
+                // (`render_draw_icb`), as the runtime runs it.
+                encoded(&mut |e| {
+                    let icb = &indirect_command_buffer.raw;
+                    match check.take() {
+                        Some((check, needs)) => {
+                            e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
                         }
-                    })?;
-                    self.checked_at_commit(checked);
-                }
+                        None => e.execute_commands_in_buffer(icb, range.clone()),
+                    }
+                })?;
+                self.checked_at_commit(checked);
                 if let Some(progress) = progress {
                     progress.executes(sel, indirect_command_buffer.clone_ref());
                 }

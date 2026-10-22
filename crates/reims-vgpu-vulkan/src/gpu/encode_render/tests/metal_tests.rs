@@ -6742,6 +6742,128 @@ fn unknown_stores_over_resolves_resolve_nothing() {
     }
 }
 
+/// The bytes of a 16 by 16 resolve texture of `format` (`bytes` a texel), a depth or the stencil
+/// one, that a pass cleared (depth to 0.75, stencil to `0x5a`) and stored, after a pass of a
+/// 4-sample attachment of `format` (Memoryless where `memoryless`, else Private) beside no other,
+/// cleared, stored by `store`, a store action that does not resolve, with that resolve texture,
+/// drawing nothing.
+fn unused_resolve<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    (format, bytes): (u64, u64),
+    store: u64,
+    memoryless: bool,
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    let resolve = d
+        .new_texture(
+            OnFault::Die,
+            &p.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 16,
+                height: 16,
+                usage: TARGET,
+                resource_options: Some(PRIVATE_OPTIONS),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let options = if memoryless {
+        MEMORYLESS
+    } else {
+        PRIVATE_OPTIONS
+    };
+    let samples = multisampled(p, d, format, options);
+    // A pass of `texture` alone, cleared, stored by `store`, into `resolve_texture`.
+    let pass = |texture, resolve_texture, store, (depth, stencil)| {
+        let pass = p.render_pass_descriptor();
+        if format == STENCIL8 {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture: Some(resolve_texture),
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_stencil: Some(stencil),
+                ..StencilAttachmentSet::default()
+            });
+        } else {
+            pass.set_depth_attachment(&DepthAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture: Some(resolve_texture),
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_depth: Some(depth),
+                ..DepthAttachmentSet::default()
+            });
+        }
+        pass
+    };
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    for pass in [
+        pass(&resolve, None, STORE, (0.75, 0x5a)),
+        pass(&samples, Some(&resolve), store, (0.25, 0x11)),
+    ] {
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    }
+    let length = 16 * 16 * bytes;
+    let out = buffer::<P>(d, length, 0, &[]);
+    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &resolve,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(16, 16, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 16 * bytes,
+            destination_bytes_per_image: length,
+        },
+        BlitCmd::EndEncoding,
+    ] {
+        blit.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    let n = usize::try_from(length).unwrap();
+    // SAFETY: a Shared buffer's bytes, read after the blit completed.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// `MTLPixelFormatStencil8`.
+const STENCIL8: u64 = 253;
+
+/// A depth or stencil attachment beside a resolve texture its store action does not use
+/// (`Store` or `DontCare`, of a Private attachment, and `DontCare` of a Memoryless one) ends its
+/// pass, and the resolve texture keeps its texels, as on Metal
+#[test]
+fn unused_depth_and_stencil_resolves_leave_their_textures() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let depth: Vec<u8> = (0..256).flat_map(|_| 0.75f32.to_ne_bytes()).collect();
+    let stencil = vec![0x5a; 256];
+    for (format, kept) in [((DEPTH32F, 4), &depth), ((STENCIL8, 1), &stencil)] {
+        for (store, memoryless) in [(STORE, false), (DONT_CARE, false), (DONT_CARE, true)] {
+            let case = format!("{format:?} store {store} memoryless {memoryless}");
+            let ours = unused_resolve(&p, &d, format, store, memoryless);
+            assert_eq!(&ours, kept, "{case}");
+            if let Some((mp, md)) = &metal {
+                assert_eq!(
+                    unused_resolve(mp, md, format, store, memoryless),
+                    ours,
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
 /// A load action, store action or store action options the runtime has no value of is
 /// taken, as Metal's setters take it, and read back as set; the encoder's creation dies at
 /// it, where Metal asserts ("-[MTLRenderPassDescriptorInternal validate:width:height:]:2401:
