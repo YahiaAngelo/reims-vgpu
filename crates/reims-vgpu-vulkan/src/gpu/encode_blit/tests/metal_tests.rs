@@ -3009,10 +3009,9 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
-/// Each of `cases`, a fill the runtime refuses (`AppleOnly::FillUnmeasured`), read back as
-/// Metal's reads back ([`fills_on`]), Metal's bytes the same on a second run. Every case runs,
-/// and the ones that differ or die here are named together.
-fn refused_fills_are_metals(cases: &[Case]) {
+/// Each of `cases` read back as Metal's reads back ([`fills_on`]), Metal's bytes the same on a
+/// second run. Every case runs, and the ones that differ or die here are named together.
+fn each_fill_reads_back_as_metals(cases: &[Case]) {
     let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;
     };
@@ -3044,28 +3043,24 @@ fn refused_fills_are_metals(cases: &[Case]) {
     );
 }
 
-/// A fill of a two-plane XR10 texture (550, 551) of its own memory at a width no multiple of 4
-/// reads back as Metal's does
-/// ([`refused_fills_are_metals`]): 7, 6 and 33 texels wide, whole, cut at the texture, and a
-/// region, with bytes and with a colour packed in `RGBA8Unorm`. Measured on the M3 Max (macOS
-/// 27.0.1): Metal's fills and its blits between a buffer and the texture both address texel (x,
-/// y)'s colour word at y * ⌊4 w / 16⌋ * 16 + 4 x, rows that overlap, so a fill of the 7 by 3
-/// texture's texels 2 to 6 of rows 1 and 2 reads back changed at texel 6 of row 0 and at texels
-/// 0 and 1 of row 2 too. The runtime fills at those addresses, and its blits between a buffer
-/// and the texture take them, but announce (`two-plane-buffer-blit`, which dies here) a copy
-/// into the texture whose rows meet, this test's first, and a copy out of it that reads the
-/// bytes between its rows a fill wrote, which the runtime holds apart and reads as 0. Relayed,
-/// the cases read back 4, 4, 48 and 8 bytes 0 where Metal's hold the fill's or the first
-/// copy's (the 7 by 3 texture's texel 3 of row 1; the 6 by 2 one's texels 2 and 3 of row 1)
+/// A fill of a two-plane XR10 texture (550, 551) of its own memory at a width no multiple of 4,
+/// narrower than 32 texels, reads back as Metal's does ([`each_fill_reads_back_as_metals`]): 7
+/// and 6 texels wide, whole and a region cut at the texture, with bytes and with a colour packed
+/// in `RGBA8Unorm`. Measured on the M3 Max (macOS 27.0.1): Metal's fills and its blits between a
+/// buffer and the texture both address texel (x, y)'s colour word at y * ⌊4 w / 16⌋ * 16 + 4 x,
+/// rows that overlap, so a fill of the 7 by 3 texture's texels 2 to 6 of rows 1 and 2 reads back
+/// changed at texel 6 of row 0 and at texels 0 and 1 of row 2 too. The runtime fills at those
+/// addresses, and its blits between a buffer and the texture take them, the bytes where rows
+/// meet included; at 32 texels wide or wider it announces a copy into such rows
+/// ([`a_wide_two_plane_fill_relays_the_copy_into_its_rows`])
 #[test]
-#[ignore = "the runtime reads a two-plane texture's bytes between rows as 0: m2v fix pending"]
 fn two_plane_fills_at_widths_off_4_are_metals() {
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let eight: Vec<u8> = (1..=8).collect();
     let case = |format, [w, h]: [u64; 2], fill| {
         read_case((format, 4, [1, 1]), (2, [w, h, 1], 1, 1), vec![fill])
     };
-    refused_fills_are_metals(&[
+    each_fill_reads_back_as_metals(&[
         case(550, [7, 3], bytes_fill(0, 0, [0, 0, 0], [7, 3, 1], &eight)),
         case(
             550,
@@ -3074,11 +3069,63 @@ fn two_plane_fills_at_widths_off_4_are_metals() {
         ),
         case(
             551,
-            [33, 5],
+            [7, 3],
             color_fill((0, 0), ([3, 1, 0], [20, 3, 1]), rgba, 70),
         ),
         case(550, [6, 2], bytes_fill(0, 0, [0, 0, 0], [6, 2, 1], &eight)),
     ]);
+}
+
+/// A fill of a two-plane XR10 texture (550, 551) of its own memory 32 texels wide or wider, at a
+/// width no multiple of 4, whose copy in from a buffer ([`fills_on`]) meets rows at Metal's
+/// addresses: the runtime keeps the earlier row's bytes there, where Metal's GPU writes such rows
+/// in an order that varies from run to run, and announces it (`two-plane-buffer-blit`), which
+/// dies here at the copy, naming it, and is relayed otherwise. Relayed, the fill reads back
+/// Metal's bytes, as the copy writes one byte value everywhere, so no order shows: 33 by 5 of
+/// 551, a colour packed in `RGBA8Unorm` over a region cut at the texture, and 37 by 3 of 550, a
+/// region with bytes. Measured on the M3 Max (macOS 27.0.1); a texture 31 texels wide announces
+/// nothing
+#[test]
+fn a_wide_two_plane_fill_relays_the_copy_into_its_rows() {
+    const COPY_IN: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                           sourceSize:toTexture:destinationSlice:destinationLevel:\
+                           destinationOrigin:";
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let case = |format, [w, h]: [u64; 2], fill| {
+        read_case((format, 4, [1, 1]), (2, [w, h, 1], 1, 1), vec![fill])
+    };
+    for c in [
+        case(
+            551,
+            [33, 5],
+            color_fill((0, 0), ([3, 1, 0], [20, 3, 1]), rgba, 70),
+        ),
+        case(
+            550,
+            [37, 3],
+            bytes_fill(0, 0, [2, 1, 0], [9, 5, 1], &[9, 10, 11]),
+        ),
+    ] {
+        let what = format!("{} {:?}: {:?}", c.format, c.extent, c.fills);
+        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, &c);
+        let again = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, &c);
+        assert_eq!(theirs, again, "{what}: Metal's bytes vary between runs");
+        let site = catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &c));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(site.map_err(|site| site.file), Err(COPY_IN), "{what}");
+        let named = "(metal2vulkan-degrade-two-plane-buffer-blit)";
+        assert!(line.contains(named), "{what}: {line}");
+        let ours = crate::answer::relaxed(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &c));
+        assert!(ours == theirs, "{what}: the bytes differ from Metal's");
+    }
+    let relayed = crate::answer::relayed_counts();
+    let kinds: Vec<_> = relayed.iter().map(|&(kind, _)| kind).collect();
+    assert_eq!(kinds, [rt::Degradation::TwoPlaneBufferBlit]);
 }
 
 /// A fill of a placement heap's texture of a two-plane XR10 format (550) of more than one level
@@ -3089,13 +3136,15 @@ fn two_plane_fills_at_widths_off_4_are_metals() {
 /// of one level. Measured on the M3 Max (macOS 27.0.1): Metal writes each texel (x, y) of the
 /// region, cut at the level's extent, of slice s at the texture's first byte + s * 4 w0 h0 + y *
 /// 4 w0 + 4 x, w0 and h0 level 0's extent, whatever the level: as level 0's colour words lie; it
-/// writes no byte of the alpha plane. The runtime's fill writes those words (level 0 of the
-/// slice, at level 0's rows) and does not die, but this platform dies at each where the heap's
-/// buffer is made over the texture's bytes: the runtime keeps such a texture's texels in memory
-/// of their own (`heap-two-plane-texture`); the cases pass once the runtime holds them in the
-/// heap's bytes
+/// writes no byte of the alpha plane. The arrays of one level pass. The runtime announces each
+/// texture of more than one level as it is made (`heap-two-plane-layout`, which dies here, at
+/// `newTextureWithDescriptor:offset:`): it keeps the first level's texels in the heap's bytes and
+/// the later levels' apart from them. Relayed, the 2D array's fill of level 1 of slice 1 writes
+/// Metal's bytes, but the 2D texture's of level 1 and 2 write none of Metal's words into the
+/// heap's bytes (128, 32 and 24 bytes differ); the cases pass once the runtime writes them there
 #[test]
-#[ignore = "the runtime holds such a heap texture apart from the heap's bytes: m2v fix pending"]
+#[ignore = "the runtime announces heap-two-plane-layout, and relayed misses Metal's words: m2v \
+            fix pending"]
 fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
     let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;

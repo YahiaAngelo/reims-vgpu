@@ -90,13 +90,13 @@
 //!   `two_plane_xr10_copies_of_any_region_are_the_metal_platforms`). Their copies to and from a
 //!   buffer move plane 0's colour words, as Metal's do on this host
 //!   (`two_plane_xr10_copies_are_the_metal_platforms`). Where the runtime's answer is not Metal's
-//!   measured one, it announces so, and the blit dies (`TwoPlaneTextureCopy` and
-//!   `TwoPlaneBufferBlit`, [`crate::answer::DIES`]): a copy within one texture, of a texture of
-//!   more than one level or slice, of rows that overlap in the destination, of a texture
-//!   narrower than 4 texels, or reading bytes outside the source's texels that an earlier blit
-//!   wrote or a heap's other resources hold, and a copy from a buffer into a level 32 texels wide
-//!   or wider whose width is no multiple of 4 whose rows meet at Metal's addresses, or out of such
-//!   a level after a copy from another texture wrote the bytes between them
+//!   measured one, it announces so, which is relayed, a death in strict mode (`TwoPlaneTextureCopy`
+//!   and `TwoPlaneBufferBlit`, [`crate::answer::DIES`]): a copy within one texture, of a texture of
+//!   more than one level or slice, of rows that overlap in the destination, of a texture narrower
+//!   than 4 texels, or reading bytes outside the source's texels that an earlier blit wrote or a
+//!   heap's other resources hold, and a copy from a buffer into a level 32 texels wide or wider
+//!   whose width is no multiple of 4 whose rows meet at Metal's addresses, or out of such a level
+//!   after a copy from another texture wrote the bytes between them
 //!   (`two_plane_xr10_blits_metal_was_not_measured_at_die`); where a narrower level's rows meet
 //!   between Metal's groups of 32 rows, the earlier row's bytes stand, one of Metal's outcomes
 //!   (`two-plane-buffer-blit-order`, [`crate::answer`]). A copy into a
