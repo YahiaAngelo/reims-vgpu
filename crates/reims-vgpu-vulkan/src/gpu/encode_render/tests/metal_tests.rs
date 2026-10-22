@@ -6924,8 +6924,9 @@ fn a_display_pipeline_answers_metals_values() {
 /// by a mutable map's reset, that only loads or clears its target and stores it stores what
 /// Metal's does, in a process that has released no map of layers and after one was made,
 /// drawn with and released, which makes Metal's draws in such a pass draw (its fresh side
-/// first); a draw in such a pass dies at its selector, naming the map, and a draw of
-/// primitive type 9 of no vertices and a tile dispatch there die by their own lines
+/// first); a draw in such a pass, of a public or a private type, dies at its selector, naming
+/// the map, and a draw of primitive type 9 of no vertices and a tile dispatch there die by
+/// their own lines
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     use reims_vgpu_core::platform::rate_map::{
@@ -7095,10 +7096,13 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
     let q = d.new_command_queue().unwrap();
-    // A draw, named by the map; a draw of primitive type 9 of no vertices, by its own count;
-    // and a tile dispatch, by its own line.
+    // A draw, of a public type and over indices of the platform's own (a triangle fan and
+    // quads), named by the map; a draw of primitive type 9 of no vertices, by its own count; and
+    // a tile dispatch, by its own line.
     let deaths = [
         (3, 3, "rate map of no layers"),
+        (6, 4, "rate map of no layers"),
+        (7, 4, "rate map of no layers"),
         (9, 0, "primitive type 9 of 0 vertices"),
         (
             0,

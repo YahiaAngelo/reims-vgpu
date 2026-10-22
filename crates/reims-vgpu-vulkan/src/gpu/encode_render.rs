@@ -2638,14 +2638,7 @@ impl VulkanRenderEncoder {
         crate::gpu::timing::count_draw();
         match drawn {
             Some((shape, k)) => {
-                self.bfloat_drawn(sel);
-                if !empty {
-                    self.layered(sel);
-                    self.sized(sel, shape);
-                    self.issues(sel, None);
-                    self.rounds(sel, false);
-                    self.encodes(sel, "a draw");
-                }
+                self.drawn(sel, shape, empty);
                 if !empty && self.rotates(sel, shape) {
                     crate::answer::inexact(
                         sel,
@@ -2656,6 +2649,24 @@ impl VulkanRenderEncoder {
                 self.binds(sel, &mut |e| call(e, k))
             }
             None => self.encoder.nothing(sel),
+        }
+    }
+
+    /// What a draw `sel` of `shape` asks of what the encoder holds, after its pipeline state
+    /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
+    /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
+    /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
+    /// may write ([`Self::issues`], [`Self::rounds`]) and the indirect commands its state may
+    /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
+    /// ([`Self::primitives`]).
+    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
+        self.bfloat_drawn(sel);
+        if !empty {
+            self.layered(sel);
+            self.sized(sel, shape);
+            self.issues(sel, None);
+            self.rounds(sel, false);
+            self.encodes(sel, "a draw");
         }
     }
 
@@ -4180,13 +4191,14 @@ impl VulkanRenderEncoder {
     /// vertices ([`Private::indices`]), and a list or strip of triangles the provoking vertex
     /// rotates ([`Self::rotates`]) as a list over its triangles' vertices last first
     /// ([`last_first`]), each in a buffer the encoder keeps for its later draws of the kind
-    /// ([`OwnIndices`]) and the command buffer until it completes; one of too few vertices draws
-    /// nothing, as on Metal. The indices are relative to `start`, the indexed draw's base vertex,
-    /// so `[[base_vertex]]` reads `start` and `[[vertex_id]]` each vertex's own, as Metal's
-    /// non-indexed draws give them (the module docs); a `start` past `i32::MAX`, which the
-    /// runtime's base vertex cannot hold and Metal draws from, dies. Such a draw restarts at the
-    /// all-ones index alone after `setPrimitiveRestartEnabled:index:` too, as a line loop's line
-    /// strip has no index where Metal's loop restarts.
+    /// ([`OwnIndices`]) and the command buffer until it completes, and each asks what any draw
+    /// asks ([`Self::drawn`]); one of too few vertices draws nothing, as on Metal. The indices are
+    /// relative to `start`, the indexed draw's base vertex, so `[[base_vertex]]` reads `start` and
+    /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module
+    /// docs); a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal
+    /// draws from, dies. Such a draw restarts at the all-ones index alone after
+    /// `setPrimitiveRestartEnabled:index:` too, as a line loop's line strip has no index where
+    /// Metal's loop restarts.
     fn primitives(
         &self,
         sel: &'static str,
@@ -4232,8 +4244,8 @@ impl VulkanRenderEncoder {
         let buffer = plain(|| self.own_indices.lock().take(sel, &self.device, taken));
         let n = small(sel, indices);
         self.pipelined(sel);
-        self.issues(sel, None);
-        self.rounds(sel, false);
+        crate::gpu::timing::count_draw();
+        self.drawn(sel, shape, false);
         if matches!(topology, Topology::Private(_)) && self.rotates(sel, shape) {
             crate::answer::inexact(
                 sel,
