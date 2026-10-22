@@ -234,16 +234,17 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
-    let zero_bytes: u64 = (resolved.iter())
-        .filter(|p| super::import::zeros(&p.backing.fd))
-        .map(|p| p.length)
+    let of_zeros = super::import::of_zeros(&resolved);
+    let zero_bytes: u64 = (resolved.iter().zip(&of_zeros))
+        .filter(|&(_, &zeros)| zeros)
+        .map(|(p, _)| p.length)
         .sum();
     let zeros = (zero_bytes > 0).then(|| vm::memfd(zero_bytes));
     let mut zeros_at = 0;
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
-    for piece in resolved {
+    for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
         let backing = match &zeros {
-            Some(zeros) if super::import::zeros(&piece.backing.fd) => {
+            Some(zeros) if of_zeros => {
                 let backing = Backing {
                     fd: Arc::clone(zeros),
                     offset: zeros_at,

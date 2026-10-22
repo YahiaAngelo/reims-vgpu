@@ -62,8 +62,16 @@ pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
 }
 
 /// Whether `fd` is a file of zeros.
-pub(super) fn zeros(fd: &Arc<OwnedFd>) -> bool {
+#[cfg(test)]
+fn zeros(fd: &Arc<OwnedFd>) -> bool {
     ZERO_FILES.lock().iter().any(|z| Arc::ptr_eq(z, fd))
+}
+
+/// Whether each of `pieces` is of a file of zeros, the files looked at once.
+pub(super) fn of_zeros(pieces: &[files::Piece]) -> Vec<bool> {
+    let zero_files = ZERO_FILES.lock();
+    let zeros = |fd: &Arc<OwnedFd>| zero_files.iter().any(|z| Arc::ptr_eq(z, fd));
+    pieces.iter().map(|p| zeros(&p.backing.fd)).collect()
 }
 
 /// The memory the runtime imports for `length` bytes at `at` (module docs).
@@ -204,19 +212,21 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     else {
         return plain;
     };
+    // Looked up without collecting the pieces, which only a twin needs.
+    if files::writable(first, end - first) != Some(false) {
+        return plain;
+    }
     let Some(pieces) = files::pieces(first, end - first) else {
         return plain;
     };
-    log::debug!(
-        "an import of {length:#x} bytes at {start:#x}: {} runs of files",
-        twin_mappings(&pieces)
-    );
-    if pieces.iter().all(|p| p.prot & libc::PROT_WRITE != 0) {
-        return plain;
-    }
     let Some(twin) = twin(first, end - first, &pieces) else {
         return plain;
     };
+    log::debug!(
+        "an import of {length:#x} bytes at {start:#x}: a writable twin at {:#x} of {} mappings",
+        twin.first,
+        twin.mappings
+    );
     let Some(twin_at) = address(twin.first + (start - first)) else {
         return plain;
     };
@@ -227,9 +237,11 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
 }
 
 /// A writable twin of the `length` bytes from `first` that `pieces` show: each piece's file
-/// pages, shared, read and write, but zeros' (private zeros); `None` where the host maps none.
+/// pages, shared, read and write, but zeros', which stay the fresh reservation's own private
+/// zeros; `None` where the host maps none.
 fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
-    let mappings = twin_mappings(pieces);
+    let zeros = of_zeros(pieces);
+    let mappings = twin_mappings(pieces, &zeros);
     budget::admit(mappings, "an import's twin");
     let base = vm::anonymous(None, length, "an import's twin").ok()?;
     let mut twin = Twin {
@@ -238,13 +250,9 @@ fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
         mappings: 0,
     };
     let rw = libc::PROT_READ | libc::PROT_WRITE;
-    for piece in pieces {
-        let at = Some(base + piece.at);
-        if zeros(&piece.backing.fd) {
-            // The reservation is private zeros already: mapped again, so no earlier bytes stay.
-            vm::anonymous(at, piece.length, "an import's twin").ok()?;
-        } else {
-            vm::file(at, piece.length, &piece.backing, rw).ok()?;
+    for (piece, zeros) in pieces.iter().zip(zeros) {
+        if !zeros {
+            vm::file(Some(base + piece.at), piece.length, &piece.backing, rw).ok()?;
         }
     }
     budget::twins_hold(mappings, true);
@@ -253,11 +261,11 @@ fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
     Some(twin)
 }
 
-/// The kernel's mappings a twin of `pieces` takes: one for each run of them that maps as one,
-/// pieces of zeros next to each other (private zeros, as the twin's reservation is) or each piece
-/// following the one before in the same file (all read and write in the twin).
-fn twin_mappings(pieces: &[files::Piece]) -> u64 {
-    let zeros: Vec<bool> = pieces.iter().map(|p| zeros(&p.backing.fd)).collect();
+/// The kernel's mappings a twin of `pieces` takes, `zeros` saying which are of zeros: one for each
+/// run of them that maps as one, pieces of zeros next to each other (private zeros, as the twin's
+/// reservation is) or each piece following the one before in the same file (all read and write
+/// in the twin).
+fn twin_mappings(pieces: &[files::Piece], zeros: &[bool]) -> u64 {
     let apart = (1..pieces.len())
         .filter(|&i| {
             let (a, b) = (&pieces[i - 1], &pieces[i]);
@@ -382,11 +390,12 @@ mod tests {
             },
             prot: libc::PROT_READ,
         };
-        assert_eq!(twin_mappings(&[piece(0, &f, 0), piece(1, &f, 1)]), 1);
-        assert_eq!(twin_mappings(&[piece(0, &f, 1), piece(1, &f, 0)]), 2);
-        assert_eq!(twin_mappings(&[piece(0, &z, 0), piece(1, &z, 5)]), 1);
+        let mappings = |pieces: &[files::Piece]| twin_mappings(pieces, &of_zeros(pieces));
+        assert_eq!(mappings(&[piece(0, &f, 0), piece(1, &f, 1)]), 1);
+        assert_eq!(mappings(&[piece(0, &f, 1), piece(1, &f, 0)]), 2);
+        assert_eq!(mappings(&[piece(0, &z, 0), piece(1, &z, 5)]), 1);
         let mixed = [piece(0, &f, 0), piece(1, &z, 0), piece(2, &f, 2)];
-        assert_eq!(twin_mappings(&mixed), 3);
+        assert_eq!(mappings(&mixed), 3);
         // A read-only view of the file's pages 2, 3, 0 and 1: its twin maps as two.
         let vm = LinuxVm::new();
         let source = vm::allocate_aliasable(4 * PAGE).unwrap();

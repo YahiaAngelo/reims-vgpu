@@ -145,24 +145,51 @@ impl Table {
         self.registered.iter().find(|r| r.first <= at && at < r.end)
     }
 
+    /// The file behind byte `at`: the run or registration holding it, the file offset of `at`, its
+    /// protection, and the end of the bytes from `at` that show the same file on, with the same
+    /// protection, up to `end` (a registration's stop where a run starts); `None` where neither
+    /// holds it.
+    fn file_at(&self, at: u64, end: u64) -> Option<(&Arc<OwnedFd>, u64, i32, u64)> {
+        if let Some((first, run)) = self.run_at(at) {
+            let offset = run.backing.offset + (at - first);
+            return Some((&run.backing.fd, offset, run.prot, run.end.min(end)));
+        }
+        let registered = self.registered_at(at)?;
+        let to = (registered.end.min(end)).min(self.next_run(at, end).unwrap_or(end));
+        let offset = registered.backing.offset + (at - registered.first);
+        Some((&registered.backing.fd, offset, READ_WRITE, to))
+    }
+
+    /// Cuts the run holding `at` in two there, where `at` lies past its first byte: two runs the
+    /// kernel holds as one mapping, so the count of mappings stays.
+    fn cut(&mut self, at: u64) {
+        let Some(first) = self.run_at(at).map(|(first, _)| first).filter(|&f| f < at) else {
+            return;
+        };
+        let Some(run) = self.remove(first) else {
+            return;
+        };
+        let tail = Run {
+            end: run.end,
+            backing: Backing {
+                fd: Arc::clone(&run.backing.fd),
+                offset: run.backing.offset + (at - first),
+            },
+            prot: run.prot,
+        };
+        self.insert(first, Run { end: at, ..run });
+        self.insert(at, tail);
+    }
+
     /// Drops what of the runs lies in `first..end`, keeping the rest of each.
     fn forget(&mut self, first: u64, end: u64) {
-        let meeting: Vec<(u64, Run)> = (self.runs.range(..end).rev())
-            .take_while(|(_, run)| run.end > first)
-            .map(|(&at, run)| (at, run.clone()))
-            .collect();
-        for (at, run) in meeting {
+        if first >= end {
+            return;
+        }
+        self.cut(first);
+        self.cut(end);
+        while let Some(at) = self.runs.range(first..end).next().map(|(&at, _)| at) {
             self.remove(at);
-            if at < first {
-                let mut head = run.clone();
-                head.end = first;
-                self.insert(at, head);
-            }
-            if end < run.end {
-                let mut tail = run.clone();
-                tail.backing.offset = run.backing.offset + (end - at);
-                self.insert(end, tail);
-            }
         }
     }
 
@@ -174,23 +201,48 @@ impl Table {
         }
     }
 
-    /// Sets the protection of what of the runs lies in `first..end` (`protect`).
+    /// Sets the protection of what of the runs lies in `first..end` (`protect`), cutting a run it
+    /// changes where the range ends inside it. A run that has the protection already stays as it
+    /// is, as the kernel leaves a mapping that a protect does not change.
     fn protect(&mut self, first: u64, end: u64, prot: i32) {
-        let meeting: Vec<(u64, Run)> = (self.runs.range(..end).rev())
-            .take_while(|(_, run)| run.end > first)
-            .map(|(&at, run)| (at, run.clone()))
-            .collect();
-        for (at, run) in meeting {
-            let (from, to) = (at.max(first), run.end.min(end));
-            self.forget(from, to);
-            let mut changed = run.clone();
-            changed.end = to;
-            changed.backing.offset = run.backing.offset + (from - at);
-            changed.prot = prot;
-            self.insert(from, changed);
+        if first >= end {
+            return;
+        }
+        for at in [first, end] {
+            if self.run_at(at).is_some_and(|(_, run)| run.prot != prot) {
+                self.cut(at);
+            }
+        }
+        let mut from = first;
+        while let Some(at) = (self.runs.range(from..end))
+            .find(|(_, run)| run.prot != prot)
+            .map(|(&at, _)| at)
+        {
+            let Some(mut run) = self.remove(at) else {
+                break;
+            };
+            from = run.end;
+            run.prot = prot;
+            self.insert(at, run);
         }
     }
+
+    /// Whether every byte of `first..end` has `bit` (`PROT_*`) in its protection: `None` where
+    /// a byte lies in neither a run nor a registration.
+    fn all_have(&self, first: u64, end: u64, bit: i32) -> Option<bool> {
+        let mut all = true;
+        let mut at = first;
+        while at < end {
+            let (_, _, prot, to) = self.file_at(at, end)?;
+            all &= prot & bit != 0;
+            at = to;
+        }
+        Some(all)
+    }
 }
+
+/// The protection of a registration's bytes: read and write.
+const READ_WRITE: i32 = libc::PROT_READ | libc::PROT_WRITE;
 
 /// The kernel's mappings the table's runs take (module docs): every view the library made and
 /// every range a view can be made of.
@@ -227,56 +279,90 @@ pub(crate) fn forget(first: u64, length: u64) {
     TABLE.lock().forget(first, first.saturating_add(length));
 }
 
-/// The pieces of `length` bytes from `first`, each the bytes of one run or registration in
-/// order, those of a run cut where it ends; `None` where a byte has no file behind it.
+/// The pieces of `length` bytes from `first`, in order, each bytes of one file that follow on in
+/// it with one protection, through the runs and registrations over them (one piece where the runs
+/// a view of following pages left follow on, as the kernel maps them as one); `None` where a byte
+/// has no file behind it.
 pub(crate) fn pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
     let end = first.checked_add(length)?;
     let table = TABLE.lock();
-    let mut pieces = Vec::new();
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut at = first;
     while at < end {
-        if let Some((run_first, run)) = table.run_at(at) {
-            let to = run.end.min(end);
-            let mut backing = run.backing.clone();
-            backing.offset += at - run_first;
-            pieces.push(Piece {
+        let (fd, offset, prot, to) = table.file_at(at, end)?;
+        match pieces.last_mut() {
+            Some(last)
+                if Arc::ptr_eq(&last.backing.fd, fd)
+                    && last.backing.offset + last.length == offset
+                    && last.prot == prot =>
+            {
+                last.length += to - at;
+            }
+            _ => pieces.push(Piece {
                 at: at - first,
                 length: to - at,
-                backing,
-                prot: run.prot,
-            });
-            at = to;
-            continue;
+                backing: Backing {
+                    fd: Arc::clone(fd),
+                    offset,
+                },
+                prot,
+            }),
         }
-        let registered = table.registered_at(at)?;
-        let to = (registered.end.min(end)).min(table.next_run(at, end).unwrap_or(end));
-        let mut backing = registered.backing.clone();
-        backing.offset += at - registered.first;
-        pieces.push(Piece {
-            at: at - first,
-            length: to - at,
-            backing,
-            prot: libc::PROT_READ | libc::PROT_WRITE,
-        });
         at = to;
     }
     Some(pieces)
 }
 
+/// `pieces` of a range, as [`pieces`] gave them, show from `target` on from now on, each
+/// `piece.at` bytes in: what of other runs they cover goes (a remap's record, under one lock).
+pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
+    let mut table = TABLE.lock();
+    for piece in pieces {
+        let first = target.saturating_add(piece.at);
+        let end = first.saturating_add(piece.length);
+        table.record(first, end, piece.backing, piece.prot);
+    }
+}
+
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
-/// cutting the runs it meets at its ends.
+/// cutting a run it changes at its ends.
 pub(crate) fn protect(first: u64, length: u64, prot: i32) {
     TABLE
         .lock()
         .protect(first, first.saturating_add(length), prot);
 }
 
+/// Whether every byte of `length` bytes from `first` lies in a run whose protection is `prot`
+/// already, so a protect of them to `prot` changes no mapping: the table's runs have the
+/// protections the kernel's mappings of them have, as each map and protect of them records what
+/// it set. Bytes of a registration, which the table does not map, never are.
+pub(crate) fn protected(first: u64, length: u64, prot: i32) -> bool {
+    let Some(end) = first.checked_add(length) else {
+        return false;
+    };
+    let table = TABLE.lock();
+    let mut at = first;
+    while at < end {
+        match table.run_at(at) {
+            Some((_, run)) if run.prot == prot => at = run.end,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Whether the table knows every byte of `length` bytes from `first`: `Some(readable)` where
 /// each lies in a run or a registration, readable where each has read access; `None` where one
 /// lies in neither.
 pub(crate) fn readable(first: u64, length: u64) -> Option<bool> {
-    let pieces = pieces(first, length)?;
-    Some(pieces.iter().all(|p| p.prot & libc::PROT_READ != 0))
+    let end = first.checked_add(length)?;
+    TABLE.lock().all_have(first, end, libc::PROT_READ)
+}
+
+/// As [`readable`], for write access.
+pub(crate) fn writable(first: u64, length: u64) -> Option<bool> {
+    let end = first.checked_add(length)?;
+    TABLE.lock().all_have(first, end, libc::PROT_WRITE)
 }
 
 /// Whether a byte of `length` bytes from `first` lies in a registration.
@@ -543,6 +629,95 @@ mod tests {
         assert_eq!(t.mappings(), 5);
         t.forget(base, at(6));
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
+    }
+
+    /// A protect to the protection a run has leaves it whole; one that changes part of a run cuts
+    /// it there, and the runs it leaves count as the mappings the kernel holds
+    #[test]
+    fn a_protect_cuts_only_the_runs_it_changes() {
+        let f = file();
+        let mut t = Table::default();
+        let at = |i: u64| 0x2000_0000 + i * 0x1000;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let backing = Backing {
+            fd: Arc::clone(&f),
+            offset: 0,
+        };
+        t.record(at(0), at(4), backing, rw);
+        t.protect(at(1), at(3), rw);
+        assert_eq!((t.runs.len(), t.mappings()), (1, 1), "unchanged");
+        t.protect(at(1), at(2), libc::PROT_READ);
+        assert_eq!((t.runs.len(), t.mappings()), (3, 3), "its second page");
+        t.protect(at(0), at(4), libc::PROT_READ);
+        assert_eq!(t.mappings(), 1, "all of it read-only: one mapping");
+        assert!(t.runs.values().all(|run| run.prot == libc::PROT_READ));
+        t.forget(at(0), at(4));
+        assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
+    }
+
+    /// Runs that follow on in one file with one protection resolve as one piece, as the kernel
+    /// maps them as one; a protection or a file apart cuts it
+    #[test]
+    fn runs_that_follow_on_resolve_as_one_piece() {
+        let (f, g) = (file(), file());
+        let base = 0x7e00_0000_0000;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let backing = |fd: &Arc<OwnedFd>, offset| Backing {
+            fd: Arc::clone(fd),
+            offset,
+        };
+        for i in 0..4 {
+            record(
+                base + i * 0x1000,
+                0x1000,
+                backing(&f, 0x8000 + i * 0x1000),
+                rw,
+            );
+        }
+        assert_eq!(
+            shape(&pieces(base + 0x800, 0x3000).unwrap()),
+            [(0, 0x3000, 0x8800)]
+        );
+        protect(base + 0x2000, 0x1000, libc::PROT_READ);
+        record(base + 0x3000, 0x1000, backing(&g, 0xb000), rw);
+        assert_eq!(
+            shape(&pieces(base, 0x4000).unwrap()),
+            [
+                (0, 0x2000, 0x8000),
+                (0x2000, 0x1000, 0xa000),
+                (0x3000, 0x1000, 0xb000)
+            ]
+        );
+        forget(base, 0x4000);
+    }
+
+    /// A range is protected where every byte lies in a run of that protection: not where one
+    /// lies in a registration or in neither
+    #[test]
+    fn protected_is_runs_of_the_protection_alone() {
+        let f = file();
+        let base = 0x7f00_0000_0000;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let backing = || Backing {
+            fd: Arc::clone(&f),
+            offset: 0,
+        };
+        record(base, 0x2000, backing(), rw);
+        record(base + 0x2000, 0x1000, backing(), rw);
+        assert!(protected(base, 0x3000, rw));
+        assert!(!protected(base, 0x3000, libc::PROT_READ));
+        assert!(!protected(base, 0x4000, rw), "a byte of no run");
+        let held = Registration::new(base + 0x3000, 0x1000, backing());
+        assert!(!protected(base, 0x4000, rw), "a byte of a registration");
+        assert_eq!(writable(base, 0x4000), Some(true));
+        protect(base + 0x1000, 0x1000, libc::PROT_READ);
+        assert_eq!(
+            (readable(base, 0x4000), writable(base, 0x4000)),
+            (Some(true), Some(false))
+        );
+        assert_eq!(writable(base, 0x5000), None);
+        drop(held);
+        forget(base, 0x3000);
     }
 
     /// The same bytes registered again over the same file and offset are counted: they stay

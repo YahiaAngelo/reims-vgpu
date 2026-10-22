@@ -533,9 +533,7 @@ impl HostVm for LinuxVm {
                 return Err(kr);
             }
         }
-        for piece in pieces {
-            files::record(target + piece.at, piece.length, piece.backing, piece.prot);
-        }
+        files::record_pieces(target, pieces);
         Ok(HostAddr::from_addr(target.to_usize()))
     }
 
@@ -546,6 +544,11 @@ impl HostVm for LinuxVm {
         }
         let (first, length) = pages(addr, len).ok_or(INVALID_ARGUMENT)?;
         let bits = prot_bits(prot);
+        // Core protects each mapping it made once its views are in, read and write as the views
+        // already are unless it is read-only: no call where the views have the protection.
+        if files::protected(first, length, bits) {
+            return Ok(());
+        }
         // SAFETY: lowering or raising a range's protection is the caller's decision; a later
         // access it forbids faults (a process death).
         if unsafe { libc::mprotect(ptr(first), length.to_usize(), bits) } != 0 {
