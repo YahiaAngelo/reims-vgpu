@@ -3044,19 +3044,21 @@ fn refused_fills_are_metals(cases: &[Case]) {
     );
 }
 
-/// A fill of a two-plane XR10 texture (550, 551) of its own memory at a width no multiple of 4,
-/// which the runtime refuses (`AppleOnly::FillUnmeasured`), reads back as Metal's does
+/// A fill of a two-plane XR10 texture (550, 551) of its own memory at a width no multiple of 4
+/// reads back as Metal's does
 /// ([`refused_fills_are_metals`]): 7, 6 and 33 texels wide, whole, cut at the texture, and a
 /// region, with bytes and with a colour packed in `RGBA8Unorm`. Measured on the M3 Max (macOS
 /// 27.0.1): Metal's fills and its blits between a buffer and the texture both address texel (x,
 /// y)'s colour word at y * ⌊4 w / 16⌋ * 16 + 4 x, rows that overlap, so a fill of the 7 by 3
 /// texture's texels 2 to 6 of rows 1 and 2 reads back changed at texel 6 of row 0 and at texels
-/// 0 and 1 of row 2 too. The texture's bytes are written and read by such blits, which the
-/// runtime moves at the texture's own rows and announces (`two-plane-buffer-blit`), a
-/// degradation this platform ends the process on: the cases pass once the runtime fills and
-/// blits at Metal's addresses (`m2v-fill-handoff.md`)
+/// 0 and 1 of row 2 too. The runtime fills at those addresses, and its blits between a buffer
+/// and the texture take them, but announce (`two-plane-buffer-blit`, which dies here) a copy
+/// into the texture whose rows meet, this test's first, and a copy out of it that reads the
+/// bytes between its rows a fill wrote, which the runtime holds apart and reads as 0. Relayed,
+/// the cases read back 4, 4, 48 and 8 bytes 0 where Metal's hold the fill's or the first
+/// copy's (the 7 by 3 texture's texel 3 of row 1; the 6 by 2 one's texels 2 and 3 of row 1)
 #[test]
-#[ignore = "the runtime refuses: m2v fix pending"]
+#[ignore = "the runtime reads a two-plane texture's bytes between rows as 0: m2v fix pending"]
 fn two_plane_fills_at_widths_off_4_are_metals() {
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let eight: Vec<u8> = (1..=8).collect();
@@ -3080,19 +3082,20 @@ fn two_plane_fills_at_widths_off_4_are_metals() {
 }
 
 /// A fill of a placement heap's texture of a two-plane XR10 format (550) of more than one level
-/// or slice, which the runtime refuses (`AppleOnly::FillUnmeasured`), writes the heap's bytes as
+/// or slice, which the runtime fills apart from the heap's bytes, writes the heap's bytes as
 /// Metal's does, byte for byte ([`two_plane_heap_texture_fill_on`]), Metal's the same on a
 /// second run: of a 16 by 8 texture, level 1 of 2 whole, level 2 of 3 whole and a region of
 /// level 1 of 3; level 1 of slice 1 of a 2D array of 2 levels; and slices 1 and 0 of a 2D array
 /// of one level. Measured on the M3 Max (macOS 27.0.1): Metal writes each texel (x, y) of the
 /// region, cut at the level's extent, of slice s at the texture's first byte + s * 4 w0 h0 + y *
 /// 4 w0 + 4 x, w0 and h0 level 0's extent, whatever the level: as level 0's colour words lie; it
-/// writes no byte of the alpha plane. This platform dies at each, where the heap's buffer is
-/// made over the texture's bytes: the runtime keeps such a texture's texels in memory of their
-/// own (`heap-two-plane-texture`); the cases pass once the runtime fills them in the heap's bytes
-/// (`m2v-fill-handoff.md`)
+/// writes no byte of the alpha plane. The runtime's fill writes those words (level 0 of the
+/// slice, at level 0's rows) and does not die, but this platform dies at each where the heap's
+/// buffer is made over the texture's bytes: the runtime keeps such a texture's texels in memory
+/// of their own (`heap-two-plane-texture`); the cases pass once the runtime holds them in the
+/// heap's bytes
 #[test]
-#[ignore = "the runtime refuses: m2v fix pending"]
+#[ignore = "the runtime holds such a heap texture apart from the heap's bytes: m2v fix pending"]
 fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
     let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;

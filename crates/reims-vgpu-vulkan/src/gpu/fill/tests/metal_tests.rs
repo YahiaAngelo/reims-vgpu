@@ -491,9 +491,9 @@ fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
     }
 }
 
-/// Formats outside [`LEFTOVER_FORMATS`] Metal packs no fill's colour in either, whose colour the
-/// runtime fills as zero bytes or refuses: compressed (BC1, BC4, BC6H, BC7, PVRTC, EAC, ETC2,
-/// ASTC LDR, sRGB and HDR), 4:2:2, YCbCr (8-bit, 10-bit and packed 10-bit) and padded 10-bit.
+/// Formats outside [`LEFTOVER_FORMATS`] Metal packs no fill's colour in either: compressed (BC1,
+/// BC4, BC6H, BC7, PVRTC, EAC, ETC2, ASTC LDR, sRGB and HDR), 4:2:2, YCbCr (8-bit, 10-bit and
+/// packed 10-bit) and padded 10-bit.
 const UNPACKED_FORMATS: [u64; 19] = [
     130, 140, 150, 152, 160, 170, 180, 186, 204, 222, 240, 241, 500, 505, 508, 576, 577, 578, 579,
 ];
@@ -592,16 +592,13 @@ fn leftover_on<P: Platform>(
 /// fill packed in RGBA32Uint earlier in the command buffer, in the same encoder or an earlier
 /// one ([`leftover_on`]): that fill's 16 bytes, repeated or cut at the texel, into an RGBA32Uint
 /// texel, 4 RGBA8Unorm ones and 4 R8Unorm ones, whatever the colour. The formats: each of
-/// [`LEFTOVER_FORMATS`], and of the formats the runtime fills zero bytes for
-/// (`UnpackedFillColor`) or refuses ([`UNPACKED_FORMATS`]). Measured on the M3 Max (macOS
+/// [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`]. Measured on the M3 Max (macOS
 /// 27.0.1), the same for every one of them and two colours: `07 00 00 00 09 00 00 00 03 00 00
 /// 00 01 00 00 00`, `07 00 00 00` each and `07` each. After a colour packed in a format of
 /// fewer bytes, only that many are the colour's; after a bytes fill alone, or a colour fill in
-/// an earlier command buffer, none of the bytes is a fill's (`m2v-fill-handoff.md`). This
-/// platform dies at each where it gates the format (`colour_format`), until the runtime's
-/// colour fill writes those bytes
+/// an earlier command buffer, none of the bytes is a fill's. The runtime's colour fill writes
+/// those bytes, holding the command buffer's last packed texel
 #[test]
-#[ignore = "the runtime refuses: m2v fix pending"]
 fn leftover_colours_fill_an_earlier_colours_bytes_as_metals() {
     let Some(metal) = MetalPlatform::system_default_device() else {
         return;

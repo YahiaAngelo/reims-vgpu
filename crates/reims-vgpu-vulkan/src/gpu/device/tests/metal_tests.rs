@@ -1067,8 +1067,9 @@ fn refused_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
     out
 }
 
-/// A fill of a texture Metal makes over memory it is given, of a format whose fill the runtime
-/// refuses (`AppleOnly::FillUnmeasured`), writes the memory as Metal's does, every byte compared
+/// A fill of a texture Metal makes over memory it is given, of a YCbCr or padded format, which
+/// the runtime refused (`AppleOnly::FillUnmeasured`) before 6b9a3b33d6 and fills since, writes the
+/// memory as Metal's does, every byte compared
 /// ([`refused_fill_on`]): of each YCbCr format the runtime makes over a surface, over plane 0 of
 /// a surface of its kind, and of each padded format over a buffer and over a plane of an 'x420'
 /// surface ([`refused_fill_textures`]); at two sizes; with bytes, 8 of them, 3 and 1, and with a
@@ -1078,11 +1079,9 @@ fn refused_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
 /// Metal writes each texel of the region (cut at the texture) at plane offset +
 /// y * bytesPerRow + x * the block bytes Metal describes (1, 2 or 4), the pattern repeated from
 /// its start and cut at those bytes, every other byte kept; a packed format's texel (508 to 510,
-/// 528 to 530: 1 byte) is written 0 whatever the pattern. This platform dies at each fill that
-/// reaches a texel, naming the runtime's refusal, until the runtime fills them
-/// (`m2v-fill-handoff.md`); a region wholly past the texture writes nothing on either.
+/// 528 to 530: 1 byte) is written 0 whatever the pattern. A region wholly past the texture writes
+/// nothing on either.
 #[test]
-#[ignore = "the runtime refuses: m2v fix pending"]
 fn fills_of_ycbcr_and_padded_textures_are_metals() {
     use reims_vgpu_core::platform::types::ClearColor;
     use reims_vgpu_core::testkit::capture::catch_death;
