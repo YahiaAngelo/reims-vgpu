@@ -205,7 +205,7 @@ use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::{
-    Policy, get, hang, metal_aborts, plain, refusal, refused, send, unrepresentable,
+    Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Opened};
 use crate::gpu::desc::VulkanRenderPassDescriptor;
@@ -1360,9 +1360,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// refuses them. Its creation ends the exact `uniqueIdentifier` of later indirect command
     /// buffers ([`crate::gpu::icb::encoder_made`]), as every encoder creator's does.
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
-        crate::gpu::icb::encoder_made();
-        predication::boundary(&self.predication, "blitCommandEncoder");
         let raw = encoding("blitCommandEncoder", Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            predication::boundary(&self.predication, "blitCommandEncoder");
             self.raw.blit_command_encoder()
         })?;
         Ok(Some(Obj::new(EncoderObject::new(raw, self))))
@@ -1381,10 +1381,10 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`Hangs`]); one that hangs Metal's GPU is in flight until [`HANG_TIME`] after the GPU
     /// reached its hang ([`hang_ends`]).
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
-        predication::boundary(&self.predication, "commit");
         let progress = self.progress.lock().clone();
         let hold = plain(|| self.hold.lock().take());
         let committed = encoding("commit", Policy::Dies, || {
+            predication::boundary(&self.predication, "commit");
             self.hangs.committing();
             let opened = self.opened.lock().take();
             let failure = self.failure("commit", || {
@@ -1426,9 +1426,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// it dies ([`CommandBufferObject::protected_creation`]). A first use of Metal's device
     /// ([`FirstUse::ComputeEncoder`]).
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        crate::gpu::icb::encoder_made();
-        self.protected_creation("computeCommandEncoder");
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            self.protected_creation("computeCommandEncoder");
             self.raw.compute_command_encoder()
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
@@ -1447,9 +1447,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeSignalEvent:value:";
         // evsig: command buffer, event, value
         trace_event("evsig", &self.raw, event.as_ref(), value);
-        let event = self::event(sel, event);
-        predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
+            let event = self::event(sel, event);
+            predication::boundary(&self.predication, sel);
             self.raw.encode_signal_event(event, value)
         })
     }
@@ -1465,15 +1465,15 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let traced = signal_event_scheduled.map_or(0, event_id);
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
-        let event = signal_event_scheduled
-            .map(|e| rt::SharedEvent::clone(e))
-            .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-        let handler: rt::Handler = Box::new(move |_| {
-            // evschedset: event, value: the scheduled handler sets it
-            reims_vgpu_core::trace::event("evschedset", &[traced, value]);
-            event.set_signaled_value(value)
-        });
         encoding(sel, Policy::Dies, || {
+            let event = signal_event_scheduled
+                .map(|e| rt::SharedEvent::clone(e))
+                .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
+            let handler: rt::Handler = Box::new(move |_| {
+                // evschedset: event, value: the scheduled handler sets it
+                reims_vgpu_core::trace::event("evschedset", &[traced, value]);
+                event.set_signaled_value(value)
+            });
             self.raw.add_scheduled_handler(handler)
         })
     }
@@ -1486,9 +1486,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeWaitForEvent:value:";
         // evwait: command buffer, event, value
         trace_event("evwait", &self.raw, event.as_ref(), value);
-        let event = self::event(sel, event);
-        predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
+            let event = self::event(sel, event);
+            predication::boundary(&self.predication, sel);
             self.raw.encode_wait_for_event(event, value)
         })
     }
@@ -1503,7 +1503,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         on: OnFault,
         render_pass_descriptor: &VulkanRenderPassDescriptor,
     ) -> RaiseResult<Option<VulkanRenderEncoder>> {
-        predication::boundary(&self.predication, "renderCommandEncoderWithDescriptor:");
+        let sel = "renderCommandEncoderWithDescriptor:";
+        plain_at(sel, || predication::boundary(&self.predication, sel));
         crate::gpu::encode_render::open(self, on, render_pass_descriptor)
     }
 
@@ -1580,8 +1581,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        crate::gpu::icb::encoder_made();
-        let dispatch_type = match desc.dispatch_type {
+        let dispatch_type = plain_at("setDispatchType:", || match desc.dispatch_type {
             None => DispatchType::Serial,
             Some(raw) => match u32::try_from(raw) {
                 Ok(raw) => DispatchType::try_from(raw).unwrap_or(DispatchType::Serial),
@@ -1590,9 +1590,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     &format!("dispatch type {raw:#x}, past 32 bits, which nothing measured"),
                 ),
             },
-        };
-        self.protected_creation("computeCommandEncoderWithDescriptor:");
-        let raw = encoding("computeCommandEncoderWithDescriptor:", Policy::Dies, || {
+        });
+        let sel = "computeCommandEncoderWithDescriptor:";
+        let raw = encoding(sel, Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            self.protected_creation(sel);
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
         })?;
@@ -2159,6 +2161,60 @@ mod tests {
         assert!(life.exit());
         h(&cb.raw);
         assert_eq!(rx.recv().unwrap().status, CommandBufferStatus::COMPLETED);
+    }
+
+    /// A thread of an isolated task that ended stops at a command buffer's send before anything
+    /// of it dies or takes effect: an event send of a nil event, an encoder's creation, and a
+    /// commit whose unit of compute encoders holds an open block of command predication, each
+    /// of which dies while the task runs, stop, and the command buffer stays uncommitted
+    #[test]
+    fn an_ended_tasks_sends_stop_before_they_die() {
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        let condition = crate::gpu::resource::tests::shared(16);
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let start = ComputeCmd::EncodeStartIf {
+            buffer: Some(&condition),
+            offset: 0,
+            comparison: 0,
+            reference_value: 0,
+        };
+        e.encode(OnFault::Return, start).unwrap();
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        let sends: [(&str, &dyn Fn()); 6] = [
+            ("encodeSignalEvent:value:", &|| {
+                let _ = cb.encode_signal(None, 1);
+            }),
+            ("encodeSignalEventScheduled:value:", &|| {
+                let _ = cb.encode_signal_when_scheduled(None, 1);
+            }),
+            ("encodeWaitForEvent:value:", &|| {
+                let _ = cb.encode_wait(None, 1);
+            }),
+            ("blitCommandEncoder", &|| {
+                let _ = cb.blit_encoder(OnFault::Return);
+            }),
+            ("renderCommandEncoderWithDescriptor:", &|| {
+                use reims_vgpu_core::platform::Platform as _;
+                let pass = crate::platform::tests::platform().render_pass_descriptor();
+                let _ = cb.render_encoder(OnFault::Return, &pass);
+            }),
+            ("commit", &|| {
+                let _ = cb.commit(OnFault::Return);
+            }),
+        ];
+        for (sel, send) in sends {
+            let site = catch_death(send).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+            let life = TaskLife::new();
+            let stopped = life.run(|| {
+                life.exit();
+                send();
+            });
+            assert!(stopped.is_none(), "{sel}");
+        }
+        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
     }
 
     /// A thread of an isolated task that ended stops at commit before the runtime's commit, and
