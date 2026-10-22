@@ -1,5 +1,6 @@
 //! The tests of `fill` that compare with Metal on this host: macOS only.
 
+use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -7,6 +8,8 @@ use reims_vgpu_core::platform::resource::Buffer;
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::MetalPlatform;
+
+use crate::platform::VulkanPlatform;
 
 use super::*;
 
