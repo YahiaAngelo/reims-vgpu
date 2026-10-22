@@ -846,7 +846,8 @@ pub struct PipelineDescriptorObject<D> {
     pub desc: Mutex<D>,
     /// The resource index and its force flag, when set.
     pub resource_index: Mutex<Option<(u64, bool)>>,
-    /// The entries of keys the format does not define, as the blob had them: Metal ignores them.
+    /// The entries of keys the format does not define, as the blob had them, the first
+    /// [`crate::gpu::serialized::KEPT_IGNORED`] alone: Metal ignores them.
     pub ignored: Vec<Ignored>,
     /// Whether the blob's `textureWriteRoundingMode` is `NEAREST_EVEN` (render blobs alone),
     /// which a state made from it is decided for ([`crate::gpu::serialized`]).
