@@ -742,7 +742,7 @@ impl Clone for Source {
 
 impl Source {
     /// Whether the GPU's writes to its texels never reach their memory
-    /// ([`crate::gpu::resource::TextureObject::gpu_read_only`]).
+    /// ([`crate::gpu::resource::TextureObject::gpu_read_only()`]).
     pub fn gpu_read_only(&self) -> bool {
         self.0.as_ref().is_some_and(|t| t.gpu_read_only())
     }

@@ -470,6 +470,7 @@ impl VulkanDevice {
         private_usage: u64,
         space: Arc<metal_space::Hold>,
     ) -> VulkanTexture {
+        let gpu_read_only = crate::gpu::resource::writes_never_reach(surface.as_deref(), None);
         Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
@@ -478,6 +479,7 @@ impl VulkanDevice {
             under: None,
             private_usage,
             space,
+            gpu_read_only,
         })
     }
 
@@ -496,6 +498,7 @@ impl VulkanDevice {
             Under::Heap(..) => metal_space::TextureKind::InHeap,
         };
         let space = Arc::new(metal_space::texture(kind));
+        let gpu_read_only = crate::gpu::resource::writes_never_reach(None, Some(&under));
         Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
@@ -504,6 +507,7 @@ impl VulkanDevice {
             under: Some(under),
             private_usage,
             space,
+            gpu_read_only,
         })
     }
 
@@ -518,6 +522,7 @@ impl VulkanDevice {
     ) -> VulkanBuffer {
         let id = raw.object_id();
         let on_guest_pages = surface.as_deref().is_some_and(crate::os::over_guest_pages);
+        let gpu_read_only = surface.as_deref().is_some_and(crate::os::gpu_read_only);
         Obj::new(BufferObject {
             raw,
             device: self.clone_ref(),
@@ -526,6 +531,7 @@ impl VulkanDevice {
             heap: None,
             kept_whole: std::sync::atomic::AtomicU64::new(0),
             over_guest_pages: over_guest_pages || on_guest_pages,
+            gpu_read_only,
         })
     }
 
@@ -540,6 +546,7 @@ impl VulkanDevice {
             heap: Some(heap.clone_ref()),
             kept_whole: std::sync::atomic::AtomicU64::new(0),
             over_guest_pages: false,
+            gpu_read_only: false,
         })
     }
 
@@ -1397,6 +1404,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             return Ok(None);
         };
         let over_guest_pages = crate::os::over_guest_pages(&surface);
+        let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(&surface), None);
         let texture = Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
@@ -1405,6 +1413,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             plane: Some(plane),
             under: None,
             private_usage: usage,
+            gpu_read_only,
         });
         // A texture on a surface over the guest's pages meets a texture a heap over them keeps
         // apart through them.
@@ -1593,6 +1602,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     heap: None,
                     kept_whole: std::sync::atomic::AtomicU64::new(0),
                     over_guest_pages,
+                    gpu_read_only: false,
                 })
             })
         })

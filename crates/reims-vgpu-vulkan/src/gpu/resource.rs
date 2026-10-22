@@ -66,6 +66,16 @@ pub struct BufferObject {
     /// no-copy buffer core makes over a task's pages ([`crate::remap::shows_guest_pages`]). Read
     /// once, as it is made: a surface's pages, and a mapping's, stay while the buffer lives.
     pub over_guest_pages: bool,
+    /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
+    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`). Read once, as it is made, as
+    /// commands ask it at every dispatch and pass: the buffer holds the surface, and a live
+    /// surface's record, which decides it, stays as it was made. It is made before the surface is
+    /// handed out, a lookup of the surface reads the same record, and only a surface made with the
+    /// ID of one gone, or the dropping of the records of surfaces gone, changes or drops one
+    /// (`records_of_live_surfaces_outlast_the_pruning`,
+    /// `a_surface_taking_the_id_of_one_gone_takes_none_of_its_record`,
+    /// `a_lookup_of_a_surface_answers_its_record`).
+    pub gpu_read_only: bool,
 }
 
 /// `id<MTLBuffer>`.
@@ -121,7 +131,7 @@ pub struct TextureObject {
     /// it lives ([`Under`]).
     pub under: Option<Under>,
     /// The usage bits it answers beyond the runtime texture's: for one whose GPU writes never
-    /// reach its memory ([`TextureObject::gpu_read_only`]), the whole usage it answers
+    /// reach its memory ([`TextureObject::gpu_read_only()`]), the whole usage it answers
     /// ([`read_only_usage`]); its texture's for a view and for one opened from a shared handle;
     /// 0 for any other. Apple's private bits Metal answers (0x4000, 0x8000 and 0x10000) are the
     /// runtime's, which keeps them for a texture, its views and a texture opened from its
@@ -134,6 +144,21 @@ pub struct TextureObject {
     /// texture, or of the buffer it is over, holds it too, until the runtime frees that
     /// ([`crate::gpu::metal_space::Hold`]).
     pub space: Arc<Hold>,
+    /// Whether the GPU's writes to its texels never reach their memory
+    /// ([`TextureObject::gpu_read_only()`]), read once, as it is made ([`writes_never_reach`]),
+    /// as a buffer's is: the texture holds its surface, or the buffer it is over, for its life.
+    pub gpu_read_only: bool,
+}
+
+/// Whether the GPU's writes to the texels of a texture on `surface`, or over `under`, never
+/// reach their memory: it lies on a surface of [`crate::os::gpu_read_only`], made on it, or over
+/// a buffer made on it ([`BufferObject::gpu_read_only()`]). A view's is its texture's.
+pub(crate) fn writes_never_reach(surface: Option<&OsSurface>, under: Option<&Under>) -> bool {
+    match (surface, under) {
+        (Some(s), _) => crate::os::gpu_read_only(s),
+        (None, Some(Under::Buffer(b, _))) => b.gpu_read_only,
+        _ => false,
+    }
 }
 
 /// `id<MTLTexture>`.
@@ -191,11 +216,10 @@ fn texel_bytes(
 
 impl BufferObject {
     /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
-    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`).
+    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`), as it was made (the field of
+    /// the same name).
     pub(crate) fn gpu_read_only(&self) -> bool {
-        self.surface
-            .as_deref()
-            .is_some_and(crate::os::gpu_read_only)
+        self.gpu_read_only
     }
 }
 
@@ -222,13 +246,13 @@ const UNKNOWN_USAGE: TextureUsage = TextureUsage::SHADER_READ
     .union(RENDER_TARGET)
     .union(TextureUsage::PIXEL_FORMAT_VIEW);
 
-/// `desc`, of a texture whose GPU writes never reach its memory ([`TextureObject::gpu_read_only`]),
-/// made without `RenderTarget` usage, and the whole usage the texture answers
-/// ([`TextureObject::private_usage`]): its descriptor's, as Metal answers it, Apple's private
-/// bits among them, which the runtime's usage holds. The runtime keeps a texture of
-/// `RenderTarget` usage over a buffer's bytes in an image of its own, copying it back into the
-/// bytes after each encoder that writes it, a copy the GPU faults on into such memory, where
-/// Metal writes nothing of its own; no pass takes such a texture as an attachment
+/// `desc`, of a texture whose GPU writes never reach its memory
+/// ([`TextureObject::gpu_read_only()`]), made without `RenderTarget` usage, and the whole usage
+/// the texture answers ([`TextureObject::private_usage`]): its descriptor's, as Metal answers
+/// it, Apple's private bits among them, which the runtime's usage holds. The runtime keeps a
+/// texture of `RenderTarget` usage over a buffer's bytes in an image of its own, copying it back
+/// into the bytes after each encoder that writes it, a copy the GPU faults on into such memory,
+/// where Metal writes nothing of its own; no pass takes such a texture as an attachment
 /// ([`crate::os::dropped_write`]). The usage answered is the descriptor's, [`UNKNOWN_USAGE`] for
 /// `Unknown`, and of a swizzled texture only its `ShaderRead` and `PixelFormatView`, as the
 /// runtime's texture answers (its `effective_usage` and `texture_usage`, measured). The texture
@@ -274,13 +298,9 @@ impl TextureObject {
 
     /// Whether the GPU's writes to its texels never reach their memory: it lies on a surface of
     /// [`crate::os::gpu_read_only`], made on it, a view of one made on it, or over a buffer made
-    /// on it.
+    /// on it ([`writes_never_reach`]), as it was made (the field of the same name).
     pub(crate) fn gpu_read_only(&self) -> bool {
-        match (&self.surface, &self.under) {
-            (Some(s), _) => crate::os::gpu_read_only(s),
-            (None, Some(Under::Buffer(b, _))) => b.gpu_read_only(),
-            _ => false,
-        }
+        self.gpu_read_only
     }
 
     /// Whether the runtime refuses the GPU's writes of its texels: one over a surface of a 4:4:4
@@ -306,7 +326,7 @@ impl TextureObject {
     }
 
     /// `replaceRegion:` (`sel`) of `region` of `level` and `slice` from `bytes`, rows and images
-    /// `rows` apart, of one whose GPU writes never reach its memory ([`Self::gpu_read_only`]),
+    /// `rows` apart, of one whose GPU writes never reach its memory ([`Self::gpu_read_only()`]),
     /// whose runtime texture lies over a read-only alias the CPU cannot write: refused as the
     /// runtime refuses it, by its read of the same region (`getBytes:`, which takes the same
     /// checks), then written row by row into the guest's page of its surface, where its base
@@ -1528,6 +1548,7 @@ impl VulkanTexture {
                 false => self.private_usage,
             },
             space: Arc::new(Hold::sharing(Arc::clone(&self.space))),
+            gpu_read_only: self.gpu_read_only,
         })))
     }
 }
@@ -1769,7 +1790,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// The runtime reads `pixel_bytes` from a copy made first ([`host_bytes`]), as it takes only
     /// a slice. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
-    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only`]),
+    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
     /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
     /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]).
     fn replace_region(

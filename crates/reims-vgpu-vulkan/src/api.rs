@@ -47,6 +47,7 @@ mod tests {
             under: None,
             private_usage: 0,
             space: std::sync::Arc::new(crate::gpu::metal_space::Hold::NONE),
+            gpu_read_only: false,
         })
     }
 
