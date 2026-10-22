@@ -1732,6 +1732,19 @@ pub fn notice(message: &rt::DebugMessage) {
 pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
     reims_vgpu_core::sync::Mutex::new(Vec::new());
 
+/// The least severity the sink hears of the messages that are no degradation
+/// (`MessageSink::with_least_severity`): `Verbose` where the log takes this module's debug lines,
+/// which [`relay_to`] writes such a message to, else `Info`. The runtime then formats none of the
+/// `Verbose` lines of its own that would go nowhere: a host import freed, on a device that keeps
+/// MoltenVK's residency set, comes at every buffer's or texture's release over the guest's pages.
+/// Its degrade notices reach the sink whatever the severity.
+pub(crate) fn least_severity() -> rt::MessageSeverity {
+    match log::log_enabled!(log::Level::Debug) {
+        true => rt::MessageSeverity::Verbose,
+        false => rt::MessageSeverity::Info,
+    }
+}
+
 /// What the id names of the runtime's own messages start with: its degradations'
 /// (`metal2vulkan-degrade-`), its pipeline-creation log's (`metal2vulkan-pipeline-creation`) and
 /// its other diagnostics' (`metal2vulkan-late-reservation`, `metal2vulkan-host-import-freed`, the
@@ -1754,10 +1767,11 @@ fn relay(message: &rt::DebugMessage) {
 /// Writes `text`, a message of `severity` and id name `id_name` the runtime gave the sink, on `w`
 /// as the runtime writes it on stderr without a sink, one line, unchanged, where it is one of the
 /// runtime's own ([`RUNTIME_MESSAGES`]). One of its own of severity `Verbose`, which the runtime
-/// gives a sink alone, goes to the log at debug instead, as the library's other diagnostics do:
-/// the runtime's line for each host import freed on a device that keeps MoltenVK's residency set
-/// (`metal2vulkan-host-import-freed`; this host's MoltenVK keeps it). A driver's or a layer's
-/// (`VK_EXT_debug_utils`), which the runtime reports to a sink alone, is dropped, as without one.
+/// gives a sink alone, and only one that hears it ([`least_severity`]), goes to the log at debug
+/// instead, as the library's other diagnostics do: the runtime's line for each host import freed
+/// on a device that keeps MoltenVK's residency set (`metal2vulkan-host-import-freed`; this host's
+/// MoltenVK keeps it). A driver's or a layer's (`VK_EXT_debug_utils`), which the runtime reports
+/// to a sink alone, is dropped, as without one.
 fn relay_to(w: &mut impl std::io::Write, severity: rt::MessageSeverity, id_name: &str, text: &str) {
     if !id_name.starts_with(RUNTIME_MESSAGES) {
         return;

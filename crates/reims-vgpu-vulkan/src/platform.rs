@@ -321,7 +321,8 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// names ([`exact_policy`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
-/// kinds announced at every occurrence ([`announced_each`]). One set,
+/// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
+/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set,
 /// so the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
@@ -358,7 +359,8 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         options.metal_level = crate::os::METAL_LEVEL;
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
-        options.messages = Some(rt::MessageSink::new(crate::answer::notice));
+        let sink = rt::MessageSink::new(crate::answer::notice);
+        options.messages = Some(sink.with_least_severity(crate::answer::least_severity()));
         options.announce_each =
             announced_each(crate::answer::strict_process() || crate::answer::census::on());
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
