@@ -1090,6 +1090,9 @@ pub struct RenderPipelineObject {
     /// The reflection of the descriptor it was made of, which tells which slots each stage
     /// writes ([`Reflection::slots`]); of none for a state made otherwise.
     pub reflection: Arc<Reflection>,
+    /// What it tells a render encoder that sets it, read at its first set
+    /// ([`crate::gpu::encode_render::StateFacts`]).
+    pub(crate) drawn: std::sync::OnceLock<crate::gpu::encode_render::StateFacts>,
 }
 
 impl Drop for ComputePipelineObject {
@@ -1201,6 +1204,7 @@ pub(crate) fn render_pipeline_of(
         unique_identifier,
         input_primitive_topology,
         reflection: Reflection::new(descriptor.map(Reflected::Render)),
+        drawn: std::sync::OnceLock::new(),
     })
 }
 

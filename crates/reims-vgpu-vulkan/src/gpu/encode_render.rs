@@ -229,7 +229,7 @@ use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Regions;
 use crate::gpu::resource::{
-    Named, RenderDescriptor, VulkanBuffer, VulkanRenderPipeline, VulkanTexture, reach,
+    Named, RenderDescriptor, VulkanBuffer, VulkanTexture, reach,
 };
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
@@ -441,11 +441,10 @@ impl RoundedTextures {
         }
     }
 
-    /// The pipeline state `state` set.
-    fn set(&mut self, state: &VulkanRenderPipeline) {
-        self.state = state
-            .rounds_texture_writes()
-            .then(|| Arc::clone(&state.reflection));
+    /// The pipeline state of `reflection` set, which rounds texture writes otherwise than the
+    /// runtime where `rounds` ([`StateFacts::rounds`]).
+    fn set(&mut self, reflection: &Arc<Reflection>, rounds: bool) {
+        self.state = rounds.then(|| Arc::clone(reflection));
     }
 
     /// What a draw, or an execution whose commands inherit the state set (`execution`), may
@@ -469,6 +468,62 @@ impl RoundedTextures {
                 .ok_or("a state of no fragment function's")
         });
         crate::gpu::serialized::rounded_texture_writes(fragment, &self.formats)
+    }
+}
+
+/// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
+/// the runtime's state and the guest's descriptor, neither of which changes, at the state's
+/// first `setRenderPipelineState:` ([`crate::gpu::resource::RenderPipelineObject::drawn`]): a
+/// set reads none of it again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StateFacts {
+    /// Whether its vertex function writes any memory, and its fragment and tile functions write
+    /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
+    /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
+    writes: [bool; 3],
+    /// Whether it rounds texture writes otherwise than the runtime
+    /// ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
+    rounds: bool,
+    /// [`Marks::flat`].
+    flat: bool,
+    /// [`Marks::barycentric`].
+    barycentric: bool,
+    /// [`Marks::routed`].
+    routed: bool,
+    /// [`Marks::points_sized`].
+    points_sized: bool,
+    /// Whether it can encode indirect commands (the runtime's `can_encode_indirect_commands`).
+    encodes: bool,
+    /// [`Marks::half_apart`].
+    half_apart: Option<(usize, PixelFormat)>,
+}
+
+impl StateFacts {
+    /// What `state` tells.
+    fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
+        let raw = &state.raw;
+        let rounds = state.rounds_texture_writes();
+        let apart = match state.reflection.descriptor() {
+            Some(Reflected::Render(RenderDescriptor::Render(d))) => {
+                half_apart(d, &plain(|| raw.fragment_color_outputs()))
+            }
+            _ => None,
+        };
+        plain(|| StateFacts {
+            writes: [
+                raw.vertex_writes_memory(),
+                raw.fragment_writes_textures(),
+                raw.tile_writes_textures(),
+            ],
+            rounds,
+            flat: raw.has_flat_fragment_inputs(),
+            barycentric: raw.reads_barycentric_coord(),
+            routed: raw.writes_render_target_array_index() || raw.writes_viewport_array_index(),
+            points_sized: raw.writes_point_size()
+                || state.input_primitive_topology == PrimitiveTopologyClass::Point,
+            encodes: raw.can_encode_indirect_commands(),
+            half_apart: apart,
+        })
     }
 }
 
@@ -1793,17 +1848,10 @@ impl Reach {
         }
     }
 
-    /// The pipeline state `state` set.
-    fn set(&mut self, state: &VulkanRenderPipeline) {
-        let raw = &state.raw;
-        let facts = plain(|| {
-            [
-                raw.vertex_writes_memory(),
-                raw.fragment_writes_textures(),
-                raw.tile_writes_textures(),
-            ]
-        });
-        self.pipeline = Some((Arc::clone(&state.reflection), facts));
+    /// The pipeline state of `reflection` set, whose functions write as `writes` says
+    /// ([`StateFacts::writes`]).
+    fn set(&mut self, reflection: &Arc<Reflection>, writes: [bool; 3]) {
+        self.pipeline = Some((Arc::clone(reflection), writes));
     }
 
     /// Whether a texture bound or made resident for writing, or a buffer bound to the tile
@@ -3612,36 +3660,22 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 }
                 Some(state) => {
                     self.run(sel, &mut |e| e.set_render_pipeline_state(&state.raw))?;
-                    plain(|| *self.nil_pipeline.lock() = false);
-                    plain(|| self.reach.lock().set(state));
-                    plain(|| self.rounded.lock().set(state));
+                    let f = *state.drawn.get_or_init(|| StateFacts::of(state));
                     self.encoder
                         .pipeline
                         .store(state.unique_identifier(), Ordering::Relaxed);
-                    let flat = plain(|| state.raw.has_flat_fragment_inputs());
-                    let barycentric = plain(|| state.raw.reads_barycentric_coord());
-                    let routed = plain(|| {
-                        state.raw.writes_render_target_array_index()
-                            || state.raw.writes_viewport_array_index()
-                    });
-                    let points_sized = plain(|| state.raw.writes_point_size())
-                        || state.input_primitive_topology == PrimitiveTopologyClass::Point;
-                    let encodes = plain(|| state.raw.can_encode_indirect_commands());
-                    self.encodes_icbs.store(encodes, Ordering::SeqCst);
-                    let apart = match state.reflection.descriptor() {
-                        Some(Reflected::Render(RenderDescriptor::Render(d))) => {
-                            half_apart(d, &plain(|| state.raw.fragment_color_outputs()))
-                        }
-                        _ => None,
-                    };
+                    self.encodes_icbs.store(f.encodes, Ordering::SeqCst);
                     plain(|| {
+                        *self.nil_pipeline.lock() = false;
+                        self.reach.lock().set(&state.reflection, f.writes);
+                        self.rounded.lock().set(&state.reflection, f.rounds);
                         let mut m = self.marks.lock();
-                        m.flat = flat;
-                        m.barycentric = barycentric;
-                        m.routed = routed;
+                        m.flat = f.flat;
+                        m.barycentric = f.barycentric;
+                        m.routed = f.routed;
                         m.pipeline = true;
-                        m.points_sized = points_sized;
-                        m.half_apart = apart;
+                        m.points_sized = f.points_sized;
+                        m.half_apart = f.half_apart;
                     });
                     Ok(())
                 }
