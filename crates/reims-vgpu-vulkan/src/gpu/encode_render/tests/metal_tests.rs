@@ -9026,9 +9026,11 @@ fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: 
 /// after it, the signal firing; of fewer, or of no instance, it fails nothing. Over indices, of
 /// any count or instances, it faults the GPU (`MTLCommandBufferErrorPageFault`, code 3), and from
 /// indirect arguments, over indices or not, fails the command buffer as a victim of the GPU's
-/// recovery (`MTLCommandBufferErrorInternal`, code 1), each as a hang fails it, but where the GPU
-/// was idle for some seconds before, where the blit after the pass runs (measured on the M3 Max,
-/// macOS 27.0.1, `type_9_draws_fail_as_metals`, which draws these after the hangs).
+/// recovery (`MTLCommandBufferErrorInternal`, code 1), each as a hang fails it: Metal's answer in
+/// a steady stream of work, which the runtime takes. There Metal's GPU races: in some runs the
+/// blit after the pass runs too ([`after_a_fault_runs`]), as where the GPU was idle for some
+/// seconds before (measured on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`, which
+/// draws these after the hangs).
 const METALS_TYPE_9: [(Nine, &str); 11] = [
     (
         Nine::Direct(0, 1),
@@ -9088,8 +9090,20 @@ fn type_9_draws_fail_their_command_buffers_as_metals() {
     }
 }
 
-/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`], and this platform's are Metal's, each
-/// of a new queue, twice over
+/// `line`, a line of [`METALS_TYPE_9`]'s of a draw over indices or from indirect arguments, as
+/// Metal's GPU answers it in the runs where it runs the blit after the faulted pass: the same
+/// but for that blit's buffer, filled. `None` for a direct draw's line, which has one answer.
+fn after_a_fault_runs(draw: Nine, line: &str) -> Option<String> {
+    match draw {
+        Nine::Direct(..) => None,
+        _ => Some(line.replace("after 0x0", "after 0x6b")),
+    }
+}
+
+/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`]'s, or after a fault or a victim the
+/// same with the blit after the pass run ([`after_a_fault_runs`]), the other answer of Metal's
+/// race, and this platform's are [`METALS_TYPE_9`]'s, each of a new queue, three times over. Each
+/// fault's and victim's draw has Metal's answer of [`METALS_TYPE_9`] in some run
 #[test]
 #[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
 fn type_9_draws_fail_as_metals() {
@@ -9098,13 +9112,20 @@ fn type_9_draws_fail_as_metals() {
     };
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
-    for _ in 0..2 {
-        for (draw, metals) in METALS_TYPE_9 {
+    let mut steady = vec![0; METALS_TYPE_9.len()];
+    for _ in 0..3 {
+        for (at, (draw, metals)) in METALS_TYPE_9.into_iter().enumerate() {
             let theirs = type_9_pass(&mp, &md, draw);
-            assert_eq!(theirs, metals, "{draw:?}");
-            assert_eq!(type_9_pass(&p, &d, draw), theirs, "{draw:?}");
+            let raced = after_a_fault_runs(draw, metals);
+            assert!(
+                theirs == metals || Some(&theirs) == raced.as_ref(),
+                "{draw:?}: {theirs}"
+            );
+            steady[at] += usize::from(theirs == metals);
+            assert_eq!(type_9_pass(&p, &d, draw), metals, "{draw:?}");
         }
     }
+    assert!(steady.iter().all(|&n| n > 0), "{steady:?}");
 }
 
 /// What a new queue of `p`'s device `d` shows once `draws`, command buffers of
