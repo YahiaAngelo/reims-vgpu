@@ -18,8 +18,10 @@
 //!   mapping's teardown, core's detach temporaries among them (`deallocate`, before the call:
 //!   one Mach refuses reports pages that did not change, which only has a later buffer over
 //!   them import them anew), and fresh ranges, which may lie where others were freed
-//!   (`allocate_anywhere`). Each reports the pages the call changes, from the page of its first
-//!   byte to the page past its last. `protect_max` changes no pages.
+//!   (`allocate_anywhere`). Each reports the pages the call changes, as Mach takes them
+//!   ([`length_pages`], [`pages`]): a fixed overwrite's and a remap's length rounded up to whole
+//!   pages from the page of the address, a deallocate's every page its bytes touch; a call of no
+//!   bytes changes none. `protect_max` changes no pages.
 //! - **The host's task and memory blocks** in a device without a memory map ([`reporting`],
 //!   `Platform::host_blocks`), where the host does the mapping work: `createTask` reports its
 //!   task's whole range, as the host may hand back addresses it freed before; `mapMemory` the
@@ -141,17 +143,31 @@ use holds::Holds;
 /// What a report tells: the pages under the given host bytes were replaced.
 pub(crate) type Report = Arc<dyn Fn(HostPtr, u64) + Send + Sync>;
 
-/// The pages a Mach VM call over `len` bytes at `addr` changes: from the page of `addr` to the
-/// page past its last byte, as the kernel takes the range.
+/// The pages `len` bytes at `addr` touch, as Mach's `deallocate` takes them: from the page of
+/// `addr` to the page past its last byte; none for no bytes.
 fn pages(addr: HostAddr, len: u64, page: u64) -> (HostPtr, u64) {
     let mask = page.wrapping_sub(1);
     let start = addr.addr().to_u64();
     let first = start & !mask;
-    let end = start.saturating_add(len).saturating_add(mask) & !mask;
+    let end = match len {
+        0 => first,
+        _ => start.saturating_add(len).saturating_add(mask) & !mask,
+    };
     (
         HostPtr::from_addr(first.to_usize()),
         end.saturating_sub(first),
     )
+}
+
+/// The pages Mach's fixed overwrite and remap of `len` bytes at `addr` change: `len` rounded up
+/// to whole pages from the page of `addr`, though the bytes run into the page after (measured on
+/// the M3 Max, macOS 27.0.1: `crate::os`'s `the_vm_spans_its_calls_as_mach_does`); none for no
+/// bytes.
+fn length_pages(addr: HostAddr, len: u64, page: u64) -> (HostPtr, u64) {
+    let mask = page.wrapping_sub(1);
+    let first = addr.addr().to_u64() & !mask;
+    let length = len.saturating_add(mask) & !mask;
+    (HostPtr::from_addr(first.to_usize()), length)
 }
 
 /// Core's mappings of the guest's pages (module docs): each run of a mapping's host bytes, keyed
@@ -350,16 +366,18 @@ impl VulkanVm {
         }
     }
 
-    /// Reports the pages a call over `len` bytes at `addr` changed, which show none of the
-    /// guest's pages from now on unless a remap says so after ([`GuestMappings`]): their range.
-    fn changed(&self, addr: HostAddr, len: u64) -> Range<u64> {
-        let (at, length) = pages(addr, len, self.vm.page_size());
+    /// Reports `length` pages at `at`, which a call changed, and which show none of the guest's
+    /// pages from now on unless a remap says so after ([`GuestMappings`]): their range. None
+    /// reports nothing.
+    fn changed(&self, (at, length): (HostPtr, u64)) -> Range<u64> {
         let first = at.addr().to_u64();
-        GUEST_MAPPINGS
-            .lock()
-            .unmapped(first, first.saturating_add(length));
+        let changed = first..first.saturating_add(length);
+        if changed.is_empty() {
+            return changed;
+        }
+        GUEST_MAPPINGS.lock().unmapped(changed.start, changed.end);
         (self.report)(at, length);
-        first..first.saturating_add(length)
+        changed
     }
 }
 
@@ -380,7 +398,7 @@ impl HostVm for VulkanVm {
 
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn> {
         let at = self.vm.allocate_anywhere(len)?;
-        self.changed(at, len);
+        self.changed(pages(at, len, self.page_size()));
         Ok(at)
     }
 
@@ -388,13 +406,13 @@ impl HostVm for VulkanVm {
     /// macOS, a file's on Linux, whose anonymous memory no view can be made of.
     fn allocate_aliasable(&self, len: u64) -> Result<HostAddr, KernReturn> {
         let at = crate::os::allocate_aliasable(len)?;
-        self.changed(at, len);
+        self.changed(pages(at, len, self.page_size()));
         Ok(at)
     }
 
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
         self.vm.allocate_fixed_overwrite(addr, len)?;
-        let pages = self.changed(addr, len);
+        let pages = self.changed(length_pages(addr, len, self.page_size()));
         HOLDS.lock().replaced(&pages);
         Ok(())
     }
@@ -406,19 +424,14 @@ impl HostVm for VulkanVm {
         len: u64,
     ) -> Result<HostAddr, KernReturn> {
         let at = self.vm.remap_shared_overwrite(dst, src, len)?;
-        // The kernel maps the source's pages, from the page of its first byte: as many bytes
-        // past `dst` as the source's offset in its page, and `len` more.
-        let mask = self.vm.page_size().wrapping_sub(1);
-        let offset = src.addr().to_u64() & mask;
-        let replaced = self.changed(dst, len.saturating_add(offset));
+        // The kernel maps as many of the source's pages, from the page of its first byte.
+        let replaced = self.changed(length_pages(dst, len, self.page_size()));
         HOLDS.lock().replaced(&replaced);
         // Those pages are one of core's mappings of the guest's (module docs).
-        let (first, length) = pages(dst, len.saturating_add(offset), self.vm.page_size());
-        let first = first.addr().to_u64();
-        let source = src.addr().to_u64() & !mask;
+        let (source, _) = length_pages(src, len, self.page_size());
         GUEST_MAPPINGS
             .lock()
-            .mapped(first, first.saturating_add(length), source);
+            .mapped(replaced.start, replaced.end, source.addr().to_u64());
         Ok(at)
     }
 
@@ -428,7 +441,7 @@ impl HostVm for VulkanVm {
 
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
         // At the unmap (module docs).
-        let pages = self.changed(addr, len);
+        let pages = self.changed(pages(addr, len, self.page_size()));
         // Pages a runtime import holds are unmapped once its hold goes (module docs).
         if HOLDS.lock().unmap(pages) {
             return KernReturn::SUCCESS;
@@ -546,10 +559,14 @@ mod tests {
         SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
 
-    /// Each Mach VM call that changes pages reports them, from the page of its first byte to
-    /// the page past its last: one that maps after it, `deallocate` at the unmap, its pages still
-    /// mapped; `protect_max` and a refused remap report nothing
+    /// Each Mach VM call that changes pages reports them as Mach takes them: a fixed overwrite's
+    /// and a remap's length in whole pages from the page of the address, though the bytes run
+    /// into the next, the remap's mapping of as many of the source's pages from the page of its
+    /// first byte; a fresh range's and a deallocate's every page the bytes touch. One that maps
+    /// reports after it, `deallocate` at the unmap, its pages still mapped; `protect_max`, a
+    /// refused remap and a call of no bytes off a page's start report nothing
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
     fn the_vm_reports_the_pages_its_calls_change() {
         let vm = VulkanVm {
             vm: OsVm::new(),
@@ -561,13 +578,26 @@ mod tests {
         vm.allocate_fixed_overwrite(at.wrapping_add(page + 0x80), 0x100)
             .unwrap();
         assert_eq!(take(), [(at.wrapping_add(page), page, true)]);
+        vm.allocate_fixed_overwrite(at.wrapping_add(page - 0x80), 0x100)
+            .unwrap();
+        assert_eq!(take(), [(at, page, true)]);
         let src = crate::os::allocate_aliasable(2 * page).unwrap();
         vm.remap_shared_overwrite(at, src.wrapping_add(0x200), page)
             .unwrap();
-        assert_eq!(take(), [(at, 2 * page, true)]);
+        assert_eq!(take(), [(at, page, true)]);
+        let (first, mapped) = (src.addr().to_u64(), at.addr().to_u64());
+        assert_eq!(
+            guest_mappings_of(first..first + 2 * page),
+            [mapped..mapped + page]
+        );
         vm.protect_max(at, page, VmProt::READ | VmProt::WRITE)
             .unwrap();
         assert_eq!(take(), []);
+        vm.allocate_fixed_overwrite(at.wrapping_add(0x80), 0)
+            .unwrap();
+        assert!(vm.deallocate(at.wrapping_add(0x80), 0).is_success());
+        assert_eq!(take(), []);
+        assert!(crate::os::mapped(at));
         assert!(vm.deallocate(at, 2 * page).is_success());
         assert_eq!(take(), [(at, 2 * page, true)]);
         assert!(!crate::os::mapped(at));
