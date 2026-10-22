@@ -70,9 +70,8 @@
 //!   arguments' roles alone, so an argument whose reflection Metal's answer has not been measured
 //!   for decides nothing; where it refuses to decide (the decode's or the
 //!   specialization's own refusal), the runtime refuses the state, unproven, and the creator dies
-//!   there, naming the refusal. Once the runtime made such a state, the creator asks the compile
-//!   layer as the runtime did, and dies naming a refusal there too
-//!   ([`direct_arguments_decided`], [`kernel_direct_arguments_decided`]). The runtime
+//!   there, naming the refusal. The runtime decides it once, as it makes the state: a state it
+//!   made is one whose use it decided, and nothing here decodes its functions again. The runtime
 //!   refuses a render state with rasterization off whose vertex function returns a value with
 //!   Metal's error too (`UnrasterizedVertexReturn`, code 3). With rasterization off the descriptor
 //!   keeps the fragment function, which the runtime checks as Metal links it and leaves out of the
@@ -497,9 +496,9 @@ fn pipeline_options(
 /// A pipeline creator's answer to core: the state, of the descriptor's input primitive topology
 /// `class`, the `NSError` ([`pipeline_error`]), or a death at the selector for the rest: an ID past
 /// Metal's limit, a gap of the runtime (an unspecialized function constant among them, which
-/// Metal aborts for), and its other refusals, as Metal raises at none. A state the runtime made
-/// that supports indirect command buffers dies where whether Metal refuses it is not decided
-/// ([`direct_arguments_decided`]).
+/// Metal aborts for), an answer it cannot prove ([`unproven`]: a state that supports indirect
+/// command buffers whose functions' use of a direct texture or sampler argument the compile layer
+/// refused to decide among them), and its other refusals, as Metal raises at none.
 fn made(
     sel: &'static str,
     (class, descriptor): (PrimitiveTopologyClass, RenderDescriptor),
@@ -509,11 +508,6 @@ fn made(
         Ok(state) => {
             let indirect = matches!(&descriptor,
                 RenderDescriptor::Render(d) if d.support_indirect_command_buffers);
-            if let RenderDescriptor::Render(d) = &descriptor
-                && indirect
-            {
-                direct_arguments_decided(sel, d);
-            }
             let made = render_pipeline_of(state, class, Some(descriptor));
             if indirect {
                 plain(|| {
@@ -533,80 +527,6 @@ fn made(
                 _ => decide_describing(sel, Policy::Dies, e, Some(&formats(&descriptor))),
             },
         },
-    }
-}
-
-/// Dies at `sel`, the creation of a render state of `d`, which supports indirect command buffers
-/// and the runtime made, where the compile layer refuses to say whether its functions use a
-/// direct texture or sampler argument once linked (`stages_using_direct_arguments`, under the
-/// standard budget, as the runtime asks it): it decides from the arguments' roles alone, and
-/// refuses where it cannot decode or specialize a function, among others. Metal answers nil and
-/// an `NSError` for a state whose functions use one (the module docs). The stages are asked with
-/// the dynamic libraries their imports reach loaded, as the runtime asks them
-/// ([`with_dependencies`]).
-fn direct_arguments_decided(sel: &'static str, d: &RenderPipelineDescriptor) {
-    let mut loaded = d.clone();
-    loaded.vertex = with_dependencies(&d.vertex);
-    loaded.fragment = d.fragment.as_ref().map(with_dependencies);
-    let entries = metal2vulkan::pipeline::StageEntries::new();
-    let budget = metal2vulkan::Budget::standard();
-    if let Err(e) = plain_at(sel, || {
-        loaded.stages_using_direct_arguments(&budget, &entries)
-    }) {
-        undecided_direct_arguments(sel, &e, &render_formats(d));
-    }
-}
-
-/// Dies at `sel`, the creation of a compute state of `d`, which supports indirect command buffers
-/// and the runtime made, where the compile layer refuses to say whether the kernel uses a direct
-/// texture or sampler argument (`uses_direct_arguments`, as the runtime asks it), as
-/// [`direct_arguments_decided`] dies for a render state's functions.
-pub(crate) fn kernel_direct_arguments_decided(sel: &'static str, d: &ComputePipelineDescriptor) {
-    let mut loaded = d.clone();
-    loaded.kernel = with_dependencies(&d.kernel);
-    let budget = metal2vulkan::Budget::standard();
-    if let Err(e) = plain_at(sel, || loaded.uses_direct_arguments(&budget)) {
-        undecided_direct_arguments(sel, &e, &compute_formats(d));
-    }
-}
-
-/// The death at `sel` of a state that supports indirect command buffers whose functions' use of
-/// a direct texture or sampler argument the compile layer refused to decide, with `e`; `formats`
-/// are the descriptor's.
-fn undecided_direct_arguments(
-    sel: &'static str,
-    e: &metal2vulkan::error::Error,
-    formats: &str,
-) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "whether a state that supports indirect command buffers has a function that uses a \
-             direct texture or sampler argument, for which Metal answers nil and an NSError: the \
-             compile layer refused to decide it ({e}), and the runtime made the state without \
-             deciding; {formats}"
-        ),
-    )
-}
-
-/// `stage` with the dynamic libraries its imports reach loaded from the files their install
-/// names name, as the runtime loads them as it makes a pipeline state (its
-/// `stage_with_dependencies`): a name that is no absolute path, or a file that holds no dynamic
-/// library, loads nothing.
-fn with_dependencies(stage: &StageSource) -> StageSource {
-    match stage {
-        StageSource::Function(function) => {
-            StageSource::Function(function.clone().with_loaded_dependencies(|name| {
-                let path = std::path::Path::new(name);
-                if !path.is_absolute() {
-                    return None;
-                }
-                let bytes = std::fs::read(path).ok()?;
-                let library = metal2vulkan::library::Library::from_metallib(&bytes).ok()?;
-                metal2vulkan::library::DynamicLibrary::loaded(library).ok()
-            }))
-        }
-        StageSource::Compiled(_) => stage.clone(),
     }
 }
 

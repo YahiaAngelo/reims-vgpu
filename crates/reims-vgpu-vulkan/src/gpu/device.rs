@@ -951,9 +951,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// refusals are decided as the function form's: the compile's of a function or descriptor it
     /// finds wrong are the `NSError`, and the rest die (an unspecialized function constant, as
     /// Metal aborts for one; a resource index of 16384 or more, which ends Metal's process). One
-    /// that supports indirect command buffers dies where the compile layer refuses its kernel's
-    /// reflection, which decides whether Metal refuses it
-    /// ([`super::states::kernel_direct_arguments_decided`]). Every state takes a new identifier
+    /// that supports indirect command buffers is refused by the runtime, with Metal's `NSError`,
+    /// where its kernel uses a direct texture or sampler argument, and as unproven, which dies,
+    /// where the compile layer refuses to decide that; the runtime decides it once, as it makes
+    /// the state ([`super::states`]' docs). Every state takes a new identifier
     /// ([`ComputePipelineObject::new`]).
     fn new_compute_pipeline_state(
         &self,
@@ -975,15 +976,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 self.raw
                     .new_compute_pipeline_state(&desc, &pipeline_options)
             }) {
-                Ok(state) => {
-                    if desc.support_indirect_command_buffers {
-                        super::states::kernel_direct_arguments_decided(sel, &desc);
-                    }
-                    Ok(Ok(Some(Obj::new(ComputePipelineObject::of(
-                        state,
-                        desc.clone(),
-                    )))))
-                }
+                Ok(state) => Ok(Ok(Some(Obj::new(ComputePipelineObject::of(
+                    state,
+                    desc.clone(),
+                ))))),
                 Err(e) => Ok(Err(compile_error(sel, e, Some(&desc)))),
             },
             || format!("kernel {}", timing::stage(&desc.kernel)),
