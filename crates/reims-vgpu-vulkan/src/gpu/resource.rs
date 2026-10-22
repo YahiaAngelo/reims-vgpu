@@ -220,11 +220,14 @@ const UNKNOWN_USAGE: TextureUsage = TextureUsage::SHADER_READ
 /// target. But a swizzle other than the default with `ShaderWrite` or `RenderTarget` usage keeps
 /// the descriptor's usage, which the runtime refuses as it refuses it over any memory: Metal's
 /// validation stops it (`SwizzleWithWrites`), and with `writeSwizzleEnabled` Metal writes
-/// through the swizzle, which the runtime does not build (`RuntimeGap::WriteSwizzle`).
+/// through the swizzle, which the runtime does not build (`RuntimeGap::WriteSwizzle`). Bit 0x8
+/// is answered by no texture (`TextureUsage::DROPPED`): one of it alone answers 0, as Metal's
+/// does, and is made of `ShaderRead`, as Metal reads it as one of that usage (the module docs of
+/// [`crate::gpu::desc`]).
 pub(crate) fn read_only_usage(desc: &mut rt::TextureDescriptor) -> u64 {
     let mut usage = match desc.usage.is_empty() {
         true => UNKNOWN_USAGE,
-        false => desc.usage,
+        false => desc.usage.without_dropped(),
     };
     if !desc.swizzle.is_default() {
         let kept = TextureUsage::SHADER_READ.union(TextureUsage::PIXEL_FORMAT_VIEW);
@@ -1399,7 +1402,10 @@ impl VulkanTexture {
     /// this texture's usage, and where `swizzled`, of a swizzle other than the default, only its
     /// `ShaderRead`, `PixelFormatView` and Apple bits 0x4000 and 0x10000, as the runtime's view
     /// answers ([`SWIZZLE_DROPPED`]); a view of a texture whose GPU writes never reach its memory
-    /// holds all it answers in its [`TextureObject::private_usage`] ([`read_only_usage`]).
+    /// holds all it answers in its [`TextureObject::private_usage`] ([`read_only_usage`]). A
+    /// swizzled view of a texture that answers no usage (one of usage 0x8 alone) dies, as Metal
+    /// asserts there (`_usage != MTLTextureUsageUnknown`, measured on the M3 Max under macOS
+    /// 27.0.1), where a view in a format alone answers 0 as the texture does.
     fn view(
         &self,
         sel: &'static str,
@@ -1408,6 +1414,9 @@ impl VulkanTexture {
         call: impl FnOnce(&rt::Texture) -> Result<rt::Texture, rt::Error>,
     ) -> RaiseResult<Option<VulkanTexture>> {
         use rt::ViewProblem as P;
+        if swizzled && Texture::usage(self) == 0 {
+            metal_aborts(sel, "a swizzled view of a texture of no usage");
+        }
         let raw = match plain_at(sel, || call(&self.raw)) {
             Ok(raw) => raw,
             Err(rt::Error::Invalid(rt::Invalid {
@@ -1421,6 +1430,7 @@ impl VulkanTexture {
                     | P::SliceRange
                     | P::SliceCount
                     | P::BufferSlices
+                    | P::SwizzledViewOfNoUsage
             ) =>
             {
                 metal_aborts(sel, &format!("a view it does not make ({problem:?})"))

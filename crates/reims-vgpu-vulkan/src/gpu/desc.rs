@@ -71,10 +71,11 @@
 //! its draws reach every tile.
 //!
 //! **A usage** (`setUsage:`) is kept whole, as Metal's descriptor keeps every bit set: the bits the
-//! runtime has a flag for (`ShaderRead`, `ShaderWrite`, `RenderTarget`, `PixelFormatView`,
-//! `ShaderAtomic`, and Apple's private `NoConcurrentAccess`, `Video` and `BlockWritesOnly`, 0x4000,
-//! 0x8000 and 0x10000) in its descriptor, and the rest raw ([`TextureFields::private_usage`]: 0x8,
-//! which Metal drops, and bits Metal does not define), sent nowhere. Measured on Metal on this host
+//! runtime takes (`ShaderRead`, `ShaderWrite`, `RenderTarget`, `PixelFormatView`, `ShaderAtomic`,
+//! Apple's private `NoConcurrentAccess`, `Video` and `BlockWritesOnly`, 0x4000, 0x8000 and
+//! 0x10000, and 0x8, which Metal's texture drops) in its descriptor, and the rest raw
+//! ([`TextureFields::private_usage`]: bits Metal does not define), sent nowhere. Measured on Metal
+//! on this host
 //! (M3 Max, macOS 26.7, without API validation and, for a few, with it, one case per process):
 //! every bit from 0 to 63, alone and with `ShaderRead | RenderTarget`, of a 2D BGRA8Unorm texture;
 //! 0x10000 of 2D textures of 15 formats (R8Unorm to RGBA32Float, the depth and stencil ones, BC1
@@ -88,8 +89,15 @@
 //!   (`isCompressed`), which clears, renders, reads, samples and is written alike (BGRA8Unorm,
 //!   RGBA8Unorm, RGBA16Float and Depth32Float compared). The texture's `usage` answers 0x4000,
 //!   0x8000 and 0x10000 among its bits and drops 0x8, and so do its views and a texture opened from
-//!   its shared handle: the runtime's texture keeps the three, as its views and shared opens do,
-//!   and its descriptor never holds 0x8. A view of a swizzle other than the default keeps
+//!   its shared handle: the runtime's texture keeps the four, answering its usage without 0x8, as
+//!   its views and shared opens do. A texture of 0x8 alone is no texture of `Unknown` usage: it
+//!   answers a usage of 0 and the heap's size query a compressed one's size (16512 bytes for a
+//!   64x64 BGRA8Unorm one in Private storage, where `Unknown` answers 16384), as a texture of
+//!   `ShaderRead` alone does, which reads, samples and renders alike (measured on the M3 Max under
+//!   macOS 27.0.1, Shared and Private storage: a kernel's read and sample, a pass's clear and
+//!   draw); a format view of it answers 0, and a swizzled view of it Metal asserts at
+//!   (`_usage != MTLTextureUsageUnknown`), as the runtime refuses it (`SwizzledViewOfNoUsage`). A
+//!   view of a swizzle other than the default keeps
 //!   `ShaderRead` and `PixelFormatView` of the public bits, and 0x4000 and 0x10000 but not 0x8000
 //!   (a texture of 0x1c01d answers a view of 0x14011), as the runtime's view does;
 //! - every creator, and the heap's size query, aborts at any other bit Metal does not define
@@ -145,8 +153,8 @@ pub struct TextureFields {
     /// One of the two YCbCr formats measured first, raw, as `setPixelFormat:` took it
     /// ([`crate::gpu::ycbcr::FORMATS`]); `desc` then holds `MTLPixelFormatInvalid`.
     pub ycbcr_format: Option<u64>,
-    /// The usage bits `setUsage:` took that the runtime has no flag for, raw: 0x8, which Metal
-    /// drops, and bits Metal does not define (measured: the module's docs).
+    /// The usage bits `setUsage:` took that the runtime does not take, raw: bits Metal does not
+    /// define (measured: the module's docs).
     pub private_usage: u64,
     /// A format Metal makes no texture of, raw, as `setPixelFormat:` took it
     /// ([`crate::gpu::no_texture`]); `desc` then holds `MTLPixelFormatInvalid`.
@@ -168,17 +176,15 @@ pub struct TextureFields {
     pub protection_options: u64,
 }
 
-/// The usage bits Metal takes beyond the runtime's flags: 0x8, which it drops (measured: the
-/// module's docs).
-const TAKEN_USAGE: u64 = metal2vulkan::metal::TextureUsage::DROPPED as u64;
-
 /// `MTLTextureRotation0`, the rotation of a texture made without one.
 pub(crate) const DEFAULT_ROTATION: u64 = 0;
 
-/// What `setUsage:` of `raw` sets: the runtime's flags of the bits it has one for, and the other
+/// What `setUsage:` of `raw` sets: the runtime's usage of the bits it takes, its flags and 0x8,
+/// which Metal's descriptor takes and its texture drops (`TextureUsage::DROPPED`), and the other
 /// bits raw ([`TextureFields::private_usage`]).
 fn usage_set(raw: u64) -> (metal2vulkan::metal::TextureUsage, u64) {
-    let runtime = u64::from(metal2vulkan::metal::TextureUsage::ALL_KNOWN.as_raw());
+    use metal2vulkan::metal::TextureUsage;
+    let runtime = u64::from(TextureUsage::ALL_KNOWN.as_raw() | TextureUsage::DROPPED);
     (texture_usage("setUsage:", raw & runtime), raw & !runtime)
 }
 
@@ -379,7 +385,7 @@ impl TextureFields {
     /// The usage bits set that Metal does not define, at which its creators abort (measured: the
     /// module's docs).
     pub fn undefined_usage(&self) -> u64 {
-        self.private_usage & !TAKEN_USAGE
+        self.private_usage
     }
 
     /// The runtime's descriptor, for a texture `maker` makes for `sel`, holding

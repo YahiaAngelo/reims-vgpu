@@ -2313,3 +2313,92 @@ fn half_nan_writes_are_metals() {
     }
     assert!(differ.is_empty(), "{differ:#?}");
 }
+
+/// A texture of usage 0x8 alone, which Metal's texture answers no usage for and keeps as one of
+/// `ShaderRead` alone (the module docs of [`crate::gpu::desc`]): a `BGRA8Unorm` one, Shared and
+/// Private, holding random bytes, answers usage 0 as Metal's does, and so does a view of it in
+/// its sRGB format; its reads, samples through each sampler and gathers are Metal's, bit for bit,
+/// and so are a pass's clear of it and the heap's size query of a 64 by 64 one (16512 bytes,
+/// where a texture of `Unknown` usage answers 16384); a swizzled view of it dies, where Metal
+/// asserts (`_usage != MTLTextureUsageUnknown`, measured)
+#[test]
+fn a_texture_of_usage_0x8_alone_is_metals() {
+    /// The usage bit Metal's texture drops.
+    const DROPPED: u64 = 0x8;
+    /// `MTLPixelFormatBGRA8Unorm`, and its sRGB twin.
+    const BGRA: (u64, u64) = (80, 81);
+    let Some((mp, md)) = metal() else {
+        return;
+    };
+    let (vp, vd) = (platform(), dev());
+    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let (mut differ, mut nans) = (Vec::new(), 0);
+    for options in [SHARED, PRIVATE] {
+        let bytes = Rng(0x0008_d409 ^ options).bytes(TEXELS * 4);
+        let metals = theirs.texture(BGRA.0, DROPPED, options, &bytes);
+        let mine = ours.texture(BGRA.0, DROPPED, options, &bytes);
+        let of = format!("options {options:#x}");
+        let view = |t: &dyn Fn() -> u64| t();
+        assert_eq!(
+            (
+                mine.usage(),
+                view(&|| mine.new_texture_view(BGRA.1).unwrap().unwrap().usage())
+            ),
+            (0, 0),
+            "{of}"
+        );
+        assert_eq!(
+            (
+                metals.usage(),
+                view(&|| metals.new_texture_view(BGRA.1).unwrap().unwrap().usage())
+            ),
+            (0, 0),
+            "{of}: Metal's"
+        );
+        let (m, o) = (
+            theirs.direct_reads(Class::Float, &metals),
+            ours.direct_reads(Class::Float, &mine),
+        );
+        compare(&mut differ, &mut nans, &of, &m, &o);
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
+    assert_eq!(nans, 0);
+    let colour = [0.25, 0.5, 0.75, 1.0];
+    assert_eq!(
+        ours.read(&ours.cleared(BGRA.0, DROPPED, colour), 4),
+        theirs.read(&theirs.cleared(BGRA.0, DROPPED, colour), 4),
+        "a pass's clear"
+    );
+    let sized = TextureDesc {
+        pixel_format: BGRA.0,
+        width: 64,
+        height: 64,
+        usage: DROPPED,
+        resource_options: Some(PRIVATE),
+        ..TextureDesc::default()
+    };
+    let size = vd
+        .heap_texture_size_and_align(&vp.texture_descriptor(&sized))
+        .unwrap();
+    let metals = md
+        .heap_texture_size_and_align(&mp.texture_descriptor(&sized))
+        .unwrap();
+    assert_eq!((size, size.size), (metals, 16512));
+    let t = ours.texture_of(BGRA.0, DROPPED, PRIVATE, 1);
+    let one = NsRange::new(0, 1);
+    let swapped = Swizzle {
+        red: 4,
+        green: 3,
+        blue: 2,
+        alpha: 5,
+    };
+    let died = catch_death(|| t.new_swizzled_texture_subview(BGRA.0, 2, one, one, swapped));
+    let site = died.map(drop).unwrap_err();
+    assert_eq!(
+        (site.kind, site.file),
+        (
+            DeathKind::Abort,
+            "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:"
+        )
+    );
+}
