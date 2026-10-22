@@ -689,7 +689,10 @@ mod tests {
             gpu_end: cb.gpu_end_time().unwrap_or(0.0),
             handler: rt::host_time(),
         };
-        let mut runs: [(&str, Vec<(Times, Duration)>, [u64; 3]); 2] = [
+        /// A path's name, each command buffer's times and how long its commit held its thread,
+        /// and the runtime's counts below, summed.
+        type Run = (&'static str, Vec<(Times, Duration)>, [u64; 3]);
+        let mut runs: [Run; 2] = [
             ("platform", Vec::new(), [0; 3]),
             ("runtime", Vec::new(), [0; 3]),
         ];
