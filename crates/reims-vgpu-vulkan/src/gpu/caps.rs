@@ -376,7 +376,9 @@ fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option
     if count.is_none() {
         log::warn!(
             target: "reims_vgpu_vulkan::caps",
-            "gpuCoreCount (gpu-core-count-unknown): {name}: its driver reports no core count and              no Metal device stands for it, so the guest's device info carries none (key 34) and              its device answers 0"
+            "gpuCoreCount (gpu-core-count-unknown): {name}: its driver reports no core count and \
+             no Metal device stands for it, so the guest's device info carries none (key 34) and \
+             its device answers 0"
         );
     }
     count
