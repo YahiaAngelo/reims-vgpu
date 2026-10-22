@@ -189,7 +189,8 @@ pub struct Backing {
     alias: Mutex<Aliased>,
     /// Whether the runtime imports the memory the object lies in now through a writable twin of
     /// read-only pages ([`crate::os::import_view`]): the alias of its last replace, or of the
-    /// ranges a heap was made over, or the memory a no-copy buffer was made over.
+    /// ranges a heap was made over, or the memory a no-copy buffer was made over; counted while
+    /// it holds ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
     /// The guest's pages the object's memory is over, whether a detach left it in no memory since
     /// its last replace, and the commands' uses of those pages, as [`crate::gpu::over_pages`]
@@ -399,7 +400,7 @@ impl Backing {
     pub(crate) fn made_over(&self, ranges: &[ResourceAddressRange], alias: Option<Arc<Alias>>) {
         let kept = alias.as_ref().is_some_and(|alias| alias.writes_kept());
         self.alias.lock().last = alias;
-        self.kept.store(kept, Ordering::Release);
+        crate::gpu::writes::set_kept(&self.kept, kept);
         self.seen.set_pages(pages(ranges));
     }
 
@@ -412,7 +413,7 @@ impl Backing {
     /// imports through a writable twin of read-only pages where `kept`
     /// ([`crate::os::import_view`]).
     pub(crate) fn imported(&self, kept: bool) {
-        self.kept.store(kept, Ordering::Release);
+        crate::gpu::writes::set_kept(&self.kept, kept);
     }
 
     /// Whether the GPU's writes through the object reach read-only memory, where Metal's drop:
@@ -487,7 +488,7 @@ impl Backing {
         rebind(first, keep)?;
         let own = {
             let mut aliased = self.alias.lock();
-            self.kept.store(alias.writes_kept(), Ordering::Release);
+            crate::gpu::writes::set_kept(&self.kept, alias.writes_kept());
             aliased.last = Some(alias);
             self.seen.set_pages(pages(ranges));
             aliased.own.take()
@@ -520,6 +521,7 @@ impl Drop for Backing {
         if let Some(own) = own {
             own.held.release();
         }
+        crate::gpu::writes::set_kept(&self.kept, false);
     }
 }
 

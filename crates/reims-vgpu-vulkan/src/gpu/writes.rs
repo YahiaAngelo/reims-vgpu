@@ -25,6 +25,7 @@
 //! pages, as the runtime imports no read-only memory there.
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use metal2vulkan::metal::{BindingAccess, BindingType, PixelFormat};
 use metal2vulkan::pipeline::ComputePipelineDescriptor;
@@ -200,6 +201,56 @@ pub fn buffer_kept(b: &BufferObject) -> bool {
         (Some(s), _) => surface_kept(s),
         (None, Some(h)) => h.backing.writes_kept(),
         (None, None) => b.backing.writes_kept(),
+    }
+}
+
+/// How many objects [`texture_kept`] and [`buffer_kept`] may answer true through now: buffers
+/// and heaps whose memory the runtime imports through a writable twin of read-only pages
+/// ([`set_kept`]), and surfaces whose GPU writes never reach their memory where the runtime twins
+/// read-only memory (`Keeping`, on Linux). Each is counted before it answers true and uncounted
+/// once it no longer can, so none counted means they answer false for every object.
+static KEPT_NOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether [`texture_kept`] or [`buffer_kept`] may answer true for any object now. Where not, they
+/// answer false for every object, and a walk of what a command writes for an object over
+/// read-only pages ([`kept_write`]) finds none.
+pub(crate) fn any_kept() -> bool {
+    KEPT_NOW.load(Ordering::SeqCst) != 0
+}
+
+/// Sets `flag`, whether the runtime imports a buffer's or heap's memory through a writable twin of
+/// read-only pages ([`crate::gpu::backing::Backing::writes_kept`]), to `kept`, keeping the count
+/// ([`KEPT_NOW`]): counted before it becomes true, and uncounted once it becomes false.
+pub(crate) fn set_kept(flag: &AtomicBool, kept: bool) {
+    if kept {
+        KEPT_NOW.fetch_add(1, Ordering::SeqCst);
+        if flag.swap(true, Ordering::SeqCst) {
+            KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+        }
+    } else if flag.swap(false, Ordering::SeqCst) {
+        KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One surface counted in [`KEPT_NOW`] while this lives: one whose GPU writes never reach its
+/// memory ([`surface_kept`]), which every object made on it holds.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct Keeping(());
+
+#[cfg(target_os = "linux")]
+impl Keeping {
+    /// A count of one, from now on.
+    pub(crate) fn new() -> Keeping {
+        KEPT_NOW.fetch_add(1, Ordering::SeqCst);
+        Keeping(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Keeping {
+    fn drop(&mut self) {
+        KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -605,6 +656,33 @@ mod tests {
 
     use super::*;
     use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};
+
+    /// A buffer or heap whose memory the runtime imports through a writable twin of read-only
+    /// pages is counted once while it is, set so again or not, and uncounted as it goes, which
+    /// releases it; none counted, none is kept (in one process per test, as nextest runs them)
+    #[test]
+    fn kept_backings_are_counted_while_they_are_kept() {
+        use crate::gpu::backing::Backing;
+        let count = || KEPT_NOW.load(Ordering::SeqCst);
+        assert!(!any_kept());
+        let (a, b) = (Backing::fixed(), Backing::fixed());
+        a.imported(false);
+        assert_eq!(count(), 0);
+        a.imported(true);
+        a.imported(true);
+        assert_eq!(count(), 1);
+        assert!(any_kept());
+        b.imported(true);
+        assert_eq!(count(), 2);
+        a.imported(false);
+        a.imported(false);
+        assert_eq!(count(), 1);
+        drop(b);
+        assert!(!any_kept());
+        a.imported(true);
+        drop(a);
+        assert!(!any_kept());
+    }
 
     /// What a bind keeps of a buffer's or a texture's memory, read without collecting ranges, is
     /// what the memory collected answers: for a buffer of the device's memory, one placed in a

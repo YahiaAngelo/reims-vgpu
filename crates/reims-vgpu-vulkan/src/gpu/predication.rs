@@ -2002,9 +2002,10 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
     // A write through an object over memory the runtime imports through a writable twin of
-    // read-only pages dies, at every extent.
+    // read-only pages dies, at every extent; with no such object, none is looked for.
     if crate::os::TWINS_READ_ONLY
         && !empty
+        && crate::gpu::writes::any_kept()
         && let Some(whether) = u.kept_write_through(work.inherits())
     {
         drop(u);

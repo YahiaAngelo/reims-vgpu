@@ -116,6 +116,9 @@ struct Data {
     memory: Arc<Memory>,
     /// What it was made over ([`crate::os::surface_memory`] and the helpers beside it).
     made: Mutex<MadeOver>,
+    /// For a surface whose GPU writes never reach its memory, its count among the objects whose
+    /// GPU writes may reach read-only memory ([`crate::gpu::writes::any_kept`]).
+    _kept: Option<crate::gpu::writes::Keeping>,
 }
 
 /// The memory a surface mapped: its own, or its view of the guest's pages; none for one over a
@@ -485,6 +488,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 (own.first(), Some(own), None)
             }
         };
+        let kept = made.gpu_read_only.then(crate::gpu::writes::Keeping::new);
         Some(LinuxSurface::new(Data {
             pixel_format: spec.pixel_format,
             width: spec.width,
@@ -500,6 +504,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: view_made,
             }),
             made: Mutex::new(made),
+            _kept: kept,
         }))
     }
 
@@ -545,6 +550,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: None,
             }),
             made: Mutex::new(MadeOver::default()),
+            _kept: None,
         }))
     }
 
@@ -836,6 +842,33 @@ mod tests {
         let s = LinuxSurfaces::new().create(&spec).unwrap();
         assert_eq!(s.protection_options(), 7);
         assert!(s.base_address().is_null());
+    }
+
+    /// A surface whose GPU writes never reach its memory is counted among the objects whose GPU
+    /// writes may reach read-only memory while it or a lookup of it lives; one whose writes
+    /// reach its memory is not (in one process per test, as nextest runs them)
+    #[test]
+    fn read_only_surfaces_are_counted_while_they_live() {
+        use crate::gpu::writes::any_kept;
+        let page = page_size();
+        let (_, ranges) = guest_pages(2);
+        let surfaces = LinuxSurfaces::new();
+        let over = |direction| SurfaceSpec {
+            alloc_size: 2 * page,
+            client_direction: direction,
+            client_address_ranges: Some(ranges.clone()),
+            ..host_only()
+        };
+        let writable = surfaces.create(&over(None)).unwrap();
+        assert!(!any_kept());
+        let read_only = surfaces.create(&over(Some(READ_ONLY_DIRECTION))).unwrap();
+        assert!(any_kept());
+        let looked_up = read_only.lookup_by_port().unwrap();
+        drop(read_only);
+        assert!(any_kept());
+        drop(looked_up);
+        assert!(!any_kept());
+        drop(writable);
     }
 
     /// A surface over one range of the guest's pages is that range, at its offset; one over
