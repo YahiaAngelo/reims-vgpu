@@ -1766,17 +1766,9 @@ const BFLOAT_CLEARS: [[f64; 4]; 13] = [
 /// holding random codes, draws nothing and stores it, which keeps every code; and a colour fill
 /// in the format of each of [`BFLOAT_COLOURS`] (`fillTexture:level:slice:region:color:
 /// pixelFormat:`), which the runtime's colour fill packs ([`crate::gpu::fill::RUNTIME_PACKED`]).
-/// Each stores Metal's bytes, bit for bit. Of a Private 16 by
-/// 16 `RGBA16Float` texture, a pass's clear to each of [`FLOAT_CLEARS`] the runtime keeps, and
-/// its store, stores Metal's bytes, bit for bit: at 4 samples, with its resolve, the resolve's
-/// and each sample's ([`Gpu::multisample_cleared`]); at 1, the plain quiet NaN among them. One
-/// the runtime does not keep dies where the pass is made, naming the clear (`encode_render`'s
-/// `nan_clear`): at 4 samples, a clear to a NaN, which Metal's resolve keeps at this size, both
-/// sides 16 or more (`7e00`, or `fe00` where negative; below 16 a side it stores 0), and the
-/// runtime's multisampled clear drops (its samples hold no NaN, and their resolve reads 0
-/// there); at 1, a clear to a negative NaN, which the runtime is not measured to store as Metal
-/// does. So does a clear of a single-sample 16 by 16 `BGRA10_XR` texture to each of
-/// [`XR_NAN_CLEARS`], which the runtime is not measured to store as Metal does either
+/// Each stores Metal's bytes, bit for bit. Of a Private 16 by 16 `RGBA16Float` texture of 4
+/// samples, a pass's clear to each of [`FLOAT_CLEARS`], and its store, stores Metal's bytes, bit
+/// for bit, the resolve's and each sample's ([`Gpu::multisample_cleared`])
 #[test]
 fn clears_and_bfloat_fills_are_metals() {
     /// The bytes of a texture of `texel` bytes `g` reads after a pass that loads it, holding
@@ -1797,19 +1789,6 @@ fn clears_and_bfloat_fills_are_metals() {
             e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
         });
         g.read(&t, texel)
-    }
-    /// What `g` stores of a clear of an `RGBA16Float` texture of `samples` samples to `colour`:
-    /// the texture's bytes and no samples at 1 ([`Gpu::cleared`]), else its resolve's bytes
-    /// and its samples ([`Gpu::multisample_cleared`]).
-    fn float_cleared<P: Platform>(
-        g: &Gpu<'_, P>,
-        samples: u64,
-        colour: [f64; 4],
-    ) -> (Vec<u8>, Vec<u8>) {
-        match samples {
-            1 => (g.read(&g.cleared(115, RENDER, colour), 8), Vec::new()),
-            _ => g.multisample_cleared(115, 8, colour),
-        }
     }
     let Some((mp, md)) = metal() else {
         return;
@@ -1837,7 +1816,6 @@ fn clears_and_bfloat_fills_are_metals() {
             }
             Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
         };
-    let mut dies = Vec::new();
     for (seed, (format, name, texel)) in (1u64..).zip(formats) {
         for colour in BFLOAT_CLEARS {
             for (usage, route) in [(RENDER, "straight"), (RENDER | READ_WRITE, "through half")] {
@@ -1857,84 +1835,293 @@ fn clears_and_bfloat_fills_are_metals() {
         let mine = survived(|| loaded(&ours, format, texel, &bytes));
         compare(format!("{name} loaded, nothing drawn"), metals, mine);
     }
-    for (samples, colour, nan) in FLOAT_CLEARS {
-        let of = format!("RGBA16Float {samples} samples clear to {colour:?}");
-        let (stored, held) = float_cleared(&theirs, samples, colour);
-        let mine = survived(|| float_cleared(&ours, samples, colour));
-        let Some(channel) = nan else {
-            match mine {
-                Ok((mine, _)) if mine != stored => compare(of, stored, Ok(mine)),
-                Ok((_, mine)) => compare(format!("{of}, samples"), held, Ok(mine)),
-                Err(death) => compare(of, stored, Err(death)),
-            }
-            continue;
-        };
-        if samples > 1 {
-            let code = if colour[channel].is_sign_negative() {
-                0xfe00
-            } else {
-                0x7e00
-            };
-            let metals = u16::from_le_bytes([stored[2 * channel], stored[2 * channel + 1]]);
-            if metals != code {
-                dies.push(format!(
-                    "{of}: Metal's resolve holds {metals:04x} in channel {channel}"
-                ));
-            }
+    for colour in FLOAT_CLEARS {
+        let of = format!("RGBA16Float 4 samples clear to {colour:?}");
+        let (stored, held) = theirs.multisample_cleared(115, 8, colour);
+        match survived(|| ours.multisample_cleared(115, 8, colour)) {
+            Ok((mine, _)) if mine != stored => compare(of, stored, Ok(mine)),
+            Ok((_, mine)) => compare(format!("{of}, samples"), held, Ok(mine)),
+            Err(death) => compare(of, stored, Err(death)),
         }
-        let named = match samples {
-            1 => "a clear of colour attachment 0 (MTLPixelFormatRGBA16Float)",
-            _ => "a clear of 4-sample colour attachment 0 (MTLPixelFormatRGBA16Float)",
-        };
-        held_nan_clear_dies(&mut dies, &of, named, mine.map(drop));
     }
-    for colour in XR_NAN_CLEARS {
-        let of = format!("BGRA10_XR clear to {colour:?}");
-        drop(theirs.cleared(552, RENDER, colour));
-        let mine = survived(|| drop(ours.cleared(552, RENDER, colour)));
-        let named = "a clear of colour attachment 0 (MTLPixelFormatBGRA10_XR)";
-        held_nan_clear_dies(&mut dies, &of, named, mine);
-    }
-    differ.extend(dies);
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
-/// The clears of a 16 by 16 `RGBA16Float` texture [`clears_and_bfloat_fills_are_metals`] makes:
-/// its sample count, the colour, red, green, blue and alpha, and the channel of its first NaN
-/// the runtime's clear is not known to keep as Metal does, where it has one. At 4 samples: plain
-/// values; half's largest, an infinity, negative zero; a NaN in red and alpha; and a negative
-/// one in alpha, which Metal's resolve keeps at this size. At 1: a NaN in red and alpha, which
-/// the runtime's clear stores as Metal's; and a negative one in alpha.
-const FLOAT_CLEARS: [(u64, [f64; 4], Option<usize>); 6] = [
-    (4, [0.25, 1.0, 0.5, -2.0], None),
-    (4, [65_504.0, f64::NEG_INFINITY, -0.0, 1.0e-3], None),
-    (4, [f64::NAN, 1.0, 0.5, f64::NAN], Some(0)),
-    (4, [0.0, 1.0, 0.5, -f64::NAN], Some(3)),
-    (1, [f64::NAN, 1.0, 0.5, f64::NAN], None),
-    (1, [0.0, 1.0, 0.5, -f64::NAN], Some(3)),
+/// The state of `rounding.metal`'s `sweep_vertex` and `sweep_fragment` into colour attachment 0
+/// of `format` at `samples` samples, decoded from a guest's blob on `d`.
+fn sweep_state<P: Platform>(d: &P::Device, format: u64, samples: u64) -> P::RenderPipeline {
+    use reims_vgpu_core::platform::Handle as _;
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::encode_render::tests::ROUNDING;
+    use crate::gpu::serialized::tests::{le, rounded_render_of};
+
+    let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
+    let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+    let functions = [function("sweep_vertex"), function("sweep_fragment")];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    let samples = format!("04 04 {}", le(u32::try_from(samples).unwrap()));
+    let colour: &[(u8, u32)] = &[(0, 0), (1, u32::try_from(format).unwrap())];
+    let blob = rounded_render_of(&["02 04 02000000", &samples], &[colour], 0);
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+/// What a pass that clears a Private `side` by `side` texture of `format` (of `texel` bytes),
+/// `usage` and `samples` samples to `colour` (red, green, blue, alpha) and stores it leaves on
+/// `g`, drawing nothing, or, where `drawn` holds a vertex count, drawing that many vertices of a
+/// triangle list ([`sweep_state`]), which make no triangle: at one sample, its bytes; at more,
+/// those of a Private texture of the format and `RENDER` usage the pass resolves it into, by its
+/// store action (`StoreAndMultisampleResolve`), and, at a side of 16, each sample as a `float4`
+/// (`rgbx_read_samples`). Each texture's bytes are read by a blit into a buffer. `None` where the
+/// device makes no such texture.
+fn nan_cleared<P: Platform>(
+    g: &Gpu<'_, P>,
+    (format, texel): (u64, usize),
+    (usage, side, samples): (u64, u64, u64),
+    [red, green, blue, alpha]: [f64; 4],
+    drawn: Option<u64>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let made = |samples, usage| {
+        let desc = g.p.texture_descriptor(&TextureDesc {
+            texture_type: if samples > 1 { 4 } else { 2 },
+            sample_count: samples,
+            pixel_format: format,
+            width: side,
+            height: side,
+            usage,
+            resource_options: Some(PRIVATE),
+            ..TextureDesc::default()
+        });
+        g.d.new_texture(OnFault::Die, &desc).unwrap()
+    };
+    let cleared = made(samples, usage)?;
+    let resolve = match samples > 1 {
+        true => Some(made(1, RENDER)?),
+        false => None,
+    };
+    let state = drawn.map(|_| sweep_state::<P>(g.d, format, samples));
+    let pass = g.p.render_pass_descriptor();
+    let attachment = ColorAttachmentSet {
+        texture: Some(Some(&cleared)),
+        resolve_texture: resolve.as_ref().map(Some),
+        load_action: Some(2),
+        store_action: Some(if resolve.is_some() { 3 } else { 1 }),
+        clear_color: Some(ClearColor {
+            red,
+            green,
+            blue,
+            alpha,
+        }),
+        ..ColorAttachmentSet::default()
+    };
+    pass.set_color_attachment(OnFault::Die, 0, &attachment)
+        .unwrap();
+    let kind = g.buffer(&[0; 4]);
+    g.run(|cb| {
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        if let (Some(state), Some(vertex_count)) = (&state, drawn) {
+            for cmd in [
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                RenderCmd::SetFragmentBuffer {
+                    buffer: Some(&kind),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::DrawPrimitives {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count,
+                },
+            ] {
+                e.encode(OnFault::Die, cmd).unwrap();
+            }
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    });
+    let stored = resolve.as_ref().unwrap_or(&cleared);
+    let n = usize::try_from(side * side).unwrap() * texel;
+    let b = g.buffer(&vec![0; n]);
+    let row = side * u64::try_from(texel).unwrap();
+    g.blit(vec![BlitCmd::CopyTextureToBuffer {
+        source_texture: stored,
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(side, side, 1),
+        destination_buffer: &b,
+        destination_offset: 0,
+        destination_bytes_per_row: row,
+        destination_bytes_per_image: row * side,
+    }]);
+    // A read of a NaN's samples takes the device's NaN encoding, which the runtime announces
+    // (`device-nan-encoding`), here this host's own: their bytes are compared.
+    let held = match samples > 1 && side == SIDE {
+        true => crate::answer::relaxed(|| g.output("rgbx_read_samples", &cleared, 64, &[], None)),
+        false => Vec::new(),
+    };
+    Some((Gpu::<P>::bytes_of(&b, n), held))
+}
+
+/// The NaNs [`nan_clears_are_metals`] clears to, as doubles: the plain quiet NaN, a negative
+/// one, one of a payload, all ones, and a signalling one.
+const CLEAR_NANS: [u64; 5] = [
+    0x7ff8_0000_0000_0000,
+    0xfff8_0000_0000_0000,
+    0x7ff8_4000_0000_0000,
+    0x7fff_ffff_ffff_ffff,
+    0x7ff0_0000_0000_0001,
 ];
 
-/// The clears of a `BGRA10_XR` texture of one sample [`clears_and_bfloat_fills_are_metals`]
-/// holds as deaths, red, green, blue and alpha: a NaN in red, and a negative one in alpha.
-const XR_NAN_CLEARS: [[f64; 4]; 2] = [[f64::NAN, 0.5, 0.25, 1.0], [0.25, 0.5, 0.75, -f64::NAN]];
-
-/// Adds to `dies` what of `cleared`, of the case `of`, a pass that clears an attachment to a NaN,
-/// is other than its death where the pass is made, naming the clear by `named`
-/// (`encode_render`'s `nan_clear`).
-fn held_nan_clear_dies(
-    dies: &mut Vec<String>,
-    of: &str,
-    named: &str,
-    cleared: Result<(), (DeathSite, String)>,
-) {
-    let pass = "renderCommandEncoderWithDescriptor:";
-    match cleared {
-        Err((site, line))
-            if (site.kind, site.file) == (DeathKind::Abort, pass) && line.contains(named) => {}
-        Err((site, line)) => dies.push(format!("{of}: died at {site:?}: {line}")),
-        Ok(()) => dies.push(format!("{of}: taken")),
+/// A pass's clear of a colour attachment to a NaN, and its store, stores Metal's bytes, bit for
+/// bit, as the runtime writes it: each of [`CLEAR_NANS`] in red and blue, and in green and
+/// alpha, beside other values; of half, float and packed float formats (`R16Float`,
+/// `RG16Float`, `RGBA16Float`, `R32Float`, `RG32Float`, `RGBA32Float`, `RG11B10Float`,
+/// `RGB9E5Float`) and of the extended-range ones (`BGRA10_XR`, `BGR10_XR`, `RGB10A8_2P_XR10`
+/// and their `_sRGB` twins; Metal makes no `RGBA16Float_XR` texture); 16 and 4 texels a side;
+/// of `RENDER` usage, which Metal keeps losslessly compressed, and of shader writes too, which it
+/// keeps uncompressed; at one sample, and at two and four of the half, float and `RG11B10Float`
+/// formats, the resolve's bytes and, at 16 a side, each sample's; in a pass with no draw call,
+/// and, of the plain and the negative NaN, in one with a draw call of no vertices or of one. A
+/// draw of none in a pass that clears a multisampled float attachment to a NaN other than the
+/// plain quiet one and resolves it dies, naming the clear (`encode_render`'s
+/// `nan_resolve_kept`): the runtime's resolve keeps a negative NaN's bits (`ffc00000`) at 16 a
+/// side of `RENDER` usage, where Metal counts the draw and resolves to `7fc00000`. The runtime
+/// refuses a pass of an RGBX format (the module docs), and of a multisampled extended-range one,
+/// whatever it clears to; Metal makes no multisampled texture of a bfloat format, nor a bfloat
+/// view of one
+#[test]
+fn nan_clears_are_metals() {
+    let Some((mp, md)) = metal() else {
+        return;
+    };
+    let (vp, vd) = (platform(), dev());
+    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let nans: Vec<[f64; 4]> = CLEAR_NANS
+        .iter()
+        .map(|&bits| f64::from_bits(bits))
+        .flat_map(|v| [[v, 0.5, v, 1.0], [0.25, v, 0.75, v]])
+        .collect();
+    let formats: [(u64, usize, &str, &[u64]); 14] = [
+        (25, 2, "R16Float", &[1, 2, 4]),
+        (65, 4, "RG16Float", &[1, 2, 4]),
+        (115, 8, "RGBA16Float", &[1, 2, 4]),
+        (55, 4, "R32Float", &[1, 2, 4]),
+        (105, 8, "RG32Float", &[1, 2, 4]),
+        (125, 16, "RGBA32Float", &[1, 2, 4]),
+        (92, 4, "RG11B10Float", &[1, 2, 4]),
+        (93, 4, "RGB9E5Float", &[1]),
+        (552, 8, "BGRA10_XR", &[1]),
+        (553, 8, "BGRA10_XR_sRGB", &[1]),
+        (554, 4, "BGR10_XR", &[1]),
+        (555, 4, "BGR10_XR_sRGB", &[1]),
+        (550, 4, "RGB10A8_2P_XR10", &[1]),
+        (551, 4, "RGB10A8_2P_XR10_sRGB", &[1]),
+    ];
+    // Whether the draw of none in a pass of a clear of `format` at `samples` samples to `colour`
+    // dies, naming the clear: of a float format of a NaN other than the plain quiet one.
+    let held = |format, samples, colour: [f64; 4]| {
+        let channels = match format {
+            55 => 1,
+            105 => 2,
+            125 => 4,
+            _ => 0,
+        };
+        let unplain = |v: &f64| v.is_nan() && v.to_bits() != CLEAR_NANS[0];
+        samples > 1 && colour[..channels].iter().any(unplain)
+    };
+    let mut differ = Vec::new();
+    let mut cases = 0;
+    for (format, texel, name, counts) in formats {
+        for (at, &colour) in nans.iter().enumerate() {
+            let draws: &[Option<u64>] = match at < 4 {
+                true => &[None, Some(0), Some(1)],
+                false => &[None],
+            };
+            let shapes = counts
+                .iter()
+                .flat_map(|&s| draws.iter().map(move |&d| (s, d)));
+            for usage in [RENDER, RENDER | READ_WRITE] {
+                for side in [SIDE, 4] {
+                    for (samples, drawn) in shapes.clone() {
+                        let shape = (usage, side, samples);
+                        let of = format!(
+                            "{name} {samples} samples {side} a side, usage {usage:#x}, drawn \
+                             {drawn:?}, clear to {:#x?}",
+                            colour.map(f64::to_bits)
+                        );
+                        let metals = nan_cleared(&theirs, (format, texel), shape, colour, drawn)
+                            .unwrap_or_else(|| panic!("{of}: Metal makes no such texture"));
+                        let mine =
+                            survived(|| nan_cleared(&ours, (format, texel), shape, colour, drawn));
+                        cases += 1;
+                        if drawn == Some(0) && held(format, samples, colour) {
+                            let named = "a draw of nothing in a pass that resolves";
+                            match mine {
+                                Err((site, line))
+                                    if (site.kind, site.file)
+                                        == (
+                                            DeathKind::Abort,
+                                            "drawPrimitives:vertexStart:vertexCount:",
+                                        )
+                                        && line.contains(named) => {}
+                                Err((site, line)) => {
+                                    differ.push(format!("{of}: died at {site:?}: {line}"));
+                                }
+                                Ok(_) => differ.push(format!("{of}: drew")),
+                            }
+                            continue;
+                        }
+                        match mine {
+                            Ok(Some(mine)) if mine == metals => {}
+                            Ok(None) => differ.push(format!("{of}: no texture made")),
+                            Ok(Some(mine)) => {
+                                let at = (metals.0.iter().zip(&mine.0)).position(|(m, o)| m != o);
+                                let at = at.map_or(0, |at| at / 16 * 16);
+                                let end = metals.0.len().min(at + 16);
+                                differ.push(format!(
+                                    "{of}: from byte {at}, Metal {:02x?}, ours {:02x?}{}",
+                                    &metals.0[at..end],
+                                    &mine.0[at..end],
+                                    if mine.1 == metals.1 {
+                                        ""
+                                    } else {
+                                        ", samples differ"
+                                    }
+                                ));
+                            }
+                            Err((site, line)) => {
+                                differ.push(format!("{of}: died at {site:?}: {line}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    assert_eq!(cases, 2016);
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
+
+/// The clears of a 16 by 16 `RGBA16Float` texture of 4 samples
+/// [`clears_and_bfloat_fills_are_metals`] makes, red, green, blue and alpha: plain values; and
+/// half's largest, an infinity and negative zero. Its clears to a NaN are
+/// [`nan_clears_are_metals`]'.
+const FLOAT_CLEARS: [[f64; 4]; 2] = [
+    [0.25, 1.0, 0.5, -2.0],
+    [65_504.0, f64::NEG_INFINITY, -0.0, 1.0e-3],
+];
 
 /// Adds to `differ` what of `read`, of the case `of`, a read, sample or gather through an
 /// argument buffer ([`Gpu::held_float_reads`], [`Gpu::held_samples`]), is other than the

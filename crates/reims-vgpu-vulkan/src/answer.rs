@@ -1983,8 +1983,8 @@ pub enum Inexact {
     /// or converted at its attachment (`HalfOutputPrecision`, `crate::gpu::encode_render`'s
     /// `half_apart`).
     HalfOutputBlend,
-    /// An attachment cleared to a NaN, or a bfloat one to a value, the runtime stores otherwise
-    /// than Metal.
+    /// A multisampled float attachment cleared to a NaN whose resolve, in a pass that draws
+    /// nothing but a draw of nothing, the runtime stores otherwise than Metal.
     Clear,
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.

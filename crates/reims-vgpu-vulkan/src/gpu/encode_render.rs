@@ -393,6 +393,9 @@ pub struct RenderEncoderObject {
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
+    /// The pass's multisampled float attachment it clears to a NaN and resolves, where it has
+    /// one: a draw the runtime records nothing for relays it ([`nan_resolve_kept`]).
+    nan_resolve_kept: Option<String>,
     /// Whether it drew primitive type 9, which Metal's GPU hangs at: its end holds what comes
     /// after it ([`VulkanRenderEncoder::hangs`]).
     hung: AtomicBool,
@@ -1251,11 +1254,9 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. One that clears a bfloat attachment to a value the runtime stores
-/// otherwise than Metal dies too ([`inexact_bfloat_clear`]), and so does one that clears an
-/// attachment to a NaN the runtime is not known to store as Metal does ([`nan_clear`]): a
-/// multisampled one to any NaN, which the runtime's multisampled clear drops, and a
-/// single-sample one to any but the plain quiet NaN, or of an extended-range format to any.
+/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits
+/// (`rgbx`'s `nan_clears_are_metals`), but for the resolve of a multisampled float attachment in
+/// a pass whose only draws record nothing, at which such a draw dies ([`nan_resolve_kept`]).
 /// A colour attachment that resolves into a texture of another format the runtime refuses is
 /// made without the resolve where plain Metal was measured to leave the texture untouched, in
 /// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
@@ -1283,13 +1284,6 @@ pub(crate) fn open(
         );
     }
     let (d, map) = descriptor.pass();
-    if let Some(what) = inexact_bfloat_clear(&d).or_else(|| nan_clear(&d)) {
-        crate::answer::inexact(
-            "renderCommandEncoderWithDescriptor:",
-            crate::answer::Inexact::Clear,
-            || what,
-        );
-    }
     let sources = descriptor.sources();
     if crate::os::TWINS_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
@@ -1339,127 +1333,53 @@ pub(crate) fn open(
     made
 }
 
-/// The clear of a multisampled bfloat colour attachment (`R16Bfloat`, `RG16Bfloat`,
-/// `RGBA16Bfloat`) of the pass `d` that the runtime is not measured to store as Metal does, if
-/// any: one to a value of a channel of the format that `half` and bfloat do not both hold exactly
-/// ([`half_and_bfloat_hold`]), a NaN among them. Metal converts a clear's `float` to bfloat by one
-/// of two routes, by the attachment and the pass: straight to the nearest bfloat where it keeps
-/// the level losslessly compressed and the pass records no draw call, else through `half` (on
-/// the M3 Max, -3e38 stores `ff62` straight and `ff80` through `half`, 1e-40 `0001` and `0000`,
-/// 70000 `4789` and `7f80`, and 1.0039063692092896 `3f81` and `3f80`, rounded twice). The
-/// runtime takes Metal's route, measured at one sample on an M4 and
-/// on the M3 Max (`rgbx`'s `clears_and_bfloat_fills_are_metals`); no multisampled bfloat clear
-/// is measured. A value both hold converts to its own code either way, as Metal's: 0, -0, ±1,
-/// 0.5, -2.5, the infinities among them.
-fn inexact_bfloat_clear(d: &rt::RenderPassDescriptor) -> Option<String> {
+/// The multisampled 32-bit float colour attachment (`R32Float`, `RG32Float`, `RGBA32Float`) of
+/// the pass `d` that it clears to a NaN other than the plain quiet one as a `float` (Metal clears
+/// to the double's conversion, its sign and top payload bits kept) and resolves, if any, named: a
+/// draw the runtime records nothing for relays it, or in strict mode dies
+/// ([`RenderEncoderObject::empty_drawn`]). Metal counts that draw a draw call, and its resolve
+/// stores `0x7fc00000` in the NaN's channels; the runtime's resolve of a pass whose only draws
+/// record nothing keeps the NaN's bits where Metal keeps the texture compressed and both sides
+/// are 16 or more (`rgbx`'s `nan_clears_are_metals`, the M3 Max: a negative NaN resolves to
+/// `ffc00000`), and stores Metal's word elsewhere, which this does not tell apart. A pass with a
+/// draw the runtime records resolves as Metal's, and so does every other clear to a NaN, which
+/// the runtime writes as Metal does (its `nan_clear.rs`).
+fn nan_resolve_kept(d: &rt::RenderPassDescriptor) -> Option<String> {
     d.color_attachments
         .iter()
         .enumerate()
         .find_map(|(index, a)| {
             let t = a.texture.as_ref()?;
             let channels = match t.pixel_format() {
-                PixelFormat::R16Bfloat => 1,
-                PixelFormat::RG16Bfloat => 2,
-                PixelFormat::RGBA16Bfloat => 4,
+                PixelFormat::R32Float => 1,
+                PixelFormat::RG32Float => 2,
+                PixelFormat::RGBA32Float => 4,
                 _ => return None,
             };
-            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 {
+            let resolves = a.resolve_texture.is_some()
+                && matches!(
+                    a.store_action,
+                    rt::StoreAction::MultisampleResolve
+                        | rt::StoreAction::StoreAndMultisampleResolve
+                );
+            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 || !resolves {
                 return None;
             }
             let c = a.clear_color;
             let values = [c.red, c.green, c.blue, c.alpha];
-            let value = values[..channels]
-                .iter()
-                .find(|&&v| !half_and_bfloat_hold(v))?;
-            Some(format!(
-                "a clear of {}-sample bfloat colour attachment {index} to {values:?}, whose \
-                 {value:e} the runtime's multisampled clear is not measured to store as Metal \
-                 does",
-                t.sample_count()
-            ))
-        })
-}
-
-/// The clear of a colour attachment of the pass `d` to a NaN the runtime is not known to store
-/// as Metal does, in a channel its format has ([`unkept_nan`]), if any. The runtime's
-/// multisampled clear drops any NaN: the samples do not hold its bits, and their resolve reads 0
-/// in that channel (the runtime's lane on MoltenVK), where
-/// Metal's answer follows the target's size, as whether it compresses it does: where both sides
-/// are 16 or more, its samples keep the NaN, its sign too, and so does their resolve (a 4-sample
-/// `RGBA16Float` clear to (NaN, 1, 0.5, NaN) resolves to `7e00` in red and alpha, a negative NaN
-/// to `fe00`); below 16 a side its samples drop the sign (`7e00`) and their resolve stores 0 in
-/// those channels (4 by 4 on the M3 Max: samples `7e00 3c00 3800 7e00`, resolve `0000 3c00 3800
-/// 0000`). A single-sample clear of a half, float or packed float format to the plain quiet NaN
-/// is Metal's (the runtime's lanes); one to another NaN is not measured, where Metal's half
-/// clear keeps a negative NaN's sign at both sides 16 or more (`fe00`) and drops it below
-/// (`7e00`), and neither is any clear of an extended-range format to a NaN. Neither rule needs
-/// the size: a multisampled clear to any NaN dies, and a single-sample one to a negative NaN. A
-/// multisampled bfloat attachment dies at any NaN, and a single-sample one's clear takes Metal's
-/// route ([`inexact_bfloat_clear`]). Each such death is strict mode's: by default the pass opens,
-/// relaying the clear as [`crate::answer::Inexact::Clear`].
-fn nan_clear(d: &rt::RenderPassDescriptor) -> Option<String> {
-    d.color_attachments
-        .iter()
-        .enumerate()
-        .find_map(|(index, a)| {
-            let t = a.texture.as_ref()?;
-            if a.load_action != rt::LoadAction::Clear {
-                return None;
-            }
-            let c = a.clear_color;
-            let values = [c.red, c.green, c.blue, c.alpha];
-            let (format, samples) = (t.pixel_format(), t.sample_count());
-            let channel = unkept_nan(format, samples, values)?;
-            let name = format.name();
-            Some(match samples {
-                ..=1 => format!(
-                    "a clear of colour attachment {index} ({name}) to {values:?}, whose channel \
-                 {channel} is a NaN the runtime's single-sample clear is not measured to store as \
-                 Metal does: any NaN in an extended-range format, in another one other than the \
-                 plain quiet NaN"
-                ),
-                _ => format!(
-                    "a clear of {samples}-sample colour attachment {index} ({name}) to {values:?}, \
-                 whose NaN in channel {channel} the runtime's multisampled clear drops: the \
-                 samples hold no NaN and their resolve reads 0 there, where Metal keeps the NaN"
-                ),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the clear's channel as Metal converts it to a float"
+            )]
+            let kept = |v: &f64| (*v as f32).is_nan() && (*v as f32).to_bits() != 0x7fc0_0000;
+            values[..channels].iter().any(kept).then(|| {
+                format!(
+                    "the {}-sample colour attachment {index} ({}) cleared to {values:?}",
+                    t.sample_count(),
+                    t.pixel_format().name()
+                )
             })
         })
-}
-
-/// The first channel of `colour` (red, green, blue, alpha) among the channels of `format` that
-/// is a NaN a clear of a texture of `samples` samples to `colour` is not known to store as
-/// Metal does: any NaN, of either sign, at more than one sample; at one, any NaN in an
-/// extended-range format, and in a half, float or packed float one a NaN other than the plain
-/// quiet one (a double's `0x7ff8000000000000`, a float's `0x7fc00000`): negative, signalling or
-/// of a payload. The formats: half and float `R16Float`, `RG16Float`, `RGBA16Float`, `R32Float`,
-/// `RG32Float`, `RGBA32Float`, and `RGBX16Float` and `RGBX32Float`, whose four channels count,
-/// the X field's among them, as no clear of theirs is measured; packed float `RG11B10Float` and
-/// `RGB9E5Float` (red, green and blue); and extended-range `RGB10A8_2P_XR10`, `BGRA10_XR`,
-/// `BGR10_XR` (red, green and blue), their `_sRGB` twins, and `RGBA16Float_XR`, a half format
-/// whose clears are not measured. A bfloat format is [`inexact_bfloat_clear`]'s.
-fn unkept_nan(format: PixelFormat, samples: u64, colour: [f64; 4]) -> Option<usize> {
-    /// The plain quiet NaN, as a double.
-    const QUIET: u64 = 0x7ff8_0000_0000_0000;
-    // The format's channels, and whether a single-sample clear of it keeps the plain quiet NaN.
-    let (channels, quiet_kept) = match format {
-        PixelFormat::R16Float | PixelFormat::R32Float => (1, true),
-        PixelFormat::RG16Float | PixelFormat::RG32Float => (2, true),
-        PixelFormat::RG11B10Float | PixelFormat::RGB9E5Float => (3, true),
-        PixelFormat::RGBA16Float
-        | PixelFormat::RGBA32Float
-        | PixelFormat::RGBX16Float
-        | PixelFormat::RGBX32Float => (4, true),
-        PixelFormat::BGR10XR | PixelFormat::BGR10XRSRGB => (3, false),
-        PixelFormat::BGRA10XR
-        | PixelFormat::BGRA10XRSRGB
-        | PixelFormat::RGB10A82PXR10
-        | PixelFormat::RGB10A82PXR10SRGB
-        | PixelFormat::RGBA16FloatXR => (4, false),
-        _ => return None,
-    };
-    let unkept = |v: &f64| v.is_nan() && (samples > 1 || !quiet_kept || v.to_bits() != QUIET);
-    colour[..channels].iter().position(unkept)
 }
 
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
@@ -1499,40 +1419,6 @@ fn bfloat_loaded(d: &rt::RenderPassDescriptor) -> Option<String> {
                 && a.store_action != rt::StoreAction::DontCare;
             (bfloat && kept).then(|| format!("colour attachment {index} ({})", format.name()))
         })
-}
-
-/// Whether `v` is a value both `half` and bfloat hold exactly: an infinity, or a finite `float`
-/// whose low 16 bits are zero (bfloat) that is a multiple of `half`'s step at its binade (2^-24
-/// below 2^-14, else 2^(e - 10) in [2^e, 2^(e + 1))) no greater than 65504. A NaN is not, its
-/// payload's bits unmeasured.
-fn half_and_bfloat_hold(v: f64) -> bool {
-    if v.is_infinite() {
-        return true;
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the clear's channel as Metal converts it to a float, compared back below"
-    )]
-    let f = v as f32;
-    if v.is_nan() || f64::from(f) != v || f.to_bits() & 0xffff != 0 {
-        return false;
-    }
-    let a = f64::from(f.abs());
-    if a == 0.0 {
-        return true;
-    }
-    if a > 65504.0 {
-        return false;
-    }
-    // The float's binade, from its exponent field: a value of half's normal range is a normal
-    // float.
-    let binade = ((f.to_bits() >> 23) & 0xff).cast_signed() - 127;
-    let step = if a < 2f64.powi(-14) {
-        2f64.powi(-24)
-    } else {
-        2f64.powi(binade - 10)
-    };
-    (a / step).fract() == 0.0
 }
 
 /// Whether the runtime answers nil for the pass `d`, as Metal does: no attachment has a texture
@@ -1931,6 +1817,7 @@ fn opened(
         reach: Mutex::new(Reach::default()),
         rounded: Mutex::new(RoundedTextures::default()),
         bfloat_loaded: bfloat_loaded(&d),
+        nan_resolve_kept: nan_resolve_kept(&d),
         pass: d,
         hung: AtomicBool::new(false),
     });
@@ -2587,6 +2474,24 @@ impl VulkanRenderEncoder {
         drawn
     }
 
+    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw the
+    /// runtime records nothing for, of no vertices, indices, patches or instances (`nothing`), in
+    /// a pass that clears a multisampled float attachment to a NaN and resolves it
+    /// ([`nan_resolve_kept`]): the runtime's resolve may keep the NaN's bits there, where Metal's
+    /// stores `0x7fc00000`. A draw of vertices that make no primitive records the draw, and the
+    /// pass resolves as Metal's.
+    fn empty_drawn(&self, sel: &'static str, nothing: bool) {
+        if nothing && let Some(attachment) = &self.nan_resolve_kept {
+            crate::answer::inexact(sel, crate::answer::Inexact::Clear, || {
+                format!(
+                    "a draw of nothing in a pass that resolves {attachment}, whose NaN the \
+                     runtime's resolve keeps where the pass draws nothing else, where Metal \
+                     counts the draw and resolves to 0x7fc00000"
+                )
+            });
+        }
+    }
+
     /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw (of
     /// anything, or of nothing), an execution of render commands or a tile dispatch, in a pass
     /// that loads and stores a bfloat colour attachment ([`bfloat_loaded`]): the tiles the pass
@@ -2999,6 +2904,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches { indexed: true };
                 let empty = count == 0 || instances == 0;
+                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_indexed_patches(
                         points,
@@ -3107,6 +3013,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches { indexed: false };
                 let empty = count == 0 || instances == 0;
+                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_patches(
                         points,
@@ -4070,6 +3977,7 @@ impl VulkanRenderEncoder {
         let listed = match topology {
             Topology::Public(p) => {
                 self.pipelined(sel);
+                self.empty_drawn(sel, count == 0 || instances == 0);
                 let empty = instances == 0 || draws_none(p, count);
                 if empty || !self.rotation(sel, shape, crate::answer::strict()) {
                     return self.draw(sel, (Some((shape, p)), empty), |e, p| {
@@ -4134,6 +4042,7 @@ impl VulkanRenderEncoder {
         });
         let base_instance = small(sel, base_instance);
         let empty = instances == 0 || kinds.is_some_and(|(p, _)| draws_none(p, count));
+        self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
         let drawn = kinds.map(|(p, i)| (Shape::public(p, true, false), (p, i)));
         self.draw(sel, (drawn, empty), |e, (p, i)| {
             e.draw_indexed_primitives(
@@ -4247,193 +4156,6 @@ pub(crate) mod tests {
     }
     /// `MTLIndexTypeUInt16`.
     const U16: u64 = 0;
-
-    /// The clear values `half` and bfloat both hold exactly, which a bfloat attachment's clear
-    /// stores as Metal's, and the ones they do not, which die
-    #[test]
-    fn bfloat_clears_take_what_half_and_bfloat_both_hold() {
-        for v in [
-            0.0,
-            -0.0,
-            1.0,
-            -1.0,
-            0.5,
-            -2.5,
-            0.25,
-            0.75,
-            3.0,
-            0.375,
-            61440.0,
-            2f64.powi(-24),
-            -2f64.powi(-20),
-            2f64.powi(-14),
-            32768.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        ] {
-            assert!(half_and_bfloat_hold(v), "{v:e}");
-        }
-        for v in [
-            -3.0e38,
-            1.0e-40,
-            70_000.0,
-            1.003_906_369_209_289_6,
-            1.003_906_25,
-            1.0e-3,
-            65536.0,
-            2f64.powi(-25),
-            0.1,
-            f64::NAN,
-            -f64::NAN,
-        ] {
-            assert!(!half_and_bfloat_hold(v), "{v:e}");
-        }
-    }
-
-    /// A clear's NaN is found in each channel its format has: any NaN at 4 samples, of either
-    /// sign; at 1, any NaN in an extended-range format, and in a half, float or packed float one
-    /// a negative, signalling or payload NaN, and not the plain quiet one. In no other channel or
-    /// format
-    #[test]
-    fn clears_find_the_nans_the_runtime_does_not_keep() {
-        let (nan, neg) = (f64::NAN, -f64::NAN);
-        let payload = f64::from_bits(0x7ff8_0000_2000_0000);
-        let low = f64::from_bits(0x7ff8_0000_0000_0001);
-        let signalling = f64::from_bits(0x7ff0_0000_2000_0000);
-        let cases = [
-            (
-                PixelFormat::RGBA16Float,
-                [nan, 1.0, 0.5, nan],
-                Some(0),
-                None,
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [0.0, 1.0, 0.5, neg],
-                Some(3),
-                Some(3),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [nan, payload, 0.5, 1.0],
-                Some(0),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [nan, 1.0, signalling, 1.0],
-                Some(0),
-                Some(2),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [0.0, low, 0.5, 1.0],
-                Some(1),
-                Some(1),
-            ),
-            (PixelFormat::RGBA16Float, [0.25, 1.0, 0.5, -2.0], None, None),
-            (PixelFormat::R16Float, [0.5, neg, neg, neg], None, None),
-            (
-                PixelFormat::R16Float,
-                [neg, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (PixelFormat::RG16Float, [0.5, nan, 0.0, 0.0], Some(1), None),
-            (PixelFormat::RG16Float, [0.5, 0.5, neg, neg], None, None),
-            (PixelFormat::R32Float, [nan, 0.0, 0.0, 0.0], Some(0), None),
-            (
-                PixelFormat::RG32Float,
-                [0.0, neg, 0.0, 0.0],
-                Some(1),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGBA32Float,
-                [0.0, 0.0, nan, payload],
-                Some(2),
-                Some(3),
-            ),
-            (
-                PixelFormat::RG11B10Float,
-                [0.0, 0.0, neg, 0.0],
-                Some(2),
-                Some(2),
-            ),
-            (
-                PixelFormat::RG11B10Float,
-                [0.0, nan, 0.0, 0.0],
-                Some(1),
-                None,
-            ),
-            (PixelFormat::RG11B10Float, [0.0, 0.0, 0.0, neg], None, None),
-            (
-                PixelFormat::RGB9E5Float,
-                [nan, 0.0, 0.0, 0.0],
-                Some(0),
-                None,
-            ),
-            (
-                PixelFormat::RGB9E5Float,
-                [0.0, 0.0, neg, 0.0],
-                Some(2),
-                Some(2),
-            ),
-            (PixelFormat::RGB9E5Float, [0.0, 0.0, 0.0, nan], None, None),
-            (
-                PixelFormat::RGBX16Float,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                None,
-            ),
-            (
-                PixelFormat::RGBX32Float,
-                [neg, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (
-                PixelFormat::BGRA10XR,
-                [nan, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (
-                PixelFormat::BGRA10XRSRGB,
-                [0.0, 0.0, 0.0, neg],
-                Some(3),
-                Some(3),
-            ),
-            (PixelFormat::BGRA10XR, [0.25, 0.5, 1.25, -0.5], None, None),
-            (PixelFormat::BGR10XR, [0.0, 0.0, nan, 0.0], Some(2), Some(2)),
-            (PixelFormat::BGR10XRSRGB, [0.0, 0.0, 0.0, nan], None, None),
-            (
-                PixelFormat::RGB10A82PXR10,
-                [0.0, nan, 0.0, 0.0],
-                Some(1),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGB10A82PXR10SRGB,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                Some(3),
-            ),
-            (
-                PixelFormat::RGBA16FloatXR,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                Some(3),
-            ),
-            (PixelFormat::RGBA8Unorm, [neg, neg, neg, neg], None, None),
-            (PixelFormat::R16Bfloat, [neg, neg, neg, neg], None, None),
-        ];
-        for (format, colour, four, one) in cases {
-            let case = format!("{format:?} {colour:?}");
-            assert_eq!(unkept_nan(format, 4, colour), four, "{case} at 4 samples");
-            assert_eq!(unkept_nan(format, 1, colour), one, "{case} at 1");
-        }
-    }
 
     /// Each private type's indices: the vertices of the public type's primitives, in order,
     /// relative to the first; vertex IDs past `u32` die, and a loop through vertex 0xffffffff
