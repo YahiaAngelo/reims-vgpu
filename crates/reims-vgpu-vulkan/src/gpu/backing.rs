@@ -151,7 +151,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
@@ -722,7 +722,7 @@ struct Detached {
     /// The releases of `released`, in the order of their numbers, the oldest first.
     releases: VecDeque<(u64, rt::ObjectId)>,
     /// The open command buffers, by number, until they close ([`Opened`]). One made by an isolated
-    /// task that ended and never committed holds nothing ([`Open::holds_nothing`]): an ended
+    /// task that ended and never committed holds nothing ([`Open::let_go`]): an ended
     /// task's never commits, and one of a task that died is never released ([`TaskLife`]). Such
     /// ones go as they reach the front, the oldest open, at a close, and all of them once the
     /// open ones grew to twice `fewest`, at a close: in O(1) a close, over the closes.
@@ -739,20 +739,33 @@ struct Open {
     number: u64,
     /// The isolated task that made it, if one did.
     task: Option<Weak<TaskLife>>,
-    /// Whether it committed: open until it completed, whatever its task does.
-    committed: AtomicBool,
+    /// Whether it is open, not committed ([`OPEN`]), committed, open until it completed whatever
+    /// its task does ([`COMMITTED`]), or let go of as holding nothing ([`DROPPED`]): each change
+    /// is one exchange, so a commit and a close's letting go never both pass unseen.
+    state: AtomicU8,
     /// Its submissions the runtime submitted, until it closes: each decided and noted under this
     /// lock ([`Opened::submit`]), which a detach reads them under ([`in_flight`]). It holds the
     /// command buffer, which holds its check, which holds this: the close takes it.
     submitted: Mutex<Option<Submitted>>,
 }
 
+/// [`Open::state`]: open, not committed.
+const OPEN: u8 = 0;
+/// [`Open::state`]: committed.
+const COMMITTED: u8 = 1;
+/// [`Open::state`]: let go of, not committed, as holding nothing ([`Open::let_go`]).
+const DROPPED: u8 = 2;
+
 impl Open {
-    /// Whether it holds nothing: made by an isolated task that ended, and never committed.
-    fn holds_nothing(&self) -> bool {
-        !self.committed.load(Ordering::Acquire)
-            && (self.task.as_ref())
-                .is_some_and(|task| task.upgrade().is_none_or(|task| task.has_ended()))
+    /// Whether it holds nothing, and is let go of now: made by an isolated task that ended, and
+    /// not committed. A commit of its command buffer after this, which a task's end after the
+    /// commit's check of it lets through, finds it let go of and puts it back
+    /// ([`Registry::commit`]).
+    fn let_go(&self) -> bool {
+        (self.task.as_ref()).is_some_and(|task| task.upgrade().is_none_or(|task| task.has_ended()))
+            && (self.state)
+                .compare_exchange(OPEN, DROPPED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 }
 
@@ -784,13 +797,13 @@ impl Detached {
     /// The open command buffers that hold nothing let go of ([`Detached::open`]).
     fn prune(&mut self) {
         while let Some(oldest) = self.open.first_entry()
-            && oldest.get().holds_nothing()
+            && oldest.get().let_go()
         {
             oldest.remove();
         }
         self.fewest = self.fewest.min(self.open.len());
         if self.open.len() >= 2 * self.fewest.max(16) {
-            self.open.retain(|_, open| !open.holds_nothing());
+            self.open.retain(|_, open| !open.let_go());
             self.fewest = self.open.len();
         }
     }
@@ -822,11 +835,26 @@ impl Registry {
         let open = Arc::new(Open {
             number: state.number(),
             task,
-            committed: AtomicBool::new(false),
+            state: AtomicU8::new(OPEN),
             submitted: Mutex::new(None),
         });
         state.open.insert(open.number, Arc::clone(&open));
         open
+    }
+
+    /// The command buffer of `open` commits now: open until it completed, whatever its task does.
+    /// One a close let go of as holding nothing, its task having ended after the commit's check
+    /// of the task's end, is open again, so a detach finds what it submits
+    /// ([`Registry::noted_since`]); a release made while it was let go of may have been forgotten
+    /// already.
+    fn commit(&self, open: &Arc<Open>) {
+        let committed =
+            (open.state).compare_exchange(OPEN, COMMITTED, Ordering::AcqRel, Ordering::Acquire);
+        if committed == Err(DROPPED) {
+            let mut state = self.state.lock();
+            open.state.store(COMMITTED, Ordering::Release);
+            state.open.insert(open.number, Arc::clone(open));
+        }
     }
 
     /// Object `id` detached.
@@ -933,9 +961,10 @@ impl Opened {
         Opened(DETACHED.open(task))
     }
 
-    /// The command buffer commits now: open until it completed, whatever its task does.
+    /// The command buffer commits now: open until it completed, whatever its task does
+    /// ([`Registry::commit`]).
     pub(crate) fn commit(self) -> Opened {
-        self.0.committed.store(true, Ordering::Release);
+        DETACHED.commit(&self.0);
         self
     }
 
@@ -1901,7 +1930,7 @@ mod tests {
     /// Command buffer `made` committed now in `d`.
     fn committed(d: &Registry, made: u64) -> u64 {
         let open = Arc::clone(&d.state.lock().open[&made]);
-        open.committed.store(true, Ordering::Release);
+        d.commit(&open);
         made
     }
 
@@ -2277,6 +2306,31 @@ mod tests {
         assert!(d.fails(&[buffer], sent), "committed");
         d.closed(sent);
         assert!(open(&d).is_empty() && d.state.lock().released.is_empty());
+    }
+
+    /// A command buffer whose task ended after its commit's check of the task's end, so that a
+    /// close let go of its place as holding nothing before the commit, is open again from its
+    /// commit until it closes, so a detach finds what it submits ([`Registry::noted_since`]); a
+    /// later close keeps it
+    #[test]
+    fn a_commit_after_its_tasks_end_keeps_its_place() {
+        let d = registry();
+        let task = TaskLife::new();
+        let late = d.open(Some(Arc::downgrade(&task)));
+        let other = made(&d, None);
+        assert!(task.exit());
+        d.closed(other);
+        assert!(
+            open(&d).is_empty(),
+            "let go of: its task ended, uncommitted"
+        );
+        d.commit(&late);
+        assert_eq!(open(&d), [late.number], "open again");
+        let after = made(&d, None);
+        d.closed(after);
+        assert_eq!(open(&d), [late.number], "committed: kept");
+        d.closed(late.number);
+        assert!(open(&d).is_empty());
     }
 
     /// The command buffers of an ended task that lie behind an older open one go as the open ones
