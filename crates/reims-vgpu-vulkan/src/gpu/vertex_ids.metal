@@ -7,13 +7,14 @@
 // `(4 + 4k, 4 + 4k)` of a 16 by 16 target, `k` being `i % 3`, the second also writing a
 // `[[point_size]]` of 1. `layer_vertex` and `viewport_vertex` write buffer 1's word at the vertex
 // ID as `[[render_target_array_index]]` and `[[viewport_array_index]]`; `plain_fragment` reads no
-// input and writes white. `encoding_vertex` places its vertices as `point_vertex` does and takes
-// an indirect command buffer through the argument buffer at buffer 1, whose command 0 it resets
-// at a vertex ID past 2^24, which no test draws: a state of it can encode indirect commands.
-// `corner_patch_vertex` is a post-tessellation vertex function of triangle patches whose three
-// control points are float2 positions in buffer 0, its flat output its position in the patch,
-// so a triangle of a patch tessellated at factor 1 takes the colour of the corner its provoking
-// vertex lies at.
+// input and writes white, and `primitive_fragment` writes its `[[primitive_id]]`'s low byte over
+// 255 as red, the next as green, and 1 as blue. `encoding_vertex` places its vertices as
+// `point_vertex` does and takes an indirect command buffer through the argument buffer at buffer 1,
+// whose command 0 it resets at a vertex ID past 2^24, which no test draws: a state of it can encode
+// indirect commands. `corner_patch_vertex` is a post-tessellation vertex function of triangle
+// patches whose three control points are float2 positions in buffer 0, its flat output its position
+// in the patch, so a triangle of a patch tessellated at factor 1 takes the colour of the corner its
+// provoking vertex lies at.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -82,6 +83,10 @@ fragment float4 ids_fragment(Ids in [[stage_in]]) {
 
 fragment float4 plain_fragment() {
     return float4(1, 1, 1, 1);
+}
+
+fragment float4 primitive_fragment(uint primitive [[primitive_id]]) {
+    return float4(float(primitive & 0xff) / 255, float((primitive >> 8) & 0xff) / 255, 1, 1);
 }
 
 struct Commands {

@@ -656,6 +656,36 @@ fn private_primitive_types_draw_as_on_metal() {
     assert!(drawn > 40, "{drawn} draws drew anything");
 }
 
+/// The functions of a state whose colour is each primitive's `[[primitive_id]]`.
+const PRIMITIVES: (&str, &str) = ("vertex_ids:ids_vertex", "vertex_ids:primitive_fragment");
+
+/// Quads and quad strips, of which Metal counts a quad one primitive, give a fragment function's
+/// `[[primitive_id]]` as Metal's, directly at every count from 4 to 10, from vertex 0 and from
+/// vertex 2 as two instances, at `setProvokingVertexMode:` 0 and 1; over indices and from
+/// indirect arguments in `private_types_draw_over_indices_and_arguments_as_metals`
+#[test]
+fn quads_give_metals_primitive_ids() {
+    let (p, d) = (platform(), dev());
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    for primitive_type in [7, 8] {
+        for count in 4..=10 {
+            for (start, instances) in [(0, 1), (2, 2)] {
+                for mode in [0, 1] {
+                    let draw = (primitive_type, start, count, instances);
+                    let ours = flat_pass(&p, &d, PRIMITIVES, mode, draw);
+                    assert!(ours != clear, "{draw:?} at mode {mode}");
+                    let theirs = flat_pass(&mp, &md, PRIMITIVES, mode, draw);
+                    assert!(ours == theirs, "{draw:?} at mode {mode}");
+                }
+            }
+        }
+    }
+}
+
 /// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
 /// restarts at after `setPrimitiveRestartEnabled:index:` of 3 and the other private types take as
 /// a vertex; and of twelve with the 16-bit all-ones index (the 32-bit one at the same place)
@@ -670,8 +700,9 @@ const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9
 /// its index type's all-ones index, and from indirect arguments, over indices too, at
 /// `setProvokingVertexMode:` 0 and 1, but the line loop's lines at 1
 /// (`lines_take_metals_flat_inputs_at_the_last_vertex`): under a state whose colour is each
-/// vertex's, flat, and one whose colour is its provoking vertex's `[[vertex_id]]`. All but a
-/// fan or quads after the restart index set draw something
+/// vertex's, flat, one whose colour is its provoking vertex's `[[vertex_id]]`, and one whose
+/// colour is its primitive's `[[primitive_id]]`. All but a fan or quads after the restart index
+/// set draw something
 #[test]
 fn private_types_draw_over_indices_and_arguments_as_metals() {
     let (p, d) = (platform(), dev());
@@ -702,7 +733,7 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
         }
         let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
         for (draw, restart) in cases {
-            for functions in [FLAT, ids] {
+            for functions in [FLAT, ids, PRIMITIVES] {
                 for &mode in modes {
                     let ours = provoked(&p, &d, functions, (mode, restart), draw);
                     blank += usize::from(ours == clear);
@@ -714,7 +745,7 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
             }
         }
     }
-    assert!(blank <= 8, "{blank} draws drew nothing");
+    assert!(blank <= 12, "{blank} draws drew nothing");
 }
 
 /// The pixels of [`pass_pixels`] after `instances` instances of `count` of [`scattered`]'s

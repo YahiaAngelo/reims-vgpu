@@ -54,12 +54,15 @@
 //!   many times at each vertex as Metal's, so one that writes memory writes as often: on the M3
 //!   Max both run it once for each primitive the vertex is in (a strip's vertices up to 3 times,
 //!   a fan's first once a triangle; measured at every type, 6 to 1000 vertices, 1 to 3
-//!   instances, at either provoking vertex). Where its list cannot draw as Metal's draws (a
-//!   vertex start past `i32::MAX`, which the list's base vertex cannot hold, or quads read by a
-//!   fragment function's `[[primitive_id]]`, which Metal counts once a quad), the runtime refuses
-//!   it (`PrivatePrimitives`), which dies. One over indices or indirect arguments under a vertex
-//!   function that writes memory dies too ([`VulkanRenderEncoder::listed_runs`]): the runtime
-//!   does not run the function as often at each vertex as Metal on every device.
+//!   instances, at either provoking vertex). Quads and quad strips give a fragment function's
+//!   `[[primitive_id]]` as Metal counts them, once a quad (`quads_give_metals_primitive_ids`).
+//!   Where its list cannot draw as Metal's draws (a vertex start past `i32::MAX`, which the list's
+//!   base vertex cannot hold, or, on a device whose fragment stage cannot declare
+//!   `[[primitive_id]]`, such as MoltenVK's, a vertex function that computes it into its varying),
+//!   the runtime refuses it (`PrivatePrimitives`), which dies. One over indices or indirect
+//!   arguments under a vertex function that writes memory dies too
+//!   ([`VulkanRenderEncoder::listed_runs`]): the runtime does not run the function as often at each
+//!   vertex as Metal on every device.
 //! - **Work of a pipeline state that can encode indirect commands** (the runtime's
 //!   `can_encode_indirect_commands`) dies in an encoder that made resident for writing an indirect
 //!   command buffer whose ID is not the runtime's, as a compute encoder's does
