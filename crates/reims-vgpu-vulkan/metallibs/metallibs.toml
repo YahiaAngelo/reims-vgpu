@@ -4,7 +4,7 @@
 "predication.metallib" = "3d408cde1f3dafa068fc0fed8ed31e782bb61674ea77da6ce2a656e35c9a1d15"
 "icb_encode.metallib" = "354ca4fee482115b1cb9bbd867b10bb36c37828e7ef8ff404ebfcf9c78bf6e9d"
 "barycentric.metallib" = "7decabb9010e04bfa6edf67aa618ee8603f9df4c6aa9299f84ba70585e3077f9"
-"vertex_ids.metallib" = "72937be6482427c5775b06c8da11ba298ee583c18a5ae60dd377edca556da611"
+"vertex_ids.metallib" = "d4c2056c7c97ada7fa1bc8cc53bc4c42998ec4e868e51539e633c0fc2f7b89f5"
 "reach.metallib" = "62d21bb7cec8cf6571cf826ccccbfb1c7d3d6ea70aa815bc75d5cd5593f41a84"
 "rounding.metallib" = "4959ad05f370664fe7bda69e8bdcd081dd1e2d5734527220ae58b09e4111066e"
 "ycbcr_probe.metallib" = "f0ff7d791baf6bc798658404b77e1df827020526d1cbcf9595ca1a12df9471ed"

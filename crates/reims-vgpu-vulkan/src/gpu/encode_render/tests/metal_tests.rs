@@ -686,6 +686,36 @@ fn quads_give_metals_primitive_ids() {
     }
 }
 
+/// Metal's private types drawn directly from a vertex start whose last vertex passes `i32::MAX`
+/// (`2^31 - 3`, `2^31 + 3`, and `2^32 - 4`, whose vertex IDs wrap past `u32::MAX`), of one instance
+/// and two, draw what Metal draws, pixel for pixel, each vertex's `[[vertex_id]]` and the draw's
+/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but the
+/// line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`)
+#[test]
+fn private_types_from_far_vertex_starts_draw_as_metals() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    for t in 5..=8 {
+        let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
+        for start in [(1 << 31) - 3, (1 << 31) + 3, (1 << 32) - 4] {
+            for (count, instances) in [(8, 1), (10, 2)] {
+                for &mode in modes {
+                    let draw = (t, start, count, instances);
+                    let ours = flat_pass(&p, &d, wrapped, mode, draw);
+                    assert!(ours != clear, "{draw:?} at mode {mode}");
+                    if let Some((mp, md)) = &metal {
+                        let theirs = flat_pass(mp, md, wrapped, mode, draw);
+                        assert!(ours == theirs, "{draw:?} at mode {mode}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
 /// restarts at after `setPrimitiveRestartEnabled:index:` of 3 and the other private types take as
 /// a vertex; and of twelve with the 16-bit all-ones index (the 32-bit one at the same place)

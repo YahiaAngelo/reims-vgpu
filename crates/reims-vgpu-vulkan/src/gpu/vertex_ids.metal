@@ -2,8 +2,10 @@
 // of `rdec_flat_v`'s buffer 0, by `vertex_id`. The fragment function writes the provoking
 // vertex's ID over 255 as red, and under `bases_vertex` the draw's `[[base_vertex]]` and
 // `[[base_instance]]` over 255 as green and blue. `counting_vertex` also adds one to buffer 1's
-// word at its vertex ID each time it runs, a vertex function that writes memory. `point_vertex`
-// and `sized_vertex` read no buffer: they place vertex `i` at the centre of pixel
+// word at its vertex ID each time it runs, a vertex function that writes memory. `wrapped_vertex`
+// takes the position at its vertex ID modulo 16, so any vertex ID draws, and writes the ID's low
+// byte over 255 as red, its high byte as green and `[[base_vertex]]`'s low byte as blue.
+// `point_vertex` and `sized_vertex` read no buffer: they place vertex `i` at the centre of pixel
 // `(4 + 4k, 4 + 4k)` of a 16 by 16 target, `k` being `i % 3`, the second also writing a
 // `[[point_size]]` of 1. `layer_vertex` and `viewport_vertex` write buffer 1's word at the vertex
 // ID as `[[render_target_array_index]]` and `[[viewport_array_index]]`; `plain_fragment` reads no
@@ -47,6 +49,12 @@ vertex Ids counting_vertex(uint vid [[vertex_id]], const device float4 *position
                            device atomic_uint *runs [[buffer(1)]]) {
     atomic_fetch_add_explicit(&runs[vid], 1, memory_order_relaxed);
     return Ids{positions[vid], float4(float(vid) / 255.0, 0, 0, 1)};
+}
+
+vertex Ids wrapped_vertex(uint vid [[vertex_id]], uint base_vertex [[base_vertex]],
+                          const device float4 *positions [[buffer(0)]]) {
+    float3 bytes = float3(vid & 0xff, vid >> 24, base_vertex & 0xff) / 255.0;
+    return Ids{positions[vid & 15], float4(bytes, 1)};
 }
 
 vertex Ids point_vertex(uint vid [[vertex_id]]) {

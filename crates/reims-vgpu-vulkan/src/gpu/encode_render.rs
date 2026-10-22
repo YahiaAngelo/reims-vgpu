@@ -63,8 +63,9 @@
 //!   arguments too (`private_types_run_the_vertex_function_as_often_as_metals_at_every_draw`);
 //!   under one that computes `[[primitive_id]]` into its varying (on a device whose fragment stage
 //!   cannot declare it); and in a direct draw whose last vertex passes `i32::MAX`, which the
-//!   list's base vertex cannot hold. On a device without device addresses the runtime refuses
-//!   such a draw (`PrivatePrimitives`), which dies.
+//!   list's base vertex cannot hold, its vertex IDs wrapping past `u32::MAX` as Metal's
+//!   (`private_types_from_far_vertex_starts_draw_as_metals`). On a device without device
+//!   addresses the runtime refuses such a draw (`PrivatePrimitives`), which dies.
 //! - **Work of a pipeline state that can encode indirect commands** (the runtime's
 //!   `can_encode_indirect_commands`) dies in an encoder that made resident for writing an indirect
 //!   command buffer whose ID is not the runtime's, as a compute encoder's does
