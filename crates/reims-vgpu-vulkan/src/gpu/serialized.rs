@@ -2081,6 +2081,48 @@ pub(crate) mod tests {
         assert_eq!(Reader::new("s", &blob).array(0, "b"), vec![Some(12), None]);
     }
 
+    /// Every truncation of the suite's blobs of each form, and every blob one byte off one of
+    /// them (each byte set to 0, 1, 0x7f and 0xff), decodes or dies at its form's selector, as
+    /// Metal's deserializer answers or aborts: whatever the guest's bytes, the reader reads
+    /// nothing past the blob and fails no other way
+    #[test]
+    fn blobs_off_the_suites_decode_or_die_at_the_selector() {
+        use reims_vgpu_core::platform::Handle as _;
+        type Form = fn(&[u8], &mut Resolve) -> bool;
+        let compute: Form = |b, r| decode(b, r).is_ok();
+        let render: Form = |b, r| decode_render(b, r).is_ok();
+        let tile: Form = |b, r| decode_tile(b, r).is_ok();
+        let f = fixture_function(KERNEL);
+        let mut blobs = vec![
+            (COMPUTE_SEL, compute, compute_blob(0x2a, true, Some(64))),
+            (COMPUTE_SEL, compute, stage_in_blob(9)),
+            (TILE_SEL, tile, pipeline_blob("tile", 0, 0, 0x31)),
+        ];
+        for (name, _) in BLOBS.iter().filter(|(name, _)| *name != "tile") {
+            blobs.push((RENDER_SEL, render, pipeline_blob(name, 0x21, 0x22, 0)));
+        }
+        for (sel, form, blob) in blobs {
+            let mut variants: Vec<Vec<u8>> = (0..blob.len()).map(|n| blob[..n].to_vec()).collect();
+            for at in 0..blob.len() {
+                for byte in [0x00, 0x01, 0x7f, 0xff] {
+                    let mut variant = blob.clone();
+                    variant[at] = byte;
+                    variants.push(variant);
+                }
+            }
+            for variant in variants {
+                let mut resolve = Resolve::answering(Some(f.clone_ref()));
+                if let Err(site) = catch_death(|| form(&variant, &mut resolve)) {
+                    assert_eq!(
+                        (site.kind, site.file),
+                        (DeathKind::Abort, sel),
+                        "{variant:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The decode's death site and its detail
     fn dies(blob: &[u8], resolve: &mut Resolve) -> reims_vgpu_core::raise::death::DeathSite {
         catch_death(|| decode(blob, resolve).is_ok()).unwrap_err()
