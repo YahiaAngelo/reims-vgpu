@@ -168,7 +168,8 @@ Set in `Cargo.toml` (architecture 2.3):
 
 | profile | settings | why |
 |---|---|---|
-| `dev` | `panic = "unwind"`, overflow checks on | an unannotated arithmetic slip dies in tests |
+| `dev` | `panic = "unwind"`, overflow checks on, `debug = "line-tables-only"`, dependencies without debuginfo | an unannotated arithmetic slip dies in tests. Line tables keep a backtrace's files and lines, at a fraction of full debuginfo's build time and disk |
+| `debugging` | `dev` with full debuginfo, dependencies' too | a debugger session's build (`--profile debugging`), whose variables and types lldb shows |
 | `release` | `panic = "unwind"`, overflow checks off, `debug = "line-tables-only"`, thin LTO | the product. Wrapping is explicit where the guest's values wrap (D19), so the checks add nothing |
 | `checked` | `release` plus overflow checks and debug assertions | a second pass of the suite: a death here is an arithmetic site review missed |
 

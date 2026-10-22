@@ -97,6 +97,17 @@ lto = "thin"
 [profile.dev]
 panic = "unwind"
 overflow-checks = true         # an unannotated arithmetic slip dies in tests
+debug = "line-tables-only"     # backtraces keep file and line; full DWARF is `debugging`'s
+
+[profile.dev.package."*"]      # dependencies: no debuginfo
+debug = false
+
+[profile.debugging]            # a debugger's build: dev with full debuginfo everywhere
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
 
 [profile.checked]              # the suite's second pass (13.6)
 inherits = "release"
