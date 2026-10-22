@@ -50,7 +50,9 @@
 //!   level's extent. A 3D texture takes the region's depth and ignores the slice; every other
 //!   type ignores the region's `z` and depth. A 1D or 2D texture ignores the slice; an array
 //!   writes a slice it has and nothing past them; a cube writes face `slice % 6`, a cube array
-//!   slice `slice` while it has it. Metal's work grows with the region before the cut (2^32
+//!   slice `slice` while it has it. A 2D multisample texture ignores the slice, as a 2D one
+//!   does, and a multisample array writes a slice it has, every sample of the region's texels
+//!   (the runtime's fill, below). Metal's work grows with the region before the cut (2^32
 //!   texels: 23 ms; 2^64 did not end in 10 minutes), so a region past 2^32 texels dies, as
 //!   nothing measured how it ends. A texture buffer's fill skips `place` and goes to the runtime
 //!   as the call gives it ([`texture_buffer_writes`]): Metal writes it as bytes of the buffer,
@@ -61,8 +63,12 @@
 //!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 256 bytes, the most
 //!   measured; a longer one dies ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
 //!   bytes past the pattern's whole copies, which are its stack's, the runtime's reads zeros and
-//!   announces `TextureBufferFillLeftover`, one of Metal's answers, relayed. A multisample
-//!   texture's dies: Metal fills each sample of the region's texels, which the runtime refuses.
+//!   announces `TextureBufferFillLeftover`, one of Metal's answers, relayed.
+//! - **A multisample texture's** fill writes every sample of the region's texels and no other,
+//!   each sample its own bytes of the pattern where a texel's samples hold 16 bytes or fewer,
+//!   else every sample the pattern cut at the texel, as the runtime's fill writes them
+//!   (`encode_blit`'s `multisample_fills_are_the_metal_platforms`). The runtime refuses one only
+//!   where the device cannot run its sample copies, which dies naming the refusal.
 
 use metal2vulkan::metal::{PixelFormat, TextureType};
 use reims_vgpu_core::platform::types::MtlRegion;
@@ -280,9 +286,9 @@ fn measured(sel: &'static str, region: MtlRegion, depth: u64) {
 }
 
 /// Where a fill of `region` at `level` and `slice` writes in a texture of `shape`, as Metal
-/// writes it; `None` where it writes nothing. A multisample texture or a texture buffer (whose
-/// fill is [`texture_buffer_writes`]'s), and a region past 2^32 texels, die for `sel`, as
-/// nothing measured them here.
+/// writes it; `None` where it writes nothing. A texture buffer (whose fill is
+/// [`texture_buffer_writes`]'s), and a region past 2^32 texels, die for `sel`, as nothing
+/// measured them here.
 pub fn place(
     sel: &'static str,
     shape: &Shape,
@@ -293,8 +299,10 @@ pub fn place(
     use TextureType as T;
     let deep = shape.texture_type == T::Type3D;
     let slice = match shape.texture_type {
-        T::Type1D | T::Type2D | T::Type3D => 0,
-        T::Type1DArray | T::Type2DArray => (slice < shape.array_length).then_some(slice)?,
+        T::Type1D | T::Type2D | T::Type2DMultisample | T::Type3D => 0,
+        T::Type1DArray | T::Type2DArray | T::Type2DMultisampleArray => {
+            (slice < shape.array_length).then_some(slice)?
+        }
         T::Cube => slice % 6,
         T::CubeArray => (slice < shape.array_length.saturating_mul(6)).then_some(slice)?,
         other => unrepresentable(
@@ -373,7 +381,8 @@ mod tests {
 
     /// Where a fill writes, as measured on Metal: levels past the texture's write nothing; the
     /// region is cut at the level; 1D and 2D ignore the slice and every type but 3D the region's
-    /// depth; arrays write their slices; a cube writes face `slice % 6`. A texture buffer's fill
+    /// depth; arrays write their slices, a multisample array too; a cube writes face `slice %
+    /// 6`. A texture buffer's fill
     /// writes but for a region of no texels across, and dies at a pattern past the bytes measured
     #[test]
     fn places_are_metals() {
@@ -438,7 +447,16 @@ mod tests {
         let site = catch_death(|| place_of(&flat, 0, 0, huge)).unwrap_err();
         assert_eq!(site.file, "s");
         let many = shape(TextureType::Type2DMultisample, [4, 4, 1], 1, 1);
-        assert!(catch_death(|| place_of(&many, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
+        assert_eq!(
+            place_of(&many, 0, 3, r([3, 2, 1], [4, 4, 2])),
+            at(0, 0, [3, 2, 0], [1, 2, 1])
+        );
+        let many_array = shape(TextureType::Type2DMultisampleArray, [4, 4, 1], 1, 2);
+        assert_eq!(
+            place_of(&many_array, 0, 1, r([0, 0, 0], [1, 1, 1])),
+            at(1, 0, [0, 0, 0], [1, 1, 1])
+        );
+        assert_eq!(place_of(&many_array, 0, 2, r([0, 0, 0], [1, 1, 1])), None);
         let buffer = shape(TextureType::TextureBuffer, [8, 1, 1], 1, 1);
         assert!(catch_death(|| place_of(&buffer, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
         let writes = |region| texture_buffer_writes("s", region);

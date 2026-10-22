@@ -3494,3 +3494,218 @@ fn texture_buffer_fills_metal_streams_are_metals() {
         ),
     ]);
 }
+
+/// A multisample texture of [`multisample_fills_on`]: its format, samples a texel, bytes a
+/// sample, and slices (0 for a 2D multisample texture, else a multisample array of them).
+type MultisampleShape = (u64, u64, u64, u64);
+
+/// The bytes of each slice of a 5 by 3 multisample texture of `shape` ([`MultisampleShape`];
+/// Private, read by shaders and rendered to) on platform `P`: written from a buffer of `init`,
+/// each slice's samples in turn, then `fills` in one blit encoder, then copied back into a
+/// buffer, a pixel's samples consecutive, Metal's layout of a multisample copy.
+fn multisample_fills_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (format, samples, bpp, slices): MultisampleShape,
+    init: &[u8],
+    fills: &[Fill],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    let (width, height) = (5, 3);
+    let t = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                texture_type: if slices == 0 { 4 } else { 8 },
+                pixel_format: format,
+                width,
+                height,
+                array_length: slices.max(1),
+                sample_count: samples,
+                usage: 0x5,
+                resource_options: Some(0x20),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let row = width * samples * bpp;
+    let image = row * height;
+    let length = image * slices.max(1);
+    assert_eq!(init.len() as u64, length);
+    let [up, down] = [(); 2].map(|()| {
+        d.new_buffer_of_length(OnFault::Return, length, 0)
+            .unwrap()
+            .unwrap()
+    });
+    // SAFETY: a Shared buffer of `length` bytes the GPU does not use yet.
+    unsafe {
+        std::ptr::copy_nonoverlapping(init.as_ptr(), up.contents().as_ptr::<u8>(), init.len())
+    };
+    let run = |cmds: Vec<BlitCmd<'_, P>>| {
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in cmds {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+    };
+    let (at, size) = (MtlOrigin::new(0, 0, 0), MtlSize::new(width, height, 1));
+    run((0..slices.max(1))
+        .map(|slice| BlitCmd::CopyBufferToTexture {
+            source_buffer: &up,
+            source_offset: slice * image,
+            source_bytes_per_row: row,
+            source_bytes_per_image: image,
+            source_size: size,
+            destination_texture: &t,
+            destination_slice: slice,
+            destination_level: 0,
+            destination_origin: at,
+        })
+        .collect());
+    run(fills.iter().map(|f| fill_of::<P>(&t, f)).collect());
+    run((0..slices.max(1))
+        .map(|slice| BlitCmd::CopyTextureToBuffer {
+            source_texture: &t,
+            source_slice: slice,
+            source_level: 0,
+            source_origin: at,
+            source_size: size,
+            destination_buffer: &down,
+            destination_offset: slice * image,
+            destination_bytes_per_row: row,
+            destination_bytes_per_image: image,
+        })
+        .collect());
+    let n = usize::try_from(length).unwrap();
+    // SAFETY: a Shared buffer's `length` bytes, read after the GPU's writes completed.
+    unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// A fill of a multisample texture writes its samples as Metal's does, every byte of every
+/// sample compared ([`multisample_fills_on`]), Metal's the same on a second run: 2D multisample
+/// textures of `R8Unorm`, `RG8Unorm`, `RGBA8Unorm`, `R32Uint`, `RGBA16Float`, `Depth32Float`
+/// and `Stencil8` at 4 samples, and of `RGBA8Unorm` and `RGBA32Float` at 2 and 4; a multisample
+/// array of 2 slices of `RGBA8Unorm` at 4 samples, at slice 1 and at a slice past them; with
+/// patterns of 16 bytes and of 3, whole, at a region and at a slice a 2D texture ignores, and
+/// with a colour packed in `RGBA8Unorm` and in `RGBA32Float` (in `R32Float`, of a depth in
+/// `[0, 1]`, for `Depth32Float`, whose samples hold such depths before too). Measured on the M3
+/// Max (macOS 27.0.1), as the runtime's probe of Metal found: a fill writes every sample of the
+/// region's texels and no other byte; where a texel's samples hold 16 bytes or fewer, sample `s`
+/// takes the pattern's bytes from `s` times the sample's, the pattern repeated, and past 16
+/// each sample takes the pattern cut at the sample's bytes
+#[test]
+fn multisample_fills_are_the_metal_platforms() {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let p = crate::platform::tests::platform();
+    let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let sixteen: Vec<u8> = (0xa1..=0xb0).collect();
+    let three = [0xc1, 0xc2, 0xc3];
+    let depths: Vec<u8> = [0.25f32, 0.5, 0.75, 1.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let rgba = [0.25, 0.5, 0.75, 1.0];
+    let colour_fills = |packed: [u64; 2]| {
+        packed.map(|format| color_fill((0, 0), ([1, 1, 0], [3, 2, 1]), rgba, format))
+    };
+    let mut cases: Vec<(MultisampleShape, Vec<Fill>)> = Vec::new();
+    for shape in [
+        (10, 4, 1, 0),
+        (30, 4, 2, 0),
+        (70, 4, 4, 0),
+        (70, 2, 4, 0),
+        (53, 4, 4, 0),
+        (115, 4, 8, 0),
+        (125, 2, 16, 0),
+        (125, 4, 16, 0),
+        (253, 4, 1, 0),
+    ] {
+        cases.push((
+            shape,
+            vec![bytes_fill(0, 0, [0, 0, 0], [5, 3, 1], &sixteen)],
+        ));
+        cases.push((shape, vec![bytes_fill(0, 3, [1, 1, 0], [9, 9, 1], &three)]));
+        if shape.0 != 253 {
+            cases.push((shape, colour_fills([70, 125]).to_vec()));
+        }
+    }
+    let depth = (252, 4, 4, 0);
+    cases.push((depth, vec![bytes_fill(0, 0, [0, 0, 0], [5, 3, 1], &depths)]));
+    cases.push((
+        depth,
+        vec![bytes_fill(0, 0, [2, 0, 0], [2, 3, 1], &depths[4..8])],
+    ));
+    cases.push((
+        depth,
+        vec![color_fill((0, 0), ([1, 1, 0], [3, 2, 1]), rgba, 55)],
+    ));
+    let array = (70, 4, 4, 2);
+    cases.push((
+        array,
+        vec![bytes_fill(0, 1, [0, 0, 0], [5, 3, 1], &sixteen)],
+    ));
+    cases.push((
+        array,
+        vec![bytes_fill(0, 2, [0, 0, 0], [5, 3, 1], &sixteen)],
+    ));
+    let mut differ = Vec::new();
+    for (i, (shape, fills)) in cases.iter().enumerate() {
+        let (format, samples, bpp, slices) = *shape;
+        let what = format!("case {i}, {shape:?}: {fills:?}");
+        let n = 5 * 3 * samples * bpp * slices.max(1);
+        let init: Vec<u8> = match format {
+            252 => (0..n / 4)
+                .flat_map(|k| ((k % 64) as f32 / 64.0).to_le_bytes())
+                .collect(),
+            _ => noise(0x6d5 + u32::try_from(i).unwrap(), n),
+        };
+        let on_metal = || {
+            multisample_fills_on::<reims_vgpu_metal::MetalPlatform>(
+                &metal,
+                &metal_desc,
+                *shape,
+                &init,
+                fills,
+            )
+        };
+        let theirs = on_metal();
+        assert_eq!(
+            theirs,
+            on_metal(),
+            "{what}: Metal's bytes vary between runs"
+        );
+        match catch_death(|| {
+            multisample_fills_on::<VulkanPlatform>(&d, &ours_desc, *shape, &init, fills)
+        }) {
+            Ok(ours) if ours == theirs => {}
+            Ok(ours) => {
+                let at: Vec<usize> = (0..ours.len()).filter(|&k| ours[k] != theirs[k]).collect();
+                differ.push(format!(
+                    "{what}: {} bytes differ, from {:#x}",
+                    at.len(),
+                    at[0]
+                ));
+            }
+            Err(site) => {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                differ.push(format!("{what}: died at {}: {line}", site.file));
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}

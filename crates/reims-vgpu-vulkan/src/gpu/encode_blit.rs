@@ -54,8 +54,10 @@
 //!   rest of the formats Metal fills too: a two-plane XR10 texture of its own memory at any width
 //!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
 //!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart; the YCbCr and padded formats of a
-//!   texture over a surface or memory (`fills_of_ycbcr_and_padded_textures_are_metals`). It
-//!   refuses a multisample texture's fill alone, which `place` dies at first.
+//!   texture over a surface or memory (`fills_of_ycbcr_and_padded_textures_are_metals`); and a
+//!   multisample texture's samples (`multisample_fills_are_the_metal_platforms`). It refuses a
+//!   multisample texture's fill only where the device cannot run its sample copies (sample-rate
+//!   shading, an integer attachment at the sample count), which dies naming the refusal.
 //! - **A colour fill** is the runtime's colour fill, which packs the colour in the call's pixel
 //!   format as Metal does ([`crate::gpu::fill`]) and fills that texel as its `fill_texture` fills
 //!   a pattern (above), at the level and slice and in the region `place` gives. A colour in a
