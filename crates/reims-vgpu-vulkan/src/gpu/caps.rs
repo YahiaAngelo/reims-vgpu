@@ -3,8 +3,13 @@
 //! Each answer comes from one of three sources, in this order:
 //! - **the runtime's answer** of the Metal query (`DeviceProperties`,
 //!   `Device::heap_buffer_size_and_align`): the name, the threadgroup sizes, the public queries,
-//!   `supportsTextureWriteRoundingMode:` (Apple's SPI: yes for 1 and 2, as Metal answers; what a
-//!   state of mode 2 does that the runtime does not is [`crate::gpu::serialized`]'s), and, in
+//!   `supportsTextureWriteRoundingMode:` (Apple's SPI: yes for 1 and 2, as Metal answers; at
+//!   mode 2 the runtime rounds a render state's half-float colour attachments to nearest even,
+//!   as Metal's, announces a blend of other factors than one and zero at the draw
+//!   (`blended-write-rounding`, relayed, a death in strict mode) and refuses a fragment
+//!   function's half-float and small-float texture writes, which die at their selector; a
+//!   half-float attachment it is not measured to store as Metal does is relayed as the state is
+//!   made, a death in strict mode ([`crate::gpu::serialized::rounded_writes`])), and, in
 //!   [`crate::gpu::format_info`], Apple's private pixel format description and level layout
 //!   (`Device::pixel_format_info`, `Device::texture_level_info`);
 //! - **the runtime's answer of Apple's private property** on the device
