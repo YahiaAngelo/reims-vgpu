@@ -2,6 +2,7 @@
 //! the bookkeeping alone, which makes no call (`super`'s docs, "Unmaps an import waits for").
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::ops::Range;
 
 /// The live holds and the unmaps waiting for them, each a range of whole pages. A leaf lock
@@ -12,9 +13,9 @@ pub(super) struct Holds {
     next: u64,
     /// Each live hold's pages, by their first byte and the hold's number, to their end.
     held: BTreeMap<(u64, u64), u64>,
-    /// The most bytes any hold took, which bounds how far below a range a hold that meets it
-    /// starts.
-    longest: u64,
+    /// How many live holds took each length in bytes: the longest bounds how far below a range a
+    /// live hold that meets it starts ([`Holds::meets`]), and falls again as such holds go.
+    lengths: BTreeMap<u64, usize>,
     /// The unmaps that wait, no two sharing a page: each made whole once no hold meets it.
     waiting: Vec<Range<u64>>,
 }
@@ -25,7 +26,7 @@ impl Holds {
         Holds {
             next: 0,
             held: BTreeMap::new(),
-            longest: 0,
+            lengths: BTreeMap::new(),
             waiting: Vec::new(),
         }
     }
@@ -34,14 +35,24 @@ impl Holds {
     pub(super) fn hold(&mut self, pages: Range<u64>) -> u64 {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
-        self.longest = self.longest.max(pages.end.saturating_sub(pages.start));
+        *(self.lengths)
+            .entry(pages.end.saturating_sub(pages.start))
+            .or_default() += 1;
         self.held.insert((pages.start, id), pages.end);
         id
     }
 
-    /// Whether a live hold meets `pages`.
+    /// The most bytes a live hold took.
+    fn longest(&self) -> u64 {
+        self.lengths
+            .last_key_value()
+            .map_or(0, |(&length, _)| length)
+    }
+
+    /// Whether a live hold meets `pages`: one that starts no further below them than the longest
+    /// live hold's length.
     fn meets(&self, pages: &Range<u64>) -> bool {
-        let from = pages.start.saturating_sub(self.longest);
+        let from = pages.start.saturating_sub(self.longest());
         (self.held.range((from, 0)..(pages.end, 0)))
             .any(|(&(first, _), &end)| first < pages.end && pages.start < end)
     }
@@ -88,7 +99,14 @@ impl Holds {
     /// The hold `id` on the pages from `first` goes: the unmaps no live hold meets any more,
     /// which the caller makes.
     pub(super) fn release(&mut self, first: u64, id: u64) -> Vec<Range<u64>> {
-        self.held.remove(&(first, id));
+        if let Some(end) = self.held.remove(&(first, id))
+            && let Entry::Occupied(mut held) = self.lengths.entry(end.saturating_sub(first))
+        {
+            *held.get_mut() -= 1;
+            if *held.get() == 0 {
+                held.remove();
+            }
+        }
         if self.waiting.is_empty() {
             return Vec::new();
         }
@@ -157,6 +175,64 @@ mod tests {
         assert!(h.unmap(pages(999, 1)));
         assert!(!h.unmap(pages(1000, 1)), "past its end");
         assert_eq!(h.release(0, long), vec![pages(999, 1)]);
+    }
+
+    /// A long hold, once released, no longer widens the search below a range: the longest live
+    /// hold bounds it, whichever went before
+    #[test]
+    fn the_longest_hold_is_the_longest_that_lives() {
+        let mut h = Holds::new();
+        let long = h.hold(pages(0, 1000));
+        let again = h.hold(pages(5000, 1000));
+        let short = h.hold(pages(2000, 2));
+        assert_eq!(h.longest(), 1000 * PAGE);
+        assert!(h.release(0, long).is_empty());
+        assert_eq!(h.longest(), 1000 * PAGE, "another as long lives");
+        assert!(h.release(5000 * PAGE, again).is_empty());
+        assert_eq!(h.longest(), 2 * PAGE);
+        assert!(!h.unmap(pages(999, 1)), "the long hold went");
+        assert!(h.unmap(pages(2001, 1)));
+        assert_eq!(h.release(2000 * PAGE, short), vec![pages(2001, 1)]);
+        assert_eq!(h.longest(), 0);
+        assert!(h.lengths.is_empty());
+    }
+
+    /// Whether a live hold meets pages is what a walk of every live hold answers, over holds
+    /// taken and released at random, of lengths from a page to many, the same pages held twice
+    /// among them
+    #[test]
+    fn holds_meet_pages_as_a_walk_of_every_live_hold_does() {
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut h = Holds::new();
+        let mut live: Vec<(Range<u64>, u64)> = Vec::new();
+        for step in 0..20_000 {
+            if live.is_empty() || next(3) != 0 {
+                let length = if next(50) == 0 {
+                    1 + next(400)
+                } else {
+                    1 + next(4)
+                };
+                let held = pages(next(600), length);
+                let id = h.hold(held.clone());
+                live.push((held, id));
+            } else {
+                let (held, id) =
+                    live.swap_remove(usize::try_from(next(live.len() as u64)).unwrap());
+                h.release(held.start, id);
+            }
+            let asked = pages(next(700), 1 + next(8));
+            let walked =
+                (live.iter()).any(|(held, _)| held.start < asked.end && asked.start < held.end);
+            assert_eq!(h.meets(&asked), walked, "step {step}: {asked:x?}");
+            let longest = live.iter().map(|(held, _)| held.end - held.start).max();
+            assert_eq!(h.longest(), longest.unwrap_or(0), "step {step}");
+        }
     }
 
     /// Pages mapped anew, or unmapped now, under a waiting unmap leave it: what of it they cover
