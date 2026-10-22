@@ -1226,6 +1226,10 @@ struct Unit {
     encoders: u64,
     bindings: Bindings,
     used: Vec<Use>,
+    /// Whether a texture `used` holds lies on a surface whose GPU writes never reach its memory,
+    /// or is one whose writes the runtime refuses ([`Unit::reaches_dropped_texels`]), which a
+    /// texture answers alike for its life: asked once, as it is made resident.
+    used_dropped: bool,
     /// Whether the runtime encoder holds a pipeline the guest did not set.
     foreign: bool,
     /// The dispatch type of the unit's first compute encoder, once it has one.
@@ -1443,16 +1447,24 @@ impl Unit {
     /// whose GPU writes never reach its memory ([`crate::os::gpu_read_only`]). A kernel's stores
     /// into a buffer on one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
     fn reaches_dropped_texels(&self) -> bool {
-        let reaches = |t: &VulkanTexture| t.gpu_read_only() || t.writes_refused();
-        let textures = self.bindings.textures.values().any(reaches);
-        let used = self.used.iter().any(|u| match u {
-            Use::Resources(list, _) => (list.iter()).any(|r| match r {
-                Resource::Texture(t) => reaches(t),
-                Resource::Buffer(_) | Resource::Icb(_) => false,
-            }),
-            Use::Heaps(_) => false,
-        });
-        textures || used
+        self.used_dropped || self.bindings.textures.values().any(drops_texels)
+    }
+
+    /// The open encoder made `list` resident with `usage`: kept until the encoder ends, as a fresh
+    /// runtime encoder is given it again ([`Unit::refresh`]), with whether one of its textures
+    /// drops texels ([`Unit::reaches_dropped_texels`]).
+    fn made_resident(&mut self, list: Vec<Resource>, usage: ResourceUsage) {
+        self.used_dropped |=
+            (list.iter()).any(|r| matches!(r, Resource::Texture(t) if drops_texels(t)));
+        self.used.push(Use::Resources(list, usage));
+    }
+
+    /// The open encoder ended or went, and what it made resident with it.
+    fn let_go(&mut self) {
+        self.encoder = None;
+        self.bindings = Bindings::default();
+        self.used.clear();
+        self.used_dropped = false;
     }
 
     /// What the open encoder's next work may write through textures, `inherits` what an
@@ -1592,6 +1604,12 @@ impl Unit {
     }
 }
 
+/// Whether `t` lies on a surface whose GPU writes never reach its memory, or is one whose writes
+/// the runtime refuses ([`Unit::reaches_dropped_texels`]).
+fn drops_texels(t: &VulkanTexture) -> bool {
+    t.gpu_read_only() || t.writes_refused()
+}
+
 /// `id<MTLComputeCommandEncoder>`'s object: the runtime's encoder, with its command buffer's
 /// predication.
 #[derive(Debug)]
@@ -1619,9 +1637,7 @@ impl Drop for PredicatedEncoder {
     fn drop(&mut self) {
         let mut u = self.predication.unit.lock();
         if u.encoder == Some(self.number) {
-            u.encoder = None;
-            u.bindings = Bindings::default();
-            u.used.clear();
+            u.let_go();
         }
     }
 }
@@ -1640,10 +1656,9 @@ pub fn encoder(
         if u.recording() {
             u.log.push(Arc::new(Logged::Encoder));
         }
+        u.let_go();
         u.encoders += 1;
         u.encoder = Some(u.encoders);
-        u.bindings = Bindings::default();
-        u.used.clear();
         u.foreign = false;
         u.encoders
     };
@@ -1690,9 +1705,7 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
         // What the encoder bound and made resident goes with it: what the runtime's command
         // buffer holds until it completes is the runtime's to hold.
         ComputeCmd::EndEncoding => {
-            u.encoder = None;
-            u.bindings = Bindings::default();
-            u.used.clear();
+            u.let_go();
             return;
         }
         ComputeCmd::UpdateFence { .. } | ComputeCmd::WaitForFence { .. }
@@ -1711,7 +1724,7 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
         } => {
             let usage: ResourceUsage = metal_value(cmd.selector(), "resource usage", *usage);
             let list = list.iter().flatten().map(Resource::of).collect();
-            u.used.push(Use::Resources(list, usage));
+            u.made_resident(list, usage);
         }
         ComputeCmd::UseHeaps { heaps } => {
             let heaps = heaps.iter().flatten().map(|h| h.clone_ref()).collect();
