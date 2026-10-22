@@ -917,11 +917,11 @@ fn a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
     }
 }
 
-/// A fill of [`refused_fill_on`]: its level and slice, its region's origin and size, and its
+/// A fill of [`memory_fill_on`]: its level and slice, its region's origin and size, and its
 /// pattern.
-type RefusedFill<'a> = ((u64, u64), [u64; 2], [u64; 2], Pattern<'a>);
+type MemoryFill<'a> = ((u64, u64), [u64; 2], [u64; 2], Pattern<'a>);
 
-/// Where a texture a fill the runtime refuses fills lies: over plane `plane` of a surface of the
+/// Where a texture over memory lies: over plane `plane` of a surface of the
 /// OSType ([`crate::gpu::ycbcr::measure::Shape`]) whose luma is the texture's size (over plane 1,
 /// the texture is the chroma's size), or over a Shared buffer at rows of `row` bytes.
 #[derive(Clone, Copy, Debug)]
@@ -948,11 +948,11 @@ impl Memory {
 /// blit encoder, of a texture of `format` over `memory` (a surface's of luma `size`, or a
 /// buffer's rows of `size`) write on `p`'s device `d`: every byte of the memory, which starts as
 /// `i * 37 % 251` at byte `i` on every platform, once the command buffer completed.
-fn refused_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn memory_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
     p: &P,
     d: &P::Device,
     (format, size, memory): (u64, (u64, u64), Memory),
-    fills: &[RefusedFill<'_>],
+    fills: &[MemoryFill<'_>],
 ) -> Vec<u8> {
     use reims_vgpu_core::platform::HostRange;
     use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -1034,7 +1034,7 @@ fn refused_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::O
 /// YCbCr format the runtime makes over a surface, over plane 0 of a surface of its bits, packing
 /// and chroma; and of each padded format over a buffer and over a plane of an 'x420' surface
 /// (576 and 577 the luma, 578 and 579 the chroma).
-fn refused_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
+fn memory_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
     use metal2vulkan::metal::format::{ChromaSubsampling as C, ycbcr_format};
     let mut out = Vec::new();
     for raw in 0..2048u32 {
@@ -1067,20 +1067,18 @@ fn refused_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
     out
 }
 
-/// A fill of a texture Metal makes over memory it is given, of a YCbCr or padded format, which
-/// the runtime refused (`AppleOnly::FillUnmeasured`) before 6b9a3b33d6 and fills since, writes the
-/// memory as Metal's does, every byte compared
-/// ([`refused_fill_on`]): of each YCbCr format the runtime makes over a surface, over plane 0 of
-/// a surface of its kind, and of each padded format over a buffer and over a plane of an 'x420'
-/// surface ([`refused_fill_textures`]); at two sizes; with bytes, 8 of them, 3 and 1, and with a
-/// colour packed in RGBA8Unorm, RGBA16Float, R8Unorm, RG11B10Float and RGBA32Float; over a
-/// region inside the texture, one of an odd width and one past its edge at the smaller size (a
-/// texture over memory has one level and one slice). Measured on the M3 Max (macOS 27.0.1):
-/// Metal writes each texel of the region (cut at the texture) at plane offset +
-/// y * bytesPerRow + x * the block bytes Metal describes (1, 2 or 4), the pattern repeated from
-/// its start and cut at those bytes, every other byte kept; a packed format's texel (508 to 510,
-/// 528 to 530: 1 byte) is written 0 whatever the pattern. A region wholly past the texture writes
-/// nothing on either.
+/// A fill of a texture Metal makes over memory it is given, of a YCbCr or padded format, writes the
+/// memory as Metal's does, every byte compared ([`memory_fill_on`]): of each YCbCr format the
+/// runtime makes over a surface, over plane 0 of a surface of its kind, and of each padded format
+/// over a buffer and over a plane of an 'x420' surface ([`memory_fill_textures`]); at two sizes;
+/// with bytes, 8 of them, 3 and 1, and with a colour packed in RGBA8Unorm, RGBA16Float, R8Unorm,
+/// RG11B10Float and RGBA32Float; over a region inside the texture, one of an odd width and one past
+/// its edge at the smaller size (a texture over memory has one level and one slice). Measured on
+/// the M3 Max (macOS 27.0.1): Metal writes each texel of the region (cut at the texture) at plane
+/// offset + y * bytesPerRow + x * the block bytes Metal describes (1, 2 or 4), the pattern repeated
+/// from its start and cut at those bytes, every other byte kept; a packed format's texel (508 to
+/// 510, 528 to 530: 1 byte) is written 0 whatever the pattern. A region wholly past the texture
+/// writes nothing on either.
 #[test]
 fn fills_of_ycbcr_and_padded_textures_are_metals() {
     use reims_vgpu_core::platform::types::ClearColor;
@@ -1110,13 +1108,13 @@ fn fills_of_ycbcr_and_padded_textures_are_metals() {
     let regions = [([1, 1], [5, 2]), ([3, 2], [7, 3]), ([12, 6], [8, 4])];
     let mut differ = Vec::new();
     for size in [(16, 8), (33, 17)] {
-        for texture in refused_fill_textures(size) {
+        for texture in memory_fill_textures(size) {
             for pattern in patterns {
                 for &(origin, region) in &regions {
-                    let fills: [RefusedFill<'_>; 1] = [((0, 0), origin, region, pattern)];
+                    let fills: [MemoryFill<'_>; 1] = [((0, 0), origin, region, pattern)];
                     let what = format!("{texture:?} {fills:?}");
-                    let theirs = refused_fill_on(&mp, &md, texture, &fills);
-                    let ours = catch_death(|| refused_fill_on(&p, &d, texture, &fills));
+                    let theirs = memory_fill_on(&mp, &md, texture, &fills);
+                    let ours = catch_death(|| memory_fill_on(&p, &d, texture, &fills));
                     match ours {
                         Ok(ours) if ours == theirs => {}
                         Ok(ours) => {
