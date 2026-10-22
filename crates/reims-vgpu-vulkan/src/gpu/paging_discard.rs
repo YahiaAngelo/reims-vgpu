@@ -20,8 +20,8 @@
 //!
 //! Each case holds the paging command buffer in flight for as long as it looks. Ahead of it on the
 //! paging queue, a command buffer of the test's writes the resource's bytes (a copy into the
-//! private buffer, a depth clear of the texture), then runs the busy kernel (`spin.metal`, about
-//! half a second on the M3 Max at [`ROUNDS`]). A queue's command buffers complete in its order, so
+//! private buffer, a depth clear of the texture), then runs the busy kernel (`spin.metal`) for
+//! about half a second ([`rounds_to_hold`]). A queue's command buffers complete in its order, so
 //! the paging command buffer completes after the kernel's, and its copy reads what the work ahead
 //! wrote, a tracked hazard. As the synchronize returns, its discard made, the test reads:
 //! - whether core's deallocator ran: its mapping leaves the platform's record of core's mappings of
@@ -78,9 +78,15 @@ type P = VulkanPlatform;
 /// The busy kernel (`spin.metal`).
 const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
 
-/// The kernel's rounds: about half a second on the M3 Max, which holds the paging command buffer
-/// in flight from before the synchronize to well past its return.
+/// The kernel's fewest rounds: about half a second on the M3 Max, which holds the paging command
+/// buffer in flight from before the synchronize to well past its return ([`rounds_to_hold`]).
 const ROUNDS: u32 = 8_000;
+
+/// How long the kernel holds the GPU at least, in nanoseconds ([`rounds_to_hold`]).
+const HOLD_NS: u64 = 500_000_000;
+
+/// The kernel's rounds in the run that times it on the device ([`rounds_to_hold`]).
+const PROBE_ROUNDS: u32 = 2_000;
 
 /// The transfer buffer's length: a few MiB, as a guest's paged resources take.
 const LEN: u64 = 4 << 20;
@@ -201,6 +207,56 @@ fn first_difference(got: &[u8], want: &[u8]) -> Option<(usize, u8, u8)> {
         .map(|at| (at, got[at], want[at]))
 }
 
+/// Encodes the busy kernel into `cb`: one thread of `state`, over `words`, which name its rounds.
+fn spin(
+    cb: &CommandBuffer,
+    state: &<P as Platform>::ComputePipeline,
+    words: &<P as Platform>::Buffer,
+) {
+    let compute = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        ComputeCmd::SetComputePipelineState { state: Some(state) },
+        ComputeCmd::SetBuffers {
+            buffers: &[Some(words)],
+            offsets: &[0],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(1, 1, 1),
+            threads_per_threadgroup: MtlSize::new(1, 1, 1),
+        },
+        ComputeCmd::EndEncoding,
+    ] {
+        compute.encode(OnFault::Die, cmd).unwrap();
+    }
+}
+
+/// The busy kernel's rounds that hold the GPU for [`HOLD_NS`] or longer on `queue`'s device:
+/// [`ROUNDS`], about half a second on the M3 Max, or more where a run of [`PROBE_ROUNDS`], timed
+/// from its commit to its completion, shows the device faster. An RTX 5080 Laptop GPU runs
+/// [`ROUNDS`] in far less, and the paging command buffer had completed before the synchronize
+/// returned (NVIDIA 615.71.09: the probe takes about 2.3 ms there, and about 143 ms on the M3
+/// Max). The probe leaves `words` naming its own rounds.
+fn rounds_to_hold(
+    queue: &<P as Platform>::CommandQueue,
+    state: &<P as Platform>::ComputePipeline,
+    words: &<P as Platform>::Buffer,
+) -> u32 {
+    use reims_vgpu_core::platform::os::Clock as _;
+    // SAFETY: the kernel's rounds, in the first of the buffer's four words, before its GPU use.
+    unsafe { words.contents().as_ptr::<u32>().write(PROBE_ROUNDS) };
+    let probe = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+    spin(&probe, state, words);
+    let clock = crate::os::OsClock::new();
+    let began = clock.now_mono();
+    probe.commit(OnFault::Die).unwrap();
+    probe.wait_until_completed(OnFault::Die).unwrap();
+    let took = clock.now_mono().saturating_duration_since(began);
+    let per_round = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX) / u64::from(PROBE_ROUNDS);
+    let wanted = HOLD_NS / per_round.max(1);
+    u32::try_from(wanted).unwrap_or(u32::MAX).max(ROUNDS)
+}
+
 /// A device over guest RAM with a kernel task, the resource `case` makes registered in it, its
 /// host copy written ahead of the paging, then core's synchronize and discard of it, checked as
 /// the module docs say.
@@ -267,35 +323,19 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
         .new_buffer_of_length(OnFault::Die, 16, SHARED)
         .unwrap()
         .unwrap();
-    // SAFETY: the kernel's rounds, in the first of the buffer's four words, before any GPU use.
-    unsafe { words.contents().as_ptr::<u32>().write(ROUNDS) };
     let library = d.new_library(SPIN).unwrap().unwrap().unwrap();
     let function = library.new_function(OnFault::Die, "spin").unwrap().unwrap();
     let state = d
         .new_compute_pipeline_state_for_function(Some(&function))
         .unwrap()
         .unwrap();
+    let rounds = rounds_to_hold(&queue, &state, &words);
+    // SAFETY: the kernel's rounds, in the first of the buffer's four words; the timing run's
+    // command buffer has completed.
+    unsafe { words.contents().as_ptr::<u32>().write(rounds) };
     let ahead = queue.command_buffer(OnFault::Die).unwrap().unwrap();
     let kept = write(&ahead);
-    let compute = ahead.compute_encoder(OnFault::Die).unwrap().unwrap();
-    for cmd in [
-        ComputeCmd::SetComputePipelineState {
-            state: Some(&state),
-        },
-        ComputeCmd::SetBuffers {
-            buffers: &[Some(&words)],
-            offsets: &[0],
-            range: NsRange::new(0, 1),
-        },
-        ComputeCmd::DispatchThreads {
-            threads_per_grid: MtlSize::new(1, 1, 1),
-            threads_per_threadgroup: MtlSize::new(1, 1, 1),
-        },
-        ComputeCmd::EndEncoding,
-    ] {
-        compute.encode(OnFault::Die, cmd).unwrap();
-    }
-    drop(compute);
+    spin(&ahead, &state, &words);
     ahead.commit(OnFault::Die).unwrap();
     ahead.wait_until_scheduled().unwrap();
     // The host's copy is the one to write back, as after the guest's GPU work wrote it.
