@@ -2139,6 +2139,7 @@ mod tests {
     /// of its own, whether any of them lie in its pages, and none once a detach zeroes it, until
     /// a replace gives it pages again
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
     fn meeting_pages_is_whether_the_bytes_lie_in_them() {
         let pages = Arc::new(Pages::default());
         let all = [
@@ -2177,6 +2178,7 @@ mod tests {
     /// each run's edges, past their end, over runs of no length, and for no bytes; and they meet
     /// the pages where that finds any
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
     fn bytes_in_pages_are_found_by_a_search_as_by_a_walk() {
         let scattered: Vec<std::ops::Range<u64>> = (0..64u64)
             .map(|i| {
