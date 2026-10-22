@@ -654,16 +654,16 @@ fn may_resolve(store: rt::StoreAction) -> bool {
 /// resolves nothing into them and stores the attachment as its action says
 /// (`render_pass_memoryless`'s unused resolve textures on depth and stencil), where the runtime
 /// refuses the pass. A colour attachment's goes to the runtime, which leaves it untouched, as
-/// Metal does.
-fn without_unused_resolves(d: &rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
-    let mut out = d.clone();
-    if !may_resolve(out.depth_attachment.store_action) {
-        out.depth_attachment.resolve_texture = None;
+/// Metal does. Nothing else of the pass reads them: what Metal aborts at reads a depth or stencil
+/// resolve texture only under a store action that resolves ([`metal_aborts_at`]).
+fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
+    if !may_resolve(d.depth_attachment.store_action) {
+        d.depth_attachment.resolve_texture = None;
     }
-    if !may_resolve(out.stencil_attachment.store_action) {
-        out.stencil_attachment.resolve_texture = None;
+    if !may_resolve(d.stencil_attachment.store_action) {
+        d.stencil_attachment.resolve_texture = None;
     }
-    out
+    d
 }
 
 /// Whether the colour resolve of an attachment of `from` into a texture of `into` is the
@@ -1967,18 +1967,11 @@ fn make(
     varying_rates: bool,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let made = without_unused_resolves(&d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&made)) {
+    let d = without_unused_resolves(d);
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
         Ok(raw) => {
             command_buffer.tiler_work(crate::gpu::metal_space::FirstUse::RenderEncoder);
-            opened(
-                command_buffer,
-                raw,
-                (&d, made, dropped),
-                rasterizes,
-                varying_rates,
-            )
-            .map(Some)
+            opened(command_buffer, raw, (d, dropped), rasterizes, varying_rates).map(Some)
         }
         Err(rt::Error::Nil(n))
             if n.problem == rt::Problem::RenderPass(rt::RenderPassProblem::NoTargets) =>
@@ -2038,9 +2031,9 @@ fn make(
     }
 }
 
-/// The encoder of the runtime's `raw`, just made on `command_buffer` of `made`: the pass `d`
-/// without its unused resolves ([`without_unused_resolves`]), `d` itself made without the colour
-/// resolves `dropped` lists ([`untouched_resolves`]). It is in its handle before anything can
+/// The encoder of the runtime's `raw`, just made on `command_buffer` of the pass `d`, without its
+/// unused resolves ([`without_unused_resolves`]) and the colour resolves `dropped` lists
+/// ([`untouched_resolves`]). It is in its handle before anything can
 /// stop this thread: a thread of an isolated task that ended stops at the next send with the
 /// encoder open, as Metal's is left, where the runtime's encoder dropped as it unwinds would
 /// abandon the command buffer. What Metal aborts at in the pass dies then; a pass that
@@ -2048,34 +2041,31 @@ fn make(
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: rt::RenderCommandEncoder,
-    (d, made, dropped): (
-        &rt::RenderPassDescriptor,
-        rt::RenderPassDescriptor,
-        Vec<Dropped>,
-    ),
+    (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
     rasterizes: bool,
     varying_rates: bool,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
+    let aborts = metal_aborts_at(&d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
         nil_pipeline: Mutex::new(false),
         device: command_buffer.device.raw.clone(),
         own_indices: Mutex::new(OwnIndices::default()),
-        undecided: Mutex::new(undecided(d)),
+        undecided: Mutex::new(undecided(&d)),
         late_stores: Mutex::new(Vec::new()),
         marks: Mutex::new(Marks::default()),
         no_layers: (d.rasterization_rate_map.as_ref()).is_some_and(|m| m.layer_count() == 0),
-        pass: made,
         dropped,
         rasterizes,
         varying_rates,
         reach: Mutex::new(Reach::default()),
         rounded: Mutex::new(RoundedTextures::default()),
-        bfloat_loaded: bfloat_loaded(d),
+        bfloat_loaded: bfloat_loaded(&d),
+        pass: d,
         hung: AtomicBool::new(false),
     });
-    if let Some(what) = metal_aborts_at(d) {
+    if let Some(what) = aborts {
         metal_aborts(sel, what);
     }
     if !rasterizes {
@@ -7415,13 +7405,12 @@ pub(crate) mod tests {
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let desc = pass.descriptor();
-        let made = without_unused_resolves(&desc);
+        let made = without_unused_resolves(pass.descriptor());
         let raw = cb.raw.render_command_encoder(&made).unwrap();
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
-            opened(&cb, raw, (&desc, made, Vec::new()), false, false)
+            opened(&cb, raw, (made, Vec::new()), false, false)
         });
         assert!(stopped.is_none());
         let refused = cb.raw.blit_command_encoder().unwrap_err();
