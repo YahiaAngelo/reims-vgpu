@@ -1143,7 +1143,7 @@ fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
 
 /// A fill of a case: bytes, or a colour in a pixel format; at a level and slice, of a region
 /// given as origin and size.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Fill {
     Bytes(u64, u64, [u64; 3], [u64; 3], Vec<u8>),
     Color(u64, u64, [u64; 3], [u64; 3], [f64; 4], u64),
@@ -3243,4 +3243,220 @@ fn depth24_stencil8_textures_die_where_made_as_metals() {
             made.map(|m| m.map(|t| t.is_some()))
         );
     }
+}
+
+/// The bytes of a Shared buffer of 512 bytes, byte `i` written `i * 37 % 251` first, holding a
+/// texture buffer of `format`, `width` texels wide, at `offset`, once `fills` filled the texture
+/// in one blit encoder, on platform `P`.
+fn texture_buffer_fill_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (format, bpp, width, offset): (u64, u64, u64, u64),
+    fills: &[Fill],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    const BYTES: usize = 512;
+    let b = d
+        .new_buffer_of_length(OnFault::Return, BYTES as u64, 0)
+        .unwrap()
+        .unwrap();
+    // SAFETY: a fresh Shared buffer of `BYTES` bytes, which no command uses yet.
+    unsafe {
+        let to = b.contents().as_ptr::<u8>();
+        for i in 0..BYTES {
+            to.add(i).write(u8::try_from(i * 37 % 251).unwrap());
+        }
+    }
+    let desc = desc(&TextureDesc {
+        texture_type: 9,
+        pixel_format: format,
+        width,
+        height: 1,
+        usage: 0x1,
+        resource_options: Some(0),
+        ..TextureDesc::default()
+    });
+    let t = b
+        .new_texture(OnFault::Return, &desc, offset, width * bpp)
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    for f in fills {
+        e.encode(OnFault::Return, fill_of::<P>(&t, f)).unwrap();
+    }
+    e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    // SAFETY: the buffer's `BYTES` bytes, read after the fills completed.
+    unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), BYTES) }.to_vec()
+}
+
+/// A case of [`texture_buffer_fills_are_metals`]: a texture buffer's format, its bytes a texel
+/// and its offset in the buffer, and the fills.
+type TextureBufferCase = ((u64, u64, u64), Vec<Fill>);
+
+/// Each of `cases` (a texture buffer of a format of `bpp` bytes a texel, 12 texels wide at an
+/// offset, and its fills) writes the buffer's bytes as Metal's does, every byte compared
+/// ([`texture_buffer_fill_on`]); Metal's the same on a second run. Every case runs, and those
+/// that differ or die here are named together.
+fn texture_buffer_fills_are_metals(cases: &[TextureBufferCase]) {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let p = crate::platform::tests::platform();
+    let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let mut differ = Vec::new();
+    for ((format, bpp, offset), fills) in cases {
+        let what = format!("{format} at {offset}: {fills:?}");
+        let shape = (*format, *bpp, 12, *offset);
+        let on_metal = || {
+            texture_buffer_fill_on::<reims_vgpu_metal::MetalPlatform>(
+                &metal,
+                &metal_desc,
+                shape,
+                fills,
+            )
+        };
+        let theirs = on_metal();
+        assert_eq!(
+            theirs,
+            on_metal(),
+            "{what}: Metal's bytes vary between runs"
+        );
+        match catch_death(|| texture_buffer_fill_on::<VulkanPlatform>(&d, &ours_desc, shape, fills))
+        {
+            Ok(ours) if ours == theirs => {}
+            Ok(ours) => {
+                let at: Vec<usize> = (0..ours.len()).filter(|&k| ours[k] != theirs[k]).collect();
+                differ.push(format!(
+                    "{what}: {} bytes differ, from {:#x}",
+                    at.len(),
+                    at[0]
+                ));
+            }
+            Err(site) => {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                differ.push(format!("{what}: died at {}: {line}", site.file));
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+/// A fill of a texture buffer over a buffer that the runtime's fill writes as Metal's does
+/// ([`crate::gpu::fill::texture_buffer_writes`]) writes the buffer's bytes as Metal's, every
+/// byte compared ([`texture_buffer_fills_are_metals`]): of `R8Unorm`, `RG8Unorm`, `RGBA8Unorm`,
+/// `RGBA16Float` and `RGBA32Float` texture buffers 12 texels wide at offsets 0 and 64 (and 4 and
+/// 68 where a texel is 4 bytes or fewer); with a pattern of each power of two of bytes up to the
+/// texel, and a colour packed in a format of no more bytes than the texel; whole, inside, ending
+/// at the width, at an odd texel, and at a level, slice, row, height and depth past 0 and 1,
+/// which Metal ignores, and of no texels across, which writes nothing. Measured on the M3 Max
+/// (macOS 27.0.1): Metal writes the region's texels from its `x` at the texture's offset, one
+/// row, the pattern repeated from the region's first byte
+#[test]
+fn texture_buffer_fills_are_the_metal_platforms() {
+    let colour = [0.25, -0.5, 1.25, 0.75];
+    let pattern =
+        |n: usize| -> Vec<u8> { (0..n).map(|i| 0xa1 + u8::try_from(i).unwrap()).collect() };
+    let mut cases = Vec::new();
+    for (format, bpp) in [(10, 1), (30, 2), (70, 4), (115, 8), (125, 16)] {
+        let offsets: &[u64] = if bpp <= 4 { &[0, 4, 64, 68] } else { &[0, 64] };
+        let units = (0..).map(|k| 1usize << k).take_while(|&u| u as u64 <= bpp);
+        let colours = [(10, 1), (30, 2), (70, 4), (115, 8), (125, 16)]
+            .into_iter()
+            .filter(|&(_, b)| b <= bpp);
+        let mut fills: Vec<Vec<Fill>> = Vec::new();
+        for unit in units {
+            let bytes = pattern(unit);
+            fills.push(vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &bytes)]);
+            fills.push(vec![bytes_fill(0, 0, [3, 0, 0], [5, 1, 1], &bytes)]);
+            fills.push(vec![bytes_fill(0, 0, [7, 0, 0], [5, 1, 1], &bytes)]);
+            fills.push(vec![bytes_fill(3, 7, [2, 5, 4], [4, 3, 2], &bytes)]);
+        }
+        for (packed, _) in colours {
+            fills.push(vec![color_fill(
+                (1, 2),
+                ([1, 4, 0], [6, 2, 1]),
+                colour,
+                packed,
+            )]);
+        }
+        fills.push(vec![
+            bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &pattern(1)),
+            bytes_fill(0, 0, [5, 0, 0], [0, 1, 1], &pattern(1)),
+            bytes_fill(0, 0, [12, 0, 0], [0, 1, 1], &pattern(1)),
+            color_fill((0, 0), ([9, 0, 0], [2, 1, 1]), colour, 10),
+        ]);
+        for &offset in offsets {
+            for f in &fills {
+                cases.push(((format, bpp, offset), f.clone()));
+            }
+        }
+    }
+    texture_buffer_fills_are_metals(&cases);
+}
+
+/// A fill of a texture buffer whose bytes Metal writes as the runtime's fill does not
+/// ([`crate::gpu::fill::texture_buffer_writes`], which dies at each here) writes the buffer's
+/// bytes as Metal's ([`texture_buffer_fills_are_metals`]): a pattern longer than the texel, of
+/// 8 bytes into `R8Unorm` texels from an odd byte and into `RGBA8Unorm` texels from a byte a
+/// multiple of 16, and a colour packed in `RGBA16Float` into `RGBA8Unorm` texels; a region past
+/// the width and one ending past it; and one of no rows, and of no images. Measured on the M3
+/// Max (macOS 27.0.1), each the same on a second run: Metal writes the pattern repeated across
+/// the region's bytes from its first, not started again at each texel, past the width too, and
+/// one row of a region of no rows or images. Other fills of the kind write bytes that are not
+/// the pattern's (`m2v-fill-handoff.md`)
+#[test]
+#[ignore = "the runtime cuts a texture buffer's fill at the texel and the width: m2v fix pending"]
+fn texture_buffer_fills_metal_streams_are_metals() {
+    let eight: Vec<u8> = (0xa1..=0xa8).collect();
+    let colour = [0.25, -0.5, 1.25, 0.75];
+    texture_buffer_fills_are_metals(&[
+        (
+            (10, 1, 0),
+            vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &eight)],
+        ),
+        (
+            (10, 1, 4),
+            vec![bytes_fill(0, 0, [3, 0, 0], [5, 1, 1], &eight)],
+        ),
+        (
+            (70, 4, 0),
+            vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &eight)],
+        ),
+        (
+            (70, 4, 64),
+            vec![bytes_fill(0, 0, [4, 0, 0], [8, 1, 1], &eight)],
+        ),
+        (
+            (70, 4, 0),
+            vec![color_fill((0, 0), ([4, 0, 0], [6, 1, 1]), colour, 115)],
+        ),
+        (
+            (10, 1, 0),
+            vec![bytes_fill(0, 0, [12, 0, 0], [3, 1, 1], &eight[..1])],
+        ),
+        (
+            (70, 4, 0),
+            vec![bytes_fill(0, 0, [10, 0, 0], [5, 1, 1], &eight[..4])],
+        ),
+        (
+            (10, 1, 0),
+            vec![bytes_fill(0, 0, [1, 0, 0], [2, 0, 1], &eight[..1])],
+        ),
+        (
+            (70, 4, 64),
+            vec![bytes_fill(0, 0, [1, 0, 0], [2, 1, 0], &eight[..4])],
+        ),
+    ]);
 }

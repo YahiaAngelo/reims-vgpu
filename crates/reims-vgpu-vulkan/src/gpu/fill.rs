@@ -52,10 +52,15 @@
 //!   writes a slice it has and nothing past them; a cube writes face `slice % 6`, a cube array
 //!   slice `slice` while it has it. Metal's work grows with the region before the cut (2^32
 //!   texels: 23 ms; 2^64 did not end in 10 minutes), so a region past 2^32 texels dies, as
-//!   nothing measured how it ends.
+//!   nothing measured how it ends. A texture buffer's fill skips `place`
+//!   ([`texture_buffer_writes`]): Metal writes it as bytes of the buffer, from the region's `x`,
+//!   one row whatever the level, slice and row, the pattern repeated across the texels' bytes,
+//!   past the width too; the fills where the runtime's bytes are those
+//!   (`texture_buffer_fills_are_the_metal_platforms`) go to it, the others die. A multisample
+//!   texture's dies: Metal fills each sample of the region's texels, which the runtime refuses.
 
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use reims_vgpu_core::platform::types::MtlRegion;
+use reims_vgpu_core::platform::types::{MtlRegion, MtlSize};
 
 use crate::answer::unrepresentable;
 
@@ -222,9 +227,70 @@ pub struct Place {
     pub size: [u64; 3],
 }
 
+/// Whether a fill of `region` of a texture buffer `width` texels of `texel` bytes wide, with a
+/// pattern of `unit` bytes (a bytes fill's pattern, a colour fill's packed texel; 0 for a colour
+/// packed in no format of [`PACKED`] or [`OWN_FORMAT_PACKED`]), writes a texel, given to the
+/// runtime's fill as it is. Metal fills a texture buffer as bytes of its buffer (measured on the
+/// M3 Max): from the texture's offset plus the region's `x` texels, one row and image whatever
+/// the level, slice, row, height and depth, the pattern repeated across the region's bytes, not
+/// started again at each texel, and the region not cut at the width. The runtime's fill writes
+/// each texel the pattern cut or repeated at the texel, cut at the width, which is Metal's where
+/// the unit is a power of two no longer than the texel and the region lies inside the width,
+/// of a row and an image. Another dies for `sel`, as do a region past 2^32 texels across and
+/// down, as [`place`]'s, and a region past `width` texels, which Metal writes past the texture
+/// (`texture_buffer_fills_metal_streams_are_metals`). A region of no texels across writes
+/// nothing, as Metal's.
+pub fn texture_buffer_writes(
+    sel: &'static str,
+    (texel, width): (u64, u64),
+    region: MtlRegion,
+    unit: u64,
+) -> bool {
+    measured(sel, region, 1);
+    let MtlSize {
+        width: w,
+        height,
+        depth,
+    } = region.size;
+    if w == 0 {
+        return false;
+    }
+    let why = if unit == 0 {
+        "bytes of a colour it packs in no format, which nothing measured there"
+    } else if !unit.is_power_of_two() || unit > texel {
+        "its pattern repeated across the texels' bytes, which the runtime's fill cuts at each texel"
+    } else if region.origin.x.checked_add(w).is_none_or(|end| end > width) {
+        "texels past the texture's width, which the runtime's fill cuts at it"
+    } else if height == 0 || depth == 0 {
+        "a row of a region of no rows or images, which the runtime's fill writes nothing of"
+    } else {
+        return true;
+    };
+    unrepresentable(
+        sel,
+        &format!("a fill of the region {region:?} of a texture buffer, where Metal writes {why}"),
+    )
+}
+
+/// Dies for `sel` at a fill of `region`, of `depth` images, past [`MEASURED_TEXELS`].
+fn measured(sel: &'static str, region: MtlRegion, depth: u64) {
+    let texels = region
+        .size
+        .width
+        .checked_mul(region.size.height)
+        .and_then(|area| area.checked_mul(depth));
+    if texels.is_none_or(|texels| texels > MEASURED_TEXELS) {
+        unrepresentable(
+            sel,
+            &format!("a fill of the region {region:?}, past what was measured to end on Metal"),
+        );
+    }
+}
+
 /// Where a fill of `region` at `level` and `slice` writes in a texture of `shape`, as Metal
-/// writes it; `None` where it writes nothing. A multisample texture or a texture buffer, and a
-/// region past 2^32 texels, die for `sel`, as nothing measured them.
+/// writes it; `None` where it writes nothing. A multisample texture or a texture buffer (whose
+/// fill is [`texture_buffer_writes`]'s), and a region past 2^32 texels, die for `sel`, as
+/// nothing measured them here.
 pub fn place(
     sel: &'static str,
     shape: &Shape,
@@ -249,17 +315,7 @@ pub fn place(
     } else {
         (0, 1)
     };
-    let texels = region
-        .size
-        .width
-        .checked_mul(region.size.height)
-        .and_then(|area| area.checked_mul(depth));
-    if texels.is_none_or(|texels| texels > MEASURED_TEXELS) {
-        unrepresentable(
-            sel,
-            &format!("a fill of the region {region:?}, past what was measured to end on Metal"),
-        );
-    }
+    measured(sel, region, depth);
     if level >= shape.levels {
         return None;
     }
@@ -284,7 +340,7 @@ pub fn place(
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
+    use reims_vgpu_core::platform::types::MtlOrigin;
     use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::testkit::capture::catch_death;
 
@@ -390,6 +446,30 @@ mod tests {
         assert_eq!(site.file, "s");
         let many = shape(TextureType::Type2DMultisample, [4, 4, 1], 1, 1);
         assert!(catch_death(|| place_of(&many, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
+        let buffer = shape(TextureType::TextureBuffer, [8, 1, 1], 1, 1);
+        assert!(catch_death(|| place_of(&buffer, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
+        let writes = |region, unit| texture_buffer_writes("s", (4, 8), region, unit);
+        assert!(writes(r([4, 5, 3], [4, 2, 2]), 4));
+        assert!(writes(r([0, 0, 0], [8, 1, 1]), 2));
+        assert!(writes(r([7, 0, 0], [1, 1, 1]), 1));
+        assert!(!writes(r([9, 0, 0], [0, 1, 1]), 4));
+        for (region, unit) in [
+            (r([0, 0, 0], [1, 1, 1]), 8),
+            (r([0, 0, 0], [1, 1, 1]), 3),
+            (r([0, 0, 0], [1, 1, 1]), 0),
+            (r([7, 0, 0], [2, 1, 1]), 4),
+            (r([8, 0, 0], [1, 1, 1]), 4),
+            (r([0, 0, 0], [1, 0, 1]), 4),
+            (r([0, 0, 0], [1, 1, 0]), 4),
+            (r([0, 0, 0], [1 << 16, (1 << 16) + 1, 1]), 4),
+        ] {
+            let site = catch_death(|| writes(region, unit)).unwrap_err();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::Abort, "s"),
+                "{region:?} {unit}"
+            );
+        }
         assert_eq!(
             place_of(&flat, 0, 0, r([0, 0, 0], [1 << 16, 1 << 16, 1])),
             at(0, 0, [0, 0, 0], [4, 4, 1])

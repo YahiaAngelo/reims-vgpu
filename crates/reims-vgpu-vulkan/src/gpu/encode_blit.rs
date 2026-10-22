@@ -18,7 +18,10 @@
 //!   its `fill_texture` of the pattern, a colour fill its colour fill, which fills the texel it
 //!   packs as `fill_texture` fills a pattern ([`crate::gpu::fill`]), each copies from a staging
 //!   buffer outside the Metal address space, at the level and slice and in the region
-//!   [`crate::gpu::fill::place`] gives; a fill that writes nothing encodes nothing. They write
+//!   [`crate::gpu::fill::place`] gives (a texture buffer's as the call gives them, its texels
+//!   written from the region's `x` whatever the level, slice and row,
+//!   `texture_buffer_fills_are_the_metal_platforms`); a fill that writes nothing encodes
+//!   nothing. They write
 //!   what Metal's fill writes on this host (`texture_fills_are_the_metal_platforms`, of colour
 //!   and depth formats, levels, slices, cube faces, 3D depths, cut regions and a fill larger than
 //!   the runtime stages at once) and:
@@ -294,7 +297,7 @@ fn indices(
 
 impl VulkanBlitEncoder {
     /// A fill of `region` of `texture` at `level` and `slice` with `pattern`, for `sel`: the
-    /// runtime's fill, where [`fill::place`] says, which cuts the pattern at its unit or repeats
+    /// runtime's fill, where [`fill_place`] says, which cuts the pattern at its unit or repeats
     /// it to it and refuses what it did not measure (the module's docs). An empty pattern (a
     /// length of 0 at a readable address, which nothing measured on Metal) fills zeroes.
     fn fill_texture(
@@ -307,26 +310,28 @@ impl VulkanBlitEncoder {
         pattern: &[u8],
     ) -> RaiseResult<()> {
         let raw = texture.copied(sel);
-        let shape = plain(|| fill::Shape {
-            texture_type: raw.texture_type(),
-            extent: [raw.width(), raw.height(), raw.depth()],
-            levels: raw.mipmap_level_count(),
-            array_length: raw.array_length(),
+        let (own, shape) = plain(|| {
+            let shape = fill::Shape {
+                texture_type: raw.texture_type(),
+                extent: [raw.width(), raw.height(), raw.depth()],
+                levels: raw.mipmap_level_count(),
+                array_length: raw.array_length(),
+            };
+            (raw.pixel_format(), shape)
         });
-        let Some(place) = fill::place(sel, &shape, level, slice, region) else {
-            return self.nothing(sel);
-        };
-        let ([x, y, z], [w, h, d]) = (place.origin, place.size);
-        let region = rt::Region::new_3d(x, y, z, w, h, d);
         let pattern = if pattern.is_empty() {
             &[0][..]
         } else {
             pattern
         };
+        let unit = pattern.len() as u64;
+        let Some((level, slice, region)) =
+            fill_place(sel, (&shape, own), (level, slice, region), unit)
+        else {
+            return self.nothing(sel);
+        };
         send(sel, Policy::Dies, || {
-            self.with(sel, |e| {
-                e.fill_texture(raw, place.level, place.slice, region, pattern)
-            })
+            self.with(sel, |e| e.fill_texture(raw, level, slice, region, pattern))
         })
     }
 }
@@ -334,7 +339,7 @@ impl VulkanBlitEncoder {
 impl VulkanBlitEncoder {
     /// A colour fill of `region` of `texture` at `level` and `slice` with `color` packed in
     /// `format`, one of [`fill::colour_format`]'s, for `sel`: the runtime's colour fill, which
-    /// packs it, where [`fill::place`] says. A colour in a format of [`fill::OWN_FORMAT_PACKED`]
+    /// packs it, where [`fill_place`] says. A colour in a format of [`fill::OWN_FORMAT_PACKED`]
     /// into a texture of another format is filled, the runtime repeating the packed texel,
     /// relayed, and dies in strict mode ([`crate::answer::Inexact::FillFormat`]): an
     /// extended-range `_sRGB` twin's bytes there follow no rule measured on Metal (into an
@@ -372,11 +377,17 @@ impl VulkanBlitEncoder {
                 )
             });
         }
-        let Some(place) = fill::place(sel, &shape, level, slice, region) else {
+        let packs = fill::PACKED.contains(&format) || fill::OWN_FORMAT_PACKED.contains(&format);
+        let unit = || {
+            let raw = u64::from(format.as_raw());
+            crate::gpu::format_info::block(sel, raw, "a colour packed in").bytes()
+        };
+        let unit = if packs { unit() } else { 0 };
+        let Some((level, slice, region)) =
+            fill_place(sel, (&shape, own), (level, slice, region), unit)
+        else {
             return self.nothing(sel);
         };
-        let ([x, y, z], [w, h, d]) = (place.origin, place.size);
-        let region = rt::Region::new_3d(x, y, z, w, h, d);
         let color = rt::ClearColor {
             red: color.red,
             green: color.green,
@@ -385,10 +396,40 @@ impl VulkanBlitEncoder {
         };
         send(sel, Policy::Dies, || {
             self.with(sel, |e| {
-                e.fill_texture_color(raw, place.level, place.slice, region, color, Some(format))
+                e.fill_texture_color(raw, level, slice, region, color, Some(format))
             })
         })
     }
+}
+
+/// The level, slice and region a fill of `region` at `level` and `slice` of a texture of `shape`
+/// and pixel format `format`, with a pattern of `unit` bytes, gives the runtime's fill, for
+/// `sel`: [`fill::place`]'s; a texture buffer's as they are, where the runtime fills it as Metal
+/// does, whatever the level, slice, row and depth ([`fill::texture_buffer_writes`]). `None` where
+/// the fill writes nothing.
+fn fill_place(
+    sel: &'static str,
+    (shape, format): (&fill::Shape, PixelFormat),
+    (level, slice, region): (u64, u64, MtlRegion),
+    unit: u64,
+) -> Option<(u64, u64, rt::Region)> {
+    if shape.texture_type == metal2vulkan::metal::TextureType::TextureBuffer {
+        let raw = u64::from(format.as_raw());
+        let texel = crate::gpu::format_info::block(sel, raw, "a fill of a texture buffer of");
+        let (o, s) = (region.origin, region.size);
+        let texture = (texel.bytes(), shape.extent[0]);
+        return fill::texture_buffer_writes(sel, texture, region, unit).then(|| {
+            let region = rt::Region::new_3d(o.x, o.y, o.z, s.width, s.height, s.depth);
+            (level, slice, region)
+        });
+    }
+    let place = fill::place(sel, shape, level, slice, region)?;
+    let ([x, y, z], [w, h, d]) = (place.origin, place.size);
+    Some((
+        place.level,
+        place.slice,
+        rt::Region::new_3d(x, y, z, w, h, d),
+    ))
 }
 
 /// What a blit `cmd` writes: its destination's memory, as a bind keeps it
