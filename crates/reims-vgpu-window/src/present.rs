@@ -20,7 +20,10 @@ use ash::vk;
 use crate::handle::PixelRect;
 
 /// How long the render thread waits before it draws again where no image came in time: about a
-/// refresh at 120 Hz.
+/// refresh at 120 Hz. Before it answers [`Drawn::Retry`] for want of an image, the presenter has
+/// waited for one, up to 33 ms, and drawn as soon as the presentation engine gave one back
+/// (`reims_vgpu_vulkan::swapchain`): where the engine has every image queued or shown, the draws
+/// follow the screen's pace, not this one.
 pub(crate) const RETRY: Duration = Duration::from_millis(8);
 
 /// How many presenters in a row the render thread makes again after one ends, with no frame
