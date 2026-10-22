@@ -459,3 +459,169 @@ fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
         );
     }
 }
+
+/// Formats outside [`LEFTOVER_FORMATS`] Metal packs no fill's colour in either, whose colour the
+/// runtime fills as zero bytes or refuses: compressed (BC1, BC4, BC6H, BC7, PVRTC, EAC, ETC2,
+/// ASTC LDR, sRGB and HDR), 4:2:2, YCbCr (8-bit, 10-bit and packed 10-bit) and padded 10-bit.
+const UNPACKED_FORMATS: [u64; 19] = [
+    130, 140, 150, 152, 160, 170, 180, 186, 204, 222, 240, 241, 500, 505, 508, 576, 577, 578, 579,
+];
+
+/// What a colour fill in `leftover`, a format Metal packs no colour in, of each texel of a
+/// `Private` texture of `format` `width` texels wide writes on platform `P`, after a fill of
+/// (7, 9, 3, 1) packed in RGBA32Uint into another texture, earlier in the same encoder or, with
+/// `earlier_encoder`, in an earlier encoder of the command buffer: the texture's bytes, read
+/// back by a blit.
+fn leftover_on<P: Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    leftover: u64,
+    (format, bytes, width): (u64, u64, u64),
+    earlier_encoder: bool,
+) -> Vec<u8> {
+    let texture = |format, width| {
+        let desc = desc(&TextureDesc {
+            pixel_format: format,
+            width,
+            height: 1,
+            usage: 3,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        });
+        d.new_texture(OnFault::Return, &desc).unwrap().unwrap()
+    };
+    let (earlier, t) = (texture(123, 1), texture(format, width));
+    let row = bytes * width;
+    let out = d
+        .new_buffer_of_length(OnFault::Return, row, 0)
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let region = |w| MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(w, 1, 1));
+    let first = BlitCmd::<P>::FillTextureColor {
+        texture: &earlier,
+        level: 0,
+        slice: 0,
+        region: region(1),
+        color: ClearColor {
+            red: 7.0,
+            green: 9.0,
+            blue: 3.0,
+            alpha: 1.0,
+        },
+        pixel_format: 123,
+    };
+    let fill = BlitCmd::<P>::FillTextureColor {
+        texture: &t,
+        level: 0,
+        slice: 0,
+        region: region(width),
+        color: ClearColor {
+            red: 0.25,
+            green: 0.5,
+            blue: 0.75,
+            alpha: 1.0,
+        },
+        pixel_format: leftover,
+    };
+    let down = BlitCmd::<P>::CopyTextureToBufferOptions {
+        source_texture: Some(&t),
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(width, 1, 1),
+        destination_buffer: Some(&out),
+        destination_offset: 0,
+        destination_bytes_per_row: row,
+        destination_bytes_per_image: row,
+        options: 0,
+    };
+    let encode = |cmds: Vec<BlitCmd<'_, P>>| {
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for c in cmds {
+            e.encode(OnFault::Return, c).unwrap();
+        }
+        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+    };
+    if earlier_encoder {
+        encode(vec![first]);
+        encode(vec![fill, down]);
+    } else {
+        encode(vec![first, fill, down]);
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    let n = usize::try_from(row).unwrap();
+    // SAFETY: a live Shared buffer of `n` bytes, read after the GPU's writes.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// A colour fill in a format Metal packs no colour in writes what Metal's does after a colour
+/// fill packed in RGBA32Uint earlier in the command buffer, in the same encoder or an earlier
+/// one ([`leftover_on`]): that fill's 16 bytes, repeated or cut at the texel, into an RGBA32Uint
+/// texel, 4 RGBA8Unorm ones and 4 R8Unorm ones, whatever the colour. The formats: each of
+/// [`LEFTOVER_FORMATS`], and of the formats the runtime fills zero bytes for
+/// (`UnpackedFillColor`) or refuses ([`UNPACKED_FORMATS`]). Measured on the M3 Max (macOS
+/// 27.0.1), the same for every one of them and two colours: `07 00 00 00 09 00 00 00 03 00 00
+/// 00 01 00 00 00`, `07 00 00 00` each and `07` each. After a colour packed in a format of
+/// fewer bytes, only that many are the colour's; after a bytes fill alone, or a colour fill in
+/// an earlier command buffer, none of the bytes is a fill's (`m2v-fill-handoff.md`). This
+/// platform dies at each where it gates the format (`colour_format`), until the runtime's
+/// colour fill writes those bytes
+#[test]
+#[ignore = "the runtime refuses: m2v fix pending"]
+fn leftover_colours_fill_an_earlier_colours_bytes_as_metals() {
+    let Some(metal) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = crate::gpu::device::tests::dev();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let mut differ = Vec::new();
+    let leftover = LEFTOVER_FORMATS.iter().map(|f| u64::from(f.as_raw()));
+    for leftover in leftover.chain(UNPACKED_FORMATS) {
+        for texture in [(123, 16, 1), (70, 4, 4), (10, 1, 4)] {
+            for earlier_encoder in [false, true] {
+                let what = format!(
+                    "a colour in {leftover} into {texture:?}, earlier encoder {earlier_encoder}"
+                );
+                let theirs = leftover_on::<MetalPlatform>(
+                    &metal,
+                    &metal_desc,
+                    leftover,
+                    texture,
+                    earlier_encoder,
+                );
+                let ours = catch_death(|| {
+                    leftover_on::<VulkanPlatform>(
+                        &d,
+                        &vulkan_desc,
+                        leftover,
+                        texture,
+                        earlier_encoder,
+                    )
+                });
+                match ours {
+                    Ok(ours) if ours == theirs => {}
+                    Ok(ours) => {
+                        differ.push(format!("{what}: ours {ours:02x?}, Metal's {theirs:02x?}"))
+                    }
+                    Err(site) => {
+                        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                        differ.push(format!(
+                            "{what}: Metal's {theirs:02x?}, ours died at {}: {line}",
+                            site.file
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}

@@ -1150,6 +1150,7 @@ fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
 
 /// A fill of a case: bytes, or a colour in a pixel format; at a level and slice, of a region
 /// given as origin and size.
+#[derive(Debug)]
 enum Fill {
     Bytes(u64, u64, [u64; 3], [u64; 3], Vec<u8>),
     Color(u64, u64, [u64; 3], [u64; 3], [f64; 4], u64),
@@ -3015,4 +3016,237 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// Each of `cases`, a fill the runtime refuses (`AppleOnly::FillUnmeasured`), read back as
+/// Metal's reads back ([`fills_on`]), Metal's bytes the same on a second run. Every case runs,
+/// and the ones that differ or die here are named together.
+fn refused_fills_are_metals(cases: &[Case]) {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let mut differ = Vec::new();
+    for (i, c) in cases.iter().enumerate() {
+        let what = format!("case {i}, {} {:?}: {:?}", c.format, c.extent, c.fills);
+        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
+        let again = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
+        assert_eq!(theirs, again, "{what}: Metal's bytes vary between runs");
+        match catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c)) {
+            Ok(ours) if ours == theirs => {}
+            Ok(ours) => {
+                let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                differ.push(format!("{what}: {n} bytes differ"));
+            }
+            Err(site) => {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                differ.push(format!("{what}: died at {}: {line}", site.file));
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+/// A fill of a two-plane XR10 texture (550, 551) of its own memory at a width no multiple of 4,
+/// which the runtime refuses (`AppleOnly::FillUnmeasured`), reads back as Metal's does
+/// ([`refused_fills_are_metals`]): 7, 6 and 33 texels wide, whole, cut at the texture, and a
+/// region, with bytes and with a colour packed in `RGBA8Unorm`. Measured on the M3 Max (macOS
+/// 27.0.1): Metal's fills and its blits between a buffer and the texture both address texel (x,
+/// y)'s colour word at y * ⌊4 w / 16⌋ * 16 + 4 x, rows that overlap, so a fill of the 7 by 3
+/// texture's texels 2 to 6 of rows 1 and 2 reads back changed at texel 6 of row 0 and at texels
+/// 0 and 1 of row 2 too. The texture's bytes are written and read by such blits, which the
+/// runtime moves at the texture's own rows and announces (`two-plane-buffer-blit`), a
+/// degradation this platform ends the process on: the cases pass once the runtime fills and
+/// blits at Metal's addresses (`m2v-fill-handoff.md`)
+#[test]
+#[ignore = "the runtime refuses: m2v fix pending"]
+fn two_plane_fills_at_widths_off_4_are_metals() {
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let eight: Vec<u8> = (1..=8).collect();
+    let case = |format, [w, h]: [u64; 2], fill| {
+        read_case((format, 4, [1, 1]), (2, [w, h, 1], 1, 1), vec![fill])
+    };
+    refused_fills_are_metals(&[
+        case(550, [7, 3], bytes_fill(0, 0, [0, 0, 0], [7, 3, 1], &eight)),
+        case(
+            550,
+            [7, 3],
+            bytes_fill(0, 0, [2, 1, 0], [9, 5, 1], &[9, 10, 11]),
+        ),
+        case(
+            551,
+            [33, 5],
+            color_fill((0, 0), ([3, 1, 0], [20, 3, 1]), rgba, 70),
+        ),
+        case(550, [6, 2], bytes_fill(0, 0, [0, 0, 0], [6, 2, 1], &eight)),
+    ]);
+}
+
+/// A fill of a placement heap's texture of a two-plane XR10 format (550) of more than one level
+/// or slice, which the runtime refuses (`AppleOnly::FillUnmeasured`), writes the heap's bytes as
+/// Metal's does, byte for byte ([`two_plane_heap_texture_fill_on`]), Metal's the same on a
+/// second run: of a 16 by 8 texture, level 1 of 2 whole, level 2 of 3 whole and a region of
+/// level 1 of 3; level 1 of slice 1 of a 2D array of 2 levels; and slices 1 and 0 of a 2D array
+/// of one level. Measured on the M3 Max (macOS 27.0.1): Metal writes each texel (x, y) of the
+/// region, cut at the level's extent, of slice s at the texture's first byte + s * 4 w0 h0 + y *
+/// 4 w0 + 4 x, w0 and h0 level 0's extent, whatever the level: as level 0's colour words lie; it
+/// writes no byte of the alpha plane. This platform dies at each, where the heap's buffer is
+/// made over the texture's bytes: the runtime keeps such a texture's texels in memory of their
+/// own (`heap-two-plane-texture`); the cases pass once the runtime fills them in the heap's bytes
+/// (`m2v-fill-handoff.md`)
+#[test]
+#[ignore = "the runtime refuses: m2v fix pending"]
+fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let p = crate::platform::tests::platform();
+    let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let eight: Vec<u8> = (1..=8).collect();
+    let mut differ = Vec::new();
+    for ((texture_type, levels, array), fill) in [
+        ((2, 2, 1), bytes_fill(1, 0, [0, 0, 0], [8, 4, 1], &eight)),
+        ((2, 3, 1), bytes_fill(2, 0, [0, 0, 0], [4, 2, 1], &eight)),
+        (
+            (2, 3, 1),
+            bytes_fill(1, 0, [1, 1, 0], [3, 2, 1], &[0x21, 0x22, 0x23, 0x24]),
+        ),
+        ((3, 2, 2), bytes_fill(1, 1, [0, 0, 0], [8, 4, 1], &eight)),
+        ((3, 1, 2), bytes_fill(0, 1, [0, 0, 0], [16, 8, 1], &eight)),
+        ((3, 1, 2), bytes_fill(0, 0, [0, 0, 0], [16, 8, 1], &eight)),
+    ] {
+        let shape = TextureDesc {
+            texture_type,
+            pixel_format: 550,
+            width: 16,
+            height: 8,
+            mipmap_level_count: levels,
+            array_length: array,
+            usage: 0x1,
+            resource_options: Some(0x100),
+            ..TextureDesc::default()
+        };
+        let fills = [fill];
+        let what = format!(
+            "{texture_type} {levels} levels {array} slices: {:?}",
+            fills[0]
+        );
+        let on_metal = || {
+            two_plane_heap_texture_fill_on::<reims_vgpu_metal::MetalPlatform>(
+                &metal,
+                &metal_desc,
+                &shape,
+                &fills,
+            )
+        };
+        let theirs = on_metal();
+        assert_eq!(
+            theirs,
+            on_metal(),
+            "{what}: Metal's bytes vary between runs"
+        );
+        match catch_death(|| {
+            two_plane_heap_texture_fill_on::<VulkanPlatform>(&d, &ours_desc, &shape, &fills)
+        }) {
+            Ok(ours) if ours == theirs => {}
+            Ok(ours) => {
+                let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                differ.push(format!("{what}: {n} bytes differ"));
+            }
+            Err(site) => {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                differ.push(format!("{what}: died at {}: {line}", site.file));
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+/// The bytes of a Shared placement heap holding a texture of `shape` at offset 0, each byte its
+/// offset's low byte first, once `fills` filled the texture in one blit encoder, on platform
+/// `P`: the texture's size and a page more.
+fn two_plane_heap_texture_fill_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    shape: &TextureDesc,
+    fills: &[Fill],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _};
+    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+    let heap = d
+        .new_heap(&HeapDesc {
+            size: 0x20000,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+    let into = desc(shape);
+    let size = d.heap_texture_size_and_align(&into).unwrap().size;
+    let t = heap.new_texture(&into, 0).unwrap().unwrap();
+    let span = size + 4096;
+    let over = heap.new_buffer_of_length(span, 0, 0).unwrap().unwrap();
+    let n = usize::try_from(span).unwrap();
+    // SAFETY: the heap's Shared buffer of `span` bytes, which no command uses yet.
+    unsafe {
+        let to = over.contents().as_ptr::<u8>();
+        for i in 0..n {
+            to.add(i).write((i & 0xff) as u8);
+        }
+    }
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for f in fills {
+        e.encode(OnFault::Die, fill_of::<P>(&t, f)).unwrap();
+    }
+    e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    // SAFETY: the heap's Shared buffer's `span` bytes, read after the fills completed.
+    unsafe { std::slice::from_raw_parts(over.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// Depth24Unorm_Stencil8 (255) and X24_Stencil8 (262), which the runtime's fill refuses: Metal
+/// makes no texture of either on this host, its descriptor validation aborting
+/// ("MTLTextureDescriptor has invalid pixelFormat (255)", and (262)), measured on the M3 Max
+/// (macOS 27.0.1), so no fill reaches one there; this platform's texture of either dies where
+/// it is made too
+#[test]
+fn depth24_stencil8_textures_die_where_made_as_metals() {
+    for format in [255, 262] {
+        let d = dev();
+        let p = crate::platform::tests::platform();
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: format,
+            width: 8,
+            height: 8,
+            usage: 5,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        });
+        let made = catch_death(|| d.new_texture(OnFault::Return, &desc));
+        assert!(
+            made.is_err(),
+            "{format}: {:?}",
+            made.map(|m| m.map(|t| t.is_some()))
+        );
+    }
 }

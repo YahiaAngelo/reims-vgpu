@@ -917,6 +917,230 @@ fn a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
     }
 }
 
+/// A fill of [`refused_fill_on`]: its level and slice, its region's origin and size, and its
+/// pattern.
+type RefusedFill<'a> = ((u64, u64), [u64; 2], [u64; 2], Pattern<'a>);
+
+/// Where a texture a fill the runtime refuses fills lies: over plane `plane` of a surface of the
+/// OSType ([`crate::gpu::ycbcr::measure::Shape`]) whose luma is the texture's size (over plane 1,
+/// the texture is the chroma's size), or over a Shared buffer at rows of `row` bytes.
+#[derive(Clone, Copy, Debug)]
+enum Memory {
+    /// A surface's plane.
+    Plane(&'static [u8; 4], u64),
+    /// A buffer's bytes, `row` a row.
+    Buffer(u64),
+}
+
+impl Memory {
+    /// The size of a texture over this memory whose surface's luma, or which, is `size`.
+    fn texture_size(self, size: (u64, u64)) -> (u64, u64) {
+        match self {
+            Memory::Plane(ostype, 1) => {
+                crate::gpu::ycbcr::measure::Shape::of(ostype).chroma_size(size)
+            }
+            _ => size,
+        }
+    }
+}
+
+/// What `fills`, each a level, a slice, a region (its origin and size) and a pattern, in one
+/// blit encoder, of a texture of `format` over `memory` (a surface's of luma `size`, or a
+/// buffer's rows of `size`) write on `p`'s device `d`: every byte of the memory, which starts as
+/// `i * 37 % 251` at byte `i` on every platform, once the command buffer completed.
+fn refused_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+    p: &P,
+    d: &P::Device,
+    (format, size, memory): (u64, (u64, u64), Memory),
+    fills: &[RefusedFill<'_>],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::HostRange;
+    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_core::platform::os::surface::Surface as _;
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    let texture_size = memory.texture_size(size);
+    let desc = p.texture_descriptor(&crate::gpu::ycbcr::measure::desc(format, texture_size));
+    let write = |to: *mut u8, length: u64| {
+        for i in 0..length {
+            // SAFETY: `to` holds `length` bytes, which no command uses yet.
+            unsafe {
+                to.add(usize::try_from(i).unwrap())
+                    .write((i * 37 % 251) as u8)
+            };
+        }
+    };
+    let (surface, buffer, t, length);
+    match memory {
+        Memory::Plane(ostype, plane) => {
+            let made = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(size);
+            length = made.alloc_size();
+            write(made.base_address().as_ptr::<u8>(), length);
+            t = d.new_texture_on_surface(&desc, Some(&made), plane);
+            (surface, buffer) = (Some(made), None);
+        }
+        Memory::Buffer(row) => {
+            length = row * size.1;
+            let made = d
+                .new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap();
+            write(made.contents().as_ptr::<u8>(), length);
+            t = made.new_texture(OnFault::Die, &desc, 0, row);
+            (surface, buffer) = (None, Some(made));
+        }
+    }
+    let t = t.unwrap().unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for &((level, slice), [x, y], [w, h], pattern) in fills {
+        let region = MtlRegion::new(MtlOrigin::new(x, y, 0), MtlSize::new(w, h, 1));
+        let fill = match pattern {
+            Pattern::Bytes(bytes) => BlitCmd::FillTexture {
+                texture: &t,
+                level,
+                slice,
+                region,
+                bytes: HostRange::of_slice(bytes),
+            },
+            Pattern::Color(color, pixel_format) => BlitCmd::FillTextureColor {
+                texture: &t,
+                level,
+                slice,
+                region,
+                color,
+                pixel_format,
+            },
+        };
+        e.encode(OnFault::Die, fill).unwrap();
+    }
+    e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert_eq!(cb.error(), None);
+    let base = match (&surface, &buffer) {
+        (Some(s), _) => s.base_address(),
+        (_, Some(b)) => b.contents(),
+        _ => unreachable!(),
+    };
+    let length = usize::try_from(length).unwrap();
+    // SAFETY: the memory's bytes, read after the command buffer that wrote them completed.
+    unsafe { std::slice::from_raw_parts(base.as_ptr::<u8>(), length) }.to_vec()
+}
+
+/// The textures [`fills_of_ycbcr_and_padded_textures_are_metals`] fills, of `size`: of each
+/// YCbCr format the runtime makes over a surface, over plane 0 of a surface of its bits, packing
+/// and chroma; and of each padded format over a buffer and over a plane of an 'x420' surface
+/// (576 and 577 the luma, 578 and 579 the chroma).
+fn refused_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
+    use metal2vulkan::metal::format::{ChromaSubsampling as C, ycbcr_format};
+    let mut out = Vec::new();
+    for raw in 0..2048u32 {
+        let Ok(pf) = metal2vulkan::metal::PixelFormat::try_from(raw) else {
+            continue;
+        };
+        if !crate::gpu::ycbcr::runtime_makes(pf) {
+            continue;
+        }
+        let f = ycbcr_format(pf).unwrap();
+        let ostype: &'static [u8; 4] = match (f.bits, f.packed, f.subsampling) {
+            (8, _, C::Chroma420) => b"420v",
+            (8, _, C::Chroma422) => b"422v",
+            (8, _, C::Chroma444) => b"444v",
+            (_, false, C::Chroma420) => b"x420",
+            (_, false, C::Chroma422) => b"x422",
+            (_, false, C::Chroma444) => b"x444",
+            (_, true, C::Chroma420) => b"p420",
+            (_, true, C::Chroma422) => b"p422",
+            (_, true, C::Chroma444) => b"p444",
+            other => panic!("no surface for {other:?}"),
+        };
+        out.push((u64::from(raw), size, Memory::Plane(ostype, 0)));
+    }
+    for format in [576, 577, 578, 579] {
+        out.push((format, size, Memory::Buffer(256)));
+        let plane = if format < 578 { 0 } else { 1 };
+        out.push((format, size, Memory::Plane(b"x420", plane)));
+    }
+    out
+}
+
+/// A fill of a texture Metal makes over memory it is given, of a format whose fill the runtime
+/// refuses (`AppleOnly::FillUnmeasured`), writes the memory as Metal's does, every byte compared
+/// ([`refused_fill_on`]): of each YCbCr format the runtime makes over a surface, over plane 0 of
+/// a surface of its kind, and of each padded format over a buffer and over a plane of an 'x420'
+/// surface ([`refused_fill_textures`]); at two sizes; with bytes, 8 of them, 3 and 1, and with a
+/// colour packed in RGBA8Unorm, RGBA16Float, R8Unorm, RG11B10Float and RGBA32Float; over a
+/// region inside the texture, one of an odd width and one past its edge at the smaller size (a
+/// texture over memory has one level and one slice). Measured on the M3 Max (macOS 27.0.1):
+/// Metal writes each texel of the region (cut at the texture) at plane offset +
+/// y * bytesPerRow + x * the block bytes Metal describes (1, 2 or 4), the pattern repeated from
+/// its start and cut at those bytes, every other byte kept; a packed format's texel (508 to 510,
+/// 528 to 530: 1 byte) is written 0 whatever the pattern. This platform dies at each fill that
+/// reaches a texel, naming the runtime's refusal, until the runtime fills them
+/// (`m2v-fill-handoff.md`); a region wholly past the texture writes nothing on either.
+#[test]
+#[ignore = "the runtime refuses: m2v fix pending"]
+fn fills_of_ycbcr_and_padded_textures_are_metals() {
+    use reims_vgpu_core::platform::types::ClearColor;
+    use reims_vgpu_core::testkit::capture::catch_death;
+    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = crate::platform::tests::platform();
+    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let d = dev();
+    let color = ClearColor {
+        red: 0.25,
+        green: -0.5,
+        blue: 1.25,
+        alpha: 0.75,
+    };
+    let patterns = [
+        Pattern::Bytes(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+        Pattern::Bytes(&[0xa1, 0xb2, 0xc3]),
+        Pattern::Bytes(&[0x5a]),
+        Pattern::Color(color, 70),
+        Pattern::Color(color, 115),
+        Pattern::Color(color, 10),
+        Pattern::Color(color, 92),
+        Pattern::Color(color, 125),
+    ];
+    let regions = [([1, 1], [5, 2]), ([3, 2], [7, 3]), ([12, 6], [8, 4])];
+    let mut differ = Vec::new();
+    for size in [(16, 8), (33, 17)] {
+        for texture in refused_fill_textures(size) {
+            for pattern in patterns {
+                for &(origin, region) in &regions {
+                    let fills: [RefusedFill<'_>; 1] = [((0, 0), origin, region, pattern)];
+                    let what = format!("{texture:?} {fills:?}");
+                    let theirs = refused_fill_on(&mp, &md, texture, &fills);
+                    let ours = catch_death(|| refused_fill_on(&p, &d, texture, &fills));
+                    match ours {
+                        Ok(ours) if ours == theirs => {}
+                        Ok(ours) => {
+                            let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                            differ.push(format!("{what}: {n} bytes differ"));
+                        }
+                        Err(site) => {
+                            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                            differ.push(format!("{what}: died at {}: {line}", site.file));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
 /// Runs `cmd` in a blit encoder of a command buffer of `d`'s queue `q` of its own, and waits
 /// for it.
 fn blit_one<P: reims_vgpu_core::platform::Platform>(
