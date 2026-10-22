@@ -576,7 +576,9 @@ impl VulkanDevice {
     /// pages followed by zero-filled pages of the platform's own ([`backing::gather`]), from the
     /// offset into it, where the pages past the allocation would be other memory or none; what a
     /// write past the allocation's end does on Metal is not measured, and here it reaches those
-    /// pages alone.
+    /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
+    /// view of them as that alias, made with those zeros past its allocation, so no second view
+    /// of its pages is made (`crate::os::surface_alias`).
     pub(crate) fn buffer_over_surface(
         &self,
         sel: &'static str,
@@ -593,10 +595,12 @@ impl VulkanDevice {
     /// runtime's refusals are nil: `Outside` for one of the platform's own, which takes no Metal
     /// address ([`crate::gpu::own_buffer`]). The alias of the allocation, where the buffer lies
     /// over one, is one for the surface, which every buffer over it lies over while one lives
-    /// ([`crate::os::surface_alias`]), so that each lies over the same first byte. Where the
-    /// GPU's writes through the surface never reach its memory ([`crate::os::gpu_read_only`]),
-    /// the alias is read-only: the GPU reads the same pages, and its writes are dropped as
-    /// through a read-only alias of the guest's pages ([`crate::gpu::backing`]'s docs).
+    /// ([`crate::os::surface_alias`]), so that each lies over the same first byte, in one import
+    /// of the same memory, a writable twin of the alias's pages included where the runtime takes
+    /// one (`backing::Alias::into_runtime`). Where the GPU's writes through the surface never
+    /// reach its memory ([`crate::os::gpu_read_only`]), the alias is read-only: the GPU reads the
+    /// same pages, and its writes are dropped as through a read-only alias of the guest's pages
+    /// ([`crate::gpu::backing`]'s docs).
     pub(crate) fn buffer_over_surface_at(
         &self,
         sel: &'static str,
@@ -2283,6 +2287,98 @@ pub(crate) mod tests {
                 "unmapped once the import was freed (core's mapping: {cores})"
             );
             assert_eq!(imports(), before, "freed (core's mapping: {cores})");
+        }
+    }
+
+    /// The buffers under textures over a surface over scattered pages of the guest's at an offset,
+    /// or read-only for the GPU, lie over the surface's own view (`crate::os::surface_alias`),
+    /// and those over a read-only one share one writable twin of the view while one lives
+    /// (`crate::gpu::backing::Alias::into_runtime`): the textures map the guest's pages again
+    /// only for that twin, a kernel mapping a run of them, where each took a second view and its
+    /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
+    /// them takes (`/proc/self/maps`). Linux's: on macOS IOSurface maps the surface
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn textures_over_a_surface_map_its_pages_once_more_at_most() {
+        use reims_vgpu_core::host::PhysicalMemoryRange;
+        use reims_vgpu_core::num::ToU64 as _;
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::bgra;
+
+        /// The guest's pages, each its own run in the surface's view.
+        const PAGES: u64 = 16;
+        let page = OsVm::new().page_size();
+        // The file of a mapping's line (its device and inode).
+        let file_of = |line: &str| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields[3].to_owned(), fields[4].to_owned())
+        };
+        let maps = || std::fs::read_to_string("/proc/self/maps").unwrap();
+        let d = dev();
+        let (width, height) = (64, 255);
+        for (direction, twins) in [(None, 0), (Some(crate::os::READ_ONLY_DIRECTION), 1)] {
+            // Pages of a file of their own, so a mapping a case before left to the runtime's
+            // import counts in neither.
+            let guest = crate::os::allocate_aliasable(PAGES * page).unwrap();
+            let first = guest.addr().to_u64();
+            let file = (maps().lines())
+                .find(|line| {
+                    let range = line.split_whitespace().next().unwrap();
+                    let (low, high) = range.split_once('-').unwrap();
+                    let low = u64::from_str_radix(low, 16).unwrap();
+                    let high = u64::from_str_radix(high, 16).unwrap();
+                    (low..high).contains(&first)
+                })
+                .map(file_of)
+                .unwrap();
+            // The process's mappings of that file.
+            let mappings = || {
+                (maps().lines())
+                    .filter(|line| file_of(line) == file)
+                    .count()
+                    .to_u64()
+            };
+            let spec = SurfaceSpec {
+                pixel_format: u32::from_be_bytes(*b"BGRA"),
+                offset: 0x40,
+                alloc_size: PAGES * page,
+                width,
+                height,
+                bytes_per_element: 4,
+                bytes_per_row: width * 4,
+                element_width: 1,
+                element_height: 1,
+                client_direction: direction,
+                client_address_ranges: Some(
+                    (0..PAGES)
+                        .rev()
+                        .map(|i| PhysicalMemoryRange {
+                            physical_address: first + i * page,
+                            physical_length: page,
+                        })
+                        .collect(),
+                ),
+                ..SurfaceSpec::default()
+            };
+            assert_eq!(mappings(), 1, "the guest's pages: {direction:?}");
+            let surface = crate::os::OsSurfaces::new().create(&spec).unwrap();
+            assert_eq!(mappings(), 1 + PAGES, "the view: {direction:?}");
+            let textures: Vec<_> = (0..2)
+                .map(|_| {
+                    d.new_texture_on_surface(&bgra(width, height, 0), Some(&surface), 0)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                mappings(),
+                1 + PAGES * (1 + twins),
+                "the view, and a twin of it where read-only: {direction:?}"
+            );
+            drop((textures, surface));
+            // The pages are left mapped: the runtime may hold an import of them a while longer.
         }
     }
 

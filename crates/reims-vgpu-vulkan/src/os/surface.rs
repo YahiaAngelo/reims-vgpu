@@ -199,17 +199,19 @@ pub(crate) fn dropped_write(sel: &'static str, what: &str) -> ! {
 
 /// The alias of the allocation of `surface`, one at an offset into it ([`surface_offset`]) or
 /// whose GPU writes never reach its memory, read-only then ([`gpu_read_only`]), that every buffer
-/// over it lies over while one lives: the live one, or the one `make` makes, kept for the next;
-/// `None` where `make` makes none. The buffers then lie in one import of the runtime's, as those
-/// over a surface at no offset whose writes land lie over its base address: a write through one
-/// reaches the later commands of its command buffer that read another, as on Metal
-/// (`tests/client_direction.rs`), and a buffer over the surface can share the range of another
-/// over the same first byte (the device's `new_buffer_on_surface`).
+/// over it lies over while one lives: the live one, or a new one, kept for the next: the surface's
+/// own view of the guest's pages where it has one (Linux's stand-in over several ranges of them,
+/// `own_alias`), borrowed, and otherwise the one `make` makes; `None` where `make` makes none.
+/// The buffers then lie in one import of the runtime's, as those over a surface at no offset
+/// whose writes land lie over its base address: a write through one reaches the later commands
+/// of its command buffer that read another, as on Metal (`tests/client_direction.rs`), and a
+/// buffer over the surface can share the range of another over the same first byte (the device's
+/// `new_buffer_on_surface`).
 pub(crate) fn surface_alias(
     surface: &OsSurface,
     make: impl FnOnce() -> Option<Alias>,
 ) -> Option<Arc<Alias>> {
-    let mut make = Some(make);
+    let mut make = Some(|| host_os::own_alias(surface).or_else(make));
     let kept = host_os::recorded_mut(surface, |made| {
         if let Some(alias) = made.alias.upgrade() {
             return Some(alias);

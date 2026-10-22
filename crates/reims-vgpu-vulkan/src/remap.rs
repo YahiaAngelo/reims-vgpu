@@ -33,13 +33,16 @@
 //!   buffer's deallocator among them.
 //!
 //! The platform's own Mach VM calls in [`crate::gpu::backing`] report nothing: an alias's
-//! mapping (`gather`), the block of zeros, and an alias's release. Each range is a fresh one of
-//! the platform's own, which backs a heap, a rebind, or the no-copy buffers over a surface at an
-//! offset into its allocation or whose GPU writes never reach its memory
-//! (`buffer_over_surface_at` in [`crate::gpu::device`]). The runtime lets no buffer lie in the
-//! import of a heap's bytes or of the memory a rebound buffer takes, and a surface's alias is
-//! released by the keep-alive of the last buffer over it, which the runtime drops after it freed
-//! that buffer's import, so no buffer made later at the address could lie in one.
+//! mapping (`gather`), the block of zeros, and an alias's release; nor do those of Linux's
+//! surface stand-in (`os::linux::surface`), whose view of the guest's pages is the alias of a
+//! surface over several ranges of them. Each range is a fresh one of the platform's own, which
+//! backs a heap, a rebind, or the no-copy buffers over a surface at an offset into its allocation
+//! or whose GPU writes never reach its memory (`buffer_over_surface_at` in
+//! [`crate::gpu::device`]). The runtime lets no buffer lie in the import of a heap's bytes or of
+//! the memory a rebound buffer takes, and a surface's alias is released by the keep-alive of the
+//! last buffer over it, which the runtime drops after it freed that buffer's import, or, where it
+//! is the surface's view, by the surface's last release where that comes later, so no buffer made
+//! later at the address could lie in one.
 //!
 //! **Not reported**: the pages of the host's own RAM a memory map names, which core reads at the
 //! host's addresses with no mapping of its own. The host changes those without the library: no call

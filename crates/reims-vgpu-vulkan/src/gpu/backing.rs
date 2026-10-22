@@ -867,7 +867,10 @@ fn total(ranges: &[ResourceAddressRange]) -> Option<u64> {
 }
 
 /// A range of this platform's address space whose pages are the guest's, shared, and zeros past
-/// them ([`gather`]); freed when it drops.
+/// them ([`gather`]), freed when it drops; or a range another holder maps, which the alias
+/// borrows ([`Alias::borrowing`]): a surface's own view of the guest's pages on Linux, which
+/// holds the same pages, zeros past them included, and lets the surface's buffers lie over it
+/// with no second view of its pages (`crate::os::surface_alias`).
 #[derive(Debug)]
 pub(crate) struct Alias {
     at: NonNull<u8>,
@@ -875,16 +878,57 @@ pub(crate) struct Alias {
     /// Whether the runtime imports it through a writable twin of read-only pages, as its last
     /// import found ([`Alias::into_runtime`]).
     kept: AtomicBool,
+    /// What the runtime imports for it while an import of it lives: its pages, or their writable
+    /// twin ([`crate::os::import_view`]), one for every import made meanwhile
+    /// ([`Alias::into_runtime`]).
+    import: Mutex<Weak<crate::os::ImportView>>,
+    /// The hold on the memory of a borrowed alias, which its holder maps and frees, dropped with
+    /// the alias; `None` for one of this platform's own, which the alias frees.
+    borrowed: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
 }
 
-// SAFETY: an `Alias` is an address range this platform owns; nothing reads through it here, and
-// it is freed once, by whichever thread drops it.
+// SAFETY: an `Alias` is an address range this platform owns or borrows; nothing reads through it
+// here, and it is freed or let go of once, by whichever thread drops it.
 unsafe impl Send for Alias {}
 
-// SAFETY: as for `Send`: a shared `Alias` only answers where it is.
+// SAFETY: as for `Send`: a shared `Alias` only answers where it is, and imports it.
 unsafe impl Sync for Alias {}
 
 impl Alias {
+    /// An alias of this platform's own, `length` bytes at `at`, which it frees.
+    fn own(at: NonNull<u8>, length: u64) -> Alias {
+        Alias::of(at, length, None)
+    }
+
+    /// The `length` bytes at `at`, mapped by another holder while `hold` lives, as an alias that
+    /// holds `hold` and frees nothing: what it shows is the holder's (`crate::os::surface_alias`).
+    #[cfg_attr(
+        target_os = "macos",
+        expect(dead_code, reason = "only Linux's surfaces lend their own view")
+    )]
+    pub(crate) fn borrowing(
+        at: NonNull<u8>,
+        length: u64,
+        hold: impl std::fmt::Debug + Send + Sync + 'static,
+    ) -> Alias {
+        Alias::of(at, length, Some(Box::new(hold)))
+    }
+
+    /// The alias of `length` bytes at `at`, borrowed where `borrowed` holds them.
+    fn of(
+        at: NonNull<u8>,
+        length: u64,
+        borrowed: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
+    ) -> Alias {
+        Alias {
+            at,
+            length,
+            kept: AtomicBool::new(false),
+            import: Mutex::new(Weak::new()),
+            borrowed,
+        }
+    }
+
     /// The first byte the runtime imports, and the runtime's keep-alive of the alias, which lets
     /// go of it as it drops: once the runtime freed its import, at the buffer's release where
     /// it lies in a live buffer's import ([`keep_alive`]), or at once where the call was
@@ -893,15 +937,27 @@ impl Alias {
     /// The runtime imports the alias's pages, or, where the host's runtime cannot import them as
     /// they are mapped (read-only, on Linux), a writable twin of them ([`crate::os::import_view`]),
     /// whose first byte this answers, and which the keep-alive holds too: the GPU's writes then
-    /// reach the pages, where Metal drops them ([`Alias::writes_kept`]).
+    /// reach the pages, where Metal drops them ([`Alias::writes_kept`]). Every import of the alias
+    /// made while another lives is given the same memory, its twin included, so the buffers over
+    /// one surface's alias lie at one first byte, in one import of the runtime's (its
+    /// `host_aliases.rs`), with one twin's mappings, where each would take a twin of its own.
     pub(crate) fn into_runtime(self: Arc<Self>, site: ImportSite) -> (NonNull<u8>, rt::KeepAlive) {
         let first = self.at;
-        let view = crate::os::import_view(first, self.length);
+        let view = {
+            let mut import = self.import.lock();
+            match import.upgrade() {
+                Some(view) => view,
+                None => {
+                    let view = Arc::new(crate::os::import_view(first, self.length));
+                    *import = Arc::downgrade(&view);
+                    view
+                }
+            }
+        };
         let imported = view.at();
         self.kept.store(view.writes_kept(), Ordering::Release);
-        let (_, twin) = view.release(first, None);
         let traced = ImportTrace::new(site, first, self.length, imported);
-        (imported, keep_alive((twin, self, traced)))
+        (imported, keep_alive((view, self, traced)))
     }
 
     /// Whether the runtime imports the alias through a writable twin of read-only pages, whose
@@ -919,8 +975,11 @@ impl Alias {
 }
 
 impl Drop for Alias {
+    /// Frees the alias of this platform's own; lets go of a borrowed one's hold.
     fn drop(&mut self) {
-        let _ = OsVm::new().deallocate(HostPtr::from_ptr(self.at.as_ptr()), self.length);
+        if self.borrowed.take().is_none() {
+            let _ = OsVm::new().deallocate(HostPtr::from_ptr(self.at.as_ptr()), self.length);
+        }
     }
 }
 
@@ -1140,11 +1199,7 @@ pub(crate) fn gather(
         vm.allocate_anywhere(length)
     }
     .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
-    let alias = Alias {
-        at: NonNull::new(at.as_ptr::<u8>())?,
-        length,
-        kept: AtomicBool::new(false),
-    };
+    let alias = Alias::own(NonNull::new(at.as_ptr::<u8>())?, length);
     for run in runs {
         let source = HostPtr::from_addr(usize::try_from(run.source).ok()?);
         if let Err(kr) = vm.remap_shared_overwrite(at.wrapping_add(run.offset), source, run.length)
@@ -1244,26 +1299,63 @@ fn zero_block() -> Result<HostPtr, KernReturn> {
 }
 
 /// Maps the block of [`zero_block`] over the bytes from `from` to `length` of the range at `at`,
-/// whole pages: one remap maps the block, and each further one doubles what is mapped. Where the
-/// host gave no block or refused a remap, the process ends at `sel` ([`refused_by_host`]).
+/// whole pages ([`map_zeros`]). Where the host gave no block or refused a remap, the process ends
+/// at `sel` ([`refused_by_host`]).
 fn fill_zeros(sel: &'static str, vm: &OsVm, at: HostPtr, from: u64, length: u64) {
-    if from >= length {
-        return;
+    if let Err(ZerosRefused { what, length, kr }) = map_zeros(vm, at, from, length) {
+        refused_by_host(sel, what, length, kr);
     }
-    let block = zero_block()
-        .unwrap_or_else(|kr| refused_by_host(sel, "the block of zeros", ZERO_BLOCK, kr));
+}
+
+/// What the host refused [`map_zeros`]: what, of how many bytes, and its answer.
+#[derive(Debug)]
+pub(crate) struct ZerosRefused {
+    pub(crate) what: &'static str,
+    pub(crate) length: u64,
+    pub(crate) kr: KernReturn,
+}
+
+/// Maps the block of [`zero_block`] over the bytes from `from` to `length` of the range at `at`,
+/// whole pages, read-only: one remap maps the block, and each further one doubles what is mapped.
+/// Where the runtime imports read-only memory through a writable twin
+/// ([`crate::os::TWINS_READ_ONLY`]), the twin of these is zeros of its own
+/// ([`crate::os::import_view`]). `Err` where the host gave no block or refused a remap, what it
+/// mapped left as it is.
+pub(crate) fn map_zeros(
+    vm: &OsVm,
+    at: HostPtr,
+    from: u64,
+    length: u64,
+) -> Result<(), ZerosRefused> {
+    if from >= length {
+        return Ok(());
+    }
+    let block = zero_block().map_err(|kr| ZerosRefused {
+        what: "the block of zeros",
+        length: ZERO_BLOCK,
+        kr,
+    })?;
     let (first, length) = (at.wrapping_add(from), length - from);
     let mut mapped = length.min(ZERO_BLOCK);
     if let Err(kr) = vm.remap_shared_overwrite(first, block, mapped) {
-        refused_by_host(sel, "a remap of the block of zeros", mapped, kr);
+        return Err(ZerosRefused {
+            what: "a remap of the block of zeros",
+            length: mapped,
+            kr,
+        });
     }
     while mapped < length {
         let more = mapped.min(length - mapped);
         if let Err(kr) = vm.remap_shared_overwrite(first.wrapping_add(mapped), first, more) {
-            refused_by_host(sel, "a remap of zeros", more, kr);
+            return Err(ZerosRefused {
+                what: "a remap of zeros",
+                length: more,
+                kr,
+            });
         }
         mapped += more;
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,8 +12,12 @@
 //!   (`kIOSurfaceClientAddressRanges`) of one range is that range, its base address its offset
 //!   into it; one of several ranges is a view of them ([`super::vm::LinuxVm`]), read-only for
 //!   the CPU where it is read-only for the GPU (`kIOSurfaceClientDirection` 2), as IOSurface maps
-//!   it on macOS. A protected surface (protection options other than 0) has no memory the CPU
-//!   reaches: its base address is NULL.
+//!   it on macOS. The view runs on past the allocation's whole pages by the zeros a buffer over
+//!   the surface at its offset reads past its end, so that the surface's buffers lie over the
+//!   view itself ([`own_alias`]) rather than over a second view of the same pages: each view
+//!   takes a kernel mapping for each run of the pages, counted against `vm.max_map_count`. A
+//!   protected surface (protection options other than 0) has no memory the CPU reaches: its base
+//!   address is NULL.
 //!   The mapping goes with the surface's last object, or later with the last hold on it
 //!   ([`surface_memory_hold`]): a device's import of the pages at the surface's base address
 //!   holds one until the runtime has freed the import, so the pages stay mapped while it lives
@@ -66,7 +70,8 @@ use reims_vgpu_core::platform::os::vm::{HostVm as _, KernReturn, VmProt};
 use reims_vgpu_core::platform::{Handle, ObjId};
 use reims_vgpu_core::sync::Mutex;
 
-use super::vm::{LinuxVm, OwnMemory};
+use super::vm::{LinuxVm, OwnMemory, allocate_aliasable};
+use crate::gpu::backing::Alias;
 use crate::os::{MadeOver, READ_ONLY_DIRECTION, page_runs};
 use crate::platform::VulkanPlatform;
 
@@ -127,7 +132,8 @@ struct Data {
 struct Memory {
     /// Its own memory.
     own: Option<OwnMemory>,
-    /// The view of the guest's pages it made, its first byte and length.
+    /// The view of the guest's pages it made, its first byte and length: its allocation's whole
+    /// pages, then the zeros its buffers at its offset read past them ([`view`]).
     view: Option<(u64, u64)>,
 }
 
@@ -389,12 +395,34 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
 }
 
 /// A view of the first `length` bytes of `runs`, the guest's pages in their order with those that
-/// follow on in the host's memory merged ([`page_runs`]), read-only when `read_only`: one remap
-/// for each run, as core names the pages one by one. Its first byte, or `None` where a run has no
-/// file behind it or the host gives no address space, nothing left mapped.
-fn view(runs: &[std::ops::Range<u64>], length: u64, read_only: bool) -> Option<u64> {
+/// follow on in the host's memory merged ([`page_runs`]), then `zeros` bytes of zeros, whole
+/// pages, read-only when `read_only`: one remap for each run, as core names the pages one by one.
+/// Its first byte, or `None` where a run has no file behind it or the host gives no address space
+/// or zeros, nothing left mapped.
+///
+/// The zeros are the tail the buffers over the surface at an offset read past its allocation,
+/// which lie over the view ([`own_alias`]), as an alias of the allocation would give them
+/// (`crate::gpu::backing::gather`): a writable view's are a file of its own, which the runtime
+/// imports with the guest's pages, as host memory or as dma-bufs (`super::dma_buf`), which
+/// udmabuf makes of files alone; a read-only view's map the block of zeros, whose twin, which the
+/// runtime imports, is zeros of its own (`super::import`).
+fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool) -> Option<u64> {
     let vm = LinuxVm::new();
-    let at = vm.allocate_anywhere(length).ok()?;
+    let whole = length.checked_add(zeros)?;
+    let at = if zeros > 0 && !read_only {
+        allocate_aliasable(whole)
+    } else {
+        vm.allocate_anywhere(whole)
+    }
+    .ok()?;
+    let refused = |what: &str| {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "IOSurface over the guest's pages: {what}; refused"
+        );
+        let _ = vm.deallocate(at, whole);
+        None
+    };
     let mut offset = 0u64;
     for run in runs {
         if offset >= length {
@@ -406,22 +434,41 @@ fn view(runs: &[std::ops::Range<u64>], length: u64, read_only: bool) -> Option<u
             .remap_shared_overwrite(at.wrapping_add(offset), source, now)
             .is_err()
         {
-            log::warn!(
-                target: "reims_vgpu_vulkan::os",
-                "IOSurface over the guest's pages: no view of {now:#x} bytes at {:#x}, which the \
-                 library has no file of; refused",
+            return refused(&format!(
+                "no view of {now:#x} bytes at {:#x}, which the library has no file of",
                 run.start
-            );
-            let _ = vm.deallocate(at, length);
-            return None;
+            ));
         }
         offset += now;
     }
-    if read_only && vm.protect_max(at, length, VmProt::READ).is_err() {
-        let _ = vm.deallocate(at, length);
-        return None;
+    if read_only {
+        if let Err(z) = crate::gpu::backing::map_zeros(&vm, at, length, whole) {
+            return refused(&format!(
+                "the host refused {} of {:#x} bytes (kern_return {})",
+                z.what, z.length, z.kr.0
+            ));
+        }
+        if vm.protect_max(at, whole, VmProt::READ).is_err() {
+            return refused("the host refused the view's read-only protection");
+        }
     }
     Some(at.addr().to_u64())
+}
+
+/// The alias of `surface`'s allocation its buffers lie over, where it is the surface's own view
+/// of the guest's pages (`crate::os::surface_alias`), borrowed: the view holds the allocation's
+/// pages and the zeros a buffer at the surface's offset reads past them ([`view`]), read-only
+/// where the surface is read-only for the GPU, as an alias of the allocation would be
+/// (`crate::gpu::backing::gather`), and stays mapped while the alias holds the surface's memory
+/// ([`surface_memory_hold`]). `None` for a surface with no view: its own memory, one range of the
+/// guest's pages, or none.
+pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
+    let memory = &surface.data().memory;
+    let (first, length) = memory.view?;
+    let at = NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
+        first.to_usize(),
+    ))?;
+    Some(Alias::borrowing(at, length, Arc::clone(memory)))
 }
 
 /// IOSurface's creation on Linux (module docs).
@@ -476,9 +523,13 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 match ranges.as_slice() {
                     [one] => (one.physical_address, None, None),
                     _ => {
-                        let length = spec.alloc_size.checked_next_multiple_of(page_size())?;
-                        let at = view(&made.pages, length, made.gpu_read_only)?;
-                        (at, None, Some((at, length)))
+                        let page = page_size();
+                        let length = spec.alloc_size.checked_next_multiple_of(page)?;
+                        let zeros = (spec.alloc_size.checked_add(spec.offset)?)
+                            .checked_next_multiple_of(page)?
+                            - length;
+                        let at = view(&made.pages, length, zeros, made.gpu_read_only)?;
+                        (at, None, Some((at, length + zeros)))
                     }
                 }
             }
@@ -564,7 +615,6 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
 mod tests {
     use reims_vgpu_core::platform::os::surface::BackingPlaneSpec;
 
-    use super::super::vm::allocate_aliasable;
     use super::super::vm::tests::mapped;
     use super::*;
 
@@ -900,8 +950,10 @@ mod tests {
             [3, 2, 1]
         );
         assert!(recorded_mut(&several, |made| made.gpu_read_only).unwrap());
+        // The allocation's pages, then a page of zeros a buffer at the offset reads past them.
         let (view, length) = mapped_range(&several).unwrap();
-        assert_eq!((view, length), (base - 0x40, 3 * page));
+        assert_eq!((view, length), (base - 0x40, 4 * page));
+        assert_eq!(read(view + 3 * page), 0);
         let pieces = super::super::files::pieces(view, length).unwrap();
         assert!(pieces.iter().all(|p| p.prot == libc::PROT_READ));
         assert_eq!(
@@ -933,6 +985,62 @@ mod tests {
         }
         drop((one, several));
         free(at, 4 * page);
+    }
+
+    /// A surface over several ranges of the guest's pages lends its own view as the alias its
+    /// buffers lie over ([`own_alias`]): the allocation's whole pages, then zeros as far as a
+    /// buffer at its offset reads, writable or read-only as the surface is for the GPU, the
+    /// zeros of a writable one a file of their own and of a read-only one the block of zeros, as
+    /// an alias of the allocation's would be (`crate::gpu::backing::gather`). The alias keeps the
+    /// view mapped past the surface's last reference, and frees nothing of its own. A surface of
+    /// one range, or of its own memory, has no view to lend
+    #[test]
+    fn a_surface_lends_its_view_as_its_buffers_alias() {
+        use super::super::vm::tests::writable;
+        use reims_vgpu_core::platform::os::vm::HostAddr;
+
+        let page = page_size();
+        let (at, ranges) = guest_pages(3);
+        let backwards: Vec<_> = ranges.iter().rev().copied().collect();
+        let surfaces = LinuxSurfaces::new();
+        let over = |ranges: &[PhysicalMemoryRange], alloc_size, direction| SurfaceSpec {
+            alloc_size,
+            offset: 0x40,
+            client_direction: direction,
+            client_address_ranges: Some(ranges.to_vec()),
+            ..host_only()
+        };
+        for direction in [None, Some(READ_ONLY_DIRECTION)] {
+            let s = surfaces
+                .create(&over(&backwards, 3 * page, direction))
+                .unwrap();
+            let alias = own_alias(&s).unwrap();
+            let first = alias.first().as_ptr().addr().to_u64();
+            assert_eq!(first, s.base_address().addr().to_u64() - 0x40);
+            assert_eq!(
+                [read(first), read(first + 2 * page), read(first + 3 * page)],
+                [2, 0, 0],
+                "the pages in their order, then zeros: {direction:?}"
+            );
+            let tail = HostAddr::from_addr((first + 3 * page).to_usize());
+            assert_eq!(writable(tail, page), direction.is_none(), "{direction:?}");
+            let zeros = super::super::files::pieces(first + 3 * page, page).unwrap();
+            assert_eq!(
+                super::super::import::of_zeros(&zeros),
+                [direction.is_some()],
+                "{direction:?}"
+            );
+            drop(s);
+            assert!(mapped(tail), "the alias holds the view: {direction:?}");
+            drop(alias);
+            assert!(!mapped(tail), "{direction:?}");
+        }
+        let one = surfaces.create(&over(&ranges[..1], page, None)).unwrap();
+        assert!(own_alias(&one).is_none(), "one range");
+        let own = surfaces.create(&host_only()).unwrap();
+        assert!(own_alias(&own).is_none(), "its own memory");
+        drop((one, own));
+        free(at, 3 * page);
     }
 
     /// A surface over guest pages core names one by one views each run of them that follows on

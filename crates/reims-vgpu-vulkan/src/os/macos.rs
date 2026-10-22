@@ -144,6 +144,12 @@ pub(crate) struct ImportView {
     at: std::ptr::NonNull<u8>,
 }
 
+// SAFETY: an address only, which nothing here reads through: it is handed to the runtime.
+unsafe impl Send for ImportView {}
+
+// SAFETY: as for `Send`: a shared view only answers where it is.
+unsafe impl Sync for ImportView {}
+
 impl ImportView {
     /// The first byte the runtime imports.
     pub(crate) fn at(&self) -> std::ptr::NonNull<u8> {
@@ -325,6 +331,13 @@ pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u6
 /// surface gone or not: nothing here. IOSurface's memory is the surface's own, and nothing but a
 /// reference of the surface, which the guest counts, keeps it.
 pub(crate) fn surface_memory_hold(_surface: &MetalSurface) -> impl Send + 'static {}
+
+/// The alias of `surface`'s allocation its buffers lie over where it is the surface's own
+/// mapping (`crate::os::surface_alias`): none on macOS, where IOSurface's mapping goes with the
+/// surface's last release, which a buffer's alias may outlive.
+pub(crate) fn own_alias(_surface: &MetalSurface) -> Option<crate::gpu::backing::Alias> {
+    None
+}
 
 /// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
 pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";

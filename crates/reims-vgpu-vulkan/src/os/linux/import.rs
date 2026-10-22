@@ -81,6 +81,13 @@ pub(crate) struct ImportView {
     twin: Option<Twin>,
 }
 
+// SAFETY: `at` is an address only, which nothing here reads through: it is handed to the runtime;
+// the twin is unmapped once, by whichever thread drops the view.
+unsafe impl Send for ImportView {}
+
+// SAFETY: as for `Send`: a shared view only answers where it is.
+unsafe impl Sync for ImportView {}
+
 /// A writable twin's address range, unmapped when it drops.
 #[derive(Debug)]
 struct Twin {
