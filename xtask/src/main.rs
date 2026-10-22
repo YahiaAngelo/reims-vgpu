@@ -116,6 +116,9 @@ fn cmd_testkit(_args: &[String]) -> Res<bool> {
     Ok(show("testkit", &lint::testkit_manifests(&lib, &manifests)))
 }
 
+/// Runs one of the check's cargo steps, without incremental compilation (`CARGO_INCREMENTAL=0`).
+/// A check builds each configuration once in its tree, so incremental caches would only take
+/// disk, and their stale state can fail a sound build (docs/lessons.md).
 fn cargo(args: &[&str]) -> Res<bool> {
     cargo_with(args, &[])
 }
@@ -126,10 +129,11 @@ fn cargo_with(args: &[&str], env: &[(&str, &std::path::Path)]) -> Res<bool> {
         .iter()
         .map(|(k, v)| format!("{k}={} ", v.display()))
         .collect();
-    println!("$ {shown}cargo {}", args.join(" "));
+    println!("$ CARGO_INCREMENTAL=0 {shown}cargo {}", args.join(" "));
     let status =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args(args)
+            .env("CARGO_INCREMENTAL", "0")
             .envs(env.iter().copied())
             .current_dir(repo_root())
             .status()

@@ -102,7 +102,9 @@ cargo xtask smoke          # a guest linked with the library as QEMU links it (m
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
-and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`.
+and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run
+with `CARGO_INCREMENTAL=0`: each builds once in its tree, where incremental caches would only take
+disk.
 
 #### Dist
 
