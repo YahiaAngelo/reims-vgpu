@@ -24,10 +24,6 @@
 //! ([`refused`]). **A method not built yet** dies the same way ([`unbuilt`]), and so does a raw
 //! value the runtime's types cannot hold ([`unrepresentable`]).
 //!
-//! **A value of Metal's this platform does not follow**, which no runtime notice announces, dies
-//! where the guest would read it, named by its kind ([`Unfollowed`], [`unfollowed`]); what made
-//! the object it is read of went on. No such value is relayed.
-//!
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
 //!
@@ -64,10 +60,10 @@
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
 //! blend, a NaN or bfloat clear, a bfloat attachment's codes, a `textureWriteRoundingMode` the
 //! runtime does not take), or an answer it gives otherwise (a texture of protection options made
-//! unprotected, the identifier of a pipeline state made with indirect command buffer support),
-//! is relayed alike, its first occurrence writing a line naming the kind, and dies in strict
-//! mode. A death where Metal itself ends the process, or where the runtime cannot perform the
-//! call at all, is a death in either mode.
+//! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
+//! of an indirect command buffer made after an encoder), is relayed alike, its first occurrence
+//! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
+//! process, or where the runtime cannot perform the call at all, is a death in either mode.
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
@@ -2012,43 +2008,6 @@ pub fn unrepresentable(sel: &'static str, what: &str) -> ! {
     dies(sel, &format!("the Vulkan runtime cannot hold {what}"))
 }
 
-/// A value of Metal's this platform does not follow, which no runtime notice announces: it dies
-/// where the guest would read it ([`unfollowed`]), its line naming the kind's code. Each kind is
-/// placed once: listed once in [`Unfollowed::ALL`], under a code of its own that is none of the
-/// runtime's kinds' (`every_unfollowed_kind_is_placed_once`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unfollowed {
-    /// The `uniqueIdentifier` of an indirect command buffer made after an encoder of any kind was
-    /// made in the process (info command 460): Metal's address of the buffer then depends on
-    /// what each encoder took of its range by its kind, its work and whether it was committed
-    /// ([`crate::gpu::icb`]).
-    IcbIdentifierAfterEncoder,
-}
-
-impl Unfollowed {
-    /// Every kind, once.
-    pub const ALL: [Self; 1] = [Self::IcbIdentifierAfterEncoder];
-
-    /// The kind's code, which its death's line names.
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::IcbIdentifierAfterEncoder => "icb-identifier-after-encoder",
-        }
-    }
-}
-
-/// The death at `sel` of a read of a value of kind `kind` this platform does not follow, `what`
-/// saying what the guest would read.
-pub fn unfollowed(sel: &'static str, kind: Unfollowed, what: &str) -> ! {
-    dies(
-        sel,
-        &format!(
-            "this platform does not follow Metal's answer here ({}): {what}",
-            kind.code()
-        ),
-    )
-}
-
 /// A value this platform computes otherwise than Metal, which no runtime notice of [`DIES`]
 /// announces: relayed by default, a death in strict mode ([`inexact`]). Each kind is placed
 /// once, under a code of its own (`every_inexact_kind_is_placed_once`).
@@ -2102,11 +2061,18 @@ pub enum Inexact {
     /// rely on, as Metal's: one value for the state's life, no other live state's, the last
     /// released taken again first by kind (`crate::gpu::resource`'s `identified`).
     UniqueIdentifier,
+    /// The `uniqueIdentifier` the guest reads (info command 460) of an indirect command buffer
+    /// made after an encoder of any kind was made in the process: the runtime's, Metal's address
+    /// where the encoders before it took ranges of Metal's range as an M3 Max's take them, and
+    /// not where a render pass's run took more (`unmeasured-unique-identifier`, which the runtime
+    /// announces once a device, as such a buffer is read). Relayed at every such buffer, wider
+    /// than the runtime's notice ([`crate::gpu::icb`]).
+    IcbIdentifierAfterEncoder,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::HalfOutputBlend,
         Self::Clear,
         Self::BfloatLoaded,
@@ -2120,6 +2086,7 @@ impl Inexact {
         Self::LateResolve,
         Self::ProtectedContent,
         Self::UniqueIdentifier,
+        Self::IcbIdentifierAfterEncoder,
     ];
 
     /// The kind's code, which its line names.
@@ -2138,6 +2105,7 @@ impl Inexact {
             Self::LateResolve => "inexact-late-resolve",
             Self::ProtectedContent => "inexact-protected-content",
             Self::UniqueIdentifier => "inexact-unique-identifier",
+            Self::IcbIdentifierAfterEncoder => "inexact-icb-identifier-after-encoder",
         }
     }
 }
@@ -2370,8 +2338,8 @@ mod tests {
         //   runtime's relations keep Metal's: one value for a state's life, no other live
         //   state's, the last released taken again first by kind. It reads a state's own (info
         //   command 460), which is relayed there as [`Inexact::UniqueIdentifier`], dying in strict
-        //   mode; a buffer's made after an encoder dies before the runtime answers it
-        //   ([`Unfollowed::IcbIdentifierAfterEncoder`]).
+        //   mode, and a buffer's made after an encoder, relayed as
+        //   [`Inexact::IcbIdentifierAfterEncoder`].
         // Among the others:
         // - `UnreachedTilesRewritten`, `DontCareLoadTiles` and `ExtendedRangeBitsKept`: the bytes
         //   a pass leaves where its draws write nothing, announced at a pass Metal runs. Metal's
@@ -2743,15 +2711,14 @@ mod tests {
     }
 
     /// Every kind this platform relays as computed otherwise than Metal is placed once: listed
-    /// once, under a code of its own, none a runtime kind's or an unfollowed kind's
+    /// once, under a code of its own, none a runtime kind's
     #[test]
     fn every_inexact_kind_is_placed_once() {
         let codes: Vec<&str> = Inexact::ALL.iter().map(|k| k.code()).collect();
         for (at, code) in codes.iter().enumerate() {
             assert!(!codes[..at].contains(code), "{code} placed twice");
             assert!(
-                rt::Degradation::ALL.iter().all(|d| d.code() != *code)
-                    && Unfollowed::ALL.iter().all(|u| u.code() != *code),
+                rt::Degradation::ALL.iter().all(|d| d.code() != *code),
                 "{code} is another kind's"
             );
         }
@@ -2769,7 +2736,8 @@ mod tests {
                 | Inexact::FillFormat
                 | Inexact::LateResolve
                 | Inexact::ProtectedContent
-                | Inexact::UniqueIdentifier => {}
+                | Inexact::UniqueIdentifier
+                | Inexact::IcbIdentifierAfterEncoder => {}
             }
         }
     }
@@ -2815,25 +2783,6 @@ mod tests {
         relaxed(|| inexact("sel:", Inexact::LineWidth, what));
         relaxed(|| inexact("sel:", Inexact::LineWidth, what));
         assert_eq!(asked.get(), first);
-    }
-
-    /// Every kind of value this platform does not follow is placed once: listed once, under a
-    /// code of its own, none a runtime kind's
-    #[test]
-    fn every_unfollowed_kind_is_placed_once() {
-        let codes: Vec<&str> = Unfollowed::ALL.iter().map(|k| k.code()).collect();
-        for (at, code) in codes.iter().enumerate() {
-            assert!(!codes[..at].contains(code), "{code} placed twice");
-            assert!(
-                rt::Degradation::ALL.iter().all(|d| d.code() != *code),
-                "{code} is a runtime kind's"
-            );
-        }
-        for kind in Unfollowed::ALL {
-            match kind {
-                Unfollowed::IcbIdentifierAfterEncoder => {}
-            }
-        }
     }
 
     /// A call here that the runtime announced a degradation of [`DIES`] inside, and that then

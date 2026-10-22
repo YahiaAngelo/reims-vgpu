@@ -54,9 +54,9 @@
 //!   the `resourceIndex`, from Metal's pool of IDs of indirect command buffers, and the
 //!   `uniqueIdentifier`, Metal's address of the buffer in its range of the GPU's address space
 //!   (`rt::IndirectCommandBuffer::unique_identifier`), of a buffer made before the process's
-//!   first encoder. Of one made after an encoder of any kind, Metal's address depends
-//!   on what the encoders took of the range, which the runtime does not follow, and the read dies
-//!   ([`encoder_made`]).
+//!   first encoder. Of one made after an encoder of any kind, Metal's address depends on what the
+//!   encoders took of the range, which the runtime follows where an M3 Max's take it as fixed,
+//!   and the read is relayed, a death in strict mode ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
 //!   buffer reaches a buffer's records by, so the kernel reaches the records of the buffer the
 //!   guest names. A reservation is the runtime's, as Metal takes, ignores or drops it, to
@@ -89,7 +89,7 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
-    Policy, Unfollowed, decide, get, hang, metal_aborts, plain, send, unfollowed, unrepresentable,
+    Inexact, Policy, decide, get, hang, inexact, metal_aborts, plain, send, unrepresentable,
     unstopped_at,
 };
 use crate::gpu::command::{Progress, Stage};
@@ -173,15 +173,18 @@ static ENCODED: AtomicBool = AtomicBool::new(false);
 ///
 /// Metal's own encoders take ranges of its range for indirect command buffers, by the GPU, the
 /// encoder's kind, its work and whether its command buffer was committed (the runtime's
-/// `unique_identifier.rs` lists them, measured on the M3 Max and an M4), which the runtime does
-/// not follow, nor Metal's hold of a buffer's range while a command buffer that executes it may
-/// run. So an indirect command buffer made after an encoder of any kind was made in the process,
-/// counted from the encoder's creation whether or not it is committed, answers no
-/// `uniqueIdentifier`: the read dies, named ([`Unfollowed::IcbIdentifierAfterEncoder`]), and the
-/// buffer's creation and every other number of it go on. A buffer made before the first encoder
-/// answers Metal's, the runtime's. The death is wider than Metal's difference where the encoder
-/// took nothing: a compute encoder that neither dispatches nor executes a buffer, on both GPUs,
-/// and an empty blit encoder on the M3 Max.
+/// `unique_identifier.rs` lists them, measured on the M3 Max and an M4). The runtime takes them
+/// as an M3 Max's take them where that is fixed (a blit encoder's and a render encoder's at their
+/// opening, a dispatch's or a blit command's as its command buffer is scheduled), and not a
+/// render pass's run, which takes more by its targets and what the device drew before: a buffer
+/// made after a command buffer that encoded a render encoder was scheduled, or after a resource
+/// state encoder opened, answers an identifier the runtime announces as unmeasured
+/// (`unmeasured-unique-identifier`, once a device). So the `uniqueIdentifier` of an indirect
+/// command buffer made after an encoder of any kind was made in the process, counted from the
+/// encoder's creation whether or not it is committed, is the runtime's, relayed, a death in
+/// strict mode ([`crate::answer::Inexact::IcbIdentifierAfterEncoder`]): wider than the runtime's
+/// notice, which no call here hears. A buffer made before the first encoder answers Metal's, the
+/// runtime's.
 pub(crate) fn encoder_made() {
     if !ENCODED.load(Ordering::Relaxed) {
         ENCODED.store(true, Ordering::SeqCst);
@@ -266,7 +269,7 @@ pub struct Inherits {
 pub struct IcbObject {
     /// The runtime's buffer.
     pub raw: rt::IndirectCommandBuffer,
-    /// Whether it was made after an encoder ([`encoder_made`]): its `uniqueIdentifier` dies.
+    /// Whether it was made after an encoder ([`encoder_made`]): its `uniqueIdentifier` is relayed.
     after_encoder: bool,
     /// Whether its commands take attribute strides.
     strides: bool,
@@ -827,15 +830,19 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     }
 
     /// The runtime's, Metal's base plus the buffer's address in Metal's range (the module docs).
-    /// Of a buffer made after an encoder it dies, as Metal's address then depends on what the
-    /// encoders took ([`encoder_made`]).
+    /// Of a buffer made after an encoder it is relayed, a death in strict mode, as Metal's address
+    /// then depends on what the encoders took ([`encoder_made`]).
     fn unique_identifier(&self) -> u64 {
         if self.after_encoder {
-            unfollowed(
+            inexact(
                 "uniqueIdentifier",
-                Unfollowed::IcbIdentifierAfterEncoder,
-                "the uniqueIdentifier of an indirect command buffer made after an encoder, which \
-                 Metal places by what each encoder took of its range",
+                Inexact::IcbIdentifierAfterEncoder,
+                || {
+                    "the uniqueIdentifier of an indirect command buffer made after an encoder as \
+                 Metal's: it answers the runtime's, Metal's where the encoders before it took \
+                 ranges of Metal's as an M3 Max's take them"
+                        .to_owned()
+                },
             );
         }
         plain(|| self.raw.unique_identifier())
@@ -1507,8 +1514,9 @@ mod tests {
 
     /// A buffer made before the process's first encoder answers Metal's `uniqueIdentifier`, the
     /// first one's `0x1000018000`, before and after `encode` made an encoder of a command buffer
-    /// never committed; one made after it dies at the read, naming
-    /// `icb-identifier-after-encoder`, its creation and its other numbers gone on
+    /// never committed; the read of one made after it is relayed, answering the runtime's, and
+    /// dies in strict mode, naming `inexact-icb-identifier-after-encoder`, its creation and its
+    /// other numbers gone on
     fn identifiers_after(encode: impl FnOnce(&VulkanCommandBuffer)) {
         let d = dev();
         let before = make::<VulkanPlatform>(&d, &compute_desc(), 1);
@@ -1526,13 +1534,16 @@ mod tests {
             (DeathKind::Abort, "uniqueIdentifier")
         );
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        let code = crate::answer::Unfollowed::IcbIdentifierAfterEncoder.code();
-        assert!(line.contains(code), "{line}");
+        let kind = crate::answer::Inexact::IcbIdentifierAfterEncoder;
+        assert!(line.contains(kind.code()), "{line}");
+        let relayed = crate::answer::relaxed(|| after.unique_identifier());
+        assert_eq!(relayed, plain(|| after.raw.unique_identifier()));
+        assert_eq!(crate::answer::inexact_counts(), [(kind, 1)]);
     }
 
     /// [`identifiers_after`] an empty blit encoder
     #[test]
-    fn identifiers_after_a_blit_encoder_die() {
+    fn identifiers_after_a_blit_encoder_are_relayed() {
         identifiers_after(|cb| {
             let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
             e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
@@ -1542,7 +1553,7 @@ mod tests {
     /// [`identifiers_after`] an empty compute encoder, which took nothing of Metal's range on the
     /// M4
     #[test]
-    fn identifiers_after_a_compute_encoder_die() {
+    fn identifiers_after_a_compute_encoder_are_relayed() {
         identifiers_after(|cb| {
             let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
             e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
@@ -1551,7 +1562,7 @@ mod tests {
 
     /// [`identifiers_after`] an empty compute encoder of a pass descriptor
     #[test]
-    fn identifiers_after_a_compute_pass_encoder_die() {
+    fn identifiers_after_a_compute_pass_encoder_are_relayed() {
         identifiers_after(|cb| {
             let desc = reims_vgpu_core::platform::values::ComputePassDesc::default();
             let e = cb.compute_encoder_for_pass(&desc).unwrap().unwrap();
@@ -1561,7 +1572,7 @@ mod tests {
 
     /// [`identifiers_after`] an empty render encoder
     #[test]
-    fn identifiers_after_a_render_encoder_die() {
+    fn identifiers_after_a_render_encoder_are_relayed() {
         use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
         identifiers_after(|cb| {
             let p = crate::platform::tests::platform();
@@ -2542,8 +2553,8 @@ mod tests {
     /// until that command buffer completes where an encoder executes it or makes it resident, and
     /// not where a blit copies from it or into it, resets it or optimizes it, as Metal's does; an
     /// execution in a command buffer never committed keeps it until the command buffer goes. The
-    /// `uniqueIdentifier` of a buffer made after an encoder dies ([`encoder_made`]), as it does
-    /// here once the first command buffer used one
+    /// `uniqueIdentifier` of a buffer made after an encoder dies in strict mode ([`encoder_made`]),
+    /// as it does here once the first command buffer used one
     #[test]
     fn a_buffer_keeps_its_id_while_a_command_buffer_uses_it() {
         use std::sync::mpsc;
