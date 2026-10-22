@@ -76,10 +76,11 @@
 //!   which Metal crashes at, dies.
 //! - **Numbers the guest sees** are Metal's ([`Numbers`]): the `gpuResourceID`, which is also
 //!   the `resourceIndex`, from a space of IDs of Metal's indirect command buffers, and the
-//!   `uniqueIdentifier`, Metal's address of the buffer in its range of the GPU's address space,
-//!   of a buffer made before the process's first encoder. Of one made after an encoder of any
-//!   kind, Metal's address depends on what the encoders took of the range, which this platform
-//!   does not follow, and the read dies ([`Space`], [`encoder_made`]).
+//!   `uniqueIdentifier`, the runtime's, Metal's address of the buffer in its range of the GPU's
+//!   address space (`rt::IndirectCommandBuffer::unique_identifier`), of a buffer made before the
+//!   process's first encoder. Of one made after an encoder of any kind, Metal's address depends
+//!   on what the encoders took of the range, which the runtime does not follow, and the read dies
+//!   ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
 //!   buffer reaches a buffer's records by. It follows Metal's pool, placement and hold, as these
 //!   numbers do ([`Space`]): a placed buffer takes the same ID in the runtime, and each
@@ -141,22 +142,6 @@ pub const NIL_BUFFER_ADDRESS: u64 = 0x1_eeee_1111;
 
 // ---- Metal's numbers.
 
-/// The base of Metal's `uniqueIdentifier` of an indirect command buffer: the identifier is this
-/// plus the buffer's address in Metal's range for them (measured: a fresh process's first buffer
-/// answers `0x1000018000` with its private `gpuAddress` `0x18000`).
-const UNIQUE_IDENTIFIER_BASE: u64 = 0x10_0000_0000;
-
-/// Where the first buffer of a process lies in that range (measured: so too after textures,
-/// buffers and pipeline states with indirect command buffer support; what MoltenVK makes in a
-/// process moves Metal's own, which this platform's numbers do not follow).
-const FIRST_ADDRESS: u64 = 0x1_8000;
-
-/// Metal's page: a buffer's range holds one more past its `allocatedSize`.
-const PAGE: u64 = 0x4000;
-
-/// The alignment of a buffer's range, which holds its pages and one page more.
-const SLOT: u64 = 0x8000;
-
 /// The first resource ID a placement cannot take: Metal writes past its table of IDs at 16384 or
 /// more, which ends its process at random (measured: 16383 always made, 16384 to 50367 made or
 /// crashed from run to run, 100000 crashed).
@@ -169,8 +154,6 @@ struct Numbers {
     id: u64,
     /// Whether plain allocation handed the ID out (a placed one does not count against it).
     plain: bool,
-    /// Its address in Metal's range for these buffers.
-    address: u64,
 }
 
 /// The size of Metal's first pool of indirect command buffer IDs ([`Pool`]): plain allocation
@@ -189,12 +172,7 @@ const FIRST_POOL: u64 = 32;
 ///
 /// Measured on this host: plain allocation hands out IDs from Metal's pool ([`Pool`]); a
 /// placement (`setResourceIndex:` of a nonzero index) takes the index's low 32 bits whoever
-/// holds them, reserved or not, and takes no ID from the pool. Addresses are the lowest gap of
-/// the range, from [`FIRST_ADDRESS`], that holds the buffer's `allocatedSize` and one more page,
-/// aligned to [`SLOT`]. The runtime's `allocated_size` is Metal's (compared with Metal on this
-/// host for 8160 descriptors: 17 sets of command types, none and render beside compute among
-/// them, each inheriting its pipeline state and buffers or not, with dynamic strides or not, of
-/// 0 to 31 buffers a stage and 0 to 3000 commands).
+/// holds them, reserved or not, and takes no ID from the pool.
 ///
 /// A reservation (`reserveResourceIndicesForResourceType:indices:indexCount:` of type 5) keeps
 /// its IDs from plain allocation for good. Only the process's first call with an ID counts, and
@@ -229,47 +207,14 @@ const FIRST_POOL: u64 = 32;
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
 /// command buffer blocked on an event, then completed): a compute or render encoder's execution
-/// or `useResource` of it keeps the buffer, its ID and range, until the command buffer completes,
-/// or goes uncommitted; a blit's copy (from it or into it) or reset keeps only its range, its ID
-/// free at once; a blit's optimization keeps neither.
-///
-/// Metal's own work takes ranges here too, by the GPU, the encoder's kind, its work and whether
-/// its command buffer was committed. Where the next buffer lands after the process's first
-/// encoder, with two live buffers ending at `0x28000` (measured, the runtime's `API-icbenc1`
-/// rows; on the M3 Max with Metal's validation layer and without alike):
-///
-/// | the first encoder | M3 Max | M4 |
-/// |---|---|---|
-/// | compute: empty, making resources resident alone, or never committed | `0x28000` (nothing taken) | `0x28000` |
-/// | compute: a plain dispatch | `0x30000` (one slot) | `0x30000` |
-/// | compute: executing a buffer | `0x38000` | one slot past that buffer |
-/// | blit: empty | `0x28000` | `0x68000` (`0x40000` taken) |
-/// | blit: copying buffers | `0x70000` | `0x70000` |
-/// | render: never committed | `0x88000` (`0x60000` taken) | `0x88000` |
-/// | render: empty, committed | `0x4f0000` | `0x2c0000` |
-///
-/// Earlier M3 Max rows, whose live buffers they do not state: after a blit that copies or resets
-/// indirect commands, at `0x4d0000`; after one that fills a buffer, at `0x70000`; after a render
-/// encoder that executes a buffer, at `0x508000`.
-///
-/// These numbers do not follow that work. So a buffer made after an encoder of any kind was made
-/// in the process, counted from the encoder's creation whether or not it is committed
-/// ([`encoder_made`]), answers no `uniqueIdentifier`: the read dies, named
-/// ([`Unfollowed::IcbIdentifierAfterEncoder`]), and the buffer's creation and every other number
-/// of it go on. A buffer made before the first encoder answers Metal's. The death is wider than
-/// Metal's difference where the encoder took nothing: a compute encoder that neither dispatches
-/// nor executes a buffer, on both GPUs, and an empty blit encoder on the M3 Max.
+/// or `useResource` of it keeps the buffer and its ID until the command buffer completes, or goes
+/// uncommitted; a blit's copy (from it or into it) or reset keeps neither, its ID free at once.
 struct Space {
     /// The plain IDs, once a buffer was made or a reservation taken.
     pool: Option<Pool>,
-    /// The ranges of the live buffers: start, then bytes.
-    ranges: BTreeMap<u64, u64>,
 }
 
-static SPACE: Mutex<Space> = Mutex::new(Space {
-    pool: None,
-    ranges: BTreeMap::new(),
-});
+static SPACE: Mutex<Space> = Mutex::new(Space { pool: None });
 
 /// Whether an encoder of any kind was made in the process ([`encoder_made`]).
 static ENCODED: AtomicBool = AtomicBool::new(false);
@@ -277,10 +222,21 @@ static ENCODED: AtomicBool = AtomicBool::new(false);
 /// Says an encoder of any kind is being made, before the runtime's encoder is, whether or not it
 /// is committed later or the creator answers nil: each encoder creator core sends calls it first
 /// (`blitCommandEncoder`, `computeCommandEncoder`, `computeCommandEncoderWithDescriptor:` and
-/// `renderCommandEncoderWithDescriptor:`). An indirect command buffer made after it answers no
-/// `uniqueIdentifier` ([`Space`]). The buffer's creation reads it after the runtime made the
-/// buffer, so a buffer that reads it unset was made before every encoder whose creation had not
-/// set it.
+/// `renderCommandEncoderWithDescriptor:`). The buffer's creation reads it after the runtime made
+/// the buffer, so a buffer that reads it unset was made before every encoder whose creation had
+/// not set it, and before the runtime's device opened one.
+///
+/// Metal's own encoders take ranges of its range for indirect command buffers, by the GPU, the
+/// encoder's kind, its work and whether its command buffer was committed (the runtime's
+/// `unique_identifier.rs` lists them, measured on the M3 Max and an M4), which the runtime does
+/// not follow, nor Metal's hold of a buffer's range while a command buffer that executes it may
+/// run. So an indirect command buffer made after an encoder of any kind was made in the process,
+/// counted from the encoder's creation whether or not it is committed, answers no
+/// `uniqueIdentifier`: the read dies, named ([`Unfollowed::IcbIdentifierAfterEncoder`]), and the
+/// buffer's creation and every other number of it go on. A buffer made before the first encoder
+/// answers Metal's, the runtime's. The death is wider than Metal's difference where the encoder
+/// took nothing: a compute encoder that neither dispatches nor executes a buffer, on both GPUs,
+/// and an empty blit encoder on the M3 Max.
 pub(crate) fn encoder_made() {
     if !ENCODED.load(Ordering::Relaxed) {
         ENCODED.store(true, Ordering::SeqCst);
@@ -293,9 +249,8 @@ impl Space {
         self.pool.get_or_insert_with(|| Pool::new(FIRST_POOL))
     }
 
-    /// The numbers of a new buffer of `size` bytes, its `allocatedSize`, placed at `placed` when
-    /// given.
-    fn take(&mut self, placed: Option<u64>, size: u64) -> Numbers {
+    /// The numbers of a new buffer, placed at `placed` when given.
+    fn take(&mut self, placed: Option<u64>) -> Numbers {
         let (id, plain) = match placed {
             Some(id) => {
                 self.pool().started = true;
@@ -303,16 +258,7 @@ impl Space {
             }
             None => (self.pool().take(), true),
         };
-        let footprint = size.saturating_add(PAGE).next_multiple_of(SLOT);
-        let mut address = FIRST_ADDRESS;
-        for (&start, &bytes) in &self.ranges {
-            if start >= address.saturating_add(footprint) {
-                break;
-            }
-            address = address.max(start.saturating_add(bytes));
-        }
-        self.ranges.insert(address, footprint);
-        Numbers { id, plain, address }
+        Numbers { id, plain }
     }
 
     /// Frees the ID of a buffer released.
@@ -542,19 +488,6 @@ fn reserve_in<'a>(space: &'a Mutex<Space>, ids: &[u64]) -> (Reservation, MutexGu
     (reservation, held)
 }
 
-/// A buffer's range in [`Space`], free again once the buffer and every blit of its commands that
-/// may still run let go of it.
-#[derive(Debug)]
-pub(crate) struct Reserved {
-    address: u64,
-}
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        SPACE.lock().ranges.remove(&self.address);
-    }
-}
-
 // ---- The buffer.
 
 /// What Metal answers of one command that its record does not hold (the module docs).
@@ -769,8 +702,6 @@ pub struct IcbObject {
     numbers: Numbers,
     /// Whether it was made after an encoder ([`encoder_made`]): its `uniqueIdentifier` dies.
     after_encoder: bool,
-    /// Its range in [`Space`].
-    range: Arc<Reserved>,
     /// Whether its commands take attribute strides.
     strides: bool,
     /// What its commands take of the encoder that executes them.
@@ -1171,8 +1102,7 @@ impl Sides {
 }
 
 impl Drop for IcbObject {
-    /// Its ID is free again, as Metal's is once the buffer is released, and its range once no
-    /// blit that may still run holds it. The ID is given back and the runtime's buffer dropped
+    /// Its ID is free again, as Metal's is once the buffer is released. The ID is given back and the runtime's buffer dropped
     /// under the lock of [`Space`], which a creation holds while the runtime makes its buffer, so
     /// no creation takes an ID between the two ([`IcbObject::reaches_its_records`]).
     fn drop(&mut self) {
@@ -1197,12 +1127,6 @@ impl IcbObject {
     /// (the module docs).
     pub(crate) fn reaches_its_records(&self) -> bool {
         plain(|| self.raw.gpu_resource_id().0 == self.numbers.id)
-    }
-
-    /// Its range, which a blit of its commands holds until its command buffer has run (the docs
-    /// of [`Space`]).
-    pub(crate) fn range(&self) -> Arc<Reserved> {
-        Arc::clone(&self.range)
     }
 
     /// Runs `edit`, `sel`'s `access`, on what Metal answers of command `index`; a write leaves
@@ -1604,7 +1528,8 @@ impl IcbObject {
 pub type VulkanIcb = Obj<IcbObject>;
 
 /// Another reference to each indirect command buffer of `list`, which a `useResource` form made
-/// resident: its command buffer holds them until it has run (the docs of [`Space`]).
+/// resident: its command buffer holds them, and their IDs, until it has run (the docs of
+/// [`Space`]).
 pub(crate) fn made_resident(list: &[Option<ResourceRef<'_, VulkanPlatform>>]) -> Vec<VulkanIcb> {
     list.iter()
         .flatten()
@@ -1726,15 +1651,12 @@ pub(crate) fn new_indirect_command_buffer(
             .new_indirect_command_buffer(&d, max_count, options)
     })?;
     let after_encoder = ENCODED.load(Ordering::SeqCst);
-    let numbers = space.take(placed, raw.allocated_size());
+    let numbers = space.take(placed);
     drop(space);
     Ok(Some(Obj::new(IcbObject {
         raw: ManuallyDrop::new(raw),
         numbers,
         after_encoder,
-        range: Arc::new(Reserved {
-            address: numbers.address,
-        }),
         strides: d.support_dynamic_attribute_stride,
         inherits: Inherits {
             pipeline: d.inherit_pipeline_state,
@@ -1798,11 +1720,10 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
         plain(|| self.raw.size())
     }
 
-    /// Metal's base plus the buffer's address in Metal's range (the module docs). Of a buffer
-    /// made after an encoder it dies, as Metal's address then depends on what the encoders took
-    /// ([`Space`]).
+    /// The runtime's, Metal's base plus the buffer's address in Metal's range (the module docs).
+    /// Of a buffer made after an encoder it dies, as Metal's address then depends on what the
+    /// encoders took ([`encoder_made`]).
     fn unique_identifier(&self) -> u64 {
-        let address = plain(|| self.numbers.address);
         if self.after_encoder {
             unfollowed(
                 "uniqueIdentifier",
@@ -1811,7 +1732,7 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
                  Metal places by what each encoder took of its range",
             );
         }
-        UNIQUE_IDENTIFIER_BASE + address
+        plain(|| self.raw.unique_identifier())
     }
 }
 
@@ -2719,10 +2640,7 @@ mod tests {
         use std::time::Duration;
 
         let space = || -> &'static Mutex<Space> {
-            Box::leak(Box::new(Mutex::new(Space {
-                pool: None,
-                ranges: BTreeMap::new(),
-            })))
+            Box::leak(Box::new(Mutex::new(Space { pool: None })))
         };
         let taken = space();
         let (reservation, held) = reserve_in(taken, &[10]);
@@ -3814,15 +3732,14 @@ mod tests {
         }
     }
 
-    /// A buffer core released while a command buffer that uses it may still run keeps its ID and
-    /// its range until that command buffer completes where an encoder executes it or makes it
-    /// resident, only its range where a blit copies from it or into it or resets it, and neither
-    /// where a blit optimizes it, as Metal's do; an execution in a command buffer never committed
-    /// keeps them until the command buffer goes. The range is read as [`Space`] holds it: the
+    /// A buffer core released while a command buffer that uses it may still run keeps its ID
+    /// until that command buffer completes where an encoder executes it or makes it resident, and
+    /// not where a blit copies from it or into it, resets it or optimizes it, as Metal's does; an
+    /// execution in a command buffer never committed keeps it until the command buffer goes. The
     /// `uniqueIdentifier` of a buffer made after an encoder dies ([`encoder_made`]), as it does
     /// here once the first command buffer used one
     #[test]
-    fn a_buffer_keeps_its_numbers_while_a_command_buffer_uses_it() {
+    fn a_buffer_keeps_its_id_while_a_command_buffer_uses_it() {
         use std::sync::mpsc;
 
         use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
@@ -3836,14 +3753,14 @@ mod tests {
         };
         let out = holding(&d, &[0; 4]);
         let q = d.new_command_queue().unwrap();
-        let numbers = |b: &VulkanIcb| (b.gpu_resource_id(), b.numbers.address);
-        for (how, keeps_id, keeps_range) in [
-            (Use::Execution, true, true),
-            (Use::Resident, true, true),
-            (Use::CopyFrom, false, true),
-            (Use::CopyTo, false, true),
-            (Use::Optimize, false, false),
-            (Use::Reset, false, true),
+        let numbers = |b: &VulkanIcb| b.gpu_resource_id();
+        for (how, keeps_id) in [
+            (Use::Execution, true),
+            (Use::Resident, true),
+            (Use::CopyFrom, false),
+            (Use::CopyTo, false),
+            (Use::Optimize, false),
+            (Use::Reset, false),
         ] {
             let icb = make::<VulkanPlatform>(&d, &desc, 1);
             let other = make::<VulkanPlatform>(&d, &desc, 1);
@@ -3858,11 +3775,7 @@ mod tests {
             cb.commit(OnFault::Return).unwrap();
             drop(icb);
             let during = numbers(&make::<VulkanPlatform>(&d, &desc, 1));
-            assert_eq!(
-                (during.0 != old.0, during.1 != old.1),
-                (keeps_id, keeps_range),
-                "{how:?}"
-            );
+            assert_eq!(during != old, keeps_id, "{how:?}");
             event.set_signaled_value(1).unwrap();
             rx.recv().unwrap();
             assert_eq!((cb.status().0, cb.error()), (COMPLETED, None), "{how:?}");
@@ -3875,7 +3788,7 @@ mod tests {
         let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
         encode_use(&cb, Use::Execution, &icb, &other, &pipeline, &out);
         drop(icb);
-        assert_ne!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)).0, old.0);
+        assert_ne!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)), old);
         drop(cb);
         assert_eq!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)), old);
         let after = make::<VulkanPlatform>(&d, &desc, 1);

@@ -947,7 +947,6 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                         destination_index,
                     )
                 })?;
-                self.hold(sel, (source.range(), destination.range()));
                 let progress = self.progress(sel);
                 if fitting < count {
                     destination.overrun(sel, progress.clone(), 0..destination_index);
@@ -973,7 +972,6 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 if !range.is_empty() {
                     crate::gpu::command::executions::gpu_writes(sel, buffer);
                 }
-                self.hold(sel, buffer.range());
                 buffer.reset(self.progress(sel), range);
                 Ok(())
             }
