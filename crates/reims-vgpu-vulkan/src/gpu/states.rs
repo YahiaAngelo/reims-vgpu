@@ -137,6 +137,7 @@
 //!   (`PipelineOptions::label`), which no answer to the guest reads and the runtime compiles
 //!   nothing of.
 
+use std::collections::BTreeMap;
 use std::sync::Weak;
 
 use metal2vulkan::bind::SamplerDescriptor;
@@ -169,24 +170,31 @@ use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::platform::{Obj, VulkanPlatform};
 
-/// The render pipeline states made with indirect command buffer support, held weakly: an
-/// indirect command names one by the runtime's state, whose input primitive topology class only
-/// this platform holds ([`points_sized`]).
-static INDIRECT_STATES: Mutex<Vec<Weak<RenderPipelineObject>>> = Mutex::new(Vec::new());
+/// The render pipeline states made with indirect command buffer support, held weakly, by the
+/// runtime's `gpuResourceID` of each: an indirect command names one by the runtime's state, whose
+/// input primitive topology class only this platform holds ([`points_sized`]), and the runtime's
+/// state keeps its ID while it lives.
+static INDIRECT_STATES: Mutex<BTreeMap<u64, Vec<Weak<RenderPipelineObject>>>> =
+    Mutex::new(BTreeMap::new());
 
 /// Whether the runtime's state `raw`, which an indirect command names, sizes its points as Metal
 /// does (`crate::gpu::encode_render`'s `sized`): its vertex function writes `[[point_size]]`, or
 /// each live state of the program's that is `raw` is of the point input primitive topology class.
 /// `None` where it writes none and no live state of the program's is `raw` (the program released
-/// it).
+/// it). Asked once an indirect command, it reads only the states of `raw`'s ID.
 pub(crate) fn points_sized(raw: &rt::RenderPipelineState) -> Option<bool> {
     if plain(|| raw.writes_point_size()) {
         return Some(true);
     }
-    let states: Vec<_> = plain(|| INDIRECT_STATES.lock().clone());
+    let id = plain(|| raw.gpu_resource_id()).0;
+    // Each is let go of past the lock: a program's last reference may be among them.
+    let states: Vec<_> = plain(|| {
+        let states = INDIRECT_STATES.lock();
+        let held = states.get(&id).map_or(&[][..], Vec::as_slice);
+        held.iter().filter_map(Obj::upgrade).collect()
+    });
     let classes: Vec<_> = states
         .iter()
-        .filter_map(Obj::upgrade)
         .filter(|state| state.raw == *raw)
         .map(|state| state.input_primitive_topology)
         .collect();
@@ -510,10 +518,14 @@ fn made(
                 RenderDescriptor::Render(d) if d.support_indirect_command_buffers);
             let made = render_pipeline_of(state, class, Some(descriptor));
             if indirect {
+                let id = plain(|| made.raw.gpu_resource_id()).0;
                 plain(|| {
                     let mut states = INDIRECT_STATES.lock();
-                    states.retain(|state| state.strong_count() > 0);
-                    states.push(made.downgrade());
+                    states.retain(|_, held| {
+                        held.retain(|state| state.strong_count() > 0);
+                        !held.is_empty()
+                    });
+                    states.entry(id).or_default().push(made.downgrade());
                 });
             }
             Ok(Ok(Some(made)))
@@ -915,6 +927,38 @@ mod tests {
             "{ids:?}"
         );
         assert_eq!(b.clone_ref().unique_identifier(), b.unique_identifier());
+    }
+
+    /// A state of indirect command buffer support sizes its points, as an indirect command that
+    /// names its runtime state asks, where it is of the point input primitive topology class
+    /// and not otherwise; once the program released it, and for a state made without that
+    /// support, nothing answers
+    #[test]
+    fn indirect_states_answer_their_classes_while_they_live() {
+        let d = dev();
+        let functions = indirect_functions();
+        let made = |class, indirect| {
+            let desc = guest_descriptor(&functions, PixelFormat::BGRA8Unorm, None);
+            plain(|| {
+                let mut held = desc.desc.lock();
+                held.support_indirect_command_buffers = indirect;
+                held.input_primitive_topology = class;
+            });
+            (d.new_render_pipeline_state_from_descriptor(Some(&desc), 0))
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        };
+        let points = made(PrimitiveTopologyClass::Point, true);
+        let triangles = made(PrimitiveTopologyClass::Triangle, true);
+        let direct = made(PrimitiveTopologyClass::Point, false);
+        assert_eq!(points_sized(&points.raw), Some(true));
+        assert_eq!(points_sized(&triangles.raw), Some(false));
+        assert_eq!(points_sized(&direct.raw), None);
+        let raw = triangles.raw.clone();
+        drop(triangles);
+        assert_eq!(points_sized(&raw), None);
+        assert_eq!(points_sized(&points.raw), Some(true));
     }
 
     /// `desc` again, labelled `label`.
