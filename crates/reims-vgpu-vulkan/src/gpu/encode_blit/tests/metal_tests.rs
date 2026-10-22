@@ -3353,16 +3353,16 @@ fn texture_buffer_fills_are_metals(cases: &[TextureBufferCase]) {
     );
 }
 
-/// A fill of a texture buffer over a buffer that the runtime's fill writes as Metal's does
-/// ([`crate::gpu::fill::texture_buffer_writes`]) writes the buffer's bytes as Metal's, every
-/// byte compared ([`texture_buffer_fills_are_metals`]): of `R8Unorm`, `RG8Unorm`, `RGBA8Unorm`,
-/// `RGBA16Float` and `RGBA32Float` texture buffers 12 texels wide at offsets 0 and 64 (and 4 and
-/// 68 where a texel is 4 bytes or fewer); with a pattern of each power of two of bytes up to the
-/// texel, and a colour packed in a format of no more bytes than the texel; whole, inside, ending
-/// at the width, at an odd texel, and at a level, slice, row, height and depth past 0 and 1,
-/// which Metal ignores, and of no texels across, which writes nothing. Measured on the M3 Max
-/// (macOS 27.0.1): Metal writes the region's texels from its `x` at the texture's offset, one
-/// row, the pattern repeated from the region's first byte
+/// A fill of a texture buffer over a buffer, of a pattern no longer than the texel, inside the
+/// width ([`crate::gpu::fill::texture_buffer_writes`]), writes the buffer's bytes as Metal's,
+/// every byte compared ([`texture_buffer_fills_are_metals`]): of `R8Unorm`, `RG8Unorm`,
+/// `RGBA8Unorm`, `RGBA16Float` and `RGBA32Float` texture buffers 12 texels wide at offsets 0
+/// and 64 (and 4 and 68 where a texel is 4 bytes or fewer); with a pattern of each power of two
+/// of bytes up to the texel, and a colour packed in a format of no more bytes than the texel;
+/// whole, inside, ending at the width, at an odd texel, and at a level, slice, row, height and
+/// depth past 0 and 1, which Metal ignores, and of no texels across, which writes nothing.
+/// Measured on the M3 Max (macOS 27.0.1): Metal writes the region's texels from its `x` at the
+/// texture's offset, one row, the pattern repeated from the region's first byte
 #[test]
 fn texture_buffer_fills_are_the_metal_platforms() {
     let colour = [0.25, -0.5, 1.25, 0.75];
@@ -3406,22 +3406,56 @@ fn texture_buffer_fills_are_the_metal_platforms() {
     texture_buffer_fills_are_metals(&cases);
 }
 
-/// A fill of a texture buffer whose bytes Metal writes as the runtime's fill does not
-/// ([`crate::gpu::fill::texture_buffer_writes`], which dies at each here) writes the buffer's
-/// bytes as Metal's ([`texture_buffer_fills_are_metals`]): a pattern longer than the texel, of
-/// 8 bytes into `R8Unorm` texels from an odd byte and into `RGBA8Unorm` texels from a byte a
-/// multiple of 16, and a colour packed in `RGBA16Float` into `RGBA8Unorm` texels; a region past
-/// the width and one ending past it; and one of no rows, and of no images. Measured on the M3
-/// Max (macOS 27.0.1), each the same on a second run: Metal writes the pattern repeated across
-/// the region's bytes from its first, not started again at each texel, past the width too, and
-/// one row of a region of no rows or images. Other fills of the kind write bytes that are not
-/// the pattern's (`m2v-fill-handoff.md`)
+/// A fill of a texture buffer whose pattern Metal runs across the texels' bytes, or past the
+/// width, writes the buffer's bytes as Metal's ([`texture_buffer_fills_are_metals`]), as the
+/// runtime's fill streams it ([`crate::gpu::fill::texture_buffer_writes`]): a pattern longer
+/// than the texel, of 8 bytes into `R8Unorm` texels from an odd byte and into `RGBA8Unorm`
+/// texels from a byte a multiple of 16, of 32 bytes into `RGBA8Unorm` and `RGBA32Float` texels
+/// and of 256, the most measured ([`crate::gpu::fill::MOST_STREAMED_PATTERN_BYTES`]), into
+/// `RGBA32Float` texels from such a byte, and a colour packed in `RGBA16Float` into
+/// `RGBA8Unorm` texels; a pattern of 3 and of 12 bytes, no power of two, into `R8Unorm` and
+/// `RG8Unorm` texels, over no 16 bytes of the buffer whole; a region past the width and one
+/// ending past it; and one of no rows, and of no images. Measured on the M3 Max (macOS 27.0.1),
+/// each the same on a second run: Metal writes the pattern repeated across the region's bytes
+/// from its first, not started again at each texel, past the width too, and one row of a
+/// region of no rows or images; a pattern of `n` bytes, no power of two, writes its byte
+/// `j & (n - 1)` at the region's byte `j`. In 16 bytes of the buffer a region covers whole, such
+/// a pattern's fill reads a block of the pattern's whole copies, and bytes of Metal's stack
+/// past them, which the runtime reads as zeros and announces (`texture-buffer-fill-leftover`,
+/// one of Metal's answers, relayed): no case here reads those
 #[test]
-#[ignore = "the runtime cuts a texture buffer's fill at the texel and the width: m2v fix pending"]
 fn texture_buffer_fills_metal_streams_are_metals() {
     let eight: Vec<u8> = (0xa1..=0xa8).collect();
+    let three = [0xb1, 0xb2, 0xb3];
+    let twelve: Vec<u8> = (0xd1..=0xdc).collect();
+    let thirty_two: Vec<u8> = (0xc0..0xe0).collect();
+    let most: Vec<u8> = (0..=255).rev().collect();
     let colour = [0.25, -0.5, 1.25, 0.75];
     texture_buffer_fills_are_metals(&[
+        (
+            (10, 1, 0),
+            vec![bytes_fill(0, 0, [1, 0, 0], [5, 1, 1], &three)],
+        ),
+        (
+            (30, 2, 4),
+            vec![bytes_fill(0, 0, [0, 0, 0], [3, 1, 1], &three)],
+        ),
+        (
+            (10, 1, 4),
+            vec![bytes_fill(0, 0, [1, 0, 0], [9, 1, 1], &twelve)],
+        ),
+        (
+            (70, 4, 64),
+            vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &thirty_two)],
+        ),
+        (
+            (125, 16, 0),
+            vec![bytes_fill(0, 0, [0, 0, 0], [2, 1, 1], &thirty_two)],
+        ),
+        (
+            (125, 16, 64),
+            vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &most)],
+        ),
         (
             (10, 1, 0),
             vec![bytes_fill(0, 0, [0, 0, 0], [12, 1, 1], &eight)],

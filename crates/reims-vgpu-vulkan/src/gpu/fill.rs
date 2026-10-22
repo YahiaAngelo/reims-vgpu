@@ -52,26 +52,37 @@
 //!   writes a slice it has and nothing past them; a cube writes face `slice % 6`, a cube array
 //!   slice `slice` while it has it. Metal's work grows with the region before the cut (2^32
 //!   texels: 23 ms; 2^64 did not end in 10 minutes), so a region past 2^32 texels dies, as
-//!   nothing measured how it ends. A texture buffer's fill skips `place`
-//!   ([`texture_buffer_writes`]): Metal writes it as bytes of the buffer, from the region's `x`,
-//!   one row whatever the level, slice and row, the pattern repeated across the texels' bytes,
-//!   past the width too; the fills where the runtime's bytes are those
-//!   (`texture_buffer_fills_are_the_metal_platforms`) go to it, the others die. A multisample
+//!   nothing measured how it ends. A texture buffer's fill skips `place` and goes to the runtime
+//!   as the call gives it ([`texture_buffer_writes`]): Metal writes it as bytes of the buffer,
+//!   from the texture's offset plus the region's `x` texels, one row whatever the level, slice,
+//!   row, height and depth, the pattern running across the region's bytes, not started again at
+//!   each texel, past the width too and cut at the buffer's end, as the runtime's fill writes it
+//!   (`texture_buffer_fills_are_the_metal_platforms`,
+//!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 256 bytes, the most
+//!   measured; a longer one dies ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
+//!   bytes past the pattern's whole copies, which are its stack's, the runtime's reads zeros and
+//!   announces `TextureBufferFillLeftover`, one of Metal's answers, relayed. A multisample
 //!   texture's dies: Metal fills each sample of the region's texels, which the runtime refuses.
 
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use reims_vgpu_core::platform::types::{MtlRegion, MtlSize};
+use reims_vgpu_core::platform::types::MtlRegion;
 
 use crate::answer::unrepresentable;
 
 /// The most texels a fill region may span before the cut: Metal took 23 ms for this many.
 const MEASURED_TEXELS: u64 = 1 << 32;
 
-/// The most bytes of its pattern a fill of a texture with bytes reads: a block of the largest
-/// format Metal describes at any level the runtime measured (`RGBA32Float` and the 16-byte
-/// compressed blocks), as the runtime's fill cuts a texel from the pattern at its format's
-/// block, the bytes past it unread.
+/// The most bytes of its pattern a fill of a texture with bytes reads, but a texture buffer's: a
+/// block of the largest format Metal describes at any level the runtime measured
+/// (`RGBA32Float` and the 16-byte compressed blocks), as the runtime's fill cuts a texel from
+/// the pattern at its format's block, the bytes past it unread.
 pub const MOST_PATTERN_BYTES: usize = 16;
+
+/// The most bytes of its pattern a fill of a texture buffer with bytes was measured to read on
+/// Metal, which runs the whole pattern across the buffer's bytes, its length deciding which of
+/// its bytes lands where (the module's docs): the runtime's probe of Metal's fills of texture
+/// buffers took patterns of 1 to 256 bytes ([`streamed_pattern`]).
+pub const MOST_STREAMED_PATTERN_BYTES: usize = 256;
 
 /// The formats Metal packs no colour in, for which a colour fill writes bytes Metal holds from
 /// earlier work (the module's docs).
@@ -227,49 +238,30 @@ pub struct Place {
     pub size: [u64; 3],
 }
 
-/// Whether a fill of `region` of a texture buffer `width` texels of `texel` bytes wide, with a
-/// pattern of `unit` bytes (a bytes fill's pattern, a colour fill's packed texel; 0 for a colour
-/// packed in no format of [`PACKED`] or [`OWN_FORMAT_PACKED`]), writes a texel, given to the
-/// runtime's fill as it is. Metal fills a texture buffer as bytes of its buffer (measured on the
-/// M3 Max): from the texture's offset plus the region's `x` texels, one row and image whatever
-/// the level, slice, row, height and depth, the pattern repeated across the region's bytes, not
-/// started again at each texel, and the region not cut at the width. The runtime's fill writes
-/// each texel the pattern cut or repeated at the texel, cut at the width, which is Metal's where
-/// the unit is a power of two no longer than the texel and the region lies inside the width,
-/// of a row and an image. Another dies for `sel`, as do a region past 2^32 texels across and
-/// down, as [`place`]'s, and a region past `width` texels, which Metal writes past the texture
-/// (`texture_buffer_fills_metal_streams_are_metals`). A region of no texels across writes
-/// nothing, as Metal's.
-pub fn texture_buffer_writes(
-    sel: &'static str,
-    (texel, width): (u64, u64),
-    region: MtlRegion,
-    unit: u64,
-) -> bool {
+/// Whether a fill of `region` of a texture buffer writes a byte, given to the runtime's fill as
+/// it is, which writes the buffer's bytes as Metal's does (the module's docs): a region of no
+/// texels across writes nothing, as Metal's. A region past 2^32 texels across and down dies for
+/// `sel`, as [`place`]'s.
+pub fn texture_buffer_writes(sel: &'static str, region: MtlRegion) -> bool {
     measured(sel, region, 1);
-    let MtlSize {
-        width: w,
-        height,
-        depth,
-    } = region.size;
-    if w == 0 {
-        return false;
+    region.size.width != 0
+}
+
+/// Dies for `sel` at a fill of a texture buffer with a pattern of `length` bytes, past
+/// [`MOST_STREAMED_PATTERN_BYTES`]: Metal reads the whole pattern there, and nothing measured
+/// what it writes of a longer one.
+pub fn streamed_pattern(sel: &'static str, length: u64) {
+    use reims_vgpu_core::num::ToU64 as _;
+    if length > MOST_STREAMED_PATTERN_BYTES.to_u64() {
+        unrepresentable(
+            sel,
+            &format!(
+                "a fill of a texture buffer with a pattern of {length} bytes, past the \
+                 {MOST_STREAMED_PATTERN_BYTES} measured on Metal, which runs a pattern across \
+                 the buffer's bytes"
+            ),
+        );
     }
-    let why = if unit == 0 {
-        "bytes of a colour it packs in no format, which nothing measured there"
-    } else if !unit.is_power_of_two() || unit > texel {
-        "its pattern repeated across the texels' bytes, which the runtime's fill cuts at each texel"
-    } else if region.origin.x.checked_add(w).is_none_or(|end| end > width) {
-        "texels past the texture's width, which the runtime's fill cuts at it"
-    } else if height == 0 || depth == 0 {
-        "a row of a region of no rows or images, which the runtime's fill writes nothing of"
-    } else {
-        return true;
-    };
-    unrepresentable(
-        sel,
-        &format!("a fill of the region {region:?} of a texture buffer, where Metal writes {why}"),
-    )
 }
 
 /// Dies for `sel` at a fill of `region`, of `depth` images, past [`MEASURED_TEXELS`].
@@ -340,7 +332,7 @@ pub fn place(
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::types::MtlOrigin;
+    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
     use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::testkit::capture::catch_death;
 
@@ -381,7 +373,8 @@ mod tests {
 
     /// Where a fill writes, as measured on Metal: levels past the texture's write nothing; the
     /// region is cut at the level; 1D and 2D ignore the slice and every type but 3D the region's
-    /// depth; arrays write their slices; a cube writes face `slice % 6`
+    /// depth; arrays write their slices; a cube writes face `slice % 6`. A texture buffer's fill
+    /// writes but for a region of no texels across, and dies at a pattern past the bytes measured
     #[test]
     fn places_are_metals() {
         let shape = |texture_type, extent, levels, array_length| Shape {
@@ -448,28 +441,22 @@ mod tests {
         assert!(catch_death(|| place_of(&many, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
         let buffer = shape(TextureType::TextureBuffer, [8, 1, 1], 1, 1);
         assert!(catch_death(|| place_of(&buffer, 0, 0, r([0, 0, 0], [1, 1, 1]))).is_err());
-        let writes = |region, unit| texture_buffer_writes("s", (4, 8), region, unit);
-        assert!(writes(r([4, 5, 3], [4, 2, 2]), 4));
-        assert!(writes(r([0, 0, 0], [8, 1, 1]), 2));
-        assert!(writes(r([7, 0, 0], [1, 1, 1]), 1));
-        assert!(!writes(r([9, 0, 0], [0, 1, 1]), 4));
-        for (region, unit) in [
-            (r([0, 0, 0], [1, 1, 1]), 8),
-            (r([0, 0, 0], [1, 1, 1]), 3),
-            (r([0, 0, 0], [1, 1, 1]), 0),
-            (r([7, 0, 0], [2, 1, 1]), 4),
-            (r([8, 0, 0], [1, 1, 1]), 4),
-            (r([0, 0, 0], [1, 0, 1]), 4),
-            (r([0, 0, 0], [1, 1, 0]), 4),
-            (r([0, 0, 0], [1 << 16, (1 << 16) + 1, 1]), 4),
+        let writes = |region| texture_buffer_writes("s", region);
+        for region in [
+            r([4, 5, 3], [4, 2, 2]),
+            r([7, 0, 0], [2, 1, 1]),
+            r([8, 0, 0], [1, 1, 1]),
+            r([0, 0, 0], [1, 0, 1]),
+            r([0, 0, 0], [1, 1, 0]),
         ] {
-            let site = catch_death(|| writes(region, unit)).unwrap_err();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, "s"),
-                "{region:?} {unit}"
-            );
+            assert!(writes(region), "{region:?}");
         }
+        assert!(!writes(r([9, 0, 0], [0, 1, 1])));
+        let site = catch_death(|| writes(r([0, 0, 0], [1 << 16, (1 << 16) + 1, 1]))).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"));
+        streamed_pattern("s", 256);
+        let site = catch_death(|| streamed_pattern("s", 257)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"));
         assert_eq!(
             place_of(&flat, 0, 0, r([0, 0, 0], [1 << 16, 1 << 16, 1])),
             at(0, 0, [0, 0, 0], [4, 4, 1])

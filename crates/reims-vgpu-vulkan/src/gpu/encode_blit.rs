@@ -18,9 +18,10 @@
 //!   its `fill_texture` of the pattern, a colour fill its colour fill, which fills the texel it
 //!   packs as `fill_texture` fills a pattern ([`crate::gpu::fill`]), each copies from a staging
 //!   buffer outside the Metal address space, at the level and slice and in the region
-//!   [`crate::gpu::fill::place`] gives (a texture buffer's as the call gives them, its texels
-//!   written from the region's `x` whatever the level, slice and row,
-//!   `texture_buffer_fills_are_the_metal_platforms`); a fill that writes nothing encodes
+//!   [`crate::gpu::fill::place`] gives (a texture buffer's as the call gives them, the bytes
+//!   of its buffer written from the region's `x` whatever the level, slice and row, the pattern
+//!   running across them past the width, `texture_buffer_fills_are_the_metal_platforms` and
+//!   `texture_buffer_fills_metal_streams_are_metals`); a fill that writes nothing encodes
 //!   nothing. They write
 //!   what Metal's fill writes on this host (`texture_fills_are_the_metal_platforms`, of colour
 //!   and depth formats, levels, slices, cube faces, 3D depths, cut regions and a fill larger than
@@ -296,38 +297,41 @@ fn indices(
 }
 
 impl VulkanBlitEncoder {
-    /// A fill of `region` of `texture` at `level` and `slice` with `pattern`, for `sel`: the
-    /// runtime's fill, where [`fill_place`] says, which cuts the pattern at its unit or repeats
-    /// it to it and refuses what it did not measure (the module's docs). An empty pattern (a
+    /// A fill of `region` of `texture` at `level` and `slice` with the pattern `bytes`, for
+    /// `sel`: the runtime's fill, where [`fill_place`] says, which cuts the pattern at its unit
+    /// or repeats it to it, or runs it across a texture buffer's bytes (the module's docs), of the
+    /// pattern's bytes it reads ([`crate::gpu::resource::fill_bytes`]); a texture buffer's of a
+    /// pattern past the bytes measured dies ([`fill::streamed_pattern`]). An empty pattern (a
     /// length of 0 at a readable address, which nothing measured on Metal) fills zeroes.
     fn fill_texture(
         &self,
         sel: &'static str,
         texture: &VulkanTexture,
-        level: u64,
-        slice: u64,
-        region: MtlRegion,
-        pattern: &[u8],
+        (level, slice, region): (u64, u64, MtlRegion),
+        bytes: reims_vgpu_core::platform::HostRange<'_>,
     ) -> RaiseResult<()> {
         let raw = texture.copied(sel);
-        let (own, shape) = plain(|| {
-            let shape = fill::Shape {
-                texture_type: raw.texture_type(),
-                extent: [raw.width(), raw.height(), raw.depth()],
-                levels: raw.mipmap_level_count(),
-                array_length: raw.array_length(),
-            };
-            (raw.pixel_format(), shape)
+        let shape = plain(|| fill::Shape {
+            texture_type: raw.texture_type(),
+            extent: [raw.width(), raw.height(), raw.depth()],
+            levels: raw.mipmap_level_count(),
+            array_length: raw.array_length(),
         });
+        let streamed = shape.texture_type == metal2vulkan::metal::TextureType::TextureBuffer;
+        let most = match streamed {
+            true => fill::MOST_STREAMED_PATTERN_BYTES,
+            false => fill::MOST_PATTERN_BYTES,
+        };
+        let pattern = crate::gpu::resource::fill_bytes(sel, region, bytes, most);
+        if streamed {
+            fill::streamed_pattern(sel, bytes.len());
+        }
         let pattern = if pattern.is_empty() {
             &[0][..]
         } else {
-            pattern
+            &pattern[..]
         };
-        let unit = pattern.len() as u64;
-        let Some((level, slice, region)) =
-            fill_place(sel, (&shape, own), (level, slice, region), unit)
-        else {
+        let Some((level, slice, region)) = fill_place(sel, &shape, (level, slice, region)) else {
             return self.nothing(sel);
         };
         send(sel, Policy::Dies, || {
@@ -377,15 +381,7 @@ impl VulkanBlitEncoder {
                 )
             });
         }
-        let packs = fill::PACKED.contains(&format) || fill::OWN_FORMAT_PACKED.contains(&format);
-        let unit = || {
-            let raw = u64::from(format.as_raw());
-            crate::gpu::format_info::block(sel, raw, "a colour packed in").bytes()
-        };
-        let unit = if packs { unit() } else { 0 };
-        let Some((level, slice, region)) =
-            fill_place(sel, (&shape, own), (level, slice, region), unit)
-        else {
+        let Some((level, slice, region)) = fill_place(sel, &shape, (level, slice, region)) else {
             return self.nothing(sel);
         };
         let color = rt::ClearColor {
@@ -403,22 +399,17 @@ impl VulkanBlitEncoder {
 }
 
 /// The level, slice and region a fill of `region` at `level` and `slice` of a texture of `shape`
-/// and pixel format `format`, with a pattern of `unit` bytes, gives the runtime's fill, for
-/// `sel`: [`fill::place`]'s; a texture buffer's as they are, where the runtime fills it as Metal
-/// does, whatever the level, slice, row and depth ([`fill::texture_buffer_writes`]). `None` where
-/// the fill writes nothing.
+/// gives the runtime's fill, for `sel`: [`fill::place`]'s; a texture buffer's as they are, which
+/// the runtime fills as Metal does, whatever the level, slice, row and depth
+/// ([`fill::texture_buffer_writes`]). `None` where the fill writes nothing.
 fn fill_place(
     sel: &'static str,
-    (shape, format): (&fill::Shape, PixelFormat),
+    shape: &fill::Shape,
     (level, slice, region): (u64, u64, MtlRegion),
-    unit: u64,
 ) -> Option<(u64, u64, rt::Region)> {
     if shape.texture_type == metal2vulkan::metal::TextureType::TextureBuffer {
-        let raw = u64::from(format.as_raw());
-        let texel = crate::gpu::format_info::block(sel, raw, "a fill of a texture buffer of");
         let (o, s) = (region.origin, region.size);
-        let texture = (texel.bytes(), shape.extent[0]);
-        return fill::texture_buffer_writes(sel, texture, region, unit).then(|| {
+        return fill::texture_buffer_writes(sel, region).then(|| {
             let region = rt::Region::new_3d(o.x, o.y, o.z, s.width, s.height, s.depth);
             (level, slice, region)
         });
@@ -980,10 +971,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 slice,
                 region,
                 bytes,
-            } => {
-                let pattern = crate::gpu::resource::fill_bytes(sel, region, bytes);
-                self.fill_texture(sel, texture, level, slice, region, &pattern)
-            }
+            } => self.fill_texture(sel, texture, (level, slice, region), bytes),
             BlitCmd::FillTextureColor {
                 texture,
                 level,

@@ -1816,10 +1816,16 @@ fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> 
 /// 4 by 0, 1 by 1 and 4 by 4 texels, of depth 0 or 1, and of 4 by 4 texels and 0 bytes, end the
 /// process with a segmentation fault.
 ///
-/// Only the range's first [`crate::gpu::fill::MOST_PATTERN_BYTES`] are copied, the most a fill
-/// reads, so a range the guest sizes to the whole of a large buffer is no copy of it; the
-/// checks of where it lies take all of it.
-pub(crate) fn fill_bytes(sel: &'static str, region: MtlRegion, range: HostRange<'_>) -> Vec<u8> {
+/// Only the range's first `most` bytes are copied, the most the fill reads
+/// ([`crate::gpu::fill::MOST_PATTERN_BYTES`], or a texture buffer's
+/// [`crate::gpu::fill::MOST_STREAMED_PATTERN_BYTES`]), so a range the guest sizes to the whole of
+/// a large buffer is no copy of it; the checks of where it lies take all of it.
+pub(crate) fn fill_bytes(
+    sel: &'static str,
+    region: MtlRegion,
+    range: HostRange<'_>,
+    most: usize,
+) -> Vec<u8> {
     if region.size.width == 0 && region.size.height == 0 {
         return Vec::new();
     }
@@ -1827,7 +1833,7 @@ pub(crate) fn fill_bytes(sel: &'static str, region: MtlRegion, range: HostRange<
     if range.is_empty() && first < reims_vgpu_core::guest::ZERO_REGION_END {
         crate::answer::metal_reads_near_null(sel, &format!("0 bytes at {first:#x}"));
     }
-    first_bytes(sel, range, crate::gpu::fill::MOST_PATTERN_BYTES)
+    first_bytes(sel, range, most)
 }
 
 /// What the runtime answers making a texture over a buffer by `sel`,
@@ -2400,15 +2406,22 @@ pub(crate) mod tests {
     fn a_fill_copies_only_the_bytes_it_may_read() {
         let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
         let long: Vec<u8> = (0..=255u8).cycle().take(1 << 20).collect();
-        let bytes = fill_bytes("s", region, HostRange::of_slice(&long));
-        assert_eq!(bytes, long[..crate::gpu::fill::MOST_PATTERN_BYTES]);
+        let most = crate::gpu::fill::MOST_PATTERN_BYTES;
+        let bytes = fill_bytes("s", region, HostRange::of_slice(&long), most);
+        assert_eq!(bytes, long[..most]);
+        let streamed = crate::gpu::fill::MOST_STREAMED_PATTERN_BYTES;
+        let bytes = fill_bytes("s", region, HostRange::of_slice(&long), streamed);
+        assert_eq!(bytes, long[..streamed]);
         let short = [7u8, 8, 9];
-        assert_eq!(fill_bytes("s", region, HostRange::of_slice(&short)), short);
+        assert_eq!(
+            fill_bytes("s", region, HostRange::of_slice(&short), most),
+            short
+        );
         // SAFETY: a range that wraps past the top of the address space, from a real start, which
         // the fill dies at before reading.
         let wraps =
             unsafe { HostRange::new(HostPtr::from_ptr(long.as_ptr().cast_mut()), u64::MAX) };
-        let site = catch_death(|| fill_bytes("s", region, wraps)).unwrap_err();
+        let site = catch_death(|| fill_bytes("s", region, wraps, most)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
     }
 
