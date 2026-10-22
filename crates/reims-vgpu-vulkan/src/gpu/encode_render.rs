@@ -74,14 +74,24 @@
 //!   execution whose commands name their own at the commit, which reads them. Elsewhere such
 //!   work may write the records of each buffer the encoder made resident for writing, for good
 //!   (`executions::gpu_writes`).
-//! - **Primitive type 9**, which Metal's GPU draws nothing of, goes to the runtime without
-//!   indices or indirect arguments: of 3 vertices or more and an instance it hangs Metal's GPU,
-//!   and the runtime fails the command buffer as Metal's GPU does ([`VulkanRenderEncoder::nine`]),
-//!   the hang in flight as long as Metal's and a command buffer committed on its queue meanwhile
-//!   running nothing and completing without an error, as Metal's does ([`crate::gpu::command`]);
-//!   of fewer it fails nothing, as on Metal. One over indices or indirect arguments, whose
-//!   command buffer Metal's GPU fails running a blit encoder after it in some runs and not in
-//!   others, dies ([`unmeasured_type_9`]).
+//! - **Primitive type 9**, which Metal's GPU draws nothing of, goes to the runtime, which fails
+//!   the command buffer as Metal's GPU does ([`VulkanRenderEncoder::nine`]): directly, of 3
+//!   vertices or more and an instance, it hangs Metal's GPU, the hang in flight as long as
+//!   Metal's and a command buffer committed on its queue meanwhile running nothing and completing
+//!   without an error, as Metal's does ([`crate::gpu::command`]); of fewer it fails nothing, as on
+//!   Metal. Over indices, any, none or of no instance included, Metal's GPU faults it
+//!   (`MTLCommandBufferErrorPageFault`), and from indirect arguments, over indices or not, fails
+//!   it as a victim of its recovery (`MTLCommandBufferErrorInternal`): its render encoder and
+//!   every encoder after it run nothing, every event signal fires, and the command buffer
+//!   completes no sooner than Metal's earliest, its queue's others running. Metal's GPU runs the
+//!   encoders after a fault where it was idle before (the first fault after 3 s idle, and the
+//!   process's first here) and loses them where it ran just before, as in a steady stream of work
+//!   (the runtime's measurement on the M3 Max, macOS 27.0.1): the runtime answers the latter,
+//!   which `type_9_draws_fail_as_metals` compares after hangs. A hang or a fault, not a victim,
+//!   counts against its queue: from the completion of the queue's second, a command buffer
+//!   committed on it fails at once (`MTLCommandBufferErrorAccessRevoked`), running nothing and
+//!   signalling nothing, as Metal's (`type_9_faults_revoke_queues_as_metals`). One over an index
+//!   type no `MTLIndexType` is, which nothing measured, dies ([`unmeasured_type_9`]).
 //! - **Apple's private commands** compose public ones where their meaning is measured:
 //!   `setDepthClipModeSPI:` is `setDepthClipMode:`; the late resolve setters set the runtime's
 //!   resolve targets, `yInvert` dropped, which Metal ignores, and one the attachment cannot use
@@ -1861,9 +1871,9 @@ fn draws_none(t: rt::DrawPrimitiveType, count: u32) -> bool {
 }
 
 /// A draw's raw primitive type: a public one, one of the private ones Metal draws (5 to 8), or
-/// 9, which Metal's GPU fails the command buffer at ([`VulkanRenderEncoder::nine`],
-/// [`unmeasured_type_9`]), each of which the runtime draws as Metal does
-/// ([`rt::DrawPrimitiveType`]); a type past it no `MTLPrimitiveType` is, which dies.
+/// 9, which Metal's GPU fails the command buffer at ([`VulkanRenderEncoder::nine`]), each of
+/// which the runtime draws as Metal does ([`rt::DrawPrimitiveType`]); a type past it no
+/// `MTLPrimitiveType` is, which dies.
 fn draw_type(sel: &'static str, raw: u64) -> rt::DrawPrimitiveType {
     match raw {
         5..=9 => rt::DrawPrimitiveType::from_raw(raw).unwrap_or_else(|e| refused(sel, &e)),
@@ -1872,34 +1882,29 @@ fn draw_type(sel: &'static str, raw: u64) -> rt::DrawPrimitiveType {
 }
 
 /// The primitive and index type of an indexed draw: `None` for an index type no `MTLIndexType`
-/// is, which Metal draws nothing for. Of primitive type 9 it dies ([`unmeasured_type_9`]).
+/// is, which Metal draws nothing for, where the primitive type is not 9; of type 9 it dies
+/// there ([`unmeasured_type_9`]).
 fn indexed_kinds(
     sel: &'static str,
     primitive_type: u64,
     raw_index_type: u64,
 ) -> Option<(rt::DrawPrimitiveType, IndexType)> {
     let t = draw_type(sel, primitive_type);
-    if t == rt::DrawPrimitiveType::Nine {
+    let i = index_type(raw_index_type);
+    if t == rt::DrawPrimitiveType::Nine && i.is_none() {
         unmeasured_type_9(sel);
     }
-    let i = index_type(raw_index_type)?;
-    Some((t, i))
+    Some((t, i?))
 }
 
-/// Dies at `sel`, a draw of primitive type 9 over indices or indirect arguments: Metal's GPU
-/// draws nothing of it and fails its command buffer, with a page fault over indices (any, none
-/// included, of any instances) and as a victim of its recovery from indirect arguments (any),
-/// its event signals firing; it runs a render pass after it, and a later command buffer of its
-/// queue, but a blit encoder right after it in some runs and not in others (measured on the M3
-/// Max, macOS 27.0.1, each such command buffer the first of a queue of its own: the blit ran in
-/// 7 runs of 7 where the command buffer was the process's first to fail, over indices, and in 1
-/// of 35 where another had failed before it), where the runtime runs every encoder after it.
+/// Dies at `sel`, a draw of primitive type 9 over an index type no `MTLIndexType` is: Metal
+/// draws nothing of a draw of a public type over one, and faults its command buffer at a draw of
+/// type 9 over any of its index types, and nothing measured which it does at both.
 fn unmeasured_type_9(sel: &'static str) -> ! {
     unrepresentable(
         sel,
-        "primitive type 9 over indices or indirect arguments, which Metal's GPU fails with a \
-         page fault or as a victim of its recovery, running a blit encoder after it in some \
-         runs and not in others, where the runtime runs every encoder after it",
+        "primitive type 9 over an index type no MTLIndexType is, which nothing measured: Metal \
+         draws nothing of a public type over one, and faults at type 9 over its index types",
     )
 }
 
@@ -2149,19 +2154,26 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]) without indices or
-    /// indirect arguments, which goes to the runtime: Metal's GPU draws nothing of it, and where
-    /// it `hangs`, of 3 vertices or more and an instance, fails its command buffer from its
-    /// render encoder on with `MTLCommandBufferErrorTimeout`, its event signals firing, as the
-    /// runtime fails it (`GpuHang`); of fewer vertices or no instance it fails nothing (measured
-    /// on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`). One that hangs tells the
-    /// command buffer, whose commit dies where it fails another way too
+    /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]), which goes to the
+    /// runtime: Metal's GPU draws nothing of it, and `fails` its command buffer from its render
+    /// encoder on, its event signals firing, as the runtime fails it: directly, of 3 vertices or
+    /// more and an instance, with `MTLCommandBufferErrorTimeout` (`GpuHang`), of fewer vertices or
+    /// no instance with nothing (`None`); over indices with `MTLCommandBufferErrorPageFault`
+    /// (`PageFault`), of any indices or instances; from indirect arguments with
+    /// `MTLCommandBufferErrorInternal` (`GpuRecoveryVictim`) (measured on the M3 Max, macOS
+    /// 27.0.1, `type_9_draws_fail_as_metals`). One that fails it tells the command buffer, whose
+    /// commit dies where it fails another way too
     /// ([`crate::gpu::command::CommandBufferObject::fails_at_type_9`]), and asks the pass's rate
-    /// map as a draw does ([`Self::layered`]): Metal's hang was measured in no pass over a rate
+    /// map as a draw does ([`Self::layered`]): Metal's failure was measured in no pass over a rate
     /// map. One that fails nothing is a draw the runtime records nothing of
     /// ([`Self::empty_drawn`]). After `setRenderPipelineState:` of nil it dies as every draw does
     /// ([`Self::pipelined`]), and with no pipeline state set, which nothing measured, it dies.
-    fn nine(&self, sel: &'static str, hangs: bool, call: Call<'_>) -> RaiseResult<()> {
+    fn nine(
+        &self,
+        sel: &'static str,
+        fails: Option<rt::CommandBufferError>,
+        call: Call<'_>,
+    ) -> RaiseResult<()> {
         self.pipelined(sel);
         if !plain(|| self.marks.lock().pipeline) {
             unrepresentable(
@@ -2170,10 +2182,9 @@ impl VulkanRenderEncoder {
             );
         }
         crate::gpu::timing::count_draw();
-        if hangs {
+        if let Some(error) = fails {
             self.layered(sel);
-            let hang = rt::CommandBufferError::GpuHang.metal_code();
-            self.encoder.fails_at_type_9(hang);
+            self.encoder.fails_at_type_9(error.metal_code());
         } else {
             self.empty_drawn(sel, true);
         }
@@ -2496,6 +2507,10 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         indirect_buffer_offset,
                     )
                 };
+                if let Some((t @ rt::DrawPrimitiveType::Nine, i)) = kinds {
+                    let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
+                    return self.nine(sel, victim, &mut |e| call(e, (t, i)));
+                }
                 let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
                 self.draw(sel, (drawn, false), call)
             }
@@ -2551,12 +2566,14 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let t = draw_type(sel, primitive_type);
-                if t == rt::DrawPrimitiveType::Nine {
-                    unmeasured_type_9(sel);
-                }
-                self.draw(sel, (Some((Shape::Primitives(t), t)), false), |e, t| {
+                let call = |e: &mut rt::RenderCommandEncoder, t| {
                     e.draw_primitives_indirect(t, &indirect_buffer.raw, indirect_buffer_offset)
-                })
+                };
+                if t == rt::DrawPrimitiveType::Nine {
+                    let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
+                    return self.nine(sel, victim, &mut |e| call(e, t));
+                }
+                self.draw(sel, (Some((Shape::Primitives(t), t)), false), call)
             }
             RenderCmd::DrawPrimitives {
                 primitive_type,
@@ -3461,7 +3478,8 @@ impl VulkanRenderEncoder {
             e.draw_primitives(t, start, count, instances, base)
         };
         if t == rt::DrawPrimitiveType::Nine {
-            return self.nine(sel, count >= 3 && instances > 0, &mut |e| call(e, t));
+            let hang = (count >= 3 && instances > 0).then_some(rt::CommandBufferError::GpuHang);
+            return self.nine(sel, hang, &mut |e| call(e, t));
         }
         self.pipelined(sel);
         self.empty_drawn(sel, count == 0 || instances == 0);
@@ -3471,7 +3489,8 @@ impl VulkanRenderEncoder {
 
     /// An indexed draw of a raw primitive and index type: `(count, instances, base vertex, base
     /// instance)` from the index buffer at its offset; one of no instances is an empty draw,
-    /// which the runtime records nothing of (the module docs).
+    /// which the runtime records nothing of (the module docs). Of type 9, of any count and
+    /// instances, Metal's GPU faults the command buffer, as the runtime does ([`Self::nine`]).
     fn indexed(
         &self,
         sel: &'static str,
@@ -3497,6 +3516,10 @@ impl VulkanRenderEncoder {
                 base_instance,
             )
         };
+        if let Some((t @ rt::DrawPrimitiveType::Nine, i)) = kinds {
+            let fault = Some(rt::CommandBufferError::PageFault);
+            return self.nine(sel, fault, &mut |e| call(e, (t, i)));
+        }
         let empty = instances == 0 || kinds.is_some_and(|(t, _)| draws_none(t, count));
         self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
         let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
@@ -4085,6 +4108,87 @@ pub(crate) mod tests {
         runs(&q);
     }
 
+    /// A command buffer of a draw of primitive type 9 over indices, at which Metal's GPU faults,
+    /// is in flight as long as Metal's: it completes no sooner than [`FAULT`] after its commit,
+    /// with `MTLCommandBufferErrorPageFault`, its signal after the fault firing. A command buffer
+    /// committed on its queue right after it runs and completes after it, and one of another
+    /// queue runs meanwhile, as Metal's (the runtime's measurement, `command_buffer/hang.rs`)
+    #[test]
+    fn a_type_9_fault_is_in_flight_as_long_as_metals() {
+        use reims_vgpu_core::platform::event::EventRef;
+        use reims_vgpu_core::platform::os::Clock as _;
+        use reims_vgpu_core::platform::types::NsRange;
+
+        let (p, d) = (platform(), dev());
+        let (_dst, pass) = pass_of(&p, &d, (4, 4));
+        let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+        let indices = buffer::<VulkanPlatform>(&d, 16, 0, &u32s(&[0, 1, 2]));
+        let (q, other) = (
+            d.new_command_queue().unwrap(),
+            d.new_command_queue().unwrap(),
+        );
+        let event = d.new_shared_event().unwrap();
+        let fault = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = fault.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        send_all(
+            &e,
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                three(9, Some(&indices)),
+                RenderCmd::EndEncoding,
+            ],
+        );
+        fault
+            .encode_signal(Some(EventRef::Shared(&event)), 1)
+            .unwrap();
+        // A command buffer of `q` that fills a buffer with 0x5a, and the buffer.
+        let filling = |q: &crate::gpu::command::VulkanCommandQueue| {
+            let b = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let fill = BlitCmd::FillBuffer {
+                buffer: &b,
+                range: NsRange::new(0, 16),
+                value: 0x5a,
+            };
+            blit.encode(OnFault::Die, fill).unwrap();
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+            (cb, b)
+        };
+        let ran = |cb: &crate::gpu::command::VulkanCommandBuffer, b: &VulkanBuffer| {
+            assert_eq!(cb.status().0, 4);
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+            // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+            let first = unsafe { *b.contents().as_ptr::<u8>() };
+            assert_eq!(first, 0x5a);
+        };
+        let clock = crate::os::OsClock::new();
+        let (behind, b) = filling(&q);
+        let started = clock.now_mono();
+        fault.commit(OnFault::Die).unwrap();
+        behind.commit(OnFault::Die).unwrap();
+        let (meanwhile, m) = filling(&other);
+        meanwhile.commit(OnFault::Die).unwrap();
+        meanwhile.wait_until_completed(OnFault::Die).unwrap();
+        ran(&meanwhile, &m);
+        behind.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(fault.status().0, 5, "it completed before the fault");
+        ran(&behind, &b);
+        fault.wait_until_completed(OnFault::Die).unwrap();
+        assert!(clock.now_mono().saturating_duration_since(started) >= FAULT);
+        assert_eq!(fault.error().map(|e| e.code), Some(3));
+        assert_eq!(event.signaled_value(), 1);
+    }
+
+    /// The earliest after it read `Scheduled`, which follows its commit, that Metal completed a
+    /// command buffer its GPU faulted at or failed a victim of its recovery at, at a draw of
+    /// primitive type 9 or an execution under a state that cannot inherit: 6.86 ms, of 164 such
+    /// command buffers on the M3 Max, macOS 27.0.1, which completed 6.86 to 10.3 ms after it (the
+    /// runtime's measurement, `command_buffer/hang.rs`).
+    const FAULT: std::time::Duration = std::time::Duration::from_micros(6_860);
+
     /// The earliest after its commit that Metal failed a command buffer its GPU hung at, at a
     /// draw of primitive type 9: 28.3 ms, of 33 hangs on the M3 Max, macOS 27.0.1, queues warmed
     /// and not, which failed 28.3 to 46.2 ms after their commits (the runtime's measurement,
@@ -4116,14 +4220,21 @@ pub(crate) mod tests {
         assert_eq!(site.file, "commit");
     }
 
-    /// A draw of primitive type 9 over indices or indirect arguments, whose command buffer
-    /// Metal's GPU fails running a blit encoder after it in some runs and not in others, and one
-    /// with no pipeline state set, which nothing measured, die
+    /// A draw of primitive type 9 over an index type no `MTLIndexType` is, directly and from
+    /// indirect arguments, and one of each form with no pipeline state set, which nothing
+    /// measured, die
     #[test]
     fn unmeasured_type_9_draws_die() {
+        const INDEXED: &str =
+            "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
+        const INDEXED_INSTANCES: &str = "drawIndexedPrimitives:indexCount:indexType:\
+             indexBuffer:indexBufferOffset:instanceCount:";
+        const INDIRECT: &str = "drawPrimitives:indirectBuffer:indirectBufferOffset:";
+        const INDEXED_INDIRECT: &str = "drawIndexedPrimitives:indexType:indexBuffer:\
+             indexBufferOffset:indirectBuffer:indirectBufferOffset:";
         let (e, indices) = drawing_encoder("vert:tri_vert", "frag:tri_frag");
-        for (index_count, instance_count, index_type) in [(3, 1, U16), (0, 1, U16), (3, 0, 2)] {
-            let draw = RenderCmd::DrawIndexedPrimitivesInstances {
+        let instanced =
+            |index_count, instance_count, index_type| RenderCmd::DrawIndexedPrimitivesInstances {
                 primitive_type: 9,
                 index_count,
                 index_type,
@@ -4131,39 +4242,34 @@ pub(crate) mod tests {
                 index_buffer_offset: 0,
                 instance_count,
             };
-            assert_eq!(
-                dies_at(&e, draw),
-                "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:\
-                 instanceCount:"
-            );
-        }
-        let indirect = RenderCmd::DrawPrimitivesIndirect {
+        let indirect = || RenderCmd::DrawPrimitivesIndirect {
             primitive_type: 9,
             indirect_buffer: &indices,
             indirect_buffer_offset: 0,
         };
-        assert_eq!(
-            dies_at(&e, indirect),
-            "drawPrimitives:indirectBuffer:indirectBufferOffset:"
-        );
-        let indexed_indirect = RenderCmd::DrawIndexedPrimitivesIndirect {
+        let indexed_indirect = |index_type| RenderCmd::DrawIndexedPrimitivesIndirect {
             primitive_type: 9,
-            index_type: U16,
+            index_type,
             index_buffer: &indices,
             index_buffer_offset: 0,
             indirect_buffer: &indices,
             indirect_buffer_offset: 0,
         };
-        assert_eq!(
-            dies_at(&e, indexed_indirect),
-            "drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:\
-             indirectBufferOffset:"
-        );
+        for (index_count, instance_count) in [(3, 1), (0, 1), (3, 0)] {
+            assert_eq!(
+                dies_at(&e, instanced(index_count, instance_count, 2)),
+                INDEXED_INSTANCES
+            );
+        }
+        assert_eq!(dies_at(&e, indexed_indirect(2)), INDEXED_INDIRECT);
         let (e, _dst) = open_encoder();
         assert_eq!(
             dies_at(&e, three(9, None)),
             "drawPrimitives:vertexStart:vertexCount:"
         );
+        assert_eq!(dies_at(&e, three(9, Some(&indices))), INDEXED);
+        assert_eq!(dies_at(&e, indirect()), INDIRECT);
+        assert_eq!(dies_at(&e, indexed_indirect(U16)), INDEXED_INDIRECT);
     }
 
     /// The sweep library, `rounding.metal`, compiled with fast math, the compiler's default.

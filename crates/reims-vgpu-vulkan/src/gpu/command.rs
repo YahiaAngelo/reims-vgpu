@@ -121,15 +121,20 @@
 //!   command buffer: one committed on its queue while it is in flight runs, on Metal (measured
 //!   alike) as here.
 //!
-//!   A render encoder's draw of primitive type 9, at which Metal's GPU hangs or faults, the
-//!   runtime fails the command buffer at as Metal's GPU does (`crate::gpu::encode_render`), and
-//!   a command buffer of the hang's queue committed while it is in flight runs nothing and
-//!   completes without an error, as Metal's (`rt::DrawPrimitiveType::Nine`; measured on the M3
-//!   Max under macOS 26.7 and 27.0.1, `metal_runs_after_a_type_9_hang_here`,
-//!   `later_command_buffers_of_a_hang_run_as_metals`). Such a draw is told to the command
-//!   buffer ([`CommandBufferObject::fails_at_type_9`]): one that fails another way too, by its
-//!   own encoders, its protection options or a use of a detached object at its commit, dies at
-//!   the commit, as do two different ways at once of any kind, which nothing measured.
+//!   A render encoder's draw of primitive type 9, at which Metal's GPU hangs, faults or fails a
+//!   victim of its recovery, the runtime fails the command buffer at as Metal's GPU does
+//!   (`crate::gpu::encode_render`): a command buffer of a hang's queue committed while it is in
+//!   flight runs nothing and completes without an error, as Metal's
+//!   (`rt::DrawPrimitiveType::Nine`; measured on the M3 Max under macOS 26.7 and 27.0.1,
+//!   `metal_runs_after_a_type_9_hang_here`, `later_command_buffers_of_a_hang_run_as_metals`),
+//!   one of a fault's or a victim's runs, and the queue's second hang or fault to complete
+//!   revokes it: a command buffer committed on it after that fails at its commit with
+//!   `AccessRevoked` (4), running nothing and signalling nothing, as Metal's
+//!   (`type_9_faults_revoke_queues_as_metals`). Such a draw is told to the command buffer
+//!   ([`CommandBufferObject::fails_at_type_9`]): one that fails another way too, by its own
+//!   encoders, its protection options, a use of a detached object at its commit, or another
+//!   type-9 draw's other failure, dies at the commit, as do two different ways at once of any
+//!   kind, which nothing measured.
 //! - **A submission that uses a detached buffer or heap** fails with
 //!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
 //!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides

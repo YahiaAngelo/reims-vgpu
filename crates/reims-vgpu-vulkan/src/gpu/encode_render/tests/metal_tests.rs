@@ -8888,12 +8888,29 @@ fn metal_runs_after_a_type_9_hang_here() {
     }
 }
 
-/// What a command buffer shows on `p`'s device `d` whose render pass, over a 4 by 4 target filled
-/// with 0x11, draws primitive type 9 directly, `count` vertices of `instances` instances, a blit
-/// before it filling a buffer with 0x5a and one after it another with 0x6b, then an event signal:
-/// its status and error, the first byte of each buffer, whether the signal fired, and the
-/// target's first texel, black where the pass's clear ran.
-fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)) -> String {
+/// A draw of primitive type 9 of [`type_9_pass`]'s: directly, `(count, instances)`; over
+/// `(count, instances)` of the 16-bit indices 0, 1 and 2; from indirect arguments of 3 vertices
+/// and an instance; or from indirect arguments of those indices and an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nine {
+    Direct(u64, u64),
+    Indexed(u64, u64),
+    Indirect,
+    IndexedIndirect,
+}
+
+/// What a command buffer of a new queue shows on `p`'s device `d` whose render pass, over a 4 by
+/// 4 target filled with 0x11, draws primitive type 9 as `draw` says ([`type_9_pass_on`]).
+fn type_9_pass<P: Platform>(p: &P, d: &P::Device, draw: Nine) -> String {
+    type_9_pass_on(p, d, &d.new_command_queue().unwrap(), draw)
+}
+
+/// What a command buffer of `q` shows on `p`'s device `d` whose render pass, over a 4 by 4 target
+/// filled with 0x11, draws primitive type 9 as `draw` says, a blit before it filling a buffer
+/// with 0x5a and one after it another with 0x6b, then an event signal: its status and error, the
+/// first byte of each buffer, whether the signal fired, and the target's first texel, black
+/// where the pass's clear ran, read through a new queue.
+fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: Nine) -> String {
     use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
     let (dst, pass) = pass_of(p, d, (4, 4));
     let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
@@ -8904,8 +8921,13 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)
         buffer::<P>(d, 16, 0, &[0; 16]),
         buffer::<P>(d, 16, 0, &[0; 16]),
     );
+    let indices = buffer::<P>(d, 16, 0, &index_bytes(U16, &[0, 1, 2]));
+    let arguments = match draw {
+        Nine::IndexedIndirect => u32s(&[3, 1, 0, 0, 0]),
+        _ => u32s(&[3, 1, 0, 0]),
+    };
+    let arguments = buffer::<P>(d, 32, 0, &arguments);
     let event = d.new_shared_event().unwrap();
-    let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let fill = |b: &P::Buffer, value| {
         let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -8919,17 +8941,41 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)
         blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
     };
     fill(&before, 0x5a);
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    for cmd in [
-        RenderCmd::SetRenderPipelineState {
-            pipeline_state: Some(&state),
-        },
-        RenderCmd::DrawPrimitivesInstances {
+    let drawn = match draw {
+        Nine::Direct(count, instances) => RenderCmd::DrawPrimitivesInstances {
             primitive_type: 9,
             vertex_start: 0,
             vertex_count: count,
             instance_count: instances,
         },
+        Nine::Indexed(count, instances) => RenderCmd::DrawIndexedPrimitivesInstances {
+            primitive_type: 9,
+            index_count: count,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            instance_count: instances,
+        },
+        Nine::Indirect => RenderCmd::DrawPrimitivesIndirect {
+            primitive_type: 9,
+            indirect_buffer: &arguments,
+            indirect_buffer_offset: 0,
+        },
+        Nine::IndexedIndirect => RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type: 9,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            indirect_buffer: &arguments,
+            indirect_buffer_offset: 0,
+        },
+    };
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    for cmd in [
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        drawn,
         RenderCmd::EndEncoding,
     ] {
         e.encode(OnFault::Die, cmd).unwrap();
@@ -8939,7 +8985,8 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     let out = buffer::<P>(d, 4, 0, &[]);
-    let read = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let read = d.new_command_queue().unwrap();
+    let read = read.command_buffer(OnFault::Die).unwrap().unwrap();
     let blit = read.blit_encoder(OnFault::Die).unwrap().unwrap();
     for cmd in [
         BlitCmd::CopyTextureToBuffer {
@@ -8973,41 +9020,66 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)
     )
 }
 
-/// [`type_9_pass`]'s lines on Metal, each of its draw's vertices and instances: of 3 vertices
-/// or more and an instance it hangs the GPU, failing the command buffer with
-/// `MTLCommandBufferErrorTimeout` (status 5, code 2), the blit before the pass run and neither
-/// the pass's clear nor the blit after it, the signal firing; of fewer, or of no instance, it
-/// fails nothing (measured on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`).
-const METALS_TYPE_9: [((u64, u64), &str); 6] = [
+/// [`type_9_pass`]'s lines on Metal, each of its draws: directly, of 3 vertices or more and an
+/// instance it hangs the GPU, failing the command buffer with `MTLCommandBufferErrorTimeout`
+/// (status 5, code 2), the blit before the pass run and neither the pass's clear nor the blit
+/// after it, the signal firing; of fewer, or of no instance, it fails nothing. Over indices, of
+/// any count or instances, it faults the GPU (`MTLCommandBufferErrorPageFault`, code 3), and from
+/// indirect arguments, over indices or not, fails the command buffer as a victim of the GPU's
+/// recovery (`MTLCommandBufferErrorInternal`, code 1), each as a hang fails it, but where the GPU
+/// was idle for some seconds before, where the blit after the pass runs (measured on the M3 Max,
+/// macOS 27.0.1, `type_9_draws_fail_as_metals`, which draws these after the hangs).
+const METALS_TYPE_9: [(Nine, &str); 11] = [
     (
-        (0, 1),
+        Nine::Direct(0, 1),
         "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
     ),
     (
-        (1, 1),
+        Nine::Direct(1, 1),
         "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
     ),
     (
-        (2, 1),
+        Nine::Direct(2, 1),
         "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
     ),
     (
-        (3, 0),
+        Nine::Direct(3, 0),
         "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
     ),
     (
-        (3, 1),
+        Nine::Direct(3, 1),
         "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
     ),
     (
-        (6, 2),
+        Nine::Direct(6, 2),
         "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(3, 1),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(0, 1),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(3, 0),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indirect,
+        "status 5 error Some(1) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::IndexedIndirect,
+        "status 5 error Some(1) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
     ),
 ];
 
-/// A direct draw of primitive type 9 fails its command buffer as Metal's GPU does
-/// ([`METALS_TYPE_9`]): it hangs at 3 vertices or more and an instance, and fails nothing at
-/// fewer or no instance
+/// A draw of primitive type 9 fails its command buffer as Metal's GPU does ([`METALS_TYPE_9`]):
+/// directly it hangs at 3 vertices or more and an instance, and fails nothing at fewer or no
+/// instance; over indices it faults, and from indirect arguments it fails a victim of the GPU's
+/// recovery, each of a new queue
 #[test]
 fn type_9_draws_fail_their_command_buffers_as_metals() {
     let (p, d) = (platform(), dev());
@@ -9016,18 +9088,125 @@ fn type_9_draws_fail_their_command_buffers_as_metals() {
     }
 }
 
-/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`], and this platform's are Metal's
+/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`], and this platform's are Metal's, each
+/// of a new queue, twice over
 #[test]
-#[ignore = "a comparison, with the GPU free: it hangs Metal's GPU"]
+#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
 fn type_9_draws_fail_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
-    for (draw, metals) in METALS_TYPE_9 {
-        let theirs = type_9_pass(&mp, &md, draw);
-        assert_eq!(theirs, metals, "{draw:?}");
-        assert_eq!(type_9_pass(&p, &d, draw), theirs, "{draw:?}");
+    for _ in 0..2 {
+        for (draw, metals) in METALS_TYPE_9 {
+            let theirs = type_9_pass(&mp, &md, draw);
+            assert_eq!(theirs, metals, "{draw:?}");
+            assert_eq!(type_9_pass(&p, &d, draw), theirs, "{draw:?}");
+        }
+    }
+}
+
+/// What a new queue of `p`'s device `d` shows once `draws`, command buffers of
+/// [`type_9_pass_on`]'s, were committed on it in turn, each once the one before completed: each
+/// one's status and error, then a command buffer's committed on it once the last completed,
+/// which fills a buffer and signals an event ([`filling`]), and one's committed so on another
+/// new queue: each one's status and error, the buffer's first byte and whether the signal fired.
+/// What else of a type-9 command buffer ran is left out: on Metal it races, the encoders
+/// after a fault running where the GPU was idle before (the process's first fault here), and the
+/// queue's second fault running nothing of its command buffer, the blit before it included, in
+/// some runs (the runtime's measurement, `command_buffer/revocation.rs`), where
+/// [`type_9_draws_fail_as_metals`] compares it on a GPU that ran just before.
+fn after_type_9s<P: Platform>(p: &P, d: &P::Device, draws: &[Nine]) -> Vec<String> {
+    use reims_vgpu_core::platform::event::SharedEvent as _;
+    let q = d.new_command_queue().unwrap();
+    let mut lines: Vec<String> = (draws.iter())
+        .map(|&draw| {
+            let line = type_9_pass_on(p, d, &q, draw);
+            let failed = line.split(" before ").next().unwrap_or_default();
+            format!("{draw:?}: {failed}")
+        })
+        .collect();
+    let seen = Seen::default();
+    for (what, q) in [
+        ("its queue", &q),
+        ("a new queue", &d.new_command_queue().unwrap()),
+    ] {
+        let (cb, b, event) = filling::<P>(d, q, (0x11, None), &seen);
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        lines.push(format!(
+            "{what}: status {} error {:?} filled {first:#x} signal {}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            event.wait_until_signaled_value(1, 1),
+        ));
+    }
+    lines
+}
+
+/// [`after_type_9s`]'s draws: two faults, a hang then a fault, and a victim of the GPU's recovery
+/// then a fault.
+const REVOKING: [&[Nine]; 3] = [
+    &[Nine::Indexed(3, 1), Nine::Indexed(3, 1)],
+    &[Nine::Direct(3, 1), Nine::Indexed(3, 1)],
+    &[Nine::Indirect, Nine::Indexed(3, 1)],
+];
+
+/// The last two of [`after_type_9s`]'s lines on Metal after each of [`REVOKING`]'s: a queue whose
+/// second command buffer that a draw of primitive type 9 faulted or hung completed fails every
+/// command buffer committed on it after that with `MTLCommandBufferErrorAccessRevoked` (status 5,
+/// code 4), running none of its work and firing none of its signals, where a new queue runs; a
+/// victim of the GPU's recovery does not count (measured on the M3 Max, macOS 27.0.1,
+/// `type_9_faults_revoke_queues_as_metals`).
+const METALS_REVOKING: [[&str; 2]; 3] = [
+    [
+        "its queue: status 5 error Some(4) filled 0x0 signal false",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+    [
+        "its queue: status 5 error Some(4) filled 0x0 signal false",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+    [
+        "its queue: status 4 error None filled 0x11 signal true",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+];
+
+/// A queue's second command buffer that a draw of primitive type 9 faulted or hung revokes it,
+/// as Metal's ([`METALS_REVOKING`]), and a victim of the GPU's recovery does not: the type-9
+/// command buffers fail with the status and error [`METALS_TYPE_9`] says
+#[test]
+fn type_9_faults_revoke_queues_as_on_metal() {
+    let (p, d) = (platform(), dev());
+    for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
+        let lines = after_type_9s(&p, &d, draws);
+        let (failed, later) = lines.split_at(draws.len());
+        for (line, draw) in failed.iter().zip(draws) {
+            let (_, metals) = METALS_TYPE_9.iter().find(|(d, _)| d == draw).unwrap();
+            let status = metals.split(" before ").next().unwrap_or_default();
+            assert_eq!(*line, format!("{draw:?}: {status}"));
+        }
+        assert_eq!(later, metals, "{draws:?}");
+    }
+}
+
+/// [`after_type_9s`]'s lines on Metal after each of [`REVOKING`]'s end in
+/// [`METALS_REVOKING`]'s, and this platform's are Metal's, each of new queues
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
+fn type_9_faults_revoke_queues_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
+        let theirs = after_type_9s(&mp, &md, draws);
+        assert_eq!(theirs[draws.len()..], metals, "{draws:?}: {theirs:#?}");
+        assert_eq!(after_type_9s(&p, &d, draws), theirs, "{draws:?}");
     }
 }
