@@ -664,11 +664,12 @@ mod tests {
     /// platform as core drives it (a blit encoder, a completed handler, the signal, the commit),
     /// and through the runtime alone on the same device, 200 of each, alternating, after 20 to
     /// warm up. The difference is what the platform adds between the commit and core's handler.
-    /// Measured on the M3 Max (MoltenVK, a dev build, runtime a62e8a365f), at the median: 271 us
-    /// from the commit to the handler through the platform and 265 us through the runtime, of
-    /// which the commit to the submission 29 us and 22 us (the platform's submission check and
-    /// submission handler, on the runtime's scheduler thread) and the GPU until seen complete
-    /// 212 us and 213 us; the commit held its thread 11 us and 9 us.
+    /// Measured on the M3 Max (MoltenVK, a dev build, runtime a62e8a365f), at the median: 278 us
+    /// from the commit to the handler through the platform and 269 us through the runtime, of
+    /// which the commit to the submission 29 us and 20 us (the platform's submission check, on
+    /// the runtime's scheduler thread) and the GPU until seen complete 221 us and 222 us; the
+    /// commit held its thread 13 us and 10 us; one handler thread woken a command buffer, and
+    /// every transition to scheduled run where submitted, either way.
     #[test]
     #[ignore = "a measurement, run by hand: prints the latencies"]
     fn commit_to_handler_latency() {
@@ -688,11 +689,24 @@ mod tests {
             gpu_end: cb.gpu_end_time().unwrap_or(0.0),
             handler: rt::host_time(),
         };
-        let mut runs: [(&str, Vec<(Times, Duration)>); 2] =
-            [("platform", Vec::new()), ("runtime", Vec::new())];
+        let mut runs: [(&str, Vec<(Times, Duration)>, [u64; 3]); 2] = [
+            ("platform", Vec::new(), [0; 3]),
+            ("runtime", Vec::new(), [0; 3]),
+        ];
+        // The runtime's counts of handler threads woken, command buffer waiters woken and
+        // transitions to `Scheduled` run where submitted.
+        let counts = || {
+            let c = d.raw.work_counts();
+            [
+                c.wakes_handler_threads,
+                c.wakes_command_buffer_waiters,
+                c.scheduled_where_submitted,
+            ]
+        };
         let mut value = 0;
         for round in 0..220 {
-            for (platform, (_, seen)) in runs.iter_mut().enumerate() {
+            for (platform, (_, seen, counted)) in runs.iter_mut().enumerate() {
+                let before = counts();
                 value += 1;
                 let (tx, rx) = std::sync::mpsc::channel();
                 let held = if platform == 0 {
@@ -740,17 +754,24 @@ mod tests {
                 let t = rx.recv().unwrap();
                 if round >= 20 {
                     seen.push((t, held));
+                    let after = counts();
+                    for (n, (after, before)) in
+                        counted.iter_mut().zip(after.into_iter().zip(before))
+                    {
+                        *n += after - before;
+                    }
                 }
             }
         }
-        for (name, seen) in runs {
+        for (name, seen, [handler_wakes, waiter_wakes, scheduled_here]) in runs {
             let us = |s: f64| format!("{:.0}", s * 1e6);
             let at = |v: &[f64], percent: usize| v[(v.len() - 1) * percent / 100];
             let mut held: Vec<f64> = seen.iter().map(|(_, d)| d.as_secs_f64()).collect();
             held.sort_unstable_by(f64::total_cmp);
             println!(
                 "{name}: {} command buffers, the commit held its thread {} us at the median, \
-                 {} us p90",
+                 {} us p90; {handler_wakes} handler threads and {waiter_wakes} command buffer \
+                 waiters woken, {scheduled_here} scheduled where submitted",
                 seen.len(),
                 us(at(&held, 50)),
                 us(at(&held, 90))
