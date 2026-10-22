@@ -1341,6 +1341,12 @@ pub fn process() -> MutexGuard<'static, MetalSpace> {
     space
 }
 
+/// Whether the process's space took `first` through [`first_use`]: what it takes is held for
+/// good, so a later use takes nothing.
+pub fn taken(first: FirstUse) -> bool {
+    FIRST_USES.load(std::sync::atomic::Ordering::Acquire) & first.bit() != 0
+}
+
 /// The process's device used so ([`FirstUse`]): Metal's own allocations for it, the first time.
 /// Each blit command, encoder and tiler submission is one, so a use the process's space made
 /// already ([`FIRST_USES`]) is answered without its lock: it changes nothing of the space, and

@@ -303,9 +303,10 @@ pub struct CommandBufferObject {
     failing: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
-    /// Whether it holds work for Metal's tiler ([`CommandBufferObject::tiler_work`]), which its
-    /// submission handler reads ([`tiler_handler`]).
-    tiler: Arc<AtomicBool>,
+    /// Whether it carries the submission handler that takes Metal's allocation for its work for
+    /// the tiler ([`tiler_handler`]), added at its first such work while the process has not
+    /// taken it ([`CommandBufferObject::tiler_work`]).
+    tiler: AtomicBool,
     /// Its queue's hangs in flight ([`Hangs`]).
     hangs: Arc<Hangs>,
     /// The event that holds what comes after the first encoder Metal's GPU hangs at, where one
@@ -316,14 +317,18 @@ pub struct CommandBufferObject {
     executions: Mutex<Vec<(usize, executions::Execution)>>,
 }
 
-/// A new command buffer's submission handler: Metal's allocation for its work for the tiler,
-/// where it holds some ([`CommandBufferObject::tiler_work`]). Metal takes its own allocation for
-/// the first such work in the process as it submits it to the GPU
+/// The submission handler of a command buffer that holds work for Metal's tiler
+/// ([`CommandBufferObject::tiler_work`]): Metal's allocation for that work. Metal takes its own
+/// allocation for the first such work in the process as it submits it to the GPU
 /// ([`FirstUse::TilerSubmission`]; `vaprobe rendersubmit`, plain Metal, M3 Max: none of it at the
 /// commit of a render pass behind an event wait, all of it by the command buffer's completion).
 /// The runtime runs the handler as the command buffer's last batch reaches its queue, on the
 /// thread that submits it, before the command buffer reads scheduled, before
-/// `waitUntilScheduled` returns and before any scheduled or completed handler runs. Every command
+/// `waitUntilScheduled` returns and before any scheduled or completed handler runs. A command
+/// buffer encoded once the process took the allocation carries none: the allocation is held for
+/// good, and a submission handler makes the runtime run the command buffer's transition to
+/// scheduled on a handler thread, woken for it, where it runs it on its scheduler thread as it
+/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). Every command
 /// buffer this platform commits carries a submission check ([`backing::submission_check`]), which
 /// the runtime runs on its scheduler thread, so that thread submits it, once its waits are met
 /// and the work ahead of it on its queue is submitted: after `commit` returns, as Metal submits
@@ -331,13 +336,8 @@ pub struct CommandBufferObject {
 /// measurement on an M4). A range placed between the commit and the submission lies by the threads'
 /// timing, on Metal as here. A command buffer the runtime fails before its submission takes
 /// nothing.
-fn tiler_handler(tiler: &Arc<AtomicBool>) -> rt::Handler {
-    let tiler = Arc::clone(tiler);
-    Box::new(move |_| {
-        if tiler.load(Ordering::SeqCst) {
-            metal_space::first_use(FirstUse::TilerSubmission);
-        }
-    })
+fn tiler_handler() -> rt::Handler {
+    Box::new(|_| metal_space::first_use(FirstUse::TilerSubmission))
 }
 
 /// The end of a hang held by `hold` ([`CommandBufferObject::hold_after_hang`]), committed by
@@ -412,12 +412,17 @@ impl CommandBufferObject {
 }
 
 impl CommandBufferObject {
-    /// Work for Metal's tiler encoded, `first`: a render encoder made, or a blit's reset or copy
-    /// of an indirect command buffer. Metal's own allocations for it the first time, and the
-    /// command buffer's submission a first use too ([`tiler_handler`]).
-    pub(crate) fn tiler_work(&self, first: FirstUse) {
+    /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
+    /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
+    /// the command buffer's submission a first use too, which its submission handler takes, added
+    /// here while the process has not taken it ([`tiler_handler`]).
+    pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
         metal_space::first_use(first);
-        self.tiler.store(true, Ordering::SeqCst);
+        if !metal_space::taken(FirstUse::TilerSubmission)
+            && !self.tiler.swap(true, Ordering::SeqCst)
+        {
+            get(sel, || self.raw.add_submission_handler(tiler_handler()));
+        }
     }
 
     /// Dies at `sel`, the creation of a compute or render encoder, under protection options that
@@ -927,10 +932,6 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
     fn command_buffer(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         let raw = waiting("commandBuffer", || self.raw.command_buffer())?;
         let predication = Predication::new(&self.device);
-        let tiler = Arc::default();
-        get("commandBuffer", || {
-            raw.add_submission_handler(tiler_handler(&tiler))
-        });
         Ok(Some(Obj::new(CommandBufferObject {
             raw,
             device: self.device.clone_ref(),
@@ -941,7 +942,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
-            tiler,
+            tiler: AtomicBool::new(false),
             hangs: Arc::clone(&self.hangs),
             hold: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
@@ -1707,7 +1708,7 @@ mod tests {
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         event.set_signaled_value(1).unwrap();
@@ -1717,27 +1718,59 @@ mod tests {
 
     /// With no event wait and nothing ahead of it on its queue, a command buffer's first work
     /// for the tiler is taken as the runtime submits it, after its commit and before it reads
-    /// scheduled, as Metal submits it on a thread of its own: a blit's work, and a render
-    /// encoder's made through the platform's `renderCommandEncoderWithDescriptor:` (a render pass
-    /// that clears and stores a texture)
+    /// scheduled, as Metal submits it on a thread of its own
     #[test]
     fn tiler_work_with_no_wait_is_taken_as_it_is_submitted() {
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.tiler_work("test", FirstUse::TilerBlit);
+        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_scheduled().unwrap();
+        assert!(metal_space::process().took(FirstUse::TilerSubmission));
+        cb.wait_until_completed(OnFault::Return).unwrap();
+    }
+
+    /// Once the process took Metal's allocation for its work for the tiler, a command buffer
+    /// with such work carries no submission handler for it: the runtime runs its transition to
+    /// scheduled on its scheduler thread as it submits it, with no handler thread woken for it,
+    /// as it runs one with no work for the tiler
+    #[test]
+    fn tiler_work_once_taken_is_scheduled_where_submitted() {
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.tiler_work("test", FirstUse::TilerBlit);
+        assert!(cb.tiler.load(Ordering::SeqCst));
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert!(metal_space::taken(FirstUse::TilerSubmission));
+        for tiler in [true, false] {
+            let q = d.new_command_queue().unwrap();
+            let cb = buffer(&q);
+            if tiler {
+                cb.tiler_work("test", FirstUse::TilerBlit);
+            }
+            assert!(!cb.tiler.load(Ordering::SeqCst));
+            let before = d.raw.work_counts().scheduled_where_submitted;
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert_eq!(d.raw.work_counts().scheduled_where_submitted, before + 1);
+        }
+    }
+
+    /// A render encoder made through the platform's `renderCommandEncoderWithDescriptor:` (a
+    /// render pass that clears and stores a texture) is work for the tiler: the process's first
+    /// is taken as the runtime submits its command buffer, before it reads scheduled
+    #[test]
+    fn a_render_encoders_tiler_work_is_taken_as_it_is_submitted() {
         use reims_vgpu_core::platform::Platform as _;
         use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
         use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
         use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
         let d = dev();
         let q = d.new_command_queue().unwrap();
-        let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
-        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_scheduled().unwrap();
-        assert!(metal_space::process().took(FirstUse::TilerSubmission));
-        cb.wait_until_completed(OnFault::Return).unwrap();
-
-        // A render encoder's work, from the platform's creation, is the command buffer's, which
-        // its submission takes too (the process's first use was the blit's, above).
         let p = crate::platform::tests::platform();
         let target = d
             .new_texture(
@@ -1767,7 +1800,10 @@ mod tests {
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
         assert!(metal_space::process().took(FirstUse::RenderEncoder));
         assert!(cb.tiler.load(Ordering::SeqCst));
+        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_scheduled().unwrap();
+        assert!(metal_space::process().took(FirstUse::TilerSubmission));
         cb.wait_until_completed(OnFault::Return).unwrap();
     }
 
@@ -1781,7 +1817,7 @@ mod tests {
         event.set_signaled_value(1).unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_scheduled().unwrap();
@@ -1797,7 +1833,7 @@ mod tests {
         let q = d.new_command_queue().unwrap();
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
@@ -1819,7 +1855,7 @@ mod tests {
             .unwrap();
         first.commit(OnFault::Return).unwrap();
         let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         event.set_signaled_value(1).unwrap();
@@ -1838,7 +1874,7 @@ mod tests {
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert_eq!(cb.status(), CommandBufferStatus::COMMITTED);
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));

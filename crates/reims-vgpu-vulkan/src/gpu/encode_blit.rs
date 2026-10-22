@@ -690,7 +690,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             BlitCmd::ResetCommandsInBuffer { .. } | BlitCmd::CopyIndirectCommandBuffer { .. } => {
                 metal_space::first_use(FirstUse::BlitCommand);
                 if let Some(cb) = self.command_buffer() {
-                    cb.tiler_work(FirstUse::TilerBlit);
+                    cb.tiler_work(sel, FirstUse::TilerBlit);
                 }
             }
             _ => metal_space::first_use(FirstUse::BlitCommand),
