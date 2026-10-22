@@ -2068,12 +2068,13 @@ static RELAYED_INEXACT: [std::sync::atomic::AtomicU64; Inexact::ALL.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; Inexact::ALL.len()];
 
 /// A value of kind `kind` at `sel` that the runtime computes otherwise than Metal, `what` saying
-/// which: in strict mode the death of [`unrepresentable`]; by default relayed, the process's
-/// first of the kind writing a line on stderr, and counted ([`inexact_counts`]).
+/// which: in strict mode the death of [`unrepresentable`], its line naming the kind's code, as a
+/// degradation's death names its; by default relayed, the process's first of the kind writing a
+/// line on stderr, and counted ([`inexact_counts`]).
 pub fn inexact(sel: &'static str, kind: Inexact, what: &str) {
     use std::sync::atomic::Ordering;
     if strict() {
-        unrepresentable(sel, what);
+        unrepresentable(sel, &format!("{what} ({})", kind.code()));
     }
     let at = Inexact::ALL.iter().position(|&k| k == kind);
     let first = (at.and_then(|at| RELAYED_INEXACT.get(at)))
@@ -2701,7 +2702,8 @@ mod tests {
     }
 
     /// By default a value computed otherwise than Metal is relayed and counted, and the call
-    /// returns; in strict mode it dies at its selector, as before, its line saying what
+    /// returns; in strict mode it dies at its selector, as before, its line saying what and
+    /// naming the kind's code
     #[test]
     fn an_inexact_value_is_relayed_but_in_strict_mode() {
         let counted = || {
@@ -2721,6 +2723,7 @@ mod tests {
         assert_eq!(site.file, "sel:");
         let line = LAST_LINE.lock().take().unwrap_or_default();
         assert!(line.contains("cannot hold a value"), "{line}");
+        assert!(line.contains("(inexact-clear)"), "{line}");
         assert_eq!(counted(), before + 2);
     }
 
