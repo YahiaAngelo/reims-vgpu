@@ -166,7 +166,6 @@ use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::unrepresentable;
-use crate::gpu::over_pages::Seen;
 use crate::os::OsVm;
 
 /// `replaceBackingWithRanges:readOnly:`.
@@ -204,14 +203,14 @@ pub struct Backing {
     /// ranges a heap was made over, or the memory a no-copy buffer was made over; counted while
     /// it holds ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
-    /// The guest's pages the object's memory is over, whether a detach left it in no memory since
-    /// its last replace, and the commands' uses of those pages, as [`crate::gpu::over_pages`]
-    /// reads them without the object.
-    pub(crate) seen: Arc<Seen>,
+    /// The guest's pages the object's memory is over, and whether a detach left it in no memory
+    /// since its last replace, which work encoded reads without the object
+    /// ([`crate::gpu::writes::Kept`]).
+    pages: Arc<Pages>,
 }
 
 /// The memory a buffer's or heap's `contents` stays over while a detach left it in no memory
-/// ([`Seen::zeroed`]): the alias of its last replace, or of the address ranges a heap was made
+/// ([`Pages::zeroed`]): the alias of its last replace, or of the address ranges a heap was made
 /// over ([`Alias`]), which the runtime holds until the object is detached or rebound and no
 /// command buffer submitted uses it, and [`Backing`] until another takes its place; or the memory
 /// a no-copy buffer was made over ([`Own`]), until its first replace.
@@ -309,6 +308,120 @@ impl Held {
     }
 }
 
+/// The guest's pages a buffer's or heap's memory is over now, as the host maps them, and whether a
+/// detach left it in no memory since its last replace, which its [`Backing`] keeps and work
+/// encoded reads without the object ([`crate::gpu::writes::Kept`]): a reference that revived a
+/// heap or buffer could run its release on the thread that reads.
+#[derive(Debug, Default)]
+pub struct Pages {
+    /// The pages.
+    paged: Mutex<Paged>,
+    /// Whether a detach left the object in no memory since its last replace, where the GPU reads
+    /// zeros through it: written with `paged` locked, and read without it, as each bind asks.
+    zeroed: AtomicBool,
+    /// Whether it is over the guest's pages now: `paged` has pages and it is not zeroed.
+    guests: AtomicBool,
+}
+
+/// The runs of [`Pages`].
+#[derive(Debug, Default)]
+struct Paged {
+    /// The guest's pages, as the host maps them (each a first byte and an end): those of the
+    /// object's last replace, or of the address ranges a heap was made over.
+    pages: Vec<std::ops::Range<u64>>,
+    /// Where each of `pages` ends in the object's bytes, laid out over them in their order: the
+    /// lengths up to it added up, so the run holding an object's byte is found by a search, not
+    /// a walk from the first (a heap over scattered pages holds a run a page).
+    ends: Vec<u64>,
+}
+
+impl Paged {
+    /// `pages`, laid out in their order.
+    fn of(pages: Vec<std::ops::Range<u64>>) -> Paged {
+        let ends = (pages.iter())
+            .scan(0u64, |at, run| {
+                *at = at.saturating_add(run.end - run.start);
+                Some(*at)
+            })
+            .collect();
+        Paged { pages, ends }
+    }
+
+    /// The host ranges that hold the object's bytes `bytes`, as a walk of `pages` from the first
+    /// finds them (`os::surface::in_runs`), from the first run whose end lies past `bytes`' start.
+    fn in_runs(&self, bytes: &std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
+        let first = self.ends.partition_point(|&end| end <= bytes.start);
+        let mut held = Vec::new();
+        let mut at = first
+            .checked_sub(1)
+            .and_then(|before| self.ends.get(before).copied())
+            .unwrap_or(0);
+        for (run, &end) in self.pages.iter().zip(&self.ends).skip(first) {
+            if at >= bytes.end {
+                break;
+            }
+            let (from, to) = (bytes.start.max(at), bytes.end.min(end));
+            if from < to {
+                held.push(run.start + (from - at)..run.start + (to - at));
+            }
+            at = end;
+        }
+        held
+    }
+
+    /// Whether [`Paged::in_runs`] finds any of `bytes`: the runs, laid out one after another,
+    /// hold the object's bytes from 0 to the last run's end, so whether `bytes` meet those.
+    fn meets(&self, bytes: &std::ops::Range<u64>) -> bool {
+        let total = self.ends.last().copied().unwrap_or(0);
+        bytes.start < bytes.end && bytes.start < total
+    }
+}
+
+impl Pages {
+    /// The object is over `pages` from now on.
+    fn set(&self, pages: Vec<std::ops::Range<u64>>) {
+        let guests = !pages.is_empty();
+        let mut paged = self.paged.lock();
+        *paged = Paged::of(pages);
+        self.zeroed.store(false, Ordering::Release);
+        self.guests.store(guests, Ordering::Release);
+    }
+
+    /// A detach left the object in no memory: the GPU reads zeros through it, and its writes
+    /// reach no guest page.
+    fn zero(&self) {
+        let _paged = self.paged.lock();
+        self.zeroed.store(true, Ordering::Release);
+        self.guests.store(false, Ordering::Release);
+    }
+
+    /// The host memory of the object's bytes `bytes` in the guest's pages it is over now, read
+    /// under its lock with no copy of the pages; `None` for one over memory of its own, or
+    /// detached, answered without the lock.
+    fn in_pages(&self, bytes: &std::ops::Range<u64>) -> Option<Vec<std::ops::Range<u64>>> {
+        if !self.guests.load(Ordering::Acquire) {
+            return None;
+        }
+        let paged = self.paged.lock();
+        (!self.zeroed() && !paged.pages.is_empty()).then(|| paged.in_runs(bytes))
+    }
+
+    /// Whether [`Pages::in_pages`] finds any memory of `bytes`, read as it reads it, with nothing
+    /// collected; `None` where it answers `None`.
+    fn meets_pages(&self, bytes: &std::ops::Range<u64>) -> Option<bool> {
+        if !self.guests.load(Ordering::Acquire) {
+            return None;
+        }
+        let paged = self.paged.lock();
+        (!self.zeroed() && !paged.pages.is_empty()).then(|| paged.meets(bytes))
+    }
+
+    /// Whether a detach left the object in no memory since its last replace.
+    pub(crate) fn zeroed(&self) -> bool {
+        self.zeroed.load(Ordering::Acquire)
+    }
+}
+
 impl Backing {
     /// The attached backing of the runtime buffer `id`, over the memory it was made with;
     /// `read_only` for one made with `MTLResourceOptions` bit 24.
@@ -332,7 +445,7 @@ impl Backing {
             id: Some(id),
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
-            seen: Arc::default(),
+            pages: Arc::default(),
         }
     }
 
@@ -347,7 +460,7 @@ impl Backing {
             id: None,
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
-            seen: Arc::default(),
+            pages: Arc::default(),
         }
     }
 
@@ -362,9 +475,7 @@ impl Backing {
     /// that, the process ends here ([`refused_detach`]), and where it answers NO, a command buffer
     /// completing as the detach is made having taken the object, it stays attached. A buffer
     /// neither replaced nor made over memory of the caller's by `newBufferWithDescriptor:` dies
-    /// here ([`unmeasured_detach`]). The commands' uses of its pages are forgotten
-    /// ([`Seen::forget_uses`]): core detaches an object the guest discards, whose pages the guest
-    /// may give another object.
+    /// here ([`unmeasured_detach`]).
     pub(crate) fn detach(&self, detach: impl FnOnce() -> Result<bool, rt::Error>) {
         let Some(id) = self.id else {
             return;
@@ -410,8 +521,7 @@ impl Backing {
         }
         self.detached.store(true, Ordering::Release);
         DETACHED.lock().detached(id);
-        self.seen.forget_uses();
-        self.seen.zero();
+        self.pages.zero();
     }
 
     /// Where the object's `contents` stays while it is detached: the first byte of the alias of
@@ -419,7 +529,7 @@ impl Backing {
     /// was made over, which it had when it was detached ([`Backing::detach`]); `None` for one
     /// attached, whose runtime object answers.
     pub(crate) fn kept_contents(&self) -> Option<NonNull<u8>> {
-        if !self.seen.zeroed() {
+        if !self.pages.zeroed() {
             return None;
         }
         let aliased = self.alias.lock();
@@ -436,7 +546,7 @@ impl Backing {
         let kept = alias.as_ref().is_some_and(|alias| alias.writes_kept());
         self.alias.lock().last = alias;
         crate::gpu::writes::set_kept(&self.kept, kept);
-        self.seen.set_pages(pages(ranges));
+        self.pages.set(pages(ranges));
     }
 
     /// The object, a no-copy buffer, was made over `own`, memory of the caller's.
@@ -455,14 +565,14 @@ impl Backing {
     /// the runtime imports the memory it lies in through a writable twin of read-only pages (on
     /// Linux, [`crate::os::TWINS_READ_ONLY`]); not while it is detached, in no memory.
     pub(crate) fn writes_kept(&self) -> bool {
-        self.kept.load(Ordering::Acquire) && !self.seen.zeroed()
+        self.kept.load(Ordering::Acquire) && !self.pages.zeroed()
     }
 
     /// [`Backing::writes_kept`], asked again as work that may write through the object is
     /// encoded ([`crate::gpu::writes::Kept`]).
     pub(crate) fn kept(&self) -> crate::gpu::writes::Kept {
         match self.writes_kept() {
-            true => crate::gpu::writes::Kept::Until(Arc::clone(&self.seen)),
+            true => crate::gpu::writes::Kept::Until(Arc::clone(&self.pages)),
             false => crate::gpu::writes::Kept::No,
         }
     }
@@ -470,18 +580,18 @@ impl Backing {
     /// The host memory of the object's bytes `bytes` in the guest's pages its memory is over now,
     /// as the host maps them (each a first byte and an end): those of its last replace, or of the
     /// address ranges a heap was made over; `None` for one over memory of its own, or detached,
-    /// whose writes reach no guest page ([`Seen::in_pages`]).
+    /// whose writes reach no guest page ([`Pages::in_pages`]).
     pub(crate) fn in_pages(
         &self,
         bytes: &std::ops::Range<u64>,
     ) -> Option<Vec<std::ops::Range<u64>>> {
-        self.seen.in_pages(bytes)
+        self.pages.in_pages(bytes)
     }
 
     /// Whether [`Backing::in_pages`] finds any memory of `bytes`, with nothing collected
-    /// ([`Seen::meets_pages`]).
+    /// ([`Pages::meets_pages`]).
     pub(crate) fn meets_pages(&self, bytes: &std::ops::Range<u64>) -> Option<bool> {
-        self.seen.meets_pages(bytes)
+        self.pages.meets_pages(bytes)
     }
 
     /// Whether a detach detaches the object: a buffer not placed in a heap, or a heap made over
@@ -501,9 +611,7 @@ impl Backing {
     /// ranges [`gather`] cannot alias, as Metal answers; else `rebind` gives the runtime's object
     /// the alias, and YES. The alias is freed by its keep-alive, which a refused `rebind` drops
     /// at once. A no-copy buffer's first YES runs its deallocator inside the call, as Metal's
-    /// does, where the runtime let go of the memory it was made over ([`Held`]). A YES dies where
-    /// the new pages bring a texture a heap keeps apart and another object over the same pages
-    /// together ([`crate::gpu::over_pages::moved`]).
+    /// does, where the runtime let go of the memory it was made over ([`Held`]).
     pub(crate) fn replace(
         &self,
         ranges: &[ResourceAddressRange],
@@ -525,7 +633,7 @@ impl Backing {
             let mut aliased = self.alias.lock();
             crate::gpu::writes::set_kept(&self.kept, alias.writes_kept());
             aliased.last = Some(alias);
-            self.seen.set_pages(pages(ranges));
+            self.pages.set(pages(ranges));
             aliased.own.take()
         };
         // The memory the buffer was made over goes now, inside the call, as Metal's does.
@@ -536,7 +644,6 @@ impl Backing {
         if let Some(id) = self.id {
             DETACHED.lock().attached(id);
         }
-        crate::gpu::over_pages::moved(REPLACE, &self.seen);
         Ok(true)
     }
 }
@@ -2023,5 +2130,90 @@ mod tests {
         assert!(d.fails(buffer, sent), "committed");
         d.closed(sent);
         assert!(d.open.is_empty() && d.released.is_empty());
+    }
+
+    /// The length of a run of pages in [`Pages`]' tests.
+    const RUN: u64 = 0x4000;
+
+    /// Whether an object's bytes meet its pages is what its memory there answers: none over memory
+    /// of its own, whether any of them lie in its pages, and none once a detach zeroes it, until
+    /// a replace gives it pages again
+    #[test]
+    fn meeting_pages_is_whether_the_bytes_lie_in_them() {
+        let pages = Arc::new(Pages::default());
+        let all = [
+            0..0,
+            0..1,
+            0..RUN,
+            RUN - 1..RUN + 1,
+            2 * RUN..3 * RUN,
+            3 * RUN..4 * RUN,
+        ];
+        let agree = |pages: &Pages| {
+            for bytes in &all {
+                let memory = pages.in_pages(bytes).map(|ranges| !ranges.is_empty());
+                assert_eq!(pages.meets_pages(bytes), memory, "{bytes:x?}");
+            }
+        };
+        agree(&pages);
+        assert_eq!(pages.meets_pages(&(0..RUN)), None);
+        pages.set(vec![
+            0x10_0000..0x10_0000 + RUN,
+            0x30_0000..0x30_0000 + 2 * RUN,
+        ]);
+        agree(&pages);
+        assert_eq!(pages.meets_pages(&(RUN - 1..RUN + 1)), Some(true));
+        assert_eq!(pages.meets_pages(&(3 * RUN..4 * RUN)), Some(false));
+        pages.zero();
+        agree(&pages);
+        assert_eq!(pages.meets_pages(&(0..RUN)), None);
+        pages.set(vec![0x50_0000..0x50_0000 + RUN]);
+        agree(&pages);
+        assert_eq!(pages.meets_pages(&(0..1)), Some(true));
+    }
+
+    /// An object's bytes are found in its pages by a search from the run that holds their first
+    /// byte, as a walk of the runs from the first finds them: in each run they reach, in order, at
+    /// each run's edges, past their end, over runs of no length, and for no bytes; and they meet
+    /// the pages where that finds any
+    #[test]
+    fn bytes_in_pages_are_found_by_a_search_as_by_a_walk() {
+        let scattered: Vec<std::ops::Range<u64>> = (0..64u64)
+            .map(|i| {
+                let at = 0x100_0000 + ((i * 37) % 64) * 2 * RUN;
+                at..at + RUN * (1 + i % 3)
+            })
+            .collect();
+        let lists = [
+            vec![
+                0x10_000..0x14_000,
+                0x50_000..0x50_000,
+                0x40_000..0x48_000,
+                0x20_000..0x24_000,
+            ],
+            vec![0x10_000..0x14_000],
+            vec![0x50_000..0x50_000],
+            vec![],
+            scattered,
+        ];
+        for runs in lists {
+            let paged = Paged::of(runs.clone());
+            let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
+            let mut edges = vec![0, 1, 0x3fff, 0x4000, 0x4001, 0xbfff, 0xc000, 0xffff];
+            edges.extend([total.saturating_sub(1), total, total + 1]);
+            edges.extend((1..12).map(|i| i * total / 11 + i % 3));
+            for &start in &edges {
+                for &end in &edges {
+                    let bytes = start..end;
+                    let walked = crate::os::in_runs(&runs, &bytes);
+                    assert_eq!(
+                        paged.meets(&bytes),
+                        !walked.is_empty(),
+                        "{runs:x?} {bytes:x?}"
+                    );
+                    assert_eq!(paged.in_runs(&bytes), walked, "{runs:x?} {bytes:x?}");
+                }
+            }
+        }
     }
 }

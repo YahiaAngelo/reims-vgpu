@@ -131,7 +131,7 @@ use crate::answer::{
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_value;
-use crate::gpu::resource::{Named, VulkanBuffer, VulkanComputePipeline, VulkanRenderPipeline};
+use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline, VulkanRenderPipeline};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// The address Metal's patch and control-point index getters answer for a nil buffer (measured:
@@ -1959,44 +1959,6 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     /// runtime's setter drops. A nil buffer the record holds at its offset (the module docs).
     fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        // Each buffer named, with the bytes an indexed draw's indices take
-        // ([`crate::gpu::encode_render::indices`]); all of any other.
-        let named: Vec<Named<'_>> = match cmd {
-            IcbRenderCmd::DrawIndexedPatches {
-                patch_index_buffer,
-                control_point_index_buffer,
-                buffer,
-                ..
-            } => vec![
-                (patch_index_buffer, None),
-                (control_point_index_buffer, None),
-                (buffer, None),
-            ],
-            IcbRenderCmd::DrawPatches {
-                patch_index_buffer,
-                buffer,
-                ..
-            } => vec![(patch_index_buffer, None), (buffer, None)],
-            IcbRenderCmd::DrawIndexedPrimitives {
-                index_count,
-                index_type,
-                index_buffer,
-                index_buffer_offset,
-                ..
-            } => vec![(
-                index_buffer,
-                crate::gpu::encode_render::indices(index_type, index_buffer_offset, index_count),
-            )],
-            IcbRenderCmd::SetFragmentBuffer { buffer, .. }
-            | IcbRenderCmd::SetVertexBuffer { buffer, .. }
-            | IcbRenderCmd::SetVertexBufferAttributeStride { buffer, .. } => vec![(buffer, None)],
-            _ => Vec::new(),
-        };
-        for (buffer, bytes) in named {
-            if let Some(buffer) = buffer {
-                buffer.used(sel, bytes);
-            }
-        }
         let c = &self.raw;
         match cmd {
             IcbRenderCmd::ClearBarrier => set(sel, || c.clear_barrier()),
@@ -2355,17 +2317,6 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     /// render command's are.
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        if let IcbComputeCmd::SetKernelBuffer {
-            buffer: Some(buffer),
-            ..
-        }
-        | IcbComputeCmd::SetKernelBufferAttributeStride {
-            buffer: Some(buffer),
-            ..
-        } = cmd
-        {
-            buffer.used(sel, None);
-        }
         let c = &self.raw;
         match cmd {
             IcbComputeCmd::ClearBarrier => set(sel, || c.clear_barrier()),

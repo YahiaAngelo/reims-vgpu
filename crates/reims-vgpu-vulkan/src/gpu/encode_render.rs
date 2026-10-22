@@ -228,7 +228,7 @@ use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Regions;
-use crate::gpu::resource::{Named, RenderDescriptor, VulkanBuffer, VulkanTexture, reach};
+use crate::gpu::resource::{RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
@@ -1286,9 +1286,6 @@ pub(crate) fn open(
         );
     }
     let sources = descriptor.sources();
-    if let Some(visibility) = &sources.visibility {
-        visibility.used("renderCommandEncoderWithDescriptor:", None);
-    }
     if crate::os::TWINS_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
     {
@@ -1559,127 +1556,6 @@ enum Bind<'a> {
     /// The textures among resources made resident, the buffers among them, and whether they
     /// were made resident with write usage, with any of them lying in any memory.
     Used(Vec<Bound>, Vec<Bound>, bool),
-}
-
-/// Hands `each` the buffers `cmd` names, in order, each with the bytes it reaches where they are
-/// exact ([`crate::gpu::resource::Named`]): an indexed draw's indices ([`indices`]), the arguments
-/// of an indirect draw (`MTLDrawPrimitivesIndirectArguments` and `MTLDrawPatchIndirectArguments`,
-/// 16 bytes; `MTLDrawIndexedPrimitivesIndirectArguments`, 20) and an indirect execution range
-/// (`MTLIndirectCommandBufferExecutionRange`, 8); all of a bound buffer, of a patch or control
-/// point index buffer, of the indices of an indirect indexed draw, whose count the GPU reads, and
-/// of a buffer made resident. Each is a use of those bytes
-/// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>, mut each: impl FnMut(Named<'a>)) {
-    match *cmd {
-        RenderCmd::DrawIndexedPatchesIndirect {
-            patch_index_buffer,
-            control_point_index_buffer,
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => {
-            each((patch_index_buffer, None));
-            each((Some(control_point_index_buffer), None));
-            each((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
-        }
-        RenderCmd::DrawIndexedPatches {
-            patch_index_buffer,
-            control_point_index_buffer,
-            ..
-        } => {
-            each((patch_index_buffer, None));
-            each((Some(control_point_index_buffer), None));
-        }
-        RenderCmd::DrawIndexedPrimitives {
-            index_count,
-            index_type,
-            index_buffer,
-            index_buffer_offset,
-            ..
-        }
-        | RenderCmd::DrawIndexedPrimitivesInstances {
-            index_count,
-            index_type,
-            index_buffer,
-            index_buffer_offset,
-            ..
-        }
-        | RenderCmd::DrawIndexedPrimitivesBase {
-            index_count,
-            index_type,
-            index_buffer,
-            index_buffer_offset,
-            ..
-        } => each((
-            Some(index_buffer),
-            indices(index_type, index_buffer_offset, index_count),
-        )),
-        RenderCmd::DrawIndexedPrimitivesIndirect {
-            index_buffer,
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => {
-            each((Some(index_buffer), None));
-            each((Some(indirect_buffer), reach(indirect_buffer_offset, 20)));
-        }
-        RenderCmd::DrawPatchesIndirect {
-            patch_index_buffer,
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => {
-            each((patch_index_buffer, None));
-            each((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
-        }
-        RenderCmd::DrawPatches {
-            patch_index_buffer, ..
-        } => each((patch_index_buffer, None)),
-        RenderCmd::DrawPrimitivesIndirect {
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => each((Some(indirect_buffer), reach(indirect_buffer_offset, 16))),
-        RenderCmd::ExecuteCommandsIndirect {
-            indirect_range_buffer,
-            indirect_buffer_offset,
-            ..
-        } => each((
-            Some(indirect_range_buffer),
-            reach(indirect_buffer_offset, 8),
-        )),
-        RenderCmd::SetFragmentBuffer { buffer, .. }
-        | RenderCmd::SetTessellationFactorBuffer { buffer, .. }
-        | RenderCmd::SetVertexBuffer { buffer, .. } => each((buffer, None)),
-        RenderCmd::SetFragmentBuffers { buffers, .. }
-        | RenderCmd::SetTileBuffers { buffers, .. }
-        | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
-        | RenderCmd::SetVertexBuffers { buffers, .. } => {
-            buffers.iter().for_each(|&b| each((b, None)));
-        }
-        RenderCmd::UseResources { resources, .. }
-        | RenderCmd::UseResourcesStages { resources, .. } => {
-            crate::gpu::encode_compute::resident_buffers(resources)
-                .into_iter()
-                .for_each(each);
-        }
-        _ => {}
-    }
-}
-
-/// The bytes `count` indices of `index_type` read from `offset`: 2 each for
-/// `MTLIndexTypeUInt16` (0), 4 for `MTLIndexTypeUInt32` (1); all of the buffer for any other
-/// type, which the draw refuses. An indexed draw, the encoder's own and an indirect command's,
-/// reads from the offset's low 32 bits, as Metal's does: an offset of 2^32 + 16 into a buffer
-/// past 4 GiB reads the index at 16, where its validation checks the whole offset, as the
-/// runtime's refusals do.
-pub(crate) fn indices(index_type: u64, offset: u64, count: u64) -> Option<std::ops::Range<u64>> {
-    let size = match index_type {
-        0 => 2,
-        1 => 4,
-        _ => return None,
-    };
-    reach(offset & 0xffff_ffff, count.checked_mul(size)?)
 }
 
 /// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
@@ -2114,17 +1990,9 @@ fn resource<'a>(r: &'a ResourceRef<'a, VulkanPlatform>) -> rt::ResourceRef<'a> {
     }
 }
 
-/// Core's heaps, as the runtime's: a nil one is skipped, as Metal's encoder skips it. Each is
-/// made resident ([`crate::gpu::resource::HeapObject::made_resident`]).
-fn heaps<'a>(
-    sel: &'static str,
-    list: &[Option<&'a crate::gpu::resource::VulkanHeap>],
-) -> Vec<&'a rt::Heap> {
-    let list: Vec<&crate::gpu::resource::VulkanHeap> = list.iter().flatten().copied().collect();
-    for heap in &list {
-        heap.made_resident(sel);
-    }
-    list.into_iter().map(|h| &h.raw).collect()
+/// Core's heaps, as the runtime's: a nil one is skipped, as Metal's encoder skips it.
+fn heaps<'a>(list: &[Option<&'a crate::gpu::resource::VulkanHeap>]) -> Vec<&'a rt::Heap> {
+    list.iter().flatten().map(|h| &h.raw).collect()
 }
 
 /// The stages `useHeaps:count:` and `useResources:count:usage:` reach on a render encoder.
@@ -3054,11 +2922,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
     #[expect(clippy::too_many_lines, reason = "one arm per command")]
     fn encode(&self, _on: OnFault, cmd: RenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        named_buffers(&cmd, |(buffer, bytes)| {
-            if let Some(buffer) = buffer {
-                buffer.used(sel, bytes);
-            }
-        });
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
             && self.encoder.command_buffer().is_some()
@@ -3903,14 +3766,14 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.update_fence(fence, stages))
             }
             RenderCmd::UseHeaps { heaps: list } => {
-                let list = heaps(sel, list);
+                let list = heaps(list);
                 encoded(&mut |e| e.use_heaps(&list, VERTEX_AND_FRAGMENT))
             }
             RenderCmd::UseHeapsStages {
                 heaps: list,
                 stages,
             } => {
-                let list = heaps(sel, list);
+                let list = heaps(list);
                 let stages: RenderStages = metal_value(sel, "render stages", stages);
                 encoded(&mut |e| e.use_heaps(&list, stages))
             }
@@ -4592,16 +4455,6 @@ pub(crate) mod tests {
             assert_eq!(unkept_nan(format, 4, colour), four, "{case} at 4 samples");
             assert_eq!(unkept_nan(format, 1, colour), one, "{case} at 1");
         }
-    }
-
-    /// An indexed draw's indices are read from its offset's low 32 bits, as Metal's are
-    #[test]
-    fn indexed_draws_read_from_their_offsets_low_32_bits() {
-        assert_eq!(indices(1, (1 << 32) + 16, 2), Some(16..24));
-        assert_eq!(indices(0, (1 << 40) + 6, 3), Some(6..12));
-        assert_eq!(indices(1, 64, 1), Some(64..68));
-        assert_eq!(indices(2, (1 << 32) + 16, 1), None);
-        assert_eq!(indices(1, 0, u64::MAX), None);
     }
 
     /// Each private type's indices: the vertices of the public type's primitives, in order,

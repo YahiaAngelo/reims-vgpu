@@ -55,16 +55,6 @@
 //! then is not measured. An isolated task's detached buffers and heaps lie in aliases of their own,
 //! fresh at each attach ([`crate::gpu::backing`]), never there.
 //!
-//! **Core's mappings of the guest's pages** ([`GuestMappings`]): every remap through [`VulkanVm`]
-//! is one of core's memory map's guest pages, which it maps afresh for a no-copy buffer over a
-//! task's pages (the transfer buffers of paged textures and buffers, a legacy heap's, the XR10
-//! plane views' and a task's shared buffers without detach backing). Heaps and buffers over
-//! address ranges and surfaces over the guest's pages name those pages by the memory map's own
-//! host addresses, where a mapping names them by its own. [`VulkanVm`] keeps which of its ranges
-//! show which pages, from the remap to the unmap, so [`crate::gpu::over_pages`] can name a
-//! buffer's bytes in such a mapping by the memory map's addresses ([`as_guests`]), and keep a
-//! command's uses of them ([`shows_guest_pages`]).
-//!
 //! **Unmaps an import waits for** ([`UnmapHold`]). The runtime runs a no-copy buffer's
 //! deallocator, given with a keep-alive, as the buffer is released, Metal's moment, and then
 //! frees the device's import of its pages (`vkFreeMemory`), dropping the keep-alive after that.
@@ -126,7 +116,9 @@
 //! live no-copy buffers the runtime imported, 40 to 62 ns per `deallocate` and 57 to 70 ns per
 //! wrapped `mapMemory` or `unmapMemory`, beside the host's own call.
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -174,15 +166,20 @@ fn length_pages(addr: HostAddr, len: u64, page: u64) -> (HostPtr, u64) {
     (HostPtr::from_addr(first.to_usize()), length)
 }
 
-/// Core's mappings of the guest's pages (module docs): each run of a mapping's host bytes, keyed
-/// by its first byte, with its end and the first byte of the pages it shows, as the memory map
-/// names them. The runs share no byte. A leaf lock: nothing is called under it.
+/// Core's mappings of the guest's pages, for tests ([`guest_mappings_of`]): every remap through
+/// [`VulkanVm`] is one of core's memory map's guest pages, which it maps afresh for a no-copy
+/// buffer over a task's pages. Each run of a mapping's host bytes, keyed by its first byte, with
+/// its end and the first byte of the pages it shows, as the memory map names them, from the remap
+/// to the unmap. The runs share no byte. A leaf lock: nothing is called under it.
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct GuestMappings(BTreeMap<u64, (u64, u64)>);
+struct GuestMappings(BTreeMap<u64, (u64, u64)>);
 
 /// The process's [`GuestMappings`], which [`VulkanVm`] keeps.
+#[cfg(test)]
 static GUEST_MAPPINGS: Mutex<GuestMappings> = Mutex::new(GuestMappings::new());
 
+#[cfg(test)]
 impl GuestMappings {
     /// None.
     const fn new() -> GuestMappings {
@@ -228,65 +225,6 @@ impl GuestMappings {
             }
         }
     }
-
-    /// `memory`'s ranges named by the memory map's addresses where they lie in a mapping, each
-    /// cut where a run starts or ends; any other byte as it is. Each range takes one lookup, of
-    /// the run holding its first byte, and then walks the runs after it in order: a surface over
-    /// scattered guest pages meets a run a page.
-    fn named(&self, memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
-        if self.0.is_empty() {
-            return memory;
-        }
-        let mut named = Vec::with_capacity(memory.len());
-        for range in memory {
-            let mut at = range.start;
-            if at >= range.end {
-                continue;
-            }
-            if let Some((first, end, source)) = self.holding(at) {
-                let to = end.min(range.end);
-                named.push(source + (at - first)..source + (to - first));
-                at = to;
-            }
-            for (&first, &(end, source)) in self.0.range(at..) {
-                if at >= range.end || first >= range.end {
-                    break;
-                }
-                if at < first {
-                    named.push(at..first);
-                    at = first;
-                }
-                let to = end.min(range.end);
-                named.push(source + (at - first)..source + (to - first));
-                at = to;
-            }
-            if at < range.end {
-                named.push(at..range.end);
-            }
-        }
-        named
-    }
-
-    /// Whether a byte of `memory` lies in a mapping.
-    fn shows(&self, memory: &Range<u64>) -> bool {
-        self.holding(memory.start).is_some()
-            || (self.0.range(memory.start..).next()).is_some_and(|(&first, _)| first < memory.end)
-    }
-}
-
-/// `memory`'s ranges named as the memory map names the guest's pages, where they lie in one of
-/// core's mappings of them, so that they meet the ranges of a heap or buffer over the same pages
-/// (module docs); any other byte as it is.
-pub(crate) fn as_guests(memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
-    GUEST_MAPPINGS.lock().named(memory)
-}
-
-/// Whether a byte of the `length` bytes at `first` lies in one of core's mappings of the
-/// guest's pages.
-pub(crate) fn shows_guest_pages(first: HostPtr, length: u64) -> bool {
-    let first = first.addr().to_u64();
-    let memory = first..first.saturating_add(length);
-    !memory.is_empty() && GUEST_MAPPINGS.lock().shows(&memory)
 }
 
 /// The process's holds on pages runtime imports cover, and the unmaps that wait for them
@@ -370,15 +308,14 @@ impl VulkanVm {
         }
     }
 
-    /// Reports `length` pages at `at`, which a call changed, and which show none of the guest's
-    /// pages from now on unless a remap says so after ([`GuestMappings`]): their range. None
-    /// reports nothing.
+    /// Reports `length` pages at `at`, which a call changed: their range. None reports nothing.
     fn changed(&self, (at, length): (HostPtr, u64)) -> Range<u64> {
         let first = at.addr().to_u64();
         let changed = first..first.saturating_add(length);
         if changed.is_empty() {
             return changed;
         }
+        #[cfg(test)]
         GUEST_MAPPINGS.lock().unmapped(changed.start, changed.end);
         (self.report)(at, length);
         changed
@@ -431,11 +368,11 @@ impl HostVm for VulkanVm {
         // The kernel maps as many of the source's pages, from the page of its first byte.
         let replaced = self.changed(length_pages(dst, len, self.page_size()));
         HOLDS.lock().replaced(&replaced);
-        // Those pages are one of core's mappings of the guest's (module docs).
-        let (source, _) = length_pages(src, len, self.page_size());
-        GUEST_MAPPINGS
-            .lock()
-            .mapped(replaced.start, replaced.end, source.addr().to_u64());
+        #[cfg(test)]
+        {
+            let (source, _) = length_pages(src, len, self.page_size());
+            (GUEST_MAPPINGS.lock()).mapped(replaced.start, replaced.end, source.addr().to_u64());
+        }
         Ok(at)
     }
 
@@ -642,136 +579,6 @@ mod tests {
         for (range, length) in [(view, 2 * page), (at, 2 * page), (anonymous, page)] {
             assert!(vm.deallocate(range, length).is_success());
         }
-    }
-
-    /// A mapping's runs name its bytes by the pages they show, cut where a run starts or ends,
-    /// and any other byte as it is; an unmap of part of a run keeps the rest, and a map over a
-    /// run replaces it; a mapping of a mapping names the first's pages
-    #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
-    fn guest_mappings_name_the_pages_they_show() {
-        let mut m = GuestMappings::new();
-        assert_eq!(m.named(vec![0x1000..0x2000]), [0x1000..0x2000]);
-        m.mapped(0x10_0000, 0x10_8000, 0x90_0000);
-        assert_eq!(m.named(vec![0x10_1000..0x10_1010]), [0x90_1000..0x90_1010]);
-        assert_eq!(
-            m.named(vec![0xf_c000..0x10_4000, 0x10_6000..0x10_a000]),
-            [
-                0xf_c000..0x10_0000,
-                0x90_0000..0x90_4000,
-                0x90_6000..0x90_8000,
-                0x10_8000..0x10_a000
-            ]
-        );
-        assert!(m.shows(&(0xf_c000..0x10_0001)));
-        assert!(!m.shows(&(0xf_c000..0x10_0000)));
-        assert!(!m.shows(&(0x10_8000..0x10_9000)));
-        m.unmapped(0x10_2000, 0x10_4000);
-        assert_eq!(
-            m.named(vec![0x10_1000..0x10_5000]),
-            [
-                0x90_1000..0x90_2000,
-                0x10_2000..0x10_4000,
-                0x90_4000..0x90_5000
-            ]
-        );
-        m.mapped(0x10_4000, 0x10_6000, 0x70_0000);
-        assert_eq!(
-            m.named(vec![0x10_4000..0x10_7000]),
-            [0x70_0000..0x70_2000, 0x90_6000..0x90_7000]
-        );
-        m.mapped(0x20_0000, 0x20_1000, 0x10_1000);
-        assert_eq!(m.named(vec![0x20_0000..0x20_0010]), [0x90_1000..0x90_1010]);
-        m.unmapped(0, u64::MAX);
-        assert_eq!(m.named(vec![0x10_1000..0x10_1010]), [0x10_1000..0x10_1010]);
-        assert!(m.0.is_empty());
-    }
-
-    /// A walk of the runs names each range as a lookup of the run at each byte does, over runs a
-    /// page apart and adjacent, with gaps, and ranges that start, end or lie inside a run or a
-    /// gap
-    #[test]
-    fn guest_mappings_name_by_one_walk_as_by_lookups() {
-        /// `memory` named by a lookup at each byte, as `named` once did.
-        fn looked_up(m: &GuestMappings, memory: &[Range<u64>]) -> Vec<Range<u64>> {
-            let mut named = Vec::new();
-            for range in memory {
-                let mut at = range.start;
-                while at < range.end {
-                    match m.holding(at) {
-                        Some((first, end, source)) => {
-                            let to = end.min(range.end);
-                            named.push(source + (at - first)..source + (to - first));
-                            at = to;
-                        }
-                        None => {
-                            let next = m.0.range(at..).next().map(|(&first, _)| first);
-                            let to = next.unwrap_or(u64::MAX).min(range.end);
-                            named.push(at..to);
-                            at = to;
-                        }
-                    }
-                }
-            }
-            named
-        }
-        let page = 0x4000;
-        let mut m = GuestMappings::new();
-        // 64 pages, each its own run, sources scattered; every eighth page unmapped.
-        for i in 0..64u64 {
-            if i % 8 != 7 {
-                let at = 0x100_0000 + i * page;
-                m.mapped(at, at + page, 0x900_0000 + ((i * 37) % 64) * page);
-            }
-        }
-        let mut ranges = vec![0x100_0000..0x100_0000 + 64 * page, 0xff_0000..0x101_0000];
-        for (start, length) in [
-            (0, 1),
-            (0x10, 0x30),
-            (page - 1, 2),
-            (7 * page, page),
-            (6 * page + 1, 3 * page),
-        ] {
-            ranges.push(0x100_0000 + start..0x100_0000 + start + length);
-        }
-        ranges.push(0x100_0000 + 70 * page..0x100_0000 + 71 * page);
-        ranges.push(0x100_0000 + 5..0x100_0000 + 5);
-        for range in &ranges {
-            assert_eq!(
-                m.named(vec![range.clone()]),
-                looked_up(&m, std::slice::from_ref(range)),
-                "{range:x?}"
-            );
-        }
-        assert_eq!(m.named(ranges.clone()), looked_up(&m, &ranges));
-    }
-
-    /// The platform's remap names its range by the source's pages from the remap, and a
-    /// deallocate of the range ends it: a buffer over it then lies over memory of its own
-    #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
-    fn a_remap_names_its_range_by_the_sources_pages() {
-        let vm = VulkanVm {
-            vm: OsVm::new(),
-            report: seen,
-        };
-        let page = vm.page_size();
-        let source = crate::os::allocate_aliasable(2 * page).unwrap();
-        let first = source.addr().to_u64();
-        let at = vm.allocate_anywhere(page).unwrap();
-        let mapped = at.addr().to_u64();
-        assert_eq!(as_guests(vec![mapped..mapped + 16]), [mapped..mapped + 16]);
-        assert!(!shows_guest_pages(at, 16));
-        vm.remap_shared_overwrite(at, source.wrapping_add(page), page)
-            .unwrap();
-        let named = first + page;
-        assert_eq!(as_guests(vec![mapped..mapped + 16]), [named..named + 16]);
-        assert!(shows_guest_pages(at.wrapping_add(8), 1));
-        assert!(vm.deallocate(at, page).is_success());
-        assert_eq!(as_guests(vec![mapped..mapped + 16]), [mapped..mapped + 16]);
-        assert!(!shows_guest_pages(at, 16));
-        assert!(OsVm::new().deallocate(source, 2 * page).is_success());
-        take();
     }
 
     /// What the host's fake blocks were called with, in order.

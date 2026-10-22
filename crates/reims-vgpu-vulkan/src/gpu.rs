@@ -1,7 +1,6 @@
 //! The runtime's GPU objects: the device's queries and creators ([`device`]), capabilities
 //! ([`caps`]) and pixel format descriptions ([`format_info`]), resources and state objects
-//! ([`resource`]) and the guest's pages under them ([`backing`]), with the textures kept apart
-//! over those pages ([`over_pages`]), the descriptors ([`desc`]) and
+//! ([`resource`]) and the guest's pages under them ([`backing`]), the descriptors ([`desc`]) and
 //! Apple's serialized pipeline descriptors ([`serialized`]), the
 //! encoders, the indirect command buffers, rate maps, the command queue and buffer, and the
 //! events; the pipeline states' unique identifiers ([`unique_id`]), which the runtime has none
@@ -35,7 +34,6 @@ mod frame_cost;
 pub mod icb;
 pub mod metal_space;
 pub mod no_texture;
-pub mod over_pages;
 #[cfg(test)]
 mod paging_discard;
 pub mod predication;

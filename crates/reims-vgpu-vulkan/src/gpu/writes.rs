@@ -32,7 +32,7 @@ use metal2vulkan::pipeline::ComputePipelineDescriptor;
 use reims_vgpu_core::num::ToU64;
 
 use crate::answer::plain;
-use crate::gpu::over_pages::Seen;
+use crate::gpu::backing::Pages;
 use crate::gpu::resource::{BufferObject, HeapObject, RenderDescriptor, TextureObject, Under};
 use crate::os::OsSurface;
 
@@ -67,7 +67,7 @@ pub enum Kept {
     /// It does until a detach leaves the object, a buffer or heap, in no memory
     /// ([`crate::gpu::backing::Backing::writes_kept`]); no replace gives it other memory while
     /// work encoded holds it, as the runtime refuses the replace (`crate::gpu::backing`).
-    Until(Arc<Seen>),
+    Until(Arc<Pages>),
 }
 
 impl Kept {
@@ -81,7 +81,7 @@ impl Kept {
         match self {
             Kept::No => false,
             Kept::Always => true,
-            Kept::Until(seen) => !seen.zeroed(),
+            Kept::Until(pages) => !pages.zeroed(),
         }
     }
 }
@@ -464,11 +464,6 @@ pub(crate) fn heap_bytes_memory(h: &HeapObject, bytes: Range<u64>) -> Memory {
         h.backing.in_pages(&bytes).unwrap_or_default(),
         h.backing.kept(),
     )
-}
-
-/// The host memory all of `h`'s bytes lie in ([`heap_bytes_memory`]).
-pub(crate) fn heap_memory(h: &HeapObject) -> Memory {
-    heap_bytes_memory(h, 0..plain(|| h.raw.size()))
 }
 
 /// The slots of one stage's function that it may write, by its pipeline's reflection: each

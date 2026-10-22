@@ -11,7 +11,6 @@
 //! buffer, so it holds no reference of the surface.
 
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
@@ -58,14 +57,6 @@ pub struct BufferObject {
     /// The heap it is placed in, which its detach detaches, held while it lives
     /// ([`crate::gpu::backing`]).
     pub heap: Option<VulkanHeap>,
-    /// The epoch of the pages of the heap or buffer its bytes lie in, plus one, at which a use of
-    /// all of it was last kept ([`crate::gpu::over_pages::used`]); 0 for none.
-    pub kept_whole: AtomicU64,
-    /// Whether it was made over the guest's pages, which no replace gave it: on a surface made
-    /// over them ([`crate::os::over_guest_pages`]), or over one of core's mappings of them, a
-    /// no-copy buffer core makes over a task's pages ([`crate::remap::shows_guest_pages`]). Read
-    /// once, as it is made: a surface's pages, and a mapping's, stay while the buffer lives.
-    pub over_guest_pages: bool,
     /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
     /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`). Read once, as it is made, as
     /// commands ask it at every dispatch and pass: the buffer holds the surface, and a live
@@ -80,38 +71,6 @@ pub struct BufferObject {
 
 /// `id<MTLBuffer>`.
 pub type VulkanBuffer = Obj<BufferObject>;
-
-/// A buffer a command names, and the bytes of it the command reaches where they are known: `None`
-/// for all of them, as for a bind, whose reach a shader decides ([`BufferObject::used`]).
-pub(crate) type Named<'a> = (Option<&'a VulkanBuffer>, Option<std::ops::Range<u64>>);
-
-/// The `length` bytes from `offset`, a command's reach of a buffer; `None`, all of the buffer,
-/// past `u64::MAX`.
-pub(crate) fn reach(offset: u64, length: u64) -> Option<std::ops::Range<u64>> {
-    offset.checked_add(length).map(|end| offset..end)
-}
-
-impl BufferObject {
-    /// A command's use `sel` of the buffer's bytes `bytes`, all of them where `bytes` is `None`,
-    /// as for a bind, whose reach a shader decides. It dies where they lie over the guest's pages
-    /// under a texture of a heap nothing may share a byte with that lives
-    /// ([`crate::gpu::over_pages`]). The use is kept where the buffer is over the guest's pages:
-    /// given them by a replace, or made over them ([`BufferObject::over_guest_pages`]).
-    pub(crate) fn used(&self, sel: &'static str, bytes: Option<std::ops::Range<u64>>) {
-        // A placed buffer's bytes lie in its heap's, whose use it is.
-        let owner = self
-            .heap
-            .as_ref()
-            .map_or(&self.backing, |heap| &heap.backing);
-        let guests = self.over_guest_pages || owner.seen.guests();
-        let whole = bytes.is_none().then_some(&self.kept_whole);
-        let keep = guests && !owner.is_detached();
-        crate::gpu::over_pages::used(sel, &owner.seen, keep, whole, || {
-            let bytes = bytes.unwrap_or_else(|| 0..plain(|| self.raw.length()));
-            crate::gpu::writes::buffer_bytes_memory(self, bytes).ranges
-        });
-    }
-}
 
 /// A runtime texture, with the device that made it and what it is over.
 #[derive(Debug)]
@@ -284,8 +243,7 @@ pub(crate) fn read_only_usage(desc: &mut rt::TextureDescriptor) -> u64 {
 }
 
 impl TextureObject {
-    /// The texture's life as [`Placements`] and [`crate::gpu::over_pages`] read it, which neither
-    /// revives: its [`space`](TextureObject::space), which every view of it shares, views of views
+    /// The texture's life as [`Placements`] reads it, which it does not revive: its [`space`](TextureObject::space), which every view of it shares, views of views
     /// included ([`Hold::sharing`]), so its bytes stay taken while it or a view of it lives, as a
     /// Metal view's `parentTexture` keeps the texture and its bytes. A texture on a surface's
     /// lasts until the runtime frees the buffer under it too, whose range token holds it, once
@@ -473,8 +431,7 @@ pub struct HeapObject {
 /// A depth or stencil texture made in a legacy heap dies, and a colour texture whose bytes there
 /// a stated rule does not show are Metal's is announced, once per device: core's copies through
 /// the heap's private buffer carry those bytes to and from the guest's pages
-/// ([`HeapObject::legacy_made`]). Objects of other heaps and buffers over the same guest's pages
-/// meet a texture kept apart through those pages: [`crate::gpu::over_pages`] decides them.
+/// ([`HeapObject::legacy_made`]).
 #[derive(Debug, Default)]
 pub struct Placements {
     /// Its textures nothing may share a byte with, and why.
@@ -560,39 +517,6 @@ impl Alone {
                  with it lives, which shows the bytes the runtime leaves in the heap for the \
                  texture, as the guest's pages under a heap over them do, where Metal's are its \
                  own, the texture {}",
-                self.reason()
-            ),
-        )
-    }
-
-    /// The death at `sel` of a command's use of bytes, or a texture made or placed over them,
-    /// that lie over the guest's pages under such a texture of another heap that lives, or of
-    /// such a texture placed over pages another heap's, a buffer's or a surface's texture lies
-    /// over, or of a replace that brings them together ([`crate::gpu::over_pages`]).
-    pub(crate) fn dies_over_pages(self, sel: &'static str) -> ! {
-        unrepresentable(
-            sel,
-            &format!(
-                "bytes over the guest's pages that a texture of a heap over them lies over while \
-                 it lives, used by a command or under a texture made over another buffer's, \
-                 heap's or surface's bytes, or such a texture placed over pages another buffer's, \
-                 heap's or surface's texture lies over, or a replace of a heap's or buffer's \
-                 backing that brings them together, the texture {}",
-                self.reason()
-            ),
-        )
-    }
-
-    /// The death at `sel` of such a texture placed over the guest's pages, or brought over them
-    /// by a replace, that a command used through another heap or a buffer since that one took
-    /// them ([`crate::gpu::over_pages`]).
-    pub(crate) fn dies_over_used_pages(self, sel: &'static str) -> ! {
-        unrepresentable(
-            sel,
-            &format!(
-                "a texture of a heap over the guest's pages placed over pages, or brought over \
-                 them by a replace of its heap's backing, that a command used through another \
-                 heap or a buffer since that one took them, the texture {}",
                 self.reason()
             ),
         )
@@ -959,16 +883,6 @@ impl HeapObject {
         }
     }
 
-    /// `useHeaps:` (`sel`) of the heap: it dies where the heap's bytes lie over the guest's pages
-    /// under a texture of another heap that [`Placements`] keeps apart
-    /// ([`crate::gpu::over_pages`]). No texture of its own is kept apart while its cover, core's
-    /// buffer over all of it, lives, which a task's argument buffers reach the heap through.
-    pub(crate) fn made_resident(&self, sel: &'static str) {
-        let keep = self.backing.seen.guests() && !self.backing.is_detached();
-        crate::gpu::over_pages::used(sel, &self.backing.seen, keep, None, || {
-            crate::gpu::writes::heap_memory(self).ranges
-        });
-    }
     /// `detachBacking`: detached from now on by the runtime, in no memory until a replace, for a
     /// heap made over address ranges ([`Backing::detach`]).
     pub(crate) fn detach(&self) {
@@ -1340,10 +1254,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             return Ok(None);
         };
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes.clone());
-        let texture = self.device.texture_in(raw, under, answered);
-        crate::gpu::over_pages::over_buffer(sel, self, bytes, texture.life());
-        Ok(Some(texture))
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
     /// A texture of the buffer's bytes from `offset`, rows `bytes_per_row` apart. Refused as
@@ -1375,10 +1287,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             return Ok(None);
         };
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes.clone());
-        let texture = self.device.texture_in(raw, under, answered);
-        crate::gpu::over_pages::over_buffer(sel, self, bytes, texture.life());
-        Ok(Some(texture))
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
     /// A detached no-copy buffer over an alias of the ranges, which total its length, from now
@@ -2048,11 +1958,8 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// every heap core makes ([`Placements`]). A 2- or 4-sample texture that Metal keeps losslessly
     /// compressed, whose image the runtime keeps apart from the heap's bytes, over the guest's
     /// pages or in a heap whose memory cannot hold its image (`heap-texture-lossless-layout`),
-    /// dies as it is made ([`crate::answer::HEARD`]). In
-    /// a heap over the guest's pages, a texture over the pages under such a texture of another
-    /// heap, and such a texture over pages another's texture lies over, die too
-    /// ([`crate::gpu::over_pages`]). So does, as it is placed or answered nil, a texture whose
-    /// layout in Metal's heaps the runtime does not model (a PVRTC format), placed by
+    /// dies as it is made ([`crate::answer::HEARD`]). So does, as it is placed or answered nil, a
+    /// texture whose layout in Metal's heaps the runtime does not model (a PVRTC format), placed by
     /// its device's image's size and alignment, larger or smaller than Metal's
     /// (`unmeasured-heap-texture-size`, [`crate::gpu::metal_space::unmeasured_size`]): no suite
     /// case or guest run places one. Its nil at an offset at or past the heap's end is Metal's,
@@ -2138,14 +2045,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     untiled.then_some(Alone::Untiled)
                 };
                 let object = texture.life();
-                plain(|| {
-                    self.placed
-                        .lock()
-                        .place(sel, bytes.clone(), object.clone(), alone)
-                });
-                if self.backing.detaches() {
-                    crate::gpu::over_pages::placed(sel, self, bytes, object, alone);
-                }
+                plain(|| self.placed.lock().place(sel, bytes, object, alone));
                 texture
             })
         })
@@ -4411,6 +4311,7 @@ pub(crate) mod tests {
     }
 
     /// [`heap_over_pages`]' heap, texture and offset, the heap over the pages at `address`.
+    #[cfg(target_os = "macos")]
     pub(crate) fn heap_over_pages_at<P: Platform>(
         p: &P,
         d: &P::Device,
@@ -4422,6 +4323,7 @@ pub(crate) mod tests {
     }
 
     /// [`heap_over_pages`]' texture of `heap`'s options, and the offset past its bytes.
+    #[cfg(target_os = "macos")]
     fn depth_stencil_of<P: Platform>(
         p: &P,
         d: &P::Device,
@@ -4453,430 +4355,6 @@ pub(crate) mod tests {
         let answer = d.heap_texture_size_and_align(&depth_stencil).unwrap();
         let beside = answer.size.next_multiple_of(answer.align.max(0x100));
         (depth_stencil, beside, answer.size)
-    }
-
-    /// Every command that names a buffer uses it: each names a buffer over all of a second heap
-    /// over the guest's pages under a texture of the first that the runtime does not lay out in
-    /// Metal's tiles (`heap-texture-untiled-layout`), the second heap's cover, while the texture
-    /// lives, and dies at its selector, naming the kind, before the runtime sees it: a compute
-    /// pass's binds, indirect dispatches, conditions, stage-in region, indirect execution range
-    /// and resources made resident, and `encodeEndDoWhile:`; a render pass's visibility buffer,
-    /// binds, indices, indirect arguments, patch index buffers, indirect execution range and
-    /// resources made resident; a blit's fill and copies; and an indirect command's binds and
-    /// indices. Making the second heap resident (`useHeaps:`) uses all of its bytes, and dies too
-    /// ([`crate::gpu::over_pages`])
-    #[test]
-    fn each_command_naming_a_buffer_over_an_untiled_textures_pages_dies() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-        use reims_vgpu_core::platform::icb::{
-            IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
-            IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-        use reims_vgpu_core::platform::types::MtlOrigin;
-        use reims_vgpu_core::platform::values::{ColorAttachmentSet, IcbDesc, PassSet};
-
-        let (p, d) = (platform(), dev());
-        let at = guest_pages();
-        let (heap, depth_stencil, _) = heap_over_pages_at(&p, &d, at);
-        let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-        let second = heap_at(&p, &d, at);
-        let options = second.resource_options();
-        let cover = second
-            .new_buffer_of_length(over_pages(), options, 0)
-            .unwrap()
-            .unwrap();
-        let other = d
-            .new_buffer_of_length(OnFault::Return, 0x1000, 0)
-            .unwrap()
-            .unwrap();
-        let target = d
-            .new_texture(
-                OnFault::Return,
-                &platform().texture_descriptor(&TextureDesc {
-                    pixel_format: 80,
-                    width: 16,
-                    height: 16,
-                    usage: 0x5,
-                    resource_options: Some(0x20),
-                    ..TextureDesc::default()
-                }),
-            )
-            .unwrap()
-            .unwrap();
-        let compute_icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 0x20,
-                    max_kernel_buffer_bind_count: 2,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let render_icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 0x3,
-                    max_vertex_buffer_bind_count: 2,
-                    max_fragment_buffer_bind_count: 2,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let covers = [Some(&cover)];
-        let (offsets, strides) = ([0u64], [4u64]);
-        let heaps = [Some(&second)];
-        let resources = [Some(ResourceRef::Buffer(&cover))];
-        let one = NsRange::new(0, 1);
-        let size = MtlSize::new(1, 1, 1);
-        let mut cases = 0;
-        let mut dies = |sel: &'static str, case: &str, run: &mut dyn FnMut()| {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(run).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, sel),
-                "{case}: {line}"
-            );
-            let pages = "bytes over the guest's pages that a texture of a heap over them lies over";
-            assert!(line.contains(pages), "{case}: {line}");
-            assert!(
-                line.contains("heap-texture-untiled-layout"),
-                "{case}: {line}"
-            );
-            cases += 1;
-        };
-
-        let compute = [
-            ComputeCmd::SetBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            ComputeCmd::SetBuffersAttributeStrides {
-                buffers: &covers,
-                offsets: &offsets,
-                strides: &strides,
-                range: one,
-            },
-            ComputeCmd::DispatchThreadgroupsIndirect {
-                indirect_buffer: Some(&cover),
-                indirect_buffer_offset: 0,
-                threads_per_threadgroup: size,
-            },
-            ComputeCmd::DispatchThreadsIndirect {
-                indirect_buffer: Some(&cover),
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::EncodeStartIf {
-                buffer: Some(&cover),
-                offset: 0,
-                comparison: 0,
-                reference_value: 0,
-            },
-            ComputeCmd::EncodeStartWhile {
-                buffer: Some(&cover),
-                offset: 0,
-                comparison: 0,
-                reference_value: 0,
-            },
-            ComputeCmd::SetStageInRegionIndirect {
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer: &compute_icb,
-                indirect_range_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::UseResources {
-                resources: &resources,
-                usage: 1,
-            },
-            ComputeCmd::UseHeaps { heaps: &heaps },
-        ];
-        for cmd in compute {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-        let end_do_while = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        dies(end_do_while, end_do_while, &mut || {
-            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-            e.encode(OnFault::Return, ComputeCmd::EncodeStartDoWhile)
-                .unwrap();
-            e.encode_end_do_while(Some(&cover), 0, 0, 0).unwrap();
-        });
-
-        let pass = |visibility: Option<&VulkanBuffer>| {
-            let pass = p.render_pass_descriptor();
-            let attachment = ColorAttachmentSet {
-                texture: Some(Some(&target)),
-                load_action: Some(2),
-                store_action: Some(1),
-                ..ColorAttachmentSet::default()
-            };
-            pass.set_color_attachment(OnFault::Die, 0, &attachment)
-                .unwrap();
-            if let Some(visibility) = visibility {
-                pass.set_pass(&PassSet {
-                    visibility_result_buffer: Some(Some(visibility)),
-                    ..PassSet::default()
-                });
-            }
-            pass
-        };
-        let visibility = "renderCommandEncoderWithDescriptor:";
-        dies(visibility, "a visibility buffer", &mut || {
-            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-            cb.render_encoder(OnFault::Return, &pass(Some(&cover)))
-                .unwrap();
-        });
-        let render = [
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetFragmentBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetTessellationFactorBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                instance_stride: 0,
-            },
-            RenderCmd::SetVertexBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::SetVertexBuffersAttributeStrides {
-                buffers: &covers,
-                offsets: &offsets,
-                strides: &strides,
-                range: one,
-            },
-            RenderCmd::SetFragmentBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::SetTileBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::DrawIndexedPrimitives {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-            },
-            RenderCmd::DrawIndexedPrimitivesInstances {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 1,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-                instance_count: 1,
-            },
-            RenderCmd::DrawIndexedPrimitivesBase {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-            RenderCmd::DrawIndexedPrimitivesIndirect {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer: &other,
-                index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawPrimitivesIndirect {
-                primitive_type: 3,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer: Some(&cover),
-                patch_index_buffer_offset: 0,
-                instance_count: 1,
-                base_instance: 0,
-            },
-            RenderCmd::DrawIndexedPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                control_point_index_buffer: &cover,
-                control_point_index_buffer_offset: 0,
-                instance_count: 1,
-                base_instance: 0,
-            },
-            RenderCmd::DrawPatchesIndirect {
-                number_of_patch_control_points: 3,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawIndexedPatchesIndirect {
-                number_of_patch_control_points: 3,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                control_point_index_buffer: &other,
-                control_point_index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer: &render_icb,
-                indirect_range_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::UseResources {
-                resources: &resources,
-                usage: 1,
-            },
-            RenderCmd::UseResourcesStages {
-                resources: &resources,
-                usage: 1,
-                stages: 3,
-            },
-            RenderCmd::UseHeaps { heaps: &heaps },
-            RenderCmd::UseHeapsStages {
-                heaps: &heaps,
-                stages: 3,
-            },
-        ];
-        for cmd in render {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.render_encoder(OnFault::Return, &pass(None));
-                let e = e.unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-
-        let blit = [
-            BlitCmd::FillBuffer {
-                buffer: &cover,
-                range: NsRange::new(0, 16),
-                value: 0,
-            },
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer: Some(&cover),
-                source_offset: 0,
-                destination_buffer: Some(&other),
-                destination_offset: 0,
-                size: 16,
-            },
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer: Some(&other),
-                source_offset: 0,
-                destination_buffer: Some(&cover),
-                destination_offset: 0,
-                size: 16,
-            },
-            BlitCmd::CopyBufferToTexture {
-                source_buffer: &cover,
-                source_offset: 0,
-                source_bytes_per_row: 64,
-                source_bytes_per_image: 1024,
-                source_size: MtlSize::new(16, 16, 1),
-                destination_texture: &target,
-                destination_slice: 0,
-                destination_level: 0,
-                destination_origin: MtlOrigin::default(),
-            },
-        ];
-        for cmd in blit {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-
-        let render_command = render_icb.render_command(0).unwrap().unwrap();
-        let icb_render = [
-            IcbRenderCmd::SetVertexBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            IcbRenderCmd::SetFragmentBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            IcbRenderCmd::DrawIndexedPrimitives {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: Some(&cover),
-                index_buffer_offset: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-        ];
-        for cmd in icb_render {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                render_command.encode(cmd.take().unwrap()).unwrap();
-            });
-        }
-        let compute_command = compute_icb.compute_command(0).unwrap().unwrap();
-        let kernel_buffer = IcbComputeCmd::SetKernelBuffer {
-            buffer: Some(&cover),
-            offset: 0,
-            index: 0,
-        };
-        let sel = kernel_buffer.selector();
-        let mut kernel_buffer = Some(kernel_buffer);
-        dies(sel, sel, &mut || {
-            compute_command
-                .encode(kernel_buffer.take().unwrap())
-                .unwrap();
-        });
-        assert_eq!(cases, 41, "every case ran");
-        drop((t, cover, second, heap));
     }
 
     /// A two-plane XR10 texture (550, 551) whose texels the runtime keeps apart from the heap's

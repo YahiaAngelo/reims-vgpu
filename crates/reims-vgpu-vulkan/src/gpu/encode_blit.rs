@@ -113,7 +113,7 @@ use crate::answer::{
 use crate::gpu::command::{CommandBufferObject, Failing, Progress, VulkanCommandBuffer};
 use crate::gpu::fill;
 use crate::gpu::metal_space::{self, FirstUse};
-use crate::gpu::resource::{Named, VulkanTexture, reach};
+use crate::gpu::resource::VulkanTexture;
 use crate::gpu::{origin, range, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -441,40 +441,6 @@ impl VulkanBlitEncoder {
     }
 }
 
-/// The buffers `cmd` copies from, copies into or fills, each with the bytes it reaches where
-/// they are exact: a fill's range and a copy between buffers' bytes; all of the buffer for a copy
-/// to or from a texture. Each is a use of those bytes
-/// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &BlitCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
-    match *cmd {
-        BlitCmd::CopyBufferToTexture { source_buffer, .. }
-        | BlitCmd::CopyTextureToBuffer {
-            destination_buffer: source_buffer,
-            ..
-        } => vec![(Some(source_buffer), None)],
-        BlitCmd::FillBufferPattern4 { buffer, range, .. }
-        | BlitCmd::FillBuffer { buffer, range, .. } => {
-            vec![(Some(buffer), reach(range.location, range.length))]
-        }
-        BlitCmd::CopyBufferToTextureOptions { source_buffer, .. }
-        | BlitCmd::CopyTextureToBufferOptions {
-            destination_buffer: source_buffer,
-            ..
-        } => vec![(source_buffer, None)],
-        BlitCmd::CopyBufferToBuffer {
-            source_buffer,
-            source_offset,
-            destination_buffer,
-            destination_offset,
-            size,
-        } => vec![
-            (source_buffer, reach(source_offset, size)),
-            (destination_buffer, reach(destination_offset, size)),
-        ],
-        _ => Vec::new(),
-    }
-}
-
 /// What a blit `cmd` writes: its destination's memory, as a bind keeps it
 /// ([`crate::gpu::writes::Bound`]).
 fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Bound {
@@ -667,11 +633,6 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        for (buffer, bytes) in named_buffers(&cmd) {
-            if let Some(buffer) = buffer {
-                buffer.used(sel, bytes);
-            }
-        }
         let written = written_memory(&cmd);
         if let Some(options) = self.aborts {
             metal_aborts(

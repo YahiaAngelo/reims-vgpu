@@ -519,17 +519,9 @@ impl VulkanDevice {
         })
     }
 
-    /// The handle of a buffer this device made, over `surface` when it was made on one, over the
-    /// guest's pages where `over_guest_pages` says so or the surface was made over them
-    /// ([`BufferObject::over_guest_pages`]).
-    pub(crate) fn buffer(
-        &self,
-        raw: rt::Buffer,
-        surface: Option<Arc<OsSurface>>,
-        over_guest_pages: bool,
-    ) -> VulkanBuffer {
+    /// The handle of a buffer this device made, over `surface` when it was made on one.
+    pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
         let id = raw.object_id();
-        let on_guest_pages = surface.as_deref().is_some_and(crate::os::over_guest_pages);
         let gpu_read_only = surface.as_deref().is_some_and(crate::os::gpu_read_only);
         Obj::new(BufferObject {
             raw,
@@ -537,8 +529,6 @@ impl VulkanDevice {
             surface,
             backing: Backing::new(false, id),
             heap: None,
-            kept_whole: std::sync::atomic::AtomicU64::new(0),
-            over_guest_pages: over_guest_pages || on_guest_pages,
             gpu_read_only,
         })
     }
@@ -552,8 +542,6 @@ impl VulkanDevice {
             surface: None,
             backing: Backing::fixed(),
             heap: Some(heap.clone_ref()),
-            kept_whole: std::sync::atomic::AtomicU64::new(0),
-            over_guest_pages: false,
             gpu_read_only: false,
         })
     }
@@ -856,11 +844,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         )
         .map(Option::flatten);
         keep_unrun(&made, slot);
-        // Core makes a task's no-copy buffers over its own mappings of the guest's pages.
-        let over_guest_pages = crate::remap::shows_guest_pages(bytes.ptr(), bytes.len());
         made.map(|b| {
             b.map(|raw| {
-                let buffer = self.buffer(raw, None, over_guest_pages);
+                let buffer = self.buffer(raw, None);
                 buffer.backing.imported(kept);
                 buffer
             })
@@ -915,7 +901,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let made =
             self.buffer_over_surface_at(sel, &surface, (placement, Some(token)), shares, nil)?;
         Ok(made.map(|raw| {
-            let buffer = self.buffer(raw, Some(surface), false);
+            let buffer = self.buffer(raw, Some(surface));
             if let rt::AddressPlacement::At(_) = placement {
                 VulkanDevice::keep_surface_buffer(key, &buffer);
             }
@@ -946,7 +932,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
-        made.map(|b| b.map(|raw| self.buffer(raw, None, false)))
+        made.map(|b| b.map(|raw| self.buffer(raw, None)))
     }
 
     /// A queue of at most 64 uncompleted command buffers, as Metal's. A first use of Metal's
@@ -1421,9 +1407,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         else {
             return Ok(None);
         };
-        let over_guest_pages = crate::os::over_guest_pages(&surface);
         let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(&surface), None);
-        let texture = Obj::new(TextureObject {
+        Ok(Some(Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
             space,
@@ -1432,14 +1417,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             under: None,
             private_usage: usage,
             gpu_read_only,
-        });
-        // A texture on a surface over the guest's pages meets a texture a heap over them keeps
-        // apart through them.
-        if over_guest_pages {
-            let memory = crate::gpu::writes::texture_memory(&texture).ranges;
-            crate::gpu::over_pages::over_surface(sel, memory, texture.life());
-        }
-        Ok(Some(texture))
+        })))
     }
 
     /// Decoded as the compute form is ([`serialized::tile`]), from `data` alone: Metal's data
@@ -1538,11 +1516,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let (placement, mut placing) =
             metal_space::placing(desc.length, bytes, desc.pinned_gpu_address);
-        // A no-copy buffer over one of core's mappings of the guest's pages is over them.
-        let over_guest_pages = match (desc.contents, desc.no_copy) {
-            (Some(bytes), true) => crate::remap::shows_guest_pages(bytes.ptr(), bytes.len()),
-            _ => false,
-        };
         // The copied contents, read once from the caller's memory before the runtime sees them:
         // its descriptor takes only a slice, and guest memory may change while it is read.
         let copied: Vec<u8>;
@@ -1618,8 +1591,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     surface: None,
                     backing,
                     heap: None,
-                    kept_whole: std::sync::atomic::AtomicU64::new(0),
-                    over_guest_pages,
                     gpu_read_only: false,
                 })
             })

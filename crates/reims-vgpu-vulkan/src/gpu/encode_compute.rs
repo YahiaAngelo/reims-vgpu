@@ -68,7 +68,7 @@ use crate::answer::{Policy, plain, send, unrepresentable};
 use crate::gpu::command::executions::{self, Execution, Points};
 use crate::gpu::icb::VulkanIcb;
 use crate::gpu::predication::{self, PredicatedEncoder, Work};
-use crate::gpu::resource::{Named, VulkanBuffer, reach};
+use crate::gpu::resource::VulkanBuffer;
 use crate::gpu::{metal_value, region};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -78,66 +78,6 @@ pub type VulkanComputeEncoder = Obj<PredicatedEncoder>;
 /// A binding index or a length core passes as `NSUInteger`, which the runtime takes as `u32`.
 fn small(sel: &'static str, value: u64) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| unrepresentable(sel, &format!("{value} as a u32")))
-}
-
-/// The buffers `cmd` names, each with the bytes it reaches where they are exact
-/// ([`crate::gpu::resource::Named`]): the arguments of an indirect dispatch
-/// (`MTLDispatchThreadgroupsIndirectArguments`, 12 bytes), an indirect stage-in region
-/// (`MTLStageInRegionIndirectArguments`, 24) and an indirect execution range
-/// (`MTLIndirectCommandBufferExecutionRange`, 8), and a condition's word ([`condition_word`]);
-/// all of a bound buffer, and of the arguments of `dispatchThreadsWithIndirectBuffer:`, whose
-/// layout nothing states. Each is a use of those bytes
-/// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &ComputeCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
-    match *cmd {
-        ComputeCmd::DispatchThreadgroupsIndirect {
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => vec![(indirect_buffer, reach(indirect_buffer_offset, 12))],
-        ComputeCmd::DispatchThreadsIndirect {
-            indirect_buffer, ..
-        } => vec![(indirect_buffer, None)],
-        ComputeCmd::EncodeStartIf { buffer, offset, .. }
-        | ComputeCmd::EncodeStartWhile { buffer, offset, .. } => {
-            vec![(buffer, Some(condition_word(offset)))]
-        }
-        ComputeCmd::ExecuteCommandsIndirect {
-            indirect_range_buffer,
-            indirect_buffer_offset,
-            ..
-        } => vec![(
-            Some(indirect_range_buffer),
-            reach(indirect_buffer_offset, 8),
-        )],
-        ComputeCmd::SetStageInRegionIndirect {
-            indirect_buffer,
-            indirect_buffer_offset,
-        } => vec![(Some(indirect_buffer), reach(indirect_buffer_offset, 24))],
-        ComputeCmd::SetBuffersAttributeStrides { buffers, .. }
-        | ComputeCmd::SetBuffers { buffers, .. } => buffers.iter().map(|&b| (b, None)).collect(),
-        ComputeCmd::UseResources { resources, .. } => resident_buffers(resources),
-        _ => Vec::new(),
-    }
-}
-
-/// The bytes a condition at `offset` reads: the 32-bit word at `offset & !3`
-/// ([`crate::gpu::predication`]).
-fn condition_word(offset: u64) -> std::ops::Range<u64> {
-    let word = offset & !3;
-    word..word.saturating_add(4)
-}
-
-/// The buffers `useResources:` makes resident, all of each ([`crate::gpu::resource::Named`]).
-pub(crate) fn resident_buffers<'a>(
-    resources: &'a [Option<ResourceRef<'a, VulkanPlatform>>],
-) -> Vec<Named<'a>> {
-    (resources.iter().flatten())
-        .filter_map(|r| match *r {
-            ResourceRef::Buffer(b) => Some((Some(b), None)),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The first index of `range`, whose length every slice bound with it has.
@@ -294,11 +234,6 @@ impl Concurrent for VulkanComputeEncoder {
 impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
     fn encode(&self, _on: OnFault, cmd: ComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        for (buffer, bytes) in named_buffers(&cmd) {
-            if let Some(buffer) = buffer {
-                buffer.used(sel, bytes);
-            }
-        }
         predication::observe(self, &cmd);
         let caught =
             |call: &mut dyn FnMut(&mut rt::ComputeCommandEncoder) -> Result<(), rt::Error>| {
@@ -542,9 +477,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
-                for heap in heaps.iter().flatten() {
-                    heap.made_resident(sel);
-                }
                 let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();
                 caught(&mut |e| e.use_heaps(&heaps))
             }
@@ -600,9 +532,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
         reference_value: u32,
     ) -> RaiseResult<bool> {
         let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        if let Some(buffer) = buffer {
-            buffer.used(sel, Some(condition_word(offset)));
-        }
         predication::end_do_while(self, sel, buffer, offset, comparison, reference_value)
     }
 

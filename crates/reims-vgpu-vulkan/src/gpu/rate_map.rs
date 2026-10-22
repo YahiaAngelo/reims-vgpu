@@ -438,10 +438,6 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     /// refusal of the runtime's (a `Private` buffer, where Metal's copy ends the process) dies.
     fn copy_parameter_data(&self, buffer: &VulkanBuffer, offset: u64) -> RaiseResult<()> {
         let sel = "copyParameterDataToBuffer:offset:";
-        buffer.used(
-            sel,
-            crate::gpu::resource::reach(offset, PARAMETER_DATA.size),
-        );
         let compiled = self.of(
             |map| {
                 send(sel, Policy::Dies, || {
@@ -645,44 +641,6 @@ mod tests {
         let site = catch_death(|| unset.physical_to_screen(MtlCoordinate2D { x: 1.0, y: 1.0 }, 0))
             .unwrap_err();
         assert_eq!(site.file, "mapPhysicalToScreenCoordinates:forLayer:");
-    }
-
-    /// `copyParameterDataToBuffer:offset:` uses Metal's 24,624 bytes of the buffer from the
-    /// offset: a copy into a buffer over all of a second heap over the guest's pages, over the
-    /// pages under a texture of the first that the runtime does not lay out in Metal's tiles,
-    /// dies at its selector while the texture lives, naming the kind
-    /// (`heap-texture-untiled-layout`), and one beside it is made
-    #[test]
-    fn a_parameter_copy_over_an_untiled_heap_texture_dies() {
-        use reims_vgpu_core::platform::resource::Heap as _;
-
-        use crate::gpu::resource::tests::{guest_pages, heap_at, heap_over_pages_at, over_pages};
-        let (p, d) = (platform(), dev());
-        let at = guest_pages();
-        let (heap, depth_stencil, beside) = heap_over_pages_at(&p, &d, at);
-        let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-        let second = heap_at(&p, &d, at);
-        let options = second.resource_options();
-        let cover = second
-            .new_buffer_of_length(over_pages(), options, 0)
-            .unwrap()
-            .unwrap();
-        let map = d
-            .new_rate_map(&descriptor(&p, 0.5, false))
-            .unwrap()
-            .unwrap();
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| map.copy_parameter_data(&cover, 0)).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "copyParameterDataToBuffer:offset:"),
-            "{line}"
-        );
-        assert!(line.contains("heap-texture-untiled-layout"), "{line}");
-        assert!(beside + PARAMETER_DATA.size <= over_pages(), "{beside:#x}");
-        map.copy_parameter_data(&cover, beside).unwrap();
-        drop((t, cover, second, heap));
     }
 
     #[cfg(target_os = "macos")]
