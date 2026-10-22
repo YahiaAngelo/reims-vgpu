@@ -149,15 +149,17 @@ impl Drop for Memory {
 
 /// A hold on the memory `surface` mapped, which keeps it mapped while it lives, the surface gone
 /// or not, and counts no reference of the surface; for one over a single range of the guest's
-/// pages, which maps nothing, an unmap hold on that range, which defers nothing for a range of
-/// the host's own RAM, the only one core makes such a surface over (module docs).
+/// pages, which maps nothing, an unmap hold on that range, its allocation's bytes from the
+/// range's first, before the base address by the surface's offset, which defers nothing for a
+/// range of the host's own RAM, the only one core makes such a surface over (module docs).
 pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static {
     let data = surface.data();
     let memory = &data.memory;
     let cores_unmap = (memory.own.is_none() && memory.view.is_none())
         .then(|| {
+            let first = data.base.saturating_sub(data.made.lock().offset);
             NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
-                data.base.to_usize(),
+                first.to_usize(),
             ))
         })
         .flatten()
@@ -985,6 +987,45 @@ mod tests {
         }
         drop((one, several));
         free(at, 4 * page);
+    }
+
+    /// A hold on a surface over one range of the guest's pages, at an offset, holds the range's
+    /// pages, from its first byte before the base address, and none past the range: an unmap of
+    /// the range's page through the platform's VM waits for the hold, and one of the page past
+    /// the range is made at once
+    #[test]
+    fn a_single_range_surfaces_hold_is_its_range() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        let page = page_size();
+        let (at, ranges) = guest_pages(4);
+        let spec = SurfaceSpec {
+            alloc_size: page,
+            offset: 0x40,
+            client_address_ranges: Some(ranges[1..2].to_vec()),
+            ..host_only()
+        };
+        let one = LinuxSurfaces::new().create(&spec).unwrap();
+        let ptr = |first: u64| HostPtr::from_addr(first.to_usize());
+        let hold = surface_memory_hold(&one);
+        let vm = crate::remap::VulkanVm::new();
+        assert!(vm.deallocate(ptr(at + page), page).is_success());
+        assert!(
+            crate::remap::unmap_waits(ptr(at + page), page),
+            "the range's page"
+        );
+        assert!(mapped(ptr(at + page)));
+        assert!(vm.deallocate(ptr(at + 2 * page), page).is_success());
+        assert!(
+            !crate::remap::unmap_waits(ptr(at + 2 * page), page),
+            "the page past it"
+        );
+        assert!(!mapped(ptr(at + 2 * page)));
+        drop((hold, one));
+        assert!(!crate::remap::unmap_waits(ptr(at + page), page));
+        assert!(!mapped(ptr(at + page)));
+        free(at, page);
+        free(at + 3 * page, page);
     }
 
     /// A surface over several ranges of the guest's pages lends its own view as the alias its
