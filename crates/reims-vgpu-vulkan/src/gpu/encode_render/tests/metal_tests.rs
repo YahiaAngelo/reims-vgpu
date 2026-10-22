@@ -935,7 +935,9 @@ fn provoked<P: Platform>(
     (mode, restart): (u64, Option<(bool, u64)>),
     draw: Provoked<'_>,
 ) -> Vec<[u8; 4]> {
-    use reims_vgpu_core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
+    use reims_vgpu_core::platform::icb::{
+        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+    };
     use reims_vgpu_core::platform::values::IcbDesc;
 
     let executed = matches!(draw, Provoked::Executed { .. });
