@@ -131,9 +131,10 @@
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
-//! - **A render descriptor's fragment function** that resolves to nil is none, as Metal's is, and
-//!   rasterization off drops it: the translator's descriptor holds none then. Its ref is resolved
-//!   either way, as Metal resolves it.
+//! - **A render descriptor's fragment function** that resolves to nil is none, as Metal's is.
+//!   Under rasterization off the translator's descriptor keeps it, as Metal's does: the runtime
+//!   checks it as Metal links it and leaves it out of the compile ([`crate::gpu::states`]). Its
+//!   ref is resolved either way, as Metal resolves it.
 //! - **Raw values** become the runtime's types: one the type cannot hold dies at the selector
 //!   ([`crate::gpu::metal_value`]), as the crate decides it everywhere.
 //! - **Metal's arrays hold every index**, the ones the blob never names at their defaults
