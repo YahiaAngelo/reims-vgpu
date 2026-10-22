@@ -385,19 +385,20 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
     (!ranges.is_empty() && alloc_size <= total).then_some(())
 }
 
-/// A view of the first `length` bytes of `ranges`, in their order, read-only when `read_only`:
-/// its first byte, or `None` where a range has no file behind it or the host gives no address
-/// space, nothing left mapped.
-fn view(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<u64> {
+/// A view of the first `length` bytes of `runs`, the guest's pages in their order with those that
+/// follow on in the host's memory merged ([`page_runs`]), read-only when `read_only`: one remap
+/// for each run, as core names the pages one by one. Its first byte, or `None` where a run has no
+/// file behind it or the host gives no address space, nothing left mapped.
+fn view(runs: &[std::ops::Range<u64>], length: u64, read_only: bool) -> Option<u64> {
     let vm = LinuxVm::new();
     let at = vm.allocate_anywhere(length).ok()?;
     let mut offset = 0u64;
-    for r in ranges {
+    for run in runs {
         if offset >= length {
             break;
         }
-        let now = r.physical_length.min(length - offset);
-        let source = HostPtr::from_addr(r.physical_address.to_usize());
+        let now = (run.end - run.start).min(length - offset);
+        let source = HostPtr::from_addr(run.start.to_usize());
         if vm
             .remap_shared_overwrite(at.wrapping_add(offset), source, now)
             .is_err()
@@ -406,7 +407,7 @@ fn view(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<
                 target: "reims_vgpu_vulkan::os",
                 "IOSurface over the guest's pages: no view of {now:#x} bytes at {:#x}, which the \
                  library has no file of; refused",
-                r.physical_address
+                run.start
             );
             let _ = vm.deallocate(at, length);
             return None;
@@ -473,7 +474,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                     [one] => (one.physical_address, None, None),
                     _ => {
                         let length = spec.alloc_size.checked_next_multiple_of(page_size())?;
-                        let at = view(ranges, length, made.gpu_read_only)?;
+                        let at = view(&made.pages, length, made.gpu_read_only)?;
                         (at, None, Some((at, length)))
                     }
                 }
@@ -898,6 +899,30 @@ mod tests {
             assert!(surfaces.create(&spec).is_none(), "{spec:?}");
         }
         drop((one, several));
+        free(at, 4 * page);
+    }
+
+    /// A surface over guest pages core names one by one views each run of them that follows on
+    /// in the host's memory with one remap, in their order: one for pages in order, one each out
+    /// of order
+    #[test]
+    fn a_surface_views_each_run_of_following_pages_at_once() {
+        let page = page_size();
+        let (at, ranges) = guest_pages(4);
+        let backwards: Vec<_> = ranges.iter().rev().copied().collect();
+        // The pages, the runs their view takes, and the guest page its second page shows.
+        for (pages, runs, second) in [(&ranges, 1, 1), (&backwards, 4, 2)] {
+            let spec = SurfaceSpec {
+                alloc_size: 4 * page,
+                client_address_ranges: Some(pages.clone()),
+                ..host_only()
+            };
+            let s = LinuxSurfaces::new().create(&spec).unwrap();
+            let (view, length) = mapped_range(&s).unwrap();
+            assert_eq!(super::super::files::runs_between(view, view + length), runs);
+            assert_eq!(read(view + page), second);
+            drop(s);
+        }
         free(at, 4 * page);
     }
 

@@ -266,6 +266,13 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     count
 }
 
+/// The runs the table holds in `first..end`, each a remap's piece or what a cut left of one
+/// (tests).
+#[cfg(test)]
+pub(crate) fn runs_between(first: u64, end: u64) -> usize {
+    TABLE.lock().runs.range(first..end).count()
+}
+
 /// `length` bytes from `first` show `backing` from now on, with protection `prot`: what of
 /// another run they cover goes.
 pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: i32) {
