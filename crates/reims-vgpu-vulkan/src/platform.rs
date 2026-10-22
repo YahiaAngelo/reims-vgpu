@@ -29,7 +29,7 @@ use reims_vgpu_core::platform::{Handle, ObjId, Platform, ProcessState};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::tasks::launcher::TaskLauncher;
 
-use crate::answer::{get, plain, refused};
+use crate::answer::{get, plain, plain_at, refused};
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::desc::{
     RenderPassDescriptorObject, TextureDescriptorObject, TextureFields,
@@ -113,10 +113,10 @@ impl<T: Send + Sync + 'static> Handle for Obj<T> {
 }
 
 /// The runtime listener every listener of the platform is a handle of. The runtime starts a thread
-/// for each listener it makes (`SharedEventListener::new`, read from code), which ends once its
-/// last handle goes. Core makes one listener for each task and posts nothing to it: one thread of
-/// the process's life replaces an idle thread for each task's. Each handle is still an object of
-/// its own (`id`).
+/// for each listener it makes as its first notification is asked for (`SharedEventListener::new`,
+/// read from code), which ends once its last handle goes. Core makes one listener for each task:
+/// one listener of the process's life holds at most one such thread. Each handle is still an
+/// object of its own (`id`).
 static LISTENER: OnceLock<rt::SharedEventListener> = OnceLock::new();
 
 /// The process's platform: the runtime's GPU objects, and the OS's IOSurface, VM (reporting the
@@ -572,7 +572,7 @@ impl Platform for VulkanPlatform {
     fn new_shared_event_listener(&self) -> VulkanSharedEventListener {
         Obj::new(
             LISTENER
-                .get_or_init(|| get("new", rt::SharedEventListener::new))
+                .get_or_init(|| plain_at("new", rt::SharedEventListener::new))
                 .clone(),
         )
     }

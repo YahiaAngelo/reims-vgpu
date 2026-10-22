@@ -1180,8 +1180,9 @@ reims_vgpu_core::death_test!(
 
 /// A draw of points, and an execution of commands that inherit the encoder's state, under a
 /// state of the point class whose vertex function can encode indirect commands die in an encoder that made resident for writing
-/// an indirect command buffer whose ID is not the runtime's (one made after a reservation the
-/// runtime is not given), as a compute dispatch does (`crate::gpu::encode_compute`); an execution
+/// an indirect command buffer whose ID is not the runtime's (one made after a reservation kept
+/// from the runtime, `icb::reserve_apart`), as a compute dispatch does
+/// (`crate::gpu::encode_compute`); an execution
 /// whose command's own state can dies at the commit, which reads its record. A draw under a
 /// state that cannot runs, and so does one under the state that can where the buffer made
 /// resident for writing has the runtime's ID
@@ -1194,7 +1195,7 @@ fn work_that_can_encode_after_an_icb_made_writable_dies() {
     use reims_vgpu_core::raise::death::DeathKind;
 
     let (p, d) = (platform(), dev());
-    d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
+    crate::gpu::icb::reserve_apart(&[2, (1 << 23) + 1]);
     let make = |inherit_pipeline_state| {
         d.new_indirect_command_buffer(
             &IcbDesc {
@@ -3031,14 +3032,15 @@ fn captured_reach_rewrites_the_tiles_metal_does() {
 /// its state, and so does one the function has no output for (colour 1 of `RGBA16Float`
 /// beside a written colour 0 of `RGBA8Unorm`), one it writes, unblended, of 1 sample, of 2
 /// or of 4, and one it writes blended by one and one, whose draw dies naming the runtime's
-/// notice (`blended-write-rounding`: the device's blend rounds the result by its own rule).
-/// `RGBA16Float` at colour 0 whose alpha alpha to coverage reads dies as the state is made, where
-/// Metal makes each: made by default (`answer::relaxed`), its draw stores another alpha than
-/// Metal's over the sweeps, which the runtime leaves to the device's conversion
+/// notice (`blended-write-rounding`: the device's blend rounds the result by its own rule), and
+/// `RGBA16Float` at colour 0 whose alpha alpha to coverage reads, whose draw dies naming the
+/// runtime's notice (`coverage-reads-rounded-alpha`). Metal makes each. That draw by default
+/// (`answer::relaxed`) stores Metal's alpha past 1 by float steps and past the largest half,
+/// rounded by the function as Metal stores it, but not through unorm values, where the coverage
+/// reads the rounded alpha and Metal's the alpha before rounding
 #[test]
 fn mode_2_render_states_are_decided_once_made() {
     use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::rt::Hold;
 
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3094,30 +3096,18 @@ fn mode_2_render_states_are_decided_once_made() {
         (7, 1),
         (8, 0),
     ]];
-    let dies: [Blob<'_>; 1] = [(&["05 04 01000000"], &written)];
-    let made: [Blob<'_>; 6] = [
+    let made: [Blob<'_>; 7] = [
         made[0],
         made[1],
         made[2],
         made[3],
         made[4],
         (&[], &additive),
+        (&["05 04 01000000"], &written),
     ];
     for (entries, colours) in made {
         assert!(
             matches!(state::<VulkanPlatform>(&d, entries, colours), Ok(Some(_))),
-            "{colours:?}"
-        );
-    }
-    for (entries, colours) in dies {
-        let site =
-            catch_death(|| state::<VulkanPlatform>(&d, entries, colours).is_ok()).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                DeathKind::Abort,
-                "newRenderPipelineStateWithDescriptor:options:reflection:error:"
-            ),
             "{entries:?} {colours:?}"
         );
     }
@@ -3130,28 +3120,29 @@ fn mode_2_render_states_are_decided_once_made() {
         swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, blended)
     });
     assert!(line.contains("blended-write-rounding"), "{line}");
+    let covered = Drawn {
+        render: &["05 04 01000000"],
+        ..PLAIN
+    };
+    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, covered)
+    });
+    assert!(line.contains("coverage-reads-rounded-alpha"), "{line}");
     if let Some(md) = &metal {
         assert!(state::<MetalPlatform>(md, &[], &refused).is_err());
-        for (entries, colours) in made.into_iter().chain(dies) {
+        for (entries, colours) in made {
             assert!(
                 matches!(state::<MetalPlatform>(md, entries, colours), Ok(Some(_))),
                 "{entries:?} {colours:?}"
             );
         }
         let mp = MetalPlatform::new(Box::new(NoLauncher));
-        let covered = Drawn {
-            render: &["05 04 01000000"],
-            ..PLAIN
-        };
-        for kind in [0, 1, 3] {
+        for (kind, metals) in [(0, false), (1, true), (3, true)] {
             let ours = crate::answer::relaxed(|| {
                 swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, covered)
             });
             let theirs = swept(&mp, md, (false, NEAREST_EVEN), (115, 8), kind, covered);
-            assert!(
-                ours != theirs,
-                "the covered alpha's sweep {kind} stores Metal's"
-            );
+            assert_eq!(ours == theirs, metals, "the covered alpha's sweep {kind}");
         }
     }
 }
@@ -3728,9 +3719,12 @@ fn bfloat_draws_store_metals_codes() {
 /// A render state of `textureWriteRoundingMode` 2 made of what no other test compares rounds
 /// as Metal's, byte for byte, over the sweeps through unorm values, past 1 by float steps
 /// and past the largest half, and so does one of mode 0 of it: `R16Float` and `RG16Float` at
-/// colour 0 under alpha to coverage; `RGBA16Float` at colour 0 under alpha to coverage of a
-/// write mask without alpha; and `R16Float`, `RG16Float` and `RGBA16Float` at colours 1 and
-/// 3, beside an `RGBA8Unorm` colour 0
+/// colour 0 under alpha to coverage; and `R16Float`, `RG16Float` and `RGBA16Float` at colours 1
+/// and 3, beside an `RGBA8Unorm` colour 0. `RGBA16Float` at colour 0 under alpha to coverage of a
+/// write mask without alpha rounds so at mode 0; at mode 2 the runtime rounds the alpha, which
+/// the attachment does not store, and the coverage reads it rounded, where Metal's reads it
+/// before rounding: its draw dies naming the runtime's notice (`coverage-reads-rounded-alpha`),
+/// and by default stores Metal's past 1 and past the largest half, not through unorm values
 #[test]
 fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3745,16 +3739,15 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
         render: coverage,
         ..PLAIN
     };
+    let unstored = Drawn {
+        colour: &[(9, 0xe)],
+        ..covered
+    };
+    let both: &[u32] = &[0, NEAREST_EVEN];
     let mut cases = vec![
-        ((25, 2), covered),
-        ((65, 4), covered),
-        (
-            (115, 8),
-            Drawn {
-                colour: &[(9, 0xe)],
-                ..covered
-            },
-        ),
+        ((25, 2), covered, both),
+        ((65, 4), covered, both),
+        ((115, 8), unstored, &[0][..]),
     ];
     for format in [(25, 2), (65, 4), (115, 8)] {
         for index in [1, 3] {
@@ -3763,12 +3756,12 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
                 index,
                 ..PLAIN
             };
-            cases.push((format, four));
+            cases.push((format, four, both));
         }
     }
     let mut differ = Vec::new();
-    for (format, how) in cases {
-        for mode in [0, NEAREST_EVEN] {
+    for (format, how, modes) in cases {
+        for &mode in modes {
             for kind in [0, 1, 3] {
                 let ours = swept(&p, &d, (false, mode), format, kind, how);
                 let theirs = swept(&mp, &md, (false, mode), format, kind, how);
@@ -3779,6 +3772,23 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
                     ));
                 }
             }
+        }
+    }
+    let draw = "drawPrimitives:vertexStart:vertexCount:";
+    let line = died_at(draw, || {
+        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, unstored)
+    });
+    assert!(line.contains("coverage-reads-rounded-alpha"), "{line}");
+    for (kind, metals) in [(0, false), (1, true), (3, true)] {
+        let ours = crate::answer::relaxed(|| {
+            swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, unstored)
+        });
+        let theirs = swept(&mp, &md, (false, NEAREST_EVEN), (115, 8), kind, unstored);
+        if (ours == theirs) != metals {
+            differ.push(format!(
+                "{unstored:?} mode 2 sweep {kind}: Metal's {}",
+                !metals
+            ));
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");

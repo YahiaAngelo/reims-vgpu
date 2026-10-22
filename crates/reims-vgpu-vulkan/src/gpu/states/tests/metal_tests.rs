@@ -793,21 +793,24 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
 }
 
 /// A draw whose fragment stage samples through a sampler an argument buffer holds, encoded
-/// while no cubic sampler state is alive, completes as Metal's does; where a cubic state is
-/// made after the draw was encoded and before its command buffer commits, the runtime cannot
-/// list it beside the fragment stage and fails the command buffer, which dies where its
-/// failure is first read, at the wait (`CommandBufferError::UnlistedArgumentSampler`), where
-/// Metal's completes
+/// while no cubic sampler state is alive, completes as Metal's does. Where a cubic state is made
+/// after the draw was encoded and before its command buffer commits, the runtime leaves it out
+/// of the fragment stage's sampler tables and announces so as the state is made
+/// (`unlisted-argument-sampler`, of [`crate::answer::DIES`]): a function of that stage that read
+/// the state through its ID would read the neutral sampler. In strict mode that dies at the
+/// state's creator, naming it; by default it is relayed, and the draw, which reads the linear
+/// state alone, completes as Metal's does
 #[test]
-fn a_cubic_state_made_before_a_fragment_stages_commit_dies_where_its_failure_is_read() {
+fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
     let linear = filtered(1, 1, 0);
     assert_eq!(held_draw(&p, &d, &linear, false), (4, 0));
     let (sel, line) = death_line(|| held_draw(&p, &d, &linear, true));
-    assert_eq!(sel, "waitUntilCompleted", "{line}");
-    let named = "a command whose argument samplers the runtime could not all list";
-    assert!(line.contains(named), "{line}");
+    assert_eq!(sel, "newSamplerStateWithDescriptor:", "{line}");
+    assert!(line.contains("unlisted-argument-sampler"), "{line}");
+    let relayed = crate::answer::relaxed(|| held_draw(&p, &d, &linear, true));
+    assert_eq!(relayed, (4, 0));
     if let Some(md) = MetalPlatform::system_default_device() {
         let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
         for cubic in [false, true] {

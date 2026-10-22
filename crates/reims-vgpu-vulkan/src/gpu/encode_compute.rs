@@ -1055,8 +1055,9 @@ mod tests {
 
     /// A direct dispatch, in each form, of a pipeline that can encode indirect commands dies in an
     /// encoder that made resident for writing an indirect command buffer whose ID is not the
-    /// runtime's (one made after a reservation the runtime is not given, of 2 and 2^23 + 1:
-    /// Metal's pool hands out 1 then 3, the runtime's 1 then 2), after that. One before it, one
+    /// runtime's (one made after a reservation of 2 and 2^23 + 1 kept from the runtime,
+    /// `icb::reserve_apart`, as only a release's window parts them in a run: Metal's pool hands out
+    /// 1 then 3, the runtime's 1 then 2), after that. One before it, one
     /// where the buffer was made resident only for reading, one of a pipeline that cannot encode
     /// indirect commands, one where the buffer written has the runtime's ID (its kernel resetting
     /// the buffer's commands through the ID), and an execution of the buffer, whose command
@@ -1066,7 +1067,7 @@ mod tests {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         let d = dev();
-        d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
+        crate::gpu::icb::reserve_apart(&[2, (1 << 23) + 1]);
         let (add, reset) = (
             pipeline(ADD, "add_one"),
             pipeline(ICB_ENCODE, "reset_commands"),
@@ -1198,7 +1199,7 @@ mod tests {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         let d = dev();
-        d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
+        crate::gpu::icb::reserve_apart(&[2, (1 << 23) + 1]);
         let state = |bytes, name| {
             let library = d.raw.new_library_with_data(bytes).unwrap();
             let function = library.new_function_with_name(name).unwrap();

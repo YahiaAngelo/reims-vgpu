@@ -41,7 +41,6 @@
     unsafe_code
 )]
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -1443,10 +1442,10 @@ fn pages_past_the_size_on_metal() {
 }
 
 /// This crate in [`past_the_size`], in a child copy of this test binary under strict mode
-/// (`REIMS_VGPU_STRICT=1`), where a death ends the process as in production: the first heap of the read-only option (resource option bit 24)
-/// dies where it is made, at `newHeapWithDescriptor:`, naming `private-resource-option` (of
-/// `reims_vgpu_vulkan::answer::DIES`), which the runtime announces as it makes the heap as
-/// without the option, where Metal makes it and keeps the GPU's writes from the CPU
+/// (`REIMS_VGPU_STRICT=1`), where a death ends the process as in production: Metal's heaps, and
+/// nothing dies. The read-only ones (resource option bit 24) are made as Metal makes them: the
+/// runtime imports their pages through a read-only view of them, which drops the GPU's writes as
+/// Metal's memory of the option does
 #[test]
 fn pages_past_the_size_on_vulkan() {
     const CHILD: &str = "RVG_PAGES_PAST_THE_SIZE";
@@ -1467,18 +1466,16 @@ fn pages_past_the_size_on_vulkan() {
         .env("REIMS_VGPU_STRICT", "1")
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     let death = stderr
         .lines()
         .find(|l| l.starts_with("reims-vgpu: fatal: "));
-    let death = death.unwrap_or_else(|| panic!("no death: {out:?}"));
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
-    let code = "metal2vulkan-degrade-private-resource-option";
-    assert!(
-        death.contains(&format!("the Vulkan runtime degraded it ({code})"))
-            && death.contains("newHeapWithDescriptor:"),
-        "{death}"
-    );
+    assert!(out.status.success() && death.is_none(), "{out:?}");
+    let metal = expected_past_the_size();
+    assert!(stdout.contains(&format!("made {metal:?}")), "{stdout}");
 }
 
 #[test]
@@ -1491,10 +1488,10 @@ fn pages_without_access_on_metal() {
 }
 
 /// This crate in [`without_access`], in a child copy of this test binary under strict mode
-/// (`REIMS_VGPU_STRICT=1`), where a death ends the process as in production: the first heap of the read-only option (resource option bit
-/// 24) dies where it is made, at `newHeapWithDescriptor:`, naming `private-resource-option` (of
-/// `reims_vgpu_vulkan::answer::DIES`), which the runtime announces as it makes the heap as
-/// without the option, where Metal makes it and keeps the GPU's writes from the CPU
+/// (`REIMS_VGPU_STRICT=1`), where a death ends the process as in production: Metal's heaps, and
+/// nothing dies. The read-only ones (resource option bit 24) are made as Metal makes them: the
+/// runtime imports their pages through a read-only view of them, which drops the GPU's writes as
+/// Metal's memory of the option does
 #[test]
 fn pages_without_access_on_vulkan() {
     const CHILD: &str = "RVG_PAGES_WITHOUT_ACCESS";
@@ -1515,18 +1512,16 @@ fn pages_without_access_on_vulkan() {
         .env("REIMS_VGPU_STRICT", "1")
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     let death = stderr
         .lines()
         .find(|l| l.starts_with("reims-vgpu: fatal: "));
-    let death = death.unwrap_or_else(|| panic!("no death: {out:?}"));
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
-    let code = "metal2vulkan-degrade-private-resource-option";
-    assert!(
-        death.contains(&format!("the Vulkan runtime degraded it ({code})"))
-            && death.contains("newHeapWithDescriptor:"),
-        "{death}"
-    );
+    assert!(out.status.success() && death.is_none(), "{out:?}");
+    let metal = expected_without_access();
+    assert!(stdout.contains(&format!("made {metal:?}")), "{stdout}");
 }
 
 /// How many shapes [`unaligned_shape`] holds.

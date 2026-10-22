@@ -45,12 +45,11 @@
 //!     `two_plane_fills_off_a_surface_keep_the_alpha_as_metals`).
 //!
 //!   It fills every texture type [`crate::gpu::fill::place`] measured, a compressed cube and
-//!   cube array too (`compressed_cube_fills_are_the_metal_platforms`). The runtime refuses what
-//!   it did not measure: a two-plane XR10 texture of its own memory of a width no multiple of 4
-//!   or of more than one level, whose texels Metal's blit rows move between rows, and a heap's of
-//!   more than one level or slice; and a format of none of these families (`X24_Stencil8`,
-//!   `Depth24Unorm_Stencil8`). That fill dies at its selector, naming the refusal, where Metal
-//!   fills (`fills_the_runtime_refuses_die`).
+//!   cube array too (`compressed_cube_fills_are_the_metal_platforms`). The runtime fills the
+//!   rest of the formats Metal fills too: a two-plane XR10 texture of its own memory at any width
+//!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
+//!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart. It refuses a multisample texture's fill
+//!   alone, which `place` dies at first.
 //! - **A colour fill in a bfloat format, an extended-range `_sRGB` twin or an RGBX format**
 //!   ([`crate::gpu::fill::RUNTIME_PACKED`]) is the runtime's colour fill, which packs the colour
 //!   by its own measured rules, at the level and slice and in the region `place` gives
@@ -85,8 +84,12 @@
 //!   `TwoPlaneBufferBlit`, [`crate::answer::DIES`]): a copy within one texture, of a texture of
 //!   more than one level or slice, of rows that overlap in the destination, of a texture
 //!   narrower than 4 texels, or reading bytes outside the source's texels that an earlier blit
-//!   wrote or a heap's other resources hold, and a copy between a buffer and a level whose width
-//!   is no multiple of 4 (`two_plane_xr10_blits_metal_was_not_measured_at_die`). A copy into a
+//!   wrote or a heap's other resources hold, and a copy from a buffer into a level 32 texels wide
+//!   or wider whose width is no multiple of 4 whose rows meet at Metal's addresses, or out of such
+//!   a level after a copy from another texture wrote the bytes between them
+//!   (`two_plane_xr10_blits_metal_was_not_measured_at_die`); where a narrower level's rows meet
+//!   between Metal's groups of 32 rows, the earlier row's bytes stand, one of Metal's outcomes
+//!   (`two-plane-buffer-blit-order`, [`crate::answer`]). A copy into a
 //!   heap's texture writes the heap's bytes at Metal's blit rows, as Metal's blit does, the bytes
 //!   outside its texels and past its alpha plane over the heap's other resources included
 //!   (`two_plane_copies_into_a_heap_are_the_metal_platforms`).
@@ -1337,9 +1340,9 @@ mod tests {
     /// two levels, and of a 2D array of two slices; one whose rows overlap in the destination
     /// (5 texels into rows of 6, which Metal's blit addresses 16 bytes apart); one reading bytes
     /// outside the source's texels where they may hold other bytes than 0: written there by an
-    /// earlier blit, and a placement heap's; and a copy to a buffer from a level whose width is no
-    /// multiple of 4, which Metal's blit moves between rows. Each case's last blit is the one
-    /// that dies
+    /// earlier blit, and a placement heap's; and a copy from a buffer into a level 34 texels wide,
+    /// whose rows meet at Metal's addresses (128 bytes apart, 136 long), where Metal's GPU writes
+    /// them in an order that varies from run to run. Each case's last blit is the one that dies
     #[test]
     fn two_plane_xr10_blits_metal_was_not_measured_at_die() {
         use reims_vgpu_core::platform::resource::Heap as _;
@@ -1362,7 +1365,7 @@ mod tests {
             })
         };
         let at = MtlOrigin::new(0, 0, 0);
-        let (wide, narrow, odd) = (texture(16, 4), texture(2, 4), texture(6, 4));
+        let (wide, narrow, odd) = (texture(16, 4), texture(2, 4), texture(34, 4));
         let (narrow_into, six) = (texture(2, 4), texture(6, 4));
         let (first, second, third) = (texture(16, 4), texture(16, 4), texture(16, 4));
         let levels = || {
@@ -1468,17 +1471,17 @@ mod tests {
                 vec![region(&placed, (0, 0), (16, 8), &wide_into, (0, 0))],
             ),
             (
-                "6 texels wide, to a buffer",
-                vec![BlitCmd::CopyTextureToBuffer {
-                    source_texture: &odd,
-                    source_slice: 0,
-                    source_level: 0,
-                    source_origin: at,
-                    source_size: MtlSize::new(6, 4, 1),
-                    destination_buffer: &b,
-                    destination_offset: 0,
-                    destination_bytes_per_row: 24,
-                    destination_bytes_per_image: 96,
+                "34 texels wide, from a buffer",
+                vec![BlitCmd::CopyBufferToTexture {
+                    source_buffer: &b,
+                    source_offset: 0,
+                    source_bytes_per_row: 136,
+                    source_bytes_per_image: 544,
+                    source_size: MtlSize::new(34, 4, 1),
+                    destination_texture: &odd,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: at,
                 }],
             ),
         ];
@@ -1552,61 +1555,6 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(site.file, "fillBuffer:range:value:");
-    }
-
-    /// A fill the runtime's fill refuses, which Metal makes, dies at its selector, naming the
-    /// refusal: of a two-plane XR10 texture of its own memory whose width is no multiple of 4,
-    /// whose texels Metal's blit rows move between rows
-    #[test]
-    fn fills_the_runtime_refuses_die() {
-        let d = dev();
-        let p = crate::platform::tests::platform();
-        let (format, texture_type, width) = (550, 2, 6);
-        let t = d
-            .new_texture(
-                OnFault::Return,
-                &p.texture_descriptor(&TextureDesc {
-                    texture_type,
-                    pixel_format: format,
-                    width,
-                    height: width,
-                    usage: 1,
-                    resource_options: Some(0x20),
-                    ..TextureDesc::default()
-                }),
-            )
-            .unwrap()
-            .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let pattern = [1u8, 2, 3, 4];
-        let site = catch_death(|| {
-            e.encode(
-                OnFault::Return,
-                BlitCmd::FillTexture {
-                    texture: &t,
-                    level: 0,
-                    slice: 0,
-                    region: MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(1, 1, 1)),
-                    bytes: reims_vgpu_core::platform::HostRange::of_slice(&pattern),
-                },
-            )
-        })
-        .unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
-                "fillTexture:level:slice:region:bytes:length:"
-            ),
-            "{format}"
-        );
-        let line = crate::answer::LAST_LINE.lock().clone().unwrap();
-        assert!(
-            line.starts_with("the Vulkan runtime refused it"),
-            "{format}: {line}"
-        );
     }
 
     #[cfg(target_os = "macos")]

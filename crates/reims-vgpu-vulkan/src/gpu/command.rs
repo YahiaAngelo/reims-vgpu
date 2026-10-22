@@ -56,25 +56,6 @@
 //!   the runtime does not filter bicubically through an argument buffer's sampler, and fails a
 //!   command buffer whose function reached one, where Metal samples and fails none. A function
 //!   that never reaches one runs as Metal's.
-//! - **A command whose argument samplers the runtime could not list as its command buffer
-//!   committed, or as a host step recorded it** (`CommandBufferError::UnlistedArgumentSampler`)
-//!   dies there too ([`unlisted_argument_sampler`]): more sampler states live than the command's
-//!   set-1 sampler arrays hold (at most 65536 elements each, fewer where the device's limits
-//!   are) or than its sampler tables hold, or one of a shape they refuse, such as a cubic state
-//!   beside a fragment stage. A command a host step records after the commit, of an indirect
-//!   command buffer whose records the GPU writes, is in no commit's listing: it fails its command
-//!   buffer as the step records it, where more states live than its set-1 sampler arrays hold.
-//!   The runtime fails such a command buffer whether or not its functions reach the state left
-//!   out, where Metal's reach every state by its ID and fail none. The runtime's announcement of
-//!   the first (`unlisted-argument-sampler`) is relayed, as the failure that follows it dies.
-//! - **A host step's Vulkan object that nothing made before it**
-//!   (`CommandBufferError::HostStepObject`) dies there too, naming the object's kind
-//!   ([`host_step_object`]): the runtime records a render encoder's execution of an indirect
-//!   command buffer the GPU may write, or of a range read from a buffer, in a host step, which
-//!   makes no image, render pass, framebuffer or neutral binding. Where a command's draw needs
-//!   one that nothing made before the step, the runtime fails the command buffer, and runs
-//!   nothing of the batch the step recorded for or of those after it, where Metal draws the
-//!   command and fails none.
 //! - **A command whose buffer over the guest's pages was rebound before its command buffer was
 //!   submitted, in an encoder the runtime cannot encode again**
 //!   (`CommandBufferError::EncodedUseRebound`) dies there too ([`encoded_use_rebound`]): the
@@ -97,12 +78,22 @@
 //!   `tessellationShader`), which it draws nothing of; a sparse mapping update it
 //!   applied none of (`SparseHeapSplit`, `SparseMappingArguments`, `SparseMappingSplit`); a
 //!   Vulkan failure of a submission other than a lost device or memory
-//!   (`Internal`); and any other the runtime gives, whatever origin it states, until one is
-//!   reviewed here. Metal's own failures, the seven the runtime states as Metal's
-//!   (`FailureOrigin::Metal`) and this platform lists, reach core as Metal's: those this platform
-//!   commits a command buffer with as Metal's GPU fails it (below), a lost device, memory, an
-//!   address fault, a render pass without attachments past 16384, a detached buffer's use, and
-//!   the driver's relay of one of Metal's codes.
+//!   (`Internal`); a command-predication loop the runtime stopped, past the copies it laid down
+//!   (`PredicatedLoopPastCopies`) or once the program held no handle of its queue
+//!   (`PredicatedLoopLetGo`), where Metal runs it on without bound, until the process ends; and
+//!   any other the runtime gives, whatever origin it states, until one is reviewed here. Metal's
+//!   own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
+//!   platform lists, reach core as Metal's: those this platform commits a command buffer with as
+//!   Metal's GPU fails it (below), a lost device, memory, an address fault, a GPU hang
+//!   (`GpuHang`, code 2) and a victim of the GPU's recovery (`GpuRecoveryVictim`, code 1) at a
+//!   draw of primitive type 9, a queue Metal stopped serving after its second such fault or hang
+//!   (`AccessRevoked`, code 4), a render pass without attachments past 16384 or with a
+//!   `defaultRasterSampleCount` Metal fails, a detached buffer's use, an encoder made under
+//!   protection options (`ProtectedEncoder`, code 16 or 1), a unit of the runtime's command
+//!   predication left with a block open (`PredicationOpenAtUnitEnd`, code 1), and the driver's
+//!   relay of one of Metal's codes. No draw of type 9, no protection option and no record of
+//!   predication reaches the runtime here (below), so of those five none fails a command buffer
+//!   yet.
 //! - **A failure of the GPU's work that the driver relayed** (`CommandBufferError::Execution`, and
 //!   `PageFault` and `DeviceLost` of the same kind): MoltenVK runs the runtime's batches as Metal
 //!   command buffers, and the runtime gives a failed one's Metal code to the command buffer whose
@@ -354,7 +345,7 @@ fn tiler_handler() -> rt::Handler {
 /// of its own, the queue's hang is no longer in flight (`hangs`), then the hold lets what comes
 /// after the hang go (`hold` to 2), as Metal's GPU fails the command buffer then.
 fn hang_ends(sel: &'static str, hold: rt::SharedEvent, hangs: Arc<Hangs>) {
-    let listener = get(sel, rt::SharedEventListener::new);
+    let listener = plain_at(sel, rt::SharedEventListener::new);
     let end: rt::SharedEventNotification = Box::new(move |hold, _| {
         std::thread::sleep(HANG_TIME);
         hangs.0.fetch_sub(1, Ordering::SeqCst);
@@ -1015,45 +1006,50 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
     Some(e)
 }
 
-/// Dies at `sel`, where a command buffer's failure `e` is read first, unless `e` is one of
-/// Metal's failures, which core then sees as Metal's: a failure this platform committed the
-/// command buffer with as Metal's GPU fails it ([`Failing`], a detached object's use), a lost
-/// device's, memory's, an address fault, a render pass without attachments past 16384, a
-/// detached buffer's use, a render pass without attachments whose `defaultRasterSampleCount`'s
-/// low 8 bits are 16 to 127, each with Metal's code, and one the driver relayed with one of
-/// Metal's codes ([`relayed`]). Those are the eight variants the runtime states as Metal's
-/// (`rt::FailureOrigin::Metal`), each listed here, so that one the runtime adds later, whatever
-/// origin it states, dies until it is reviewed ([`unanswered`]). Every other is the runtime's own
-/// (`rt::FailureOrigin::Runtime`), where Metal fails no command buffer, and dies naming it: an
-/// indirect draw's indices the index pool could not hold ([`pool_overflow`]), a sample through
-/// a cubic sampler an argument buffer holds ([`cubic_argument_sampler`]), argument samplers the
-/// runtime could not list ([`unlisted_argument_sampler`]), a host step's Vulkan object that
-/// nothing made before it ([`host_step_object`]), a command's buffer rebound before the command
-/// buffer was submitted ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the
-/// records pool ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a sparse mapping
-/// update the runtime applied none of
+/// Dies at `sel`, where a command buffer's failure `e` is read first, unless `e` is one of Metal's
+/// failures, which core then sees as Metal's: a failure this platform committed the command buffer
+/// with as Metal's GPU fails it ([`Failing`], a detached object's use), a lost device's, memory's,
+/// an address fault, a GPU hang and a victim of the GPU's recovery, a revoked queue's, a render
+/// pass without attachments past 16384, a detached buffer's use, an encoder made under protection
+/// options, a unit of command predication left with a block open, a render pass without attachments
+/// whose `defaultRasterSampleCount`'s low 8 bits are 16 to 127, each with Metal's code, and one the
+/// driver relayed with one of Metal's codes ([`relayed`]). Those are the thirteen variants the
+/// runtime states as Metal's (`rt::FailureOrigin::Metal`), each listed here, so that one the
+/// runtime adds later, whatever origin it states, dies until it is reviewed ([`unanswered`]). Every
+/// other is the runtime's own (`rt::FailureOrigin::Runtime`), where Metal fails no command buffer,
+/// and dies naming it: an indirect draw's indices the index pool could not hold
+/// ([`pool_overflow`]), a sample through a cubic sampler an argument buffer holds
+/// ([`cubic_argument_sampler`]), a command's buffer rebound before the command buffer was submitted
+/// ([`encoded_use_rebound`]), a command-predication loop the runtime stopped ([`predicated_loop`]),
+/// an emulated mesh or tessellation draw past the records pool ([`mesh_records_overflow`],
+/// [`tessellation_records_overflow`]), a sparse mapping update the runtime applied none of
 /// ([`sparse_heap_split`], [`sparse_mapping_arguments`], [`sparse_mapping_split`]), a Vulkan
 /// failure of a submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
-/// [`failed_pipeline`]). A relayed failure's death names Metal's description of it, which `cb`,
-/// the command buffer that failed, keeps.
+/// [`failed_pipeline`]). A relayed failure's death names Metal's description of it, which `cb`, the
+/// command buffer that failed, keeps.
 fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::CommandBuffer>) {
     match e {
         rt::CommandBufferError::Injected(_)
         | rt::CommandBufferError::DeviceLost
         | rt::CommandBufferError::OutOfMemory
         | rt::CommandBufferError::PageFault
+        | rt::CommandBufferError::GpuHang
+        | rt::CommandBufferError::GpuRecoveryVictim
+        | rt::CommandBufferError::AccessRevoked
         | rt::CommandBufferError::RenderTargetSize
         | rt::CommandBufferError::DetachedBacking
+        | rt::CommandBufferError::ProtectedEncoder(_)
+        | rt::CommandBufferError::PredicationOpenAtUnitEnd { .. }
         | rt::CommandBufferError::DefaultRasterSampleCount => {}
         rt::CommandBufferError::Execution(code) => {
             relayed(sel, code, cb.and_then(rt::CommandBuffer::error_description))
         }
         rt::CommandBufferError::IndexPoolOverflow => pool_overflow(sel),
         rt::CommandBufferError::CubicArgumentSampler => cubic_argument_sampler(sel),
-        rt::CommandBufferError::UnlistedArgumentSampler => unlisted_argument_sampler(sel),
-        rt::CommandBufferError::HostStepObject(object) => host_step_object(sel, object),
         rt::CommandBufferError::EncodedUseRebound => encoded_use_rebound(sel),
+        rt::CommandBufferError::PredicatedLoopPastCopies
+        | rt::CommandBufferError::PredicatedLoopLetGo => predicated_loop(sel, e),
         rt::CommandBufferError::MeshRecordsOverflow(overflow) => {
             mesh_records_overflow(sel, overflow)
         }
@@ -1192,33 +1188,18 @@ fn cubic_argument_sampler(sel: &'static str) -> ! {
     )
 }
 
-/// The death at `sel` of a command buffer the runtime failed as it committed, as a command's plan
-/// could not list the sampler states live then (more than its set-1 sampler arrays or its
-/// sampler tables hold, or one of a shape they refuse), or as a host step recorded a command
-/// after the commit whose plan could not list them (more than its set-1 sampler arrays hold),
-/// whether or not its functions reach the state left out;
-/// Metal's functions reach every live state by its resource ID, and Metal fails no command
-/// buffer so.
-fn unlisted_argument_sampler(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "a command whose argument samplers the runtime could not all list as its command buffer \
-         committed or a host step recorded it, which it fails the command buffer of, where \
-         Metal's functions reach every live sampler state by its ID",
-    )
-}
-
-/// The death at `sel` of a command buffer a host step failed, as a command it recorded needed a
-/// Vulkan object of `object`'s kind that nothing made before the step, which makes none (an
-/// image, a render pass, a framebuffer, or a neutral binding of a slot nothing is bound to):
-/// Metal draws the command and fails no command buffer.
-fn host_step_object(sel: &'static str, object: rt::HostStepObject) -> ! {
+/// The death at `sel` of a command buffer the runtime failed for a command-predication loop it
+/// stopped, `e`: one that would have run past the copies of its commands the runtime laid down,
+/// whose commands it records apart (`PredicatedLoopPastCopies`), or one still running once the
+/// program held no handle of its queue (`PredicatedLoopLetGo`), where Metal runs the loop on
+/// without bound, until the process ends. No record of the runtime's command predication reaches
+/// it here ([`predication`]), so neither is reached.
+fn predicated_loop(sel: &'static str, e: rt::CommandBufferError) -> ! {
     unrepresentable(
         sel,
         &format!(
-            "a command a host step recorded, whose draw needed a Vulkan object nothing made \
-             before the step ({object:?}), which the step makes none of and fails the command \
-             buffer of, where Metal draws it"
+            "a command-predication loop the runtime stopped ({e:?}), where Metal runs it on \
+             without bound"
         ),
     )
 }
@@ -1564,7 +1545,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// Kept here, as the runtime has no protected content: the encoders made under them decide
     /// how the command buffer fails ([`CommandBufferObject::made_encoder`]). While an encoder is
-    /// open it dies, as Metal asserts (`exec_protection_envelope_open_encoder`), and so do other
+    /// open it dies, as Metal asserts (`exec_protection_envelope_open_encoder`), and after an
+    /// encoder went without `endEncoding`, naming the runtime's refusal (`EncoderAbandoned`),
+    /// where plain Metal asserts as the encoder goes; so do other
     /// options once an encoder was made under some, or after options from 0x10 up, which
     /// nothing measured.
     fn set_protection_options(&self, _on: OnFault, options: u64) -> RaiseResult<()> {
@@ -2359,12 +2342,12 @@ mod tests {
     }
 
     /// A command buffer's failure that is one of Metal's reaches core; every failure of the
-    /// runtime's own dies at the selector that reads it first, at the commit's and at the wait,
-    /// its line naming it: a sparse mapping update the runtime applied none of, a Vulkan failure
-    /// of a submission, one nothing here matched to Metal's, and an indirect draw's indices past
-    /// the index pool. The eight this platform lists as Metal's are those the runtime states as
-    /// Metal's, and the others it names its own: a change of either at a new pin fails here, for
-    /// review
+    /// runtime's own dies at the selector that reads it first, at the commit's and at the wait, its
+    /// line naming it: a sparse mapping update the runtime applied none of, a Vulkan failure of a
+    /// submission, one nothing here matched to Metal's, an indirect draw's indices past the index
+    /// pool, and a command-predication loop the runtime stopped. The thirteen this platform lists
+    /// as Metal's are those the runtime states as Metal's, and the others it names its own: a
+    /// change of either at a new pin fails here, for review
     #[test]
     fn failures_metal_has_none_of_die_named() {
         use rt::CommandBufferError as E;
@@ -2373,8 +2356,13 @@ mod tests {
             E::DeviceLost,
             E::OutOfMemory,
             E::PageFault,
+            E::GpuHang,
+            E::GpuRecoveryVictim,
+            E::AccessRevoked,
             E::RenderTargetSize,
             E::DetachedBacking,
+            E::ProtectedEncoder(1),
+            E::PredicationOpenAtUnitEnd { record: 0 },
             E::DefaultRasterSampleCount,
             E::Execution(1),
         ];
@@ -2394,6 +2382,8 @@ mod tests {
             (E::SparseMappingSplit, "regions bind or unbind part of one"),
             (E::Internal(rt::VkResultCode(-13)), "VkResult -13"),
             (E::IndexPoolOverflow, "index pool"),
+            (E::PredicatedLoopPastCopies, "loop the runtime stopped"),
+            (E::PredicatedLoopLetGo, "loop the runtime stopped"),
         ];
         for (e, _) in named {
             assert_eq!(e.origin(), rt::FailureOrigin::Runtime, "{e:?}");
@@ -2581,29 +2571,6 @@ mod tests {
         assert_eq!(site.file, "commit");
     }
 
-    /// A command buffer a host step failed for a Vulkan object nothing made before it
-    /// (`CommandBufferError::HostStepObject`) dies at the selector where its failure is read, at
-    /// the commit's (a completed handler's, its status or error) and at the wait, its line naming
-    /// the object's kind and that Metal draws the command
-    #[test]
-    fn a_host_steps_object_dies_naming_its_kind() {
-        use rt::HostStepObject as O;
-        for sel in ["commit", "waitUntilCompleted"] {
-            for object in [O::Neutral, O::Image, O::RenderPass, O::Framebuffer] {
-                *crate::answer::LAST_LINE.lock() = None;
-                let site = catch_death(|| {
-                    host_step_object(sel, object);
-                })
-                .unwrap_err();
-                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-                assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-                let named = format!("nothing made before the step ({object:?})");
-                assert!(line.contains(&named), "{line}");
-                assert!(line.ends_with("where Metal draws it"), "{line}");
-            }
-        }
-    }
-
     /// A command buffer the runtime failed for a command's buffer rebound before its first
     /// submission (`CommandBufferError::EncodedUseRebound`) dies at the selector where its
     /// failure is read, at the commit's (a completed handler's, its status or error) and at the
@@ -2627,7 +2594,10 @@ mod tests {
     }
 
     /// While an encoder is open, what Metal asserts at dies whatever the handler: another
-    /// encoder, an event, setProtectionOptions:, commit; once it ends, each is taken
+    /// encoder, an event, setProtectionOptions:, commit; once it ends, each is taken. An encoder
+    /// that goes without endEncoding is open no more, but abandons its command buffer, whose
+    /// setProtectionOptions: then dies, naming the runtime's refusal (`EncoderAbandoned`), where
+    /// plain Metal asserts as the encoder goes (the runtime's statement)
     #[test]
     fn an_open_encoder_kills_what_metal_asserts_at() {
         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -2657,9 +2627,14 @@ mod tests {
         cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
-        // An encoder that goes without endEncoding is open no more.
+        // An encoder that goes without endEncoding is open no more, and abandons the buffer.
         let cb = buffer(&q);
         drop(cb.blit_encoder(OnFault::Return).unwrap().unwrap());
-        cb.set_protection_options(OnFault::Return, 0).unwrap();
+        *crate::answer::LAST_LINE.lock() = None;
+        dies("setProtectionOptions:", &|| {
+            let _ = cb.set_protection_options(OnFault::Return, 0);
+        });
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert!(line.contains("EncoderAbandoned"), "{line}");
     }
 }

@@ -1880,9 +1880,13 @@ impl Work<'_> {
                 ref check,
                 ..
             } => match check.take() {
-                Some((check, _)) => {
-                    e.execute_commands_in_buffer_indirect_checked(icb, buffer, offset, check)
-                }
+                Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
+                    icb,
+                    buffer,
+                    offset,
+                    check,
+                    rt::IndirectCommandCheckNeeds::ALL,
+                ),
                 None => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
             },
         }
@@ -1962,9 +1966,13 @@ impl Work<'_> {
             }
             Work::Execute { icb, ref check, .. } | Work::ExecuteIndirect { icb, ref check, .. } => {
                 match check.take() {
-                    Some((check, _)) => {
-                        e.execute_commands_in_buffer_indirect_checked(icb, chunk, at, check)
-                    }
+                    Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
+                        icb,
+                        chunk,
+                        at,
+                        check,
+                        rt::IndirectCommandCheckNeeds::ALL,
+                    ),
                     None => e.execute_commands_in_buffer_indirect(icb, chunk, at),
                 }
             }

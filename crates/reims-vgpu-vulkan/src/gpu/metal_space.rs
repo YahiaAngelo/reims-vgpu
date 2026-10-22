@@ -243,11 +243,11 @@ pub fn own_memory(
 /// may be larger (`heap-texture-larger-than-metal`: every texture on NVIDIA, whose
 /// `bufferImageGranularity` is 1024 bytes) or is for a depth or stencil texture without
 /// GPU-optimized contents (`optimized-depth-stencil-texture`), each of which the model answers.
-/// Where the model has none (a format or a sample count whose layout is not measured), of
-/// `answer`, the runtime's answer to the query for `desc`, which the runtime answers as its
-/// device's image's, larger or smaller than Metal's, and announces so
-/// (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]: a PVRTC format; 8 samples are
-/// refused first), at which a device's texture dies ([`unmeasured_size`]).
+/// Where the model has none (a format or a sample count whose layout is not measured), of `answer`,
+/// the runtime's answer to the query for `desc`, which the runtime answers as its device's image's,
+/// larger or smaller than Metal's, and announces so (`unmeasured-heap-texture-size`,
+/// [`crate::answer::HEARD`]: a PVRTC format at Metal level 26.7; 8 samples are refused first), at
+/// which a device's texture dies ([`unmeasured_size`]).
 ///
 /// The space takes a range or a slot by that size as for any texture ([`texture_space`]):
 /// `vaprobe depthsizes` took a slot of the size rounded up to [`SLOT_STEP`] in the private pool
@@ -264,7 +264,7 @@ pub fn own_heap_size(
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of `what` a
 /// texture of `desc` whose layout in Metal's heaps the runtime does not model, which `sel` heard
 /// the runtime announce (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]): a PVRTC
-/// format (8 samples, which its model has no answer for either, its
+/// format at Metal level 26.7 (8 samples, which its model has no answer for either, its
 /// descriptor check refuses first on every device), whose size and alignment the runtime answers
 /// as its device's image's, larger or smaller than Metal's, and the call goes on with them. The
 /// line names the texture.

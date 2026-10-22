@@ -951,13 +951,14 @@ fn depth_stencil_textures_without_optimized_contents_take_metals_space() {
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
-/// A depth or stencil texture's heap size with allowGPUOptimizedContents off is larger at
-/// the runtime than the Metal platform's on this host, as the runtime keeps its GPU-optimized
-/// layout (`OptimizedDepthStencilTexture`), so the query answers Metal's, the runtime's model
-/// of it: the Metal platform's size and alignment for each format, 4x4 to 128x128, of 1 and 4
-/// samples, at each of [`DEPTH_USAGES`], where the runtime's own answer is at least as many
-/// bytes, at an alignment Metal's divides, an X32_Stencil8 texture's among them, a `Stencil8`
-/// one's of its shape. With it on or unset the size is
+/// A depth or stencil texture's heap size with allowGPUOptimizedContents off is Metal's: a
+/// 128x128 `Depth32Float` or `Depth32Float_Stencil8` one's, which the runtime lays out in
+/// Metal's tiles on MoltenVK, is the runtime's own answer too; where the runtime keeps one's
+/// GPU-optimized layout (`OptimizedDepthStencilTexture`), the query answers Metal's, the
+/// runtime's model of it. The Metal platform's size and alignment for each format, 4x4 to
+/// 128x128, of 1 and 4 samples, at each of [`DEPTH_USAGES`], where the runtime's own answer is
+/// at least as many bytes, at an alignment Metal's divides, an X32_Stencil8 texture's among
+/// them, a `Stencil8` one's of its shape. With it on or unset the size is
 /// Metal's: a `Depth32Float_Stencil8` one's is the runtime's, which models its layout and
 /// announces nothing, Metal's at this shape
 #[test]
@@ -984,12 +985,12 @@ fn heap_depth_stencil_sizes_with_optimized_contents_off() {
             metal.heap_texture_size_and_align(&desc).unwrap()
         })
     };
-    for (pixel_format, runtimes, metals) in [(252, 66048, 65536), (260, 98816, 81920)] {
+    for (pixel_format, metals) in [(252, 65536), (260, 81920)] {
         let t = shape(pixel_format, 128, 1, Some(false));
         let off = platform().texture_descriptor(&t);
         let raw = off.fields().descriptor(sel, Maker::SizeQuery);
         let answer = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
-        assert_eq!(answer.size, runtimes, "{pixel_format}");
+        assert_eq!(answer.size, metals, "{pixel_format}: the runtime's");
         let ours = d.heap_texture_size_and_align(&off).unwrap();
         assert_eq!(ours.size, metals, "{pixel_format}");
         if let Some(theirs) = metal(&t) {
@@ -4459,14 +4460,14 @@ fn a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals() 
     assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
 }
 
-/// A texture the runtime does not tile placed in a heap over the guest's pages is made, as
-/// Metal makes it in the same heap, and the runtime's announcement
-/// (`heap-texture-untiled-layout`) is relayed, not a death: a two-aspect
-/// `Depth32Float_Stencil8` render target, as the suite's depth and stencil cases place it
-/// (core's detach heap, `Shared` over the pages, and the texture of the heap's options, as
-/// core sets them whatever the guest's descriptor names)
+/// A texture Metal may keep losslessly compressed placed in a heap over the guest's pages is
+/// made, as Metal makes it in the same heap, and the runtime's announcement
+/// (`heap-texture-lossless-layout`, its bytes there Metal's uncompressed tiles) is relayed, not a
+/// death: a two-aspect `Depth32Float_Stencil8` render target, as the suite's depth and stencil
+/// cases place it (core's detach heap, `Shared` over the pages, and the texture of the heap's
+/// options, as core sets them whatever the guest's descriptor names)
 #[test]
-fn heap_textures_over_guest_pages_in_an_untiled_layout_are_made() {
+fn heap_textures_over_guest_pages_metal_may_compress_are_made() {
     use crate::os::OsVm;
     use reims_vgpu_core::platform::os::vm::HostVm as _;
     use reims_vgpu_core::platform::types::ResourceAddressRange;
@@ -4510,8 +4511,8 @@ fn heap_textures_over_guest_pages_in_an_untiled_layout_are_made() {
     crate::answer::RELAYED.lock().clear();
     assert!(placed(&p, &d));
     let relayed = crate::answer::RELAYED.lock().clone();
-    let untiled = rt::Degradation::HeapTextureUntiledLayout;
-    assert!(relayed.contains(&untiled), "{relayed:?}");
+    let lossless = rt::Degradation::HeapTextureLosslessLayout;
+    assert!(relayed.contains(&lossless), "{relayed:?}");
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
         assert!(placed(&mp, &md));
@@ -4551,164 +4552,103 @@ fn use_heap<P: Platform>(d: &P::Device, heap: &P::Heap) {
     cb.wait_until_completed(OnFault::Return).unwrap();
 }
 
-/// A buffer or texture placed over a byte of a texture of a heap over the guest's pages that
-/// the runtime does not lay out in Metal's tiles dies at its placement while the texture
-/// lives, and so does such a texture placed over a byte of a buffer that lives: the runtime
-/// announced the texture at its creation (`heap-texture-untiled-layout`,
-/// [`crate::answer::HEARD`]). A buffer beside it is made, and one over its bytes once it is
-/// let go. Metal makes each of them in the same heap: a two-aspect `Depth32Float_Stencil8`
-/// render target, as the suite's cases place it, of the heap's options, beside a buffer over
-/// all of the heap, as core makes with each heap. Here the heap has no such buffer, beside which
-/// the texture dies (`untiled_textures_die_beside_the_heaps_cover`)
+/// A buffer or texture placed over a byte of a `Depth32Float_Stencil8` render target of a heap
+/// over the guest's pages, as the suite's cases place it, of the heap's options, is made while
+/// the texture lives, and so is such a texture placed over a byte of a buffer that lives: the
+/// runtime lays the texture out there as Metal's tiles, uncompressed where Metal may keep it
+/// compressed (`heap-texture-lossless-layout`, relayed), so nothing keeps it apart. A buffer
+/// beside it is made, and one over its bytes once it is let go. Each is made as Metal makes it in
+/// the same heap, beside a buffer over all of the heap, as core makes with each heap
 #[test]
-fn placements_over_untiled_heap_textures_die() {
-    use reims_vgpu_core::raise::death::DeathSite;
-
-    const BUFFER: &str = "newBufferWithLength:options:offset:";
-    const TEXTURE: &str = "newTextureWithDescriptor:offset:";
-    let size = over_pages();
-
-    // Metal's side first: each placement is made.
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (heap, depth_stencil, beside) = heap_over_pages(&mp, &md);
+fn placements_over_heap_depth_stencil_targets_are_made_as_metals() {
+    /// Each placement on `on`'s side, which `d` makes.
+    fn placements<P: Platform>(p: &P, d: &P::Device, on: &str) {
+        let (heap, depth_stencil, beside) = heap_over_pages(p, d);
         let options = heap.resource_options();
-        let whole = heap.new_buffer_of_length(size, options, 0).unwrap();
-        assert!(whole.is_some(), "Metal: a buffer over all of the heap");
+        let whole = heap.new_buffer_of_length(over_pages(), options, 0).unwrap();
+        assert!(whole.is_some(), "{on}: a buffer over all of the heap");
         let t = heap.new_texture(&depth_stencil, 0).unwrap();
-        assert!(t.is_some(), "Metal: the texture");
+        assert!(t.is_some(), "{on}: the texture");
         let over = heap.new_buffer_of_length(0x100, options, 0).unwrap();
-        assert!(over.is_some(), "Metal: a buffer over it");
+        assert!(over.is_some(), "{on}: a buffer over it");
         let b = heap.new_buffer_of_length(0x100, options, beside).unwrap();
-        assert!(b.is_some(), "Metal: a buffer beside it");
+        assert!(b.is_some(), "{on}: a buffer beside it");
         let second = heap.new_texture(&depth_stencil, beside).unwrap();
-        assert!(second.is_some(), "Metal: a texture over a buffer");
+        assert!(second.is_some(), "{on}: a texture over a buffer");
         drop((t, over, second));
         let after = heap.new_buffer_of_length(0x100, options, 0).unwrap();
-        assert!(after.is_some(), "Metal: a buffer once it is let go");
-        drop(whole);
+        assert!(after.is_some(), "{on}: a buffer once it is let go");
+        drop((b, whole));
     }
-
-    let dies = |site: DeathSite, sel, case: &str| {
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, sel),
-            "{case}: {line}"
-        );
-        assert!(
-            line.contains("heap-texture-untiled-layout"),
-            "{case}: {line}"
-        );
-    };
-    let (p, d) = (platform(), dev());
-    let (heap, depth_stencil, beside) = heap_over_pages(&p, &d);
-    let options = heap.resource_options();
-    crate::answer::RELAYED.lock().clear();
-    let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-    let untiled = rt::Degradation::HeapTextureUntiledLayout;
-    assert!(crate::answer::RELAYED.lock().contains(&untiled));
-    *crate::answer::LAST_LINE.lock() = None;
-    dies(
-        catch_death(|| heap.new_buffer_of_length(0x100, options, 0)).unwrap_err(),
-        BUFFER,
-        "a buffer over it",
-    );
-    let b = heap
-        .new_buffer_of_length(0x100, options, beside)
-        .unwrap()
-        .unwrap();
-    *crate::answer::LAST_LINE.lock() = None;
-    dies(
-        catch_death(|| heap.new_texture(&depth_stencil, beside)).unwrap_err(),
-        TEXTURE,
-        "a texture over a buffer that lives",
-    );
-    drop(t);
-    assert!(
-        (heap.new_buffer_of_length(0x100, options, 0).unwrap()).is_some(),
-        "a buffer once it is let go"
-    );
-    drop(b);
-}
-
-/// A texture the runtime does not lay out in Metal's tiles (`heap-texture-untiled-layout`)
-/// placed in a heap over the guest's pages beside its cover, core's buffer over all of it, made
-/// first, as five suite cases place one, dies at its placement, naming the cover and the kind:
-/// the cover and the guest's pages would show the runtime's layout where Metal's are its tiles
-/// ([`Placements`]). So does one placed after the heap was made resident. Once the cover is let
-/// go, the texture is made. Metal makes each, runs a fill of the cover over the texture, and
-/// makes the heap resident
-#[test]
-fn untiled_textures_die_beside_the_heaps_cover() {
-    const TEXTURE: &str = "newTextureWithDescriptor:offset:";
-
-    // Metal's side first: each is made, and the fill and the pass run.
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
-        let (heap, depth_stencil, _) = heap_over_pages(&mp, &md);
+        placements(&mp, &md, "Metal");
+    }
+    placements(&platform(), &dev(), "Vulkan");
+}
+
+/// A `Depth32Float_Stencil8` render target placed in a heap over the guest's pages beside its
+/// cover, core's buffer over all of it, made first, as five suite cases place one, is made: the
+/// runtime lays it out there as Metal's tiles, uncompressed where Metal may keep it compressed
+/// (`heap-texture-lossless-layout`, relayed), so the cover sees its bytes as Metal's
+/// ([`Placements`]). So is one placed after the heap was made resident. Each is made as Metal
+/// makes it, and a fill of the cover over the texture and the pass that makes the heap resident
+/// run on both
+#[test]
+fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
+    /// Each placement, fill and pass on `on`'s side, which `d` makes.
+    fn beside_the_cover<P: Platform>(p: &P, d: &P::Device, on: &str) {
+        let (heap, depth_stencil, _) = heap_over_pages(p, d);
         let options = heap.resource_options();
         let cover = heap.new_buffer_of_length(over_pages(), options, 0).unwrap();
         let cover = cover.unwrap();
         let t = heap.new_texture(&depth_stencil, 0).unwrap();
-        assert!(t.is_some(), "Metal: the texture");
-        fill_range::<MetalPlatform>(&md, &cover, NsRange::new(0, 16));
+        assert!(t.is_some(), "{on}: the texture");
+        fill_range::<P>(d, &cover, NsRange::new(0, 16));
         drop(t);
-        use_heap::<MetalPlatform>(&md, &heap);
+        use_heap::<P>(d, &heap);
         let t = heap.new_texture(&depth_stencil, 0).unwrap();
-        assert!(t.is_some(), "Metal: the texture once the heap was resident");
+        assert!(t.is_some(), "{on}: the texture once the heap was resident");
         drop((t, cover));
     }
-
-    let (p, d) = (platform(), dev());
-    let dies = |case: &str, place: &dyn Fn()| {
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(place).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, TEXTURE),
-            "{case}: {line}"
-        );
-        let beside = "while the buffer over all of the heap that core makes with it lives";
-        assert!(line.contains(beside), "{case}: {line}");
-        assert!(
-            line.contains("heap-texture-untiled-layout"),
-            "{case}: {line}"
-        );
-    };
-    let (heap, depth_stencil, _) = heap_over_pages(&p, &d);
-    let options = heap.resource_options();
-    let cover = heap
-        .new_buffer_of_length(over_pages(), options, 0)
-        .unwrap()
-        .unwrap();
-    dies("beside the cover", &|| {
-        drop(heap.new_texture(&depth_stencil, 0));
-    });
-    use_heap::<VulkanPlatform>(&d, &heap);
-    dies("once the heap was made resident", &|| {
-        drop(heap.new_texture(&depth_stencil, 0));
-    });
-    drop(cover);
-    let t = heap.new_texture(&depth_stencil, 0).unwrap();
-    assert!(t.is_some(), "the texture once the cover is let go");
+    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    if let Some(md) = MetalPlatform::system_default_device() {
+        beside_the_cover(&mp, &md, "Metal");
+    }
+    beside_the_cover(&platform(), &dev(), "Vulkan");
 }
 
-/// A view of a texture the runtime does not lay out in Metal's tiles
-/// (`heap-texture-untiled-layout`), in a heap over the guest's pages, keeps the texture's
-/// bytes taken once the texture is released, as a Metal view's `parentTexture` keeps the
-/// texture ([`TextureObject::life`]): a buffer placed over them in the heap dies, naming the
-/// kind; once the view is let go too, the buffer is made. Metal makes each
+/// A view of a texture a heap over the guest's pages keeps apart from its other resources, a
+/// 4-sample `Depth16Unorm` render target without `allowGPUOptimizedContents`, which the runtime
+/// sizes larger than Metal's (`optimized-depth-stencil-texture`), keeps the texture's bytes
+/// taken once the texture is released, as a Metal view's `parentTexture` keeps the texture
+/// ([`TextureObject::life`]): a buffer placed over them in the heap dies, naming the kind; once
+/// the view is let go too, the buffer is made. Metal makes each
 #[test]
 fn a_view_keeps_its_released_textures_bytes() {
     const BUFFER: &str = "newBufferWithLength:options:offset:";
+    /// The heap over the guest's pages at `at`, and its 4-sample `Depth16Unorm` render target
+    /// without `allowGPUOptimizedContents`.
+    fn heap_and_target<P: Platform>(p: &P, d: &P::Device, at: u64) -> (P::Heap, P::Texture) {
+        let (heap, ..) = heap_over_pages_at(p, d, at);
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: 250,
+            texture_type: 4,
+            sample_count: 4,
+            width: 16,
+            height: 16,
+            usage: 0x4,
+            resource_options: Some(heap.resource_options()),
+            allow_gpu_optimized_contents: Some(false),
+            ..TextureDesc::default()
+        });
+        let t = heap.new_texture(&desc, 0).unwrap().unwrap();
+        (heap, t)
+    }
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
-        let at = guest_pages();
-        let (heap, depth_stencil, _) = heap_over_pages_at(&mp, &md, at);
-        let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-        let view = t.new_texture_view(260).unwrap();
+        let (heap, t) = heap_and_target(&mp, &md, guest_pages());
+        let view = t.new_texture_view(250).unwrap();
         assert!(view.is_some(), "Metal: the view");
         drop(t);
         let over = heap.new_buffer_of_length(0x100, heap.resource_options(), 0);
@@ -4717,34 +4657,31 @@ fn a_view_keeps_its_released_textures_bytes() {
     }
 
     let (p, d) = (platform(), dev());
-    let at = guest_pages();
-    let (heap, depth_stencil, _) = heap_over_pages_at(&p, &d, at);
+    let (heap, t) = heap_and_target(&p, &d, guest_pages());
     let options = heap.resource_options();
-    let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-    let view = t.new_texture_view(260).unwrap().unwrap();
+    let view = t.new_texture_view(250).unwrap().unwrap();
     drop(t);
     *crate::answer::LAST_LINE.lock() = None;
     let site = catch_death(|| heap.new_buffer_of_length(0x100, options, 0)).unwrap_err();
     let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
     assert_eq!((site.kind, site.file), (DeathKind::Abort, BUFFER), "{line}");
-    assert!(line.contains("heap-texture-untiled-layout"), "{line}");
+    assert!(line.contains("optimized-depth-stencil-texture"), "{line}");
     drop(view);
     let over = heap.new_buffer_of_length(0x100, options, 0).unwrap();
     assert!(over.is_some(), "a buffer over them once the view is let go");
 }
 
 /// A 4-sample `RGBA8Unorm` render target placed in a `Shared` heap over the guest's pages, of
-/// the heap's options as core gives them, dies at the placement. Where Metal keeps it
-/// losslessly compressed (16 by 16, its sample grid 32 by 32, with
-/// `allowGPUOptimizedContents`), the runtime makes it, its image in memory of its own, the
-/// heap's bytes keeping what they held, and announces `heap-texture-lossless-layout`, which the
-/// placement hears and dies of, naming it. One Metal keeps uncompressed,
-/// whose samples Metal lays out in the heap's bytes, dies naming the runtime's refusal
-/// (`NotImplemented(HostHeapUncompressedMultisample)`): 16 by 16 with
-/// `allowGPUOptimizedContents` off, and 16 by 4, whose sample grid is 32 by 8. Metal makes
-/// each in the same heap. No suite case and no boot is known to place one
+/// the heap's options as core gives them, where Metal keeps it losslessly compressed (16 by 16,
+/// its sample grid 32 by 32, with `allowGPUOptimizedContents`), dies at the placement: the
+/// runtime makes it, its image in memory of its own, the heap's bytes keeping what they held,
+/// and announces `heap-texture-lossless-layout`, which the placement hears and dies of, naming
+/// it. One Metal keeps uncompressed, whose samples the runtime lays out in the heap's bytes as
+/// Metal's tiles, is made: 16 by 16 with `allowGPUOptimizedContents` off, and 16 by 4, whose
+/// sample grid is 32 by 8. Metal makes each in the same heap. No suite case and no boot is known
+/// to place one
 #[test]
-fn multisampled_textures_in_a_heap_over_guest_pages_die_where_placed() {
+fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_them() {
     use crate::os::OsVm;
     use reims_vgpu_core::platform::os::vm::HostVm as _;
     use reims_vgpu_core::platform::types::ResourceAddressRange;
@@ -4795,19 +4732,22 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_placed() {
     let compressed = (16, None);
     let uncompressed = [(16, Some(false)), (4, None)];
     let (p, d) = (platform(), dev());
-    let named = std::iter::once((compressed, "heap-texture-lossless-layout"))
-        .chain(uncompressed.map(|shape| (shape, "HostHeapUncompressedMultisample")));
-    for (shape, named) in named {
+    let (heap, multisample) = heap_and_texture(&p, &d, compressed);
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| heap.new_texture(&multisample, 0).is_ok()).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(
+        (site.kind, site.file),
+        (DeathKind::Abort, "newTextureWithDescriptor:offset:"),
+        "{line}"
+    );
+    assert!(line.contains("heap-texture-lossless-layout"), "{line}");
+    for shape in uncompressed {
         let (heap, multisample) = heap_and_texture(&p, &d, shape);
         *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| heap.new_texture(&multisample, 0).is_ok()).unwrap_err();
+        let made = catch_death(|| heap.new_texture(&multisample, 0).unwrap().is_some());
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "newTextureWithDescriptor:offset:"),
-            "{shape:?}: {line}"
-        );
-        assert!(line.contains(named), "{shape:?}: {line}");
+        assert!(matches!(made, Ok(true)), "{shape:?}: {line}");
     }
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
@@ -4821,26 +4761,23 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_placed() {
     }
 }
 
-/// A depth or stencil texture without allowGPUOptimizedContents placed in a heap, whose size
-/// the runtime answers larger than Metal's (`optimized-depth-stencil-texture`,
-/// [`crate::answer::HEARD`]). In a heap over no address ranges, core's legacy heap, one made
-/// dies where it is made, at every shape, as every depth or stencil texture made there does
-/// ([`HeapObject::legacy_made`]): a `Depth32Float` one and the suite's (a 2D
-/// `Depth32Float_Stencil8` render target, 8x8, as `render_state_depth` and four more cases place
-/// it there), and one with the property on, as core's copies would carry the runtime's layout to
-/// the guest's pages. The suite's beside the first, where Metal's size (16512 bytes, as the
-/// runtime's) runs past the heap's end, is nil, as Metal's; a placement inside the heap the
-/// runtime answers nil dies where Metal's size fits (a 64x64 one at 0x4000 of the 0x8000 heap,
-/// Metal's 16384 bytes, the runtime's 16512), and is nil where it does not either (a 128x128 one
-/// at 0, Metal's 65536 bytes) and off Metal's alignment (a 16x16 one at 0x40), as the Metal
-/// platform answers in a heap of its own; one past its end is nil. A buffer over all of the
-/// heap, as core makes with each heap, is made first. In a `Shared` heap
-/// over the guest's pages, as core's detach heap is, with no such buffer, a `Depth32Float` one
-/// is made; a buffer and a texture over a byte of it die while it lives, and so does such a
-/// texture over a byte of a buffer that lives. The Metal platform makes each made here or dying
-/// here
+/// A depth or stencil texture without allowGPUOptimizedContents placed in a heap, which the
+/// runtime sizes as Metal does (`heap_depth_stencil_sizes_with_optimized_contents_off`). In a
+/// heap over no address ranges, core's legacy heap, one made dies where it is made, at every
+/// shape, as every depth or stencil texture made there does ([`HeapObject::legacy_made`]): a
+/// `Depth32Float` one and the suite's (a 2D `Depth32Float_Stencil8` render target, 8x8, as
+/// `render_state_depth` and four more cases place it there), one with the property on, and a
+/// 64x64 one at 0x4000 of the 0x8000 heap, where Metal's 16384 bytes fit, as core's copies would
+/// carry the runtime's layout to the guest's pages. The suite's beside the first, where Metal's
+/// size (16512 bytes, as the runtime's) runs past the heap's end, is nil, as Metal's; so are a
+/// 128x128 one at 0 (Metal's 65536 bytes), one off Metal's alignment (a 16x16 one at 0x40) and
+/// one past the heap's end, as the Metal platform answers in a heap of its own. A buffer over
+/// all of the heap, as core makes with each heap, is made first. In a `Shared` heap over the
+/// guest's pages, as core's detach heap is, with no such buffer, a `Depth32Float` one is made,
+/// and so are a buffer and a texture over a byte of it while it lives, and such a texture over a
+/// byte of a buffer that lives. The Metal platform makes each made here or dying here
 #[test]
-fn placements_of_optimized_depth_textures_die_where_the_size_decides() {
+fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
     use reims_vgpu_core::raise::death::DeathSite;
     let texture_sel = "newTextureWithDescriptor:offset:";
     /// A `Depth32Float` render target, `side` by `side`, of `options`.
@@ -4970,6 +4907,7 @@ fn placements_of_optimized_depth_textures_die_where_the_size_decides() {
         ("a Depth32Float one", depth(16, Some(false)), 0),
         ("the suite's", suites, 0),
         ("with the property on", depth(16, Some(true)), beside),
+        ("a 64x64 one at 0x4000", depth(64, Some(false)), 0x4000),
     ] {
         *crate::answer::LAST_LINE.lock() = None;
         dies(
@@ -4989,14 +4927,6 @@ fn placements_of_optimized_depth_textures_die_where_the_size_decides() {
         (h.new_texture(&suites, beside).unwrap()).is_none(),
         "nil where Metal's size runs past the heap's end"
     );
-    *crate::answer::LAST_LINE.lock() = None;
-    dies(
-        catch_death(|| h.new_texture(&depth(64, Some(false)), 0x4000)).unwrap_err(),
-        texture_sel,
-        "nil inside the heap where Metal's size fits",
-    );
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert!(line.contains("which the runtime answers nil"), "{line}");
     assert!(
         (h.new_texture(&depth(128, Some(false)), 0).unwrap()).is_none(),
         "nil inside the heap where Metal's size does not fit either"
@@ -5020,8 +4950,8 @@ fn placements_of_optimized_depth_textures_die_where_the_size_decides() {
         size: size.size,
         align: size.align,
     };
-    over_pages(&p, &shared, size, &|case, sel, made| {
-        dies(catch_death(made).unwrap_err(), sel, case);
+    over_pages(&p, &shared, size, &|case, _, made| {
+        assert!(made(), "{case}");
     });
 }
 
@@ -5284,20 +5214,19 @@ fn block_writes_only_sizes_are_metals_and_fit() {
     assert!(!crate::answer::RELAYED.lock().contains(&unmeasured));
 }
 
-/// A texture whose layout in Metal's heaps the runtime does not model, a PVRTC one, whose size
-/// it answers as its device's image's (`unmeasured-heap-texture-size`), dies at each selector
-/// that heard it, naming the kind and the texture, where the Metal platform answers:
-/// `newTextureWithDescriptor:` of the suite's texture of each PVRTC format (`textures_formats`:
-/// 2D, 16x16, one level, `Private`, `ShaderRead`, `allowGPUOptimizedContents` off) and of a
-/// 32x32 one, the size query of the suite's texture, and its placement in a heap; a placement
-/// at the heap's end is nil, as Metal's. A texture of 8 samples dies at the runtime's refusal
-/// first (`SampleCount`), naming no kind, where Metal stops it (the runtime's measurement)
+/// A PVRTC texture's size and alignment in Metal's heaps are Metal's: the runtime models
+/// PVRTC's layout there at macOS 27.0.1, this host's level (its `unmeasured-heap-texture-size`
+/// names a PVRTC texture at 26.7 alone, [`crate::answer::HEARD`]). `newTextureWithDescriptor:`
+/// of the suite's texture of each PVRTC format (`textures_formats`: 2D, 16x16, one level,
+/// `Private`, `ShaderRead`, `allowGPUOptimizedContents` off) is made, and the size query
+/// answers Metal's; its placement in a heap is made, one at the heap's end is nil, and a 32x32
+/// one is made, as on Metal. A texture of 8 samples dies at the runtime's refusal (`SampleCount`),
+/// naming no kind, where Metal stops it (the runtime's measurement)
 #[test]
-fn unmodelled_heap_sizes_die() {
-    let (sel, query, place) = (
+fn pvrtc_heap_sizes_are_metals() {
+    let (sel, query) = (
         "newTextureWithDescriptor:",
         "heapTextureSizeAndAlignWithDescriptor:",
-        "newTextureWithDescriptor:offset:",
     );
     let (p, d) = (platform(), dev());
     let md = MetalPlatform::system_default_device();
@@ -5323,83 +5252,58 @@ fn unmodelled_heap_sizes_die() {
         );
         line
     };
-    for pixel_format in 160..=167 {
-        let t = suites(pixel_format);
-        let name = format!("PVRTC {pixel_format}");
-        if let Some(md) = &md {
-            let theirs = md.new_texture(OnFault::Return, &mp.texture_descriptor(&t));
-            assert!(theirs.unwrap().is_some(), "Metal: {name}");
-        }
-        let desc = p.texture_descriptor(&t);
-        let line = died(sel, &name, &|| {
-            drop(d.new_texture(OnFault::Return, &desc));
-        });
-        assert!(
-            line.contains("unmeasured-heap-texture-size"),
-            "{name}: {line}"
-        );
-        let format = format!("pixel format {pixel_format},");
-        assert!(line.contains(&format), "{name}: {line}");
-    }
-    let t = suites(166);
-    let wider = TextureDesc {
+    let wider = |t: TextureDesc| TextureDesc {
         width: 32,
         height: 32,
         ..t
     };
-    if let Some(md) = &md {
-        let metal = |t: &TextureDesc| mp.texture_descriptor(t);
-        assert!(
-            md.heap_texture_size_and_align(&metal(&t)).is_ok(),
-            "Metal's query"
-        );
-        let heap = heap_of::<MetalPlatform>(md, 0x8000, &options).heap.unwrap();
-        assert!(
-            heap.new_texture(&metal(&t), 0).unwrap().is_some(),
-            "Metal's placement"
-        );
-        assert!(
-            heap.new_texture(&metal(&t), 0x8000).unwrap().is_none(),
-            "Metal's end"
-        );
-        let made = md.new_texture(OnFault::Return, &metal(&wider));
-        assert!(made.unwrap().is_some(), "Metal's 32x32");
+    for pixel_format in 160..=167 {
+        let name = format!("PVRTC {pixel_format}");
+        for t in [suites(pixel_format), wider(suites(pixel_format))] {
+            let desc = p.texture_descriptor(&t);
+            let made = d.new_texture(OnFault::Return, &desc).unwrap();
+            assert!(made.is_some(), "{name}");
+            let ours = d.heap_texture_size_and_align(&desc).unwrap();
+            if let Some(md) = &md {
+                let metal = mp.texture_descriptor(&t);
+                let theirs = md.new_texture(OnFault::Return, &metal);
+                assert!(theirs.unwrap().is_some(), "Metal: {name}");
+                let theirs = md.heap_texture_size_and_align(&metal).unwrap();
+                assert_eq!(
+                    (ours.size, ours.align),
+                    (theirs.size, theirs.align),
+                    "{name} {}x{}",
+                    t.width,
+                    t.height
+                );
+            }
+        }
     }
-    let desc = p.texture_descriptor(&t);
-    let heap = heap_of::<VulkanPlatform>(&d, 0x8000, &options)
-        .heap
-        .unwrap();
-    assert!(
-        heap.new_texture(&desc, 0x8000).unwrap().is_none(),
-        "the end"
-    );
-    let wide = p.texture_descriptor(&wider);
-    for (at, name, line) in [
-        (
-            query,
-            "the query",
-            died(query, "the query", &|| {
-                drop(d.heap_texture_size_and_align(&desc))
-            }),
-        ),
-        (
-            place,
-            "the placement",
-            died(place, "the placement", &|| drop(heap.new_texture(&desc, 0))),
-        ),
-        (
-            sel,
-            "32x32",
-            died(sel, "32x32", &|| {
-                drop(d.new_texture(OnFault::Return, &wide))
-            }),
-        ),
-    ] {
-        assert!(
-            line.contains("unmeasured-heap-texture-size"),
-            "{at} {name}: {line}"
-        );
-        assert!(line.contains("pixel format 166"), "{at} {name}: {line}");
+    let t = suites(166);
+    for (made_at_0, at_end) in [
+        md.as_ref().map(|md| {
+            let heap = heap_of::<MetalPlatform>(md, 0x8000, &options).heap.unwrap();
+            let metal = mp.texture_descriptor(&t);
+            (
+                heap.new_texture(&metal, 0).unwrap().is_some(),
+                heap.new_texture(&metal, 0x8000).unwrap().is_some(),
+            )
+        }),
+        Some({
+            let heap = heap_of::<VulkanPlatform>(&d, 0x8000, &options)
+                .heap
+                .unwrap();
+            let desc = p.texture_descriptor(&t);
+            (
+                heap.new_texture(&desc, 0).unwrap().is_some(),
+                heap.new_texture(&desc, 0x8000).unwrap().is_some(),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!((made_at_0, at_end), (true, false), "the placement, the end");
     }
     let eight = p.texture_descriptor(&TextureDesc {
         texture_type: 4,

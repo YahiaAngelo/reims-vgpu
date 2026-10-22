@@ -44,9 +44,9 @@
 //! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536, Metal's answer at the device's Metal level, as the runtime records it (`MetalLevel::private_count`, its `PrivateAnswer::Metal`) | undocumented, and not the public `maxThreadgroupMemoryLength` (32768 on both platforms, the runtime's answer) |
 //! | `maxVertexAmplificationCount` (private, key 20) | 2, Metal's answer at the device's Metal level as the runtime records it (`MetalLevel::private_count`), or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
 //! | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (private, keys 23 and 24) | yes | the runtime makes tile pipelines and imageblocks, a `half4` member over `RGBA8Unorm` among them. **Pending support** (below): it answers no on every device (`Device::private_properties`), as its audit of Apple9 refuses part of each row (`TileShaders` and `NonsquareTileDispatch` tile shading it has not built, `Imageblocks` imageblock masters), which dies at its selector |
-//! | an indirect command buffer's `gpuResourceID` and `resourceIndex` ([`crate::gpu::icb`]'s `Space`) | an ID of Metal's pool of them (`Pool`), a placement's low 32 bits, and a placement at `ID_LIMIT` (16384) or past it dies, as Metal writes past its table there | the runtime's ID, which its records' address follows, follows Metal's pool, placement and hold too, but after a reservation holding an ID of 2^23 or more, which it is not given: it refuses one of 2^30 or more, which Metal takes to 2^31 - 1, and a buffer whose own ID is 2^23 or more |
+//! | an indirect command buffer's `gpuResourceID` and `resourceIndex` ([`crate::gpu::icb`]'s `Space`) | an ID of Metal's pool of them (`Pool`), a placement's low 32 bits, and a placement at `ID_LIMIT` (16384) or past it dies, as Metal writes past its table there | the runtime's ID, which its records' address follows, follows Metal's pool, placement, reservations (to 2^31 - 1) and hold too, and is this one but in the window a release in a completed handler leaves (`icb`'s module docs) |
 //! | the address an indirect command's arguments answer for a nil patch or control-point index buffer (`icb::NIL_BUFFER_ADDRESS`) | `0x1eeee1111` | Metal's private getters' answer, which no record holds |
-//! | what an indirect command answers beside its record ([`crate::gpu::icb`]'s `CommandSide`) | a threadgroup memory length set past the 31 the record holds | the runtime's record holds no length past its 31 (`indirect-value-past-record`), where Metal's getter answers it |
+//! | what an indirect command answers beside its record ([`crate::gpu::icb`]'s `CommandSide`) | a threadgroup memory length set past the 31 the record holds | none now: the runtime keeps such lengths too, 38 a command, as Metal's getter answers them (`icb`'s `lengths_past_the_record_read_back_as_on_metal`) |
 //! | a rate map's `parameterBufferSizeAndAlign` of a map not yet compiled ([`crate::gpu::rate_map`]'s `PARAMETER_DATA`) | 24,624 bytes aligned to 4, Metal's for every map, which a compiled map's runtime answers too (its parameter data is Metal's) | a map not yet compiled has no runtime map to answer it |
 //! | a rate map's `physicalGranularity` (`rate_map::GRANULARITY`) | 32 by 32, depth 1, compiled or not | a map not yet compiled has no runtime map to answer it |
 //! | what a mutable rate map not yet reset answers ([`crate::gpu::rate_map`]) | its descriptor's screen size and layer count, a physical size of 0 by 0 (depth 1) for every layer, screen-to-physical (0, 0), parameter data of zeros | the runtime has no map until the reset compiles one |
@@ -95,7 +95,8 @@
 //!   none for, at every shape; where the model has one, the texture takes it
 //!   ([`crate::gpu::metal_space::own_heap_size`]);
 //! - `heapTextureSizeAndAlignWithDescriptor:` of a texture whose layout in Metal's heaps the
-//!   runtime does not model (a PVRTC format; 8 samples the runtime refuses first), whose
+//!   runtime does not model (a PVRTC format at Metal level 26.7, which the runtime measured at
+//!   27.0.1; 8 samples the runtime refuses first), whose
 //!   size and alignment the runtime answers as its device's image's and announces so
 //!   (`unmeasured-heap-texture-size`), dies at its selector, naming it ([`crate::answer::HEARD`]):
 //!   a guest that sized a heap by such answers could fit more or fewer such textures in it than
@@ -105,16 +106,21 @@
 //!   `R32Uint` render target, 0x5800 bytes (`resource`'s
 //!   `lossless_mipmapped_heap_texture_sizes_are_metals`);
 //! - a two-plane XR10 texture (550, 551) in a heap takes the size and alignment
-//!   `heapTextureSizeAndAlignWithDescriptor:` answers, Metal's two planes. A 2D one of one
-//!   level, slice and sample keeps its planes in the heap's bytes where Metal lays them out, but
-//!   any other's texels lie in memory of their own, apart from the heap's bytes, which the
-//!   runtime announces (`heap-two-plane-texture`), where Metal's texture keeps its two planes
-//!   there. So a buffer or texture placed over such a texture's range of the heap while it
-//!   lives dies at the placement, as such a texture placed over a living one's does, the heap's
-//!   cover, the buffer over all of it core makes with each heap, included: such a texture dies
-//!   in every heap core makes ([`crate::gpu::resource::Placements`]); the heap's bytes there,
-//!   read through the heap's address, a replaced backing or the guest's pages under a heap over
-//!   address ranges, are not its texels either;
+//!   `heapTextureSizeAndAlignWithDescriptor:` answers, Metal's two planes. One of one level, but
+//!   for a 1D array, keeps its first level's slices in the heap's bytes where Metal lays them out
+//!   (a 3D one its first depth slice, over which Metal lays every other); a mipmapped one and a
+//!   1D array keep the first level there too, where Metal's paths address the later levels at
+//!   bytes that differ by path, which the runtime announces (`heap-two-plane-layout`, relayed, in
+//!   strict mode dying at the creation, [`crate::answer::DIES`]); any other's texels (one past the
+//!   device's limits) lie in memory of their own, apart from the heap's bytes, which the runtime
+//!   announces (`heap-two-plane-texture`),
+//!   where Metal's texture keeps its two planes there. So a buffer or texture placed over such a
+//!   texture's range of the heap while it lives dies at the placement, as such a texture placed
+//!   over a living one's does, the heap's cover, the buffer over all of it core makes with each
+//!   heap, included: such a texture dies in every heap core makes
+//!   ([`crate::gpu::resource::Placements`]); the heap's bytes there, read through the heap's
+//!   address, a replaced backing or the guest's pages under a heap over address ranges, are not its
+//!   texels either;
 //! - a two-plane XR10 texture (550, 551) over plane 0 of a 'b3a8' surface is the runtime's, its
 //!   colour words in plane 0 and its alpha bytes in plane 1, read, sampled, cleared, filled and
 //!   copied to and from another texture of the format as Metal's (the tests compare them over the

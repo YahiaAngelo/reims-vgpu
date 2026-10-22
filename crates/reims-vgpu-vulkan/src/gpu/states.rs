@@ -108,19 +108,14 @@
 //!   the runtime fails the command buffer of a function that reached a cubic one, which dies
 //!   where its failure is first read ([`crate::gpu::command`]), where Metal samples; one that
 //!   never reaches a cubic sampler runs as Metal's while a cubic state is alive. A fragment
-//!   stage tests none: while any cubic state is alive on the device, whether or not an argument
-//!   buffer holds it, a draw whose fragment stage samples through an argument buffer's sampler,
-//!   of any filter, dies at its selector, naming the refusal, as the runtime lists every live
-//!   sampler state as an argument sampler and refuses that stage while the list holds a cubic
-//!   one. The runtime lists the live states again as a command buffer commits, and fails it,
-//!   whether or not a function reaches the state it leaves out, where a command of any stage
-//!   that samples through an argument buffer's sampler meets more states than its set-1 sampler
-//!   arrays (at most 65536 elements each, fewer where the device's limits are) or its sampler
-//!   tables hold, or such a draw meets a cubic state made after it was encoded: that dies where
-//!   its failure is first read (`UnlistedArgumentSampler`, [`crate::gpu::command`]), where
-//!   Metal's functions reach every live state by its ID. A command a host step records after
-//!   the commit, which no commit lists, fails it the same way where it meets more states than
-//!   its set-1 sampler arrays hold.
+//!   stage tests none: the runtime leaves a cubic state out of its sampler tables while a render
+//!   pipeline samples argument samplers, and so a state the tables cannot hold, as more states
+//!   live than a pipeline's set-1 sampler arrays hold (at most 65536 elements each, fewer where
+//!   the device's limits are), whether or not a function reaches it
+//!   (`unlisted-argument-sampler`, of [`crate::answer::DIES`]): a function that reads it through
+//!   its ID reads the neutral sampler, where Metal's functions reach every live state by its ID.
+//!   The runtime announces it as the state is made, or as a command is encoded while it lives;
+//!   it is relayed, and in strict mode dies there, at the call's selector.
 //! - **A texture slot sampled through an argument buffer's sampler**, whatever its filter, is a
 //!   function the runtime refuses where its pipeline state is made (`ArgumentBufferTextures`),
 //!   which dies there, where Metal makes and runs it. A texture an argument buffer holds, sampled

@@ -15,7 +15,8 @@
 //!   ([`CommandSide`]), as Metal's getters answer it on this host without the API validation
 //!   layer (measured, macOS 26.7, M3 Max):
 //!   - a threadgroup memory length set past the 31 a record holds, which Metal keeps for its
-//!     getter alone, and the runtime does not (it announces `indirect-value-past-record`);
+//!     getter alone, as the runtime does too (38 a command, an index of 38 or more setting a
+//!     later command's, as Metal's), so this answers what the runtime's record would;
 //!   - the pipeline state core set on each command, by its numbers, whose `uniqueIdentifier`
 //!     the getter answers. The numbers, not the handle: the guest's release of the state lets it
 //!     go, as Metal's indirect command keeps no state alive ([`SetPipeline`]).
@@ -78,21 +79,20 @@
 //!   on what the encoders took of the range, which the runtime does not follow, and the read dies
 //!   ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
-//!   buffer reaches a buffer's records by. It follows Metal's pool, placement and hold, as these
-//!   numbers do ([`Space`]): a placed buffer takes the same ID in the runtime, and each
-//!   reservation Metal takes reaches the runtime, but one holding an ID of [`RECORDS_ID_LIMIT`]
-//!   (2^23) or more, which the runtime would refuse, or whose buffers it would refuse
-//!   ([`reserve`]). So it is the guest's, but after such a reservation, which parts them
-//!   ([`IcbObject::reaches_its_records`]): a kernel encoding through the guest's ID of such a
-//!   buffer would not reach its records, so a direct dispatch in a compute encoder that made one
-//!   resident for writing dies ([`crate::gpu::encode_compute`]). A buffer is made, its ID given
-//!   back and the runtime's buffer dropped, under the lock of [`Space`], and a reservation reaches
-//!   the runtime under it too, so the runtime takes and gives back its IDs in the order these
-//!   are. One window stays: a buffer released while a command buffer that executes it or makes it
-//!   resident is pending gives its ID back here in the command buffer's completed handler
-//!   ([`crate::gpu::command`]), and in the runtime just after, as the runtime lets go of what the
-//!   commands used once its completed handlers ran; a buffer made between the two, on another
-//!   thread, may take that ID here and another in the runtime, which parts them as above.
+//!   buffer reaches a buffer's records by. It follows Metal's pool, placement, reservations and
+//!   hold, as these numbers do ([`Space`]): a placed buffer takes the same ID in the runtime, and
+//!   each reservation Metal takes reaches the runtime, whose IDs run to 2^31 - 1, as Metal's do
+//!   (`metal2vulkan`'s `RECORDS_ID_LIMIT`, [`reserve`]). So it is the guest's. A buffer is made,
+//!   its ID given back and the runtime's buffer dropped, under the lock of [`Space`], and a
+//!   reservation reaches the runtime under it too, so the runtime takes and gives back its IDs in
+//!   the order these are. One window parts them ([`IcbObject::reaches_its_records`]): a buffer
+//!   released while a command buffer that executes it or makes it resident is pending gives its
+//!   ID back here in the command buffer's completed handler ([`crate::gpu::command`]), and in the
+//!   runtime just after, as the runtime lets go of what the commands used once its completed
+//!   handlers ran; a buffer made between the two, on another thread, may take that ID here and
+//!   another in the runtime. A kernel encoding through the guest's ID of such a buffer would not
+//!   reach its records, so a direct dispatch in a compute encoder that made one resident for
+//!   writing dies ([`crate::gpu::encode_compute`]).
 //! - **Refusals** die at the selector, naming the runtime's error: Metal without its validation
 //!   layer raises at none of them, and goes on at those measured (an index at or past the size,
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
@@ -103,7 +103,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use metal2vulkan::bind::indirect_commands::RECORDS_ID_LIMIT;
 use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::Truncate;
@@ -425,11 +424,9 @@ impl Pool {
 /// buffers (type 5) on `device`: `ids` kept from plain allocation where Metal takes the
 /// reservation, else nothing, as Metal ignores or drops it; the thread parks for good where Metal
 /// spins, and the process dies where Metal goes on to hand out IDs twice ([`Space`]). A
-/// reservation Metal takes reaches the runtime too, so its IDs stay Metal's, unless it holds an
-/// ID of [`RECORDS_ID_LIMIT`] (2^23) or more: the runtime refuses one of 2^30 or more, which
-/// Metal takes to 2^31 - 1, and a buffer whose own ID is 2^23 or more, which plain allocation
-/// may hand out past such a reservation. The runtime's numbers part from Metal's then (the module
-/// docs). Its refusal of one it is given dies.
+/// reservation Metal takes reaches the runtime too, which takes IDs to 2^31 - 1, as Metal does,
+/// and makes a buffer of any ID below that, so its IDs stay Metal's (the module docs). Its
+/// refusal of one it is given dies.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
     // The space stays held until the runtime has the reservation too, so no creation comes
     // between the two ([`IcbObject::reaches_its_records`]); no stop of an ended task comes between
@@ -442,7 +439,6 @@ pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> 
     }
     match reservation {
         Reservation::Ignored => Ok(()),
-        Reservation::Taken if ids.iter().any(|&id| id >= RECORDS_ID_LIMIT) => Ok(()),
         Reservation::Taken => {
             let ids: Vec<rt::ResourceId> = ids.iter().map(|&id| rt::ResourceId(id)).collect();
             unstopped_at(sel, || {
@@ -462,6 +458,15 @@ pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> 
             "Metal takes a reservation after one of 0 alone, then hands out IDs twice",
         ),
     }
+}
+
+/// Keeps `ids` from plain allocation in [`Space`] alone, as a reservation Metal takes, where the
+/// runtime is not given it: a test's way to part a buffer's IDs from the runtime's, which only
+/// the window the module docs name parts in a run.
+#[cfg(test)]
+pub(crate) fn reserve_apart(ids: &[u64]) {
+    let (reservation, _space) = reserve_in(&SPACE, ids);
+    assert_eq!(reservation, Reservation::Taken);
 }
 
 #[cfg(test)]
@@ -3043,23 +3048,17 @@ mod tests {
         assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
     }
 
-    /// An execution of a command a kernel encoded with a state the program released since, whose
-    /// ID nothing took, dies where the runtime announces it, at the host step that reads the
-    /// record the GPU wrote, naming its notice (`ReleasedCommandState`,
-    /// [`crate::answer::DIES`]): the runtime runs nothing of it, where Metal runs the released
-    /// state's program. The host step runs on the scheduler's thread, outside every call here,
-    /// where the death ends the process; the test capture's death there unwinds into the
-    /// runtime, which catches it, so the test reads the death's line
-    #[test]
-    fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_dies() {
-        let d = dev();
+    /// What `out`'s first word reads on `d` after an execution of a command a kernel encoded with
+    /// a state of `mark` the program released since, whose ID nothing took: 1 where the
+    /// execution runs the released state's program.
+    pub(super) fn released_state_marks<P: Platform>(d: &P::Device) -> u32 {
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
-        let state = marking_state::<VulkanPlatform>(&d, &library);
+        let state = marking_state::<P>(d, &library);
         let out = d
             .new_buffer_of_length(OnFault::Return, 16, 0)
             .unwrap()
             .unwrap();
-        let icb = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let icb = make::<P>(d, &compute_desc(), 1);
         let command = icb.compute_command(0).unwrap().unwrap();
         command
             .encode(IcbComputeCmd::SetKernelBuffer {
@@ -3069,17 +3068,22 @@ mod tests {
             })
             .unwrap();
         let id = state.gpu_resource_id();
-        encode_by_kernel::<VulkanPlatform>(&d, &library, "set_compute_state", &icb, id);
+        encode_by_kernel::<P>(d, &library, "set_compute_state", &icb, id);
         drop(state);
-        *crate::answer::LAST_LINE.lock() = None;
-        let ran = catch_death(|| execute_writing::<VulkanPlatform>(&d, &icb, &out));
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert!(
-            ran.is_ok() && line.contains("(metal2vulkan-degrade-released-command-state)"),
-            "{ran:?}: {line}"
-        );
+        execute_writing::<P>(d, &icb, &out);
         // SAFETY: the buffer's first Shared word, read after the execution completed.
-        assert_eq!(unsafe { *out.contents().as_ptr::<u32>() }, 0, "{ran:?}");
+        unsafe { *out.contents().as_ptr::<u32>() }
+    }
+
+    /// An execution of a command a kernel encoded with a state the program released since, whose
+    /// ID nothing took, runs the released state's program: the runtime keeps the program of a
+    /// state of indirect command buffer support released after a command buffer that may write
+    /// the buffer's records was encoded, and announces nothing (`ReleasedCommandState` covers
+    /// what it does not keep, [`crate::answer::DIES_BY_DEFAULT`]). Metal's is the same
+    /// (`metal_tests`)
+    #[test]
+    fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it() {
+        assert_eq!(released_state_marks::<VulkanPlatform>(&dev()), 1);
     }
 
     /// A state the guest released while a command core set it on still names it goes, as Metal's

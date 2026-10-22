@@ -118,8 +118,9 @@
 //!   which it announces as `device-rounded-resolve`; Metal's device here makes none of 8
 //!   samples, so nothing measured them). A blend of other factors the device's blend rounds by
 //!   its own rule, which the runtime announces at the draw (`blended-write-rounding`); the alpha
-//!   alpha to coverage reads it leaves to the device's conversion (`device-color-conversion`),
-//!   which MoltenVK rounds toward zero, where Metal rounds it to nearest even. A fragment
+//!   alpha to coverage reads at colour 0 the function rounds as the other channels, as Metal
+//!   stores it, and the coverage reads the rounded alpha, where Metal's reads it before rounding,
+//!   which the runtime announces at the draw (`coverage-reads-rounded-alpha`). A fragment
 //!   function's texture write of a half-float or small-float format it refuses, not built: as the
 //!   state is made where the function's slot declares the format, else at a draw or an execution
 //!   that binds such a texture at a slot the function writes, or reaches one through a heap or an
@@ -128,9 +129,8 @@
 //!   ([`rounded_writes_inexact`]), where a half-float colour attachment it writes
 //!   ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an index the function has
 //!   an output for: `fragment_color_outputs`) is of a sample count whose resolve nothing
-//!   measured at this mode, or is `RGBA16Float` at colour 0 under alpha to coverage with alpha
-//!   in its write mask ([`rounded_writes`]). Every other state of a mode the device supports is
-//!   made as at the default.
+//!   measured at this mode ([`rounded_writes`]). Every other state of a mode the device supports
+//!   is made as at the default.
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
@@ -457,24 +457,20 @@ fn texture_write_rounding(mode: u32) -> TextureWriteRoundingMode {
     }
 }
 
-/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that Metal rounds otherwise
-/// than the runtime, or that nothing measured at this mode, `None` where its writes are Metal's
-/// (the module docs). With a fragment function that rasterizes (with rasterization off none
-/// runs), these stay, of a half-float colour attachment whose write mask has a channel to write
-/// and whose index the function has an output for (`color_outputs`, the state's
-/// `fragment_color_outputs`):
-/// - one of a state of a sample count above one whose resolve nothing measured at this mode
-///   ([`resolve_measured`]): the runtime rounds each sample as Metal does, and Metal's resolve
-///   does not take the mode at 2 and 4 samples, as the runtime's does not; Metal's device here
-///   makes none of 8;
-/// - `RGBA16Float` at colour 0 under alpha to coverage, of a write mask with alpha, whose alpha
-///   the runtime leaves to the device's conversion (`device-color-conversion`, which MoltenVK
-///   rounds toward zero), where Metal rounds it to nearest even (`encode_render`'s
-///   `mode_2_render_states_are_decided_once_made`).
+/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that nothing measured at this
+/// mode, `None` where its writes are Metal's (the module docs). With a fragment function that
+/// rasterizes (with rasterization off none runs), this stays: a half-float colour attachment
+/// whose write mask has a channel to write and whose index the function has an output for
+/// (`color_outputs`, the state's `fragment_color_outputs`), of a state of a sample count above
+/// one whose resolve nothing measured at this mode ([`resolve_measured`]). The runtime rounds
+/// each sample as Metal does, and Metal's resolve does not take the mode at 2 and 4 samples, as
+/// the runtime's does not; Metal's device here makes none of 8.
 ///
 /// The rest of the mode is the runtime's: it rounds the half-float attachments to nearest even,
 /// blended or not, announcing a blend of other factors than one and zero, which the device's
-/// blend rounds by its own rule (`blended-write-rounding`), and refuses a fragment function's
+/// blend rounds by its own rule (`blended-write-rounding`), and alpha to coverage over the
+/// rounded alpha (`coverage-reads-rounded-alpha`, `encode_render`'s
+/// `mode_2_render_states_are_decided_once_made`), and refuses a fragment function's
 /// half-float and small-float texture writes, which it has not built: where the function's slot
 /// declares such a format as the state is made, else at a draw or an execution that binds such a
 /// texture at a slot the function writes or reaches one through a heap or an argument buffer.
@@ -495,25 +491,14 @@ pub fn rounded_writes(desc: &RenderPipelineDescriptor, color_outputs: &[u32]) ->
                 MODE_2_ATTACHMENT_FORMATS.contains(&c.pixel_format)
                     && c.write_mask != ColorWriteMask::NONE
             })?;
-            let coverage_alpha = index == 0
-                && desc.alpha_to_coverage
-                && c.pixel_format == PixelFormat::RGBA16Float
-                && c.write_mask.contains(ColorWriteMask::ALPHA);
             let samples = desc.raster_sample_count;
-            let why = if !resolve_measured(samples) {
-                format!(
-                    "of {samples} samples, whose resolve at this mode nothing measured (Metal's \
-                     was measured at 1 sample and at each of {RESOLVE_MEASURED:?})"
-                )
-            } else if coverage_alpha {
-                "whose alpha alpha to coverage reads, which the runtime leaves to the device's \
-                 conversion"
-                    .into()
-            } else {
+            if resolve_measured(samples) {
                 return None;
-            };
+            }
             Some(format!(
-                "colour attachment {index} of {}, {why}",
+                "colour attachment {index} of {}, of {samples} samples, whose resolve at this mode \
+                 nothing measured (Metal's was measured at 1 sample and at each of \
+                 {RESOLVE_MEASURED:?})",
                 c.pixel_format.name()
             ))
         })

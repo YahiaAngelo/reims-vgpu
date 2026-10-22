@@ -404,16 +404,20 @@ pub struct HeapObject {
 
 /// A heap's buffers and textures, while they live, and their ranges of the heap.
 ///
-/// A two-plane XR10 texture (550, 551) of a heap is one of two kinds. A 2D texture of one level,
-/// slice and sample within the device's limits keeps its two planes in the heap's bytes, where
-/// Metal lays them out, the runtime's shadow of them (`shadowed-texture`), so a buffer or texture
-/// over its range sees and changes its texels as Metal's does. Any other lies in memory of its
-/// own, apart from the heap's bytes, which the runtime announces at its creation, on the
-/// caller's thread (`heap-two-plane-texture`, [`crate::answer::HEARD`]): only those are
-/// [`Alone::TwoPlane`] here, the kind the creation heard, not one the format and shape would
-/// predict. So is a depth or stencil texture without `allowGPUOptimizedContents` whose creation
-/// heard `optimized-depth-stencil-texture` [`Alone::Optimized`], and a texture of a heap over the
-/// guest's pages whose creation heard `heap-texture-untiled-layout` [`Alone::Untiled`].
+/// A two-plane XR10 texture (550, 551) of a heap is one of three kinds. A texture of one level
+/// within the device's limits, but for a 1D array, keeps its first level's slices in the heap's
+/// bytes, where Metal lays them out, the runtime's shadow of them (`shadowed-texture`), so a
+/// buffer or texture over its range sees and changes its texels as Metal's does: a 3D one its
+/// first depth slice, over which Metal lays every other. A mipmapped one and a 1D array keep the first level's slices there too, as Metal's
+/// CPU copies and GPU writes lay them, where Metal's paths address the later levels, and a 1D
+/// array's GPU reads, at bytes that differ by path (`heap-two-plane-layout`, relayed, and in strict
+/// mode dying at its creation, [`crate::answer::DIES`]). Any other lies in memory of its own, apart
+/// from the heap's bytes, which the runtime announces at its creation, on the caller's thread
+/// (`heap-two-plane-texture`, [`crate::answer::HEARD`]): only those are [`Alone::TwoPlane`] here,
+/// the kind the creation heard, not one the format and shape would predict. So is a depth or
+/// stencil texture without `allowGPUOptimizedContents` whose creation heard
+/// `optimized-depth-stencil-texture` [`Alone::Optimized`], and a texture of a heap over the guest's
+/// pages whose creation heard `heap-texture-untiled-layout` [`Alone::Untiled`].
 ///
 /// Core makes a buffer over all of the bytes the heap's descriptor asked for with each heap, at
 /// its creation, before anything else is asked of it: a detached heap's cover buffer, which a
@@ -478,8 +482,8 @@ impl Alone {
     fn reason(self) -> &'static str {
         match self {
             Alone::TwoPlane => {
-                "a two-plane XR10 texture (550, 551) of its heap, other than a 2D texture of one \
-                 level: the runtime keeps the texture's texels in memory of their own \
+                "a two-plane XR10 texture (550, 551) of its heap past the device's limits: the \
+                 runtime keeps the texture's texels in memory of their own \
                  (heap-two-plane-texture), where Metal's lie in the heap's bytes"
             }
             Alone::Optimized => {
@@ -1944,10 +1948,10 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// tiles, and such a texture over another's (`heap-texture-untiled-layout`,
     /// [`Alone::Untiled`]). Each of the three kinds dies, too, where the heap's cover lives, so in
     /// every heap core makes ([`Placements`]). A 2- or 4-sample texture that Metal keeps losslessly
-    /// compressed, whose image the runtime keeps apart from the heap's bytes, over the guest's
-    /// pages or in a heap whose memory cannot hold its image (`heap-texture-lossless-layout`),
-    /// dies as it is made ([`crate::answer::HEARD`]). So does, as it is placed or answered nil, a
-    /// texture whose layout in Metal's heaps the runtime does not model (a PVRTC format), placed by
+    /// compressed, whose image the runtime keeps apart from the heap's bytes over the guest's
+    /// pages (`heap-texture-lossless-layout`), dies as it is made ([`crate::answer::HEARD`]). So
+    /// does, as it is placed or answered nil, a texture whose layout in Metal's heaps the runtime
+    /// does not model (a PVRTC format at Metal level 26.7), placed by
     /// its device's image's size and alignment, larger or smaller than Metal's
     /// (`unmeasured-heap-texture-size`, [`crate::gpu::metal_space::unmeasured_size`]): no suite
     /// case or guest run places one. Its nil at an offset at or past the heap's end is Metal's,
@@ -1962,7 +1966,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
     /// the guest's pages, a depth or stencil texture dies first, and a colour texture whose bytes
     /// there are not Metal's by a stated rule is announced once per device
-    /// ([`HeapObject::legacy_made`]).
+    /// ([`HeapObject::legacy_made`]): what the runtime announces there of a texture's layout
+    /// (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`), its bytes in the heap's
+    /// memory in its image's layout, is what that notices, and the creation relays it alone.
     fn new_texture(
         &self,
         descriptor: &VulkanTextureDescriptor,
@@ -2001,7 +2007,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 if !self.backing.detaches() {
                     self.legacy_made(sel, &desc);
                 }
-                let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout);
+                // Over the guest's pages alone, as an untiled one is (below).
+                let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
+                    && self.backing.detaches();
                 if lossless && desc.sample_count > 1 {
                     crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
                         format!(
@@ -2024,7 +2032,11 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let bytes = offset.min(heap_size)..end.min(heap_size);
                 let under = Under::Heap(self.clone_ref(), bytes.clone());
                 let texture = self.device.texture_in(raw, under, 0);
-                let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout);
+                // Over the guest's pages alone: in a legacy heap, over the device's memory, what
+                // the runtime announces of the texture's layout there (untiled, or lossless where
+                // Metal compresses it) is what `legacy_made` notices of its bytes.
+                let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout)
+                    && self.backing.detaches();
                 let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
                     Some(Alone::TwoPlane)
                 } else if optimized {
@@ -4116,14 +4128,14 @@ pub(crate) mod tests {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
     }
 
-    /// A texture of a PVRTC format (`PVRTC_RGBA_4BPP`) placed in a heap over the guest's pages,
-    /// whose blocks the runtime lays out as its own at every level where Metal tiles them, dies
-    /// at the placement, its line naming `heap-texture-block-compressed-layout`
-    /// ([`crate::answer::DIES`]); a texture of a plain format of `ShaderWrite` usage there, and
-    /// one of `BC1_RGBA`, whose blocks lie in Metal's tiles at every level the runtime measured,
-    /// are made (the compressed ones of `ShaderRead` usage)
+    /// A texture of a plain format of `ShaderWrite` usage placed in a heap over the guest's pages
+    /// is made, and so are one of `BC1_RGBA` and one of a PVRTC format (`PVRTC_RGBA_4BPP`), of
+    /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level the runtime measured:
+    /// PVRTC's at macOS 27.0.1, the Mac's and Linux's level here. At 26.7, where the runtime lays
+    /// a PVRTC texture's blocks out as its own, it announces `heap-texture-block-compressed-layout`
+    /// ([`crate::answer::DIES`])
     #[test]
-    fn a_heap_texture_over_guest_pages_in_the_runtimes_layout_dies() {
+    fn heap_textures_over_guest_pages_in_metals_block_layout_are_made() {
         use reims_vgpu_core::platform::types::ResourceAddressRange;
 
         const SIZE: u64 = 0x10000;
@@ -4159,18 +4171,7 @@ pub(crate) mod tests {
         };
         assert!(heap.new_texture(&desc(70, 0x3), 0).unwrap().is_some());
         assert!(heap.new_texture(&desc(130, 0x1), 0x8000).unwrap().is_some());
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| heap.new_texture(&desc(166, 0x1), 0xc000).is_ok()).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "newTextureWithDescriptor:offset:"),
-            "{line}"
-        );
-        assert!(
-            line.contains("heap-texture-block-compressed-layout"),
-            "{line}"
-        );
+        assert!(heap.new_texture(&desc(166, 0x1), 0xc000).unwrap().is_some());
     }
 
     /// A writable heap of 4 KiB over a page of the guest's, as core's detach heap makes one of
@@ -4337,40 +4338,62 @@ pub(crate) mod tests {
         (depth_stencil, beside, answer.size)
     }
 
-    /// A two-plane XR10 texture (550, 551) whose texels the runtime keeps apart from the heap's
-    /// bytes (`heap-two-plane-texture`), a mipmapped one, dies at its placement beside the heap's
-    /// cover, core's buffer over all of it, made first, as in every heap core makes: no suite
-    /// case or round places one ([`Placements`]). A one-level 2D one, whose planes the heap's
-    /// bytes keep, is made beside it
+    /// A two-plane XR10 texture (550, 551) of `pixel_format`, 16x16, of `shape`'s type, levels,
+    /// slices and depth.
+    fn xr10_shaped(pixel_format: u64, shape: fn(&mut TextureDesc)) -> VulkanTextureDescriptor {
+        let mut desc = TextureDesc {
+            pixel_format,
+            width: 16,
+            height: 16,
+            usage: 0x1,
+            resource_options: Some(0x120),
+            ..TextureDesc::default()
+        };
+        shape(&mut desc);
+        platform().texture_descriptor(&desc)
+    }
+
+    /// A 3D two-plane XR10 texture of two depth slices, whose texels the runtime keeps over its
+    /// first slice's planes in the heap's bytes, where Metal's writes lay every slice.
+    const THREE_D: fn(&mut TextureDesc) = |d| {
+        d.texture_type = 7;
+        d.depth = 2;
+    };
+
+    /// A mipmapped two-plane XR10 texture (550, 551), whose first level's planes the heap's bytes
+    /// keep and whose later levels lie apart from them (`heap-two-plane-layout`,
+    /// [`crate::answer::DIES`]), dies at its placement beside the heap's cover, core's buffer over
+    /// all of it, made first, in strict mode, naming the kind. A one-level 2D one, a 2D array of
+    /// one level and a 3D one of two slices, whose planes the heap's bytes keep (a 3D one's first
+    /// slice's), are made beside the cover. One the runtime keeps apart from the heap's bytes
+    /// (`heap-two-plane-texture`), past the device's limits, dies beside it, as
+    /// `placements_tell_the_heaps_cover_apart` shows of [`Alone::TwoPlane`]
     #[test]
-    fn two_plane_textures_apart_die_beside_the_heaps_cover() {
+    fn two_plane_textures_beside_the_heaps_cover() {
         let texture_sel = "newTextureWithDescriptor:offset:";
+        let mipmapped: fn(&mut TextureDesc) = |d| d.mipmap_level_count = 2;
+        let array: fn(&mut TextureDesc) = |d| {
+            d.texture_type = 3;
+            d.array_length = 2;
+        };
         for pixel_format in [550, 551] {
-            let xr10 = |levels| {
-                platform().texture_descriptor(&TextureDesc {
-                    pixel_format,
-                    width: 16,
-                    height: 16,
-                    mipmap_level_count: levels,
-                    usage: 0x1,
-                    resource_options: Some(0x120),
-                    ..TextureDesc::default()
-                })
-            };
             let h = private_heap();
             let cover = h.new_buffer_of_length(0x8000, 0x120, 0).unwrap().unwrap();
             *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| h.new_texture(&xr10(2), 0)).unwrap_err();
+            let site = catch_death(|| h.new_texture(&xr10_shaped(pixel_format, mipmapped), 0))
+                .unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             assert_eq!(
                 (site.kind, site.file),
                 (DeathKind::Abort, texture_sel),
                 "{pixel_format}: {line}"
             );
-            assert!(line.contains("heap-two-plane-texture"), "{line}");
-            let one_level = h.new_texture(&xr10(1), 0).unwrap();
-            assert!(one_level.is_some(), "{pixel_format} one level");
-            drop((one_level, cover));
+            assert!(line.contains("heap-two-plane-layout"), "{line}");
+            for shape in [|_: &mut TextureDesc| {}, array, THREE_D] {
+                let made = h.new_texture(&xr10_shaped(pixel_format, shape), 0).unwrap();
+                assert!(made.is_some(), "{pixel_format}");
+            }
+            drop(cover);
         }
     }
 
@@ -4451,106 +4474,33 @@ pub(crate) mod tests {
         drop((guests, over, two_plane));
     }
 
-    /// A buffer or texture placed over a byte of a two-plane XR10 texture (550, 551) of its heap
-    /// whose texels lie apart from the heap's bytes, a mipmapped one or a 2D array, dies at the
-    /// placement while the texture lives, and so does such a texture placed over a byte of a
-    /// buffer or texture that lives: the runtime announced the texture at its creation
-    /// (`heap-two-plane-texture`, [`crate::answer::HEARD`]). A buffer and a texture are made
-    /// beside it, a buffer of no bytes over it, and each over one let go; and a one-level 2D
-    /// texture of the format, whose planes the heap's bytes keep, takes a buffer and a texture
-    /// over it
+    /// A buffer and a texture are made over a two-plane XR10 texture (550, 551) of its heap whose
+    /// planes the heap's bytes keep, while it lives, and such a texture over them: a one-level 2D
+    /// one, a 2D array of one level and a 3D one of two slices, whose texels lie over its first
+    /// slice's planes, where Metal lays them. One the runtime keeps apart from the heap's bytes
+    /// (`heap-two-plane-texture`), past the device's limits, is kept alone, as
+    /// `placements_tell_the_heaps_cover_apart` shows of [`Alone::TwoPlane`]
     #[test]
-    fn placements_over_two_plane_textures_apart_die() {
-        let xr10 = |pixel_format, shape: fn(&mut TextureDesc)| {
-            let mut desc = TextureDesc {
-                pixel_format,
-                width: 16,
-                height: 16,
-                usage: 0x1,
-                resource_options: Some(0x120),
-                ..TextureDesc::default()
-            };
-            shape(&mut desc);
-            platform().texture_descriptor(&desc)
-        };
-        let mipmapped: fn(&mut TextureDesc) = |d| d.mipmap_level_count = 2;
+    fn placements_over_two_plane_textures_in_the_heaps_bytes_are_made() {
+        let xr10 = xr10_shaped;
         let array: fn(&mut TextureDesc) = |d| {
             d.texture_type = 3;
             d.array_length = 2;
         };
         let one_level: fn(&mut TextureDesc) = |_| {};
-        let buffer_sel = "newBufferWithLength:options:offset:";
-        let texture_sel = "newTextureWithDescriptor:offset:";
-        let dies = |site: reims_vgpu_core::raise::death::DeathSite, sel, case: &str| {
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{case}");
-        };
         for pixel_format in [550, 551] {
-            for (shape, named) in [(mipmapped, "mipmapped"), (array, "array")] {
-                let case = format!("{pixel_format} {named}");
+            for shape in [one_level, array, THREE_D] {
                 let h = private_heap();
-                let size = dev()
-                    .heap_texture_size_and_align(&xr10(pixel_format, shape))
-                    .unwrap()
-                    .size;
-                let align = dev()
-                    .heap_texture_size_and_align(&bgra(16, 16, 0x120))
-                    .unwrap()
-                    .align;
-                let beside = size.next_multiple_of(align.max(0x100));
                 let t = h
                     .new_texture(&xr10(pixel_format, shape), 0)
                     .unwrap()
                     .unwrap();
-                let last = (size - 1) & !0xff;
-                dies(
-                    catch_death(|| h.new_buffer_of_length(0x100, 0x20, last)).unwrap_err(),
-                    buffer_sel,
-                    &case,
-                );
-                dies(
-                    catch_death(|| h.new_texture(&bgra(16, 16, 0x120), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                dies(
-                    catch_death(|| h.new_texture(&xr10(551, shape), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                let empty = h.new_buffer_of_length(0, 0x20, 0).unwrap().unwrap();
-                let b = h
-                    .new_buffer_of_length(0x100, 0x20, beside)
-                    .unwrap()
-                    .unwrap();
-                let u = h
-                    .new_texture(&bgra(16, 16, 0x120), beside)
-                    .unwrap()
-                    .unwrap();
-                drop(t);
                 let over = h.new_buffer_of_length(0x100, 0x20, 0).unwrap().unwrap();
-                dies(
-                    catch_death(|| h.new_texture(&xr10(pixel_format, shape), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                drop((over, b, u, empty));
-                assert!(
-                    h.new_texture(&xr10(pixel_format, shape), 0)
-                        .unwrap()
-                        .is_some(),
-                    "{case}"
-                );
+                let u = h.new_texture(&bgra(16, 16, 0x120), 0).unwrap().unwrap();
+                let again = h.new_texture(&xr10(pixel_format, shape), 0).unwrap();
+                assert!(again.is_some(), "{pixel_format}");
+                drop((t, over, u, again));
             }
-            let h = private_heap();
-            let t = h
-                .new_texture(&xr10(pixel_format, one_level), 0)
-                .unwrap()
-                .unwrap();
-            let over = h.new_buffer_of_length(0x100, 0x20, 0).unwrap().unwrap();
-            let u = h.new_texture(&bgra(16, 16, 0x120), 0).unwrap().unwrap();
-            let again = h.new_texture(&xr10(pixel_format, one_level), 0).unwrap();
-            assert!(again.is_some(), "{pixel_format} one level");
-            drop((t, over, u, again));
         }
     }
 

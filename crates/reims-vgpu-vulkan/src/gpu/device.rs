@@ -735,7 +735,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// dies where the runtime's size decides it, as its image needs that size in the heap
     /// (`crate::gpu::resource::Placements`).
     /// It relays, naming the kind and the texture, and in strict mode dies at the selector, for a
-    /// texture whose layout in Metal's heaps the runtime does not model, a PVRTC format, whose
+    /// texture whose layout in Metal's heaps the runtime does not model, a PVRTC format at Metal
+    /// level 26.7, whose
     /// size and alignment the runtime answers as its device's image's, larger or smaller than
     /// Metal's, and announces so (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`];
     /// [`metal_space::unmeasured_size`]): the guest reads the answer, and no suite case or guest
@@ -1260,14 +1261,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// Metal's heap size for it ([`metal_space::own_heap_size`]: the runtime's model of Metal's
     /// answer, [`VulkanDevice::metal_answer_at`], on every device, where the device's own answer
     /// may be larger), a slot for one Metal suballocates (of a heap size under a page), none for
-    /// a memoryless one, placed before the runtime makes it, which the runtime's range token
-    /// holds until it frees the texture, and its object shares ([`metal_space::Hold`]). Where
-    /// the model has no answer, a depth or stencil texture without `allowGPUOptimizedContents`
-    /// whose size the runtime answers larger than Metal's (`optimized-depth-stencil-texture`)
-    /// and Metal's is not measured for dies here, at every shape; so does one whose
-    /// layout in Metal's heaps the runtime does not model (`unmeasured-heap-texture-size`: a
-    /// PVRTC format), at every shape ([`metal_space::unmeasured_size`]). One of protection
-    /// options other than none is made as without them, relayed, where Metal answers nil
+    /// a memoryless one, placed before the runtime makes it, which the runtime's range token holds
+    /// until it frees the texture, and its object shares ([`metal_space::Hold`]). Where the model
+    /// has no answer, a depth or stencil texture without `allowGPUOptimizedContents` whose size the
+    /// runtime answers larger than Metal's (`optimized-depth-stencil-texture`) and Metal's is not
+    /// measured for dies here, at every shape; so does one whose layout in Metal's heaps the
+    /// runtime does not model (`unmeasured-heap-texture-size`: a PVRTC format at Metal level 26.7),
+    /// at every shape ([`metal_space::unmeasured_size`]). One of protection options other than none
+    /// is made as without them, relayed, where Metal answers nil
     /// ([`crate::gpu::desc::TextureFields::made_unprotected`]).
     fn new_texture(
         &self,

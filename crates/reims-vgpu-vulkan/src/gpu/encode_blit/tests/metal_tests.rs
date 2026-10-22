@@ -93,10 +93,9 @@ fn copied_past_a_no_copy_buffer_on<P: reims_vgpu_core::platform::Platform>(
 /// The 16 by 16 `PVRTC_RGBA_4BPP` texture of `ShaderRead` usage the PVRTC copies are made
 /// with: at the descriptor's storage and `allowGPUOptimizedContents` (on), or, `suites`, at
 /// `Private` with `allowGPUOptimizedContents` off, the shape of the texture `textures_formats`
-/// makes. `newTextureWithDescriptor:` of either dies, as no model gives Metal's size of it in
-/// Metal's space ([`unmeasured_pvrtc_texture_dies`]); `newSharedTextureWithDescriptor:` of
-/// either is made, its range sized by Apple's layout, as `textures_gap_pvrtc_shared_backing`
-/// makes one.
+/// makes. `newTextureWithDescriptor:` of either is made at Metal's size in Metal's space
+/// ([`pvrtc_texture_takes_metals_size`]); `newSharedTextureWithDescriptor:` of either is made,
+/// its range sized by Apple's layout, as `textures_gap_pvrtc_shared_backing` makes one.
 fn pvrtc_copy_texture(suites: bool) -> TextureDesc {
     let t = TextureDesc {
         pixel_format: 166,
@@ -203,45 +202,39 @@ fn pvrtc_row_linear_copies_are_the_metal_platforms() {
     }
 }
 
-/// A texture of a PVRTC format, whose size in Metal's heaps no model gives, dies at
-/// `newTextureWithDescriptor:`, its line naming `unmeasured-heap-texture-size` and its format,
-/// where Metal makes one on this host: the runtime would size it as its device's image, and
-/// that size places what the guest makes next in Metal's space ([`crate::answer::HEARD`]).
-fn unmeasured_pvrtc_texture_dies(t: &TextureDesc) {
+/// A texture of a PVRTC format is made by `newTextureWithDescriptor:`, as Metal makes one on
+/// this host, and its size and alignment in Metal's heaps, which place what the guest makes next
+/// in Metal's space, are Metal's: the runtime models PVRTC's layout in Metal's heaps at macOS
+/// 27.0.1, this host's level (its `unmeasured-heap-texture-size` names it at 26.7 alone).
+fn pvrtc_texture_takes_metals_size(t: &TextureDesc) {
     let what = format!("format {}, {}x{}", t.pixel_format, t.width, t.height);
+    let desc = crate::platform::tests::platform().texture_descriptor(t);
+    let d = dev();
+    assert!(
+        d.new_texture(OnFault::Return, &desc).unwrap().is_some(),
+        "{what}"
+    );
+    let ours = d.heap_texture_size_and_align(&desc).unwrap();
     if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
         let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(t);
         let made = metal.new_texture(OnFault::Return, &desc).unwrap();
         assert!(made.is_some(), "Metal's: {what}");
+        let theirs = metal.heap_texture_size_and_align(&desc).unwrap();
+        assert_eq!(
+            (ours.size, ours.align),
+            (theirs.size, theirs.align),
+            "{what}"
+        );
     }
-    let desc = crate::platform::tests::platform().texture_descriptor(t);
-    *crate::answer::LAST_LINE.lock() = None;
-    let site = catch_death(|| drop(dev().new_texture(OnFault::Return, &desc))).unwrap_err();
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert_eq!(
-        (site.kind, site.file),
-        (
-            reims_vgpu_core::raise::death::DeathKind::Abort,
-            "newTextureWithDescriptor:"
-        ),
-        "{what}: {line}"
-    );
-    assert!(
-        line.contains("unmeasured-heap-texture-size"),
-        "{what}: {line}"
-    );
-    let format = format!("pixel format {},", t.pixel_format);
-    assert!(line.contains(&format), "{what}: {line}");
 }
 
 /// The PVRTC textures the row-linear copies are measured with ([`pvrtc_copy_texture`]), at the
-/// descriptor's storage and `allowGPUOptimizedContents` and at the suite's shape, die where
-/// `newTextureWithDescriptor:` makes them, as [`unmeasured_pvrtc_texture_dies`] says: the
-/// copies' bytes match Metal's, but no model gives Metal's size of them
+/// descriptor's storage and `allowGPUOptimizedContents` and at the suite's shape, are made at
+/// Metal's size, as [`pvrtc_texture_takes_metals_size`] says
 #[test]
-fn pvrtc_copy_textures_die_where_made() {
-    unmeasured_pvrtc_texture_dies(&pvrtc_copy_texture(false));
-    unmeasured_pvrtc_texture_dies(&pvrtc_copy_texture(true));
+fn pvrtc_copy_textures_take_metals_size() {
+    pvrtc_texture_takes_metals_size(&pvrtc_copy_texture(false));
+    pvrtc_texture_takes_metals_size(&pvrtc_copy_texture(true));
 }
 
 /// `n` bytes of a fixed pseudo-random sequence that `seed` picks, every bit of a word set in
@@ -2294,11 +2287,9 @@ fn pvrtc_fills_are_the_metal_platforms() {
 
 /// The PVRTC textures the fills were first measured with (32x32 at 2 bits a texel, 16x16 at
 /// 4, `allowGPUOptimizedContents` on), and those of the suite's shape the fills are measured
-/// with, die where `newTextureWithDescriptor:` makes them, as
-/// [`unmeasured_pvrtc_texture_dies`] says: their fills' bytes match Metal's, but no model
-/// gives Metal's size of them
+/// with, are made at Metal's size, as [`pvrtc_texture_takes_metals_size`] says
 #[test]
-fn pvrtc_fill_textures_die_where_made() {
+fn pvrtc_fill_textures_take_metals_size() {
     let suites = pvrtc_fill_cases(
         (Some(false), false),
         [
@@ -2318,7 +2309,7 @@ fn pvrtc_fill_textures_die_where_made() {
         ],
     );
     for c in cases.iter().chain(&suites) {
-        unmeasured_pvrtc_texture_dies(&texture_of(c));
+        pvrtc_texture_takes_metals_size(&texture_of(c));
     }
 }
 

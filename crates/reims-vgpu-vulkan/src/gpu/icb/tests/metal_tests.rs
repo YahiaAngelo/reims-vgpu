@@ -115,11 +115,24 @@ fn icbs_take_metals_numbers() {
     }
 }
 
-/// A reservation holding an ID of 2^23 or more does not reach the runtime, whose IDs then
-/// part from Metal's: 2 and 2^23 + 1 reserved, Metal's pool hands out 1 then 3, the runtime's
-/// 1 then 2
+/// An execution of a command a kernel encoded with a state the program released since, whose
+/// ID nothing took, runs the released state's program on Metal as on this platform
+/// (`an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it`): the state's
+/// `mark` writes 1
 #[test]
-fn a_reservation_the_runtime_is_not_given_parts_its_ids() {
+fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let ours = released_state_marks::<VulkanPlatform>(&dev());
+    assert_eq!((released_state_marks::<MetalPlatform>(&md), ours), (1, 1));
+}
+
+/// A reservation holding an ID of 2^23 or more reaches the runtime, whose IDs stay Metal's: 2
+/// and 2^23 + 1 reserved, Metal's pool hands out 1 then 3, and so do the runtime's, each buffer
+/// reaching its records
+#[test]
+fn a_reservation_past_2_23_keeps_the_runtimes_ids_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<P::Icb> {
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
         (0..2).map(|_| make::<P>(d, &compute_desc(), 1)).collect()
@@ -139,7 +152,7 @@ fn a_reservation_the_runtime_is_not_given_parts_its_ids() {
             (b.gpu_resource_id(), runtime, b.reaches_its_records())
         })
         .collect();
-    assert_eq!(seen, [(1, 1, true), (3, 2, false)]);
+    assert_eq!(seen, [(1, 1, true), (3, 3, true)]);
 }
 
 /// Plain IDs given back come back from the smallest free range, as Metal's do: with 2, 3 and
