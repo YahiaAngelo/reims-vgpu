@@ -80,11 +80,11 @@
 //!   ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
 //!   buffer reaches a buffer's records by, so the kernel reaches the records of the buffer the
-//!   guest names. What Metal does with a reservation that the runtime does not follow is kept here
-//!   ([`Ids`]): the calls Metal spins at or hands out IDs twice after. The runtime takes a
-//!   reservation of IDs to 2^31 - 1 and makes a buffer at every ID below 2^31
-//!   (`RECORDS_ID_LIMIT`), each ID's records at an address of their own, as Metal takes and makes
-//!   them ([`reserve`], [`new_indirect_command_buffer`]).
+//!   guest names. A reservation is the runtime's, as Metal takes, ignores or drops it, to
+//!   2^31 - 1, and the runtime makes a buffer at every ID below 2^31 (`RECORDS_ID_LIMIT`), each
+//!   ID's records at an address of their own, as Metal makes them; the one Metal spins at, which
+//!   the runtime refuses as one, parks the thread holding the lock creations wait on
+//!   ([`RESERVING`], [`reserve`], [`new_indirect_command_buffer`]).
 //! - **Refusals** die at the selector, naming the runtime's error: Metal without its validation
 //!   layer raises at none of them, and goes on at those measured (an index at or past the size,
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
@@ -133,9 +133,10 @@ pub const NIL_BUFFER_ADDRESS: u64 = 0x1_eeee_1111;
 /// crashed from run to run, 100000 crashed).
 const ID_LIMIT: u64 = 16384;
 
-/// What Metal does with a reservation of indirect command buffer IDs that the runtime does not
-/// follow, of the process (one device's, as the host has one). Isolated tasks share it, as every
-/// task's device is the one object of the process's device ([`crate::gpu::device::adopt`]).
+/// The lock of Metal's pool of indirect command buffer IDs, of the process (one device's, as the
+/// host has one), which a reservation Metal spins at holds for good ([`reserve`]) and every
+/// creation takes ([`new_indirect_command_buffer`]). Isolated tasks share it, as every task's
+/// device is the one object of the process's device ([`crate::gpu::device::adopt`]).
 ///
 /// Measured on this host: plain allocation hands out IDs from Metal's pool, which the runtime
 /// follows (the tests compare it with Metal: its first 32 IDs, the smallest free range first, a
@@ -148,51 +149,36 @@ const ID_LIMIT: u64 = 16384;
 /// saying "reserve() must be called before any allocation takes place". A call holding an ID of
 /// 2^32 or more is dropped whole, and a later call is the reservation. 0 is no ID: beside others
 /// the call is theirs (0 and 20 hand out what 20 alone does: 21 to 31, 1 to 19, then 32 on), and
-/// alone it reserves nothing (plain IDs from 1). The runtime does each of these. Of the calls
-/// Metal takes, two kinds go otherwise, which the runtime does not follow ([`Reservation`]):
-/// - one holding an ID of 2^31 to 2^32 - 1 never returns, which the runtime refuses, reserving
-///   nothing, as a call Metal hangs at (`Problem::ReservationHangs`): Metal spins in
-///   `AGX::Mempool<32u,0u,true,0u,0u,unsigned long long>::reserve` at full CPU (measured at 2^31,
-///   2^31 + 5 and 2^32 - 1, the longest run 5 minutes, and at 2^31 + 5 after a call of 0 alone),
-///   where 2^31 - 1 is taken and hands out 1 next. While it spins it holds its pool's lock
-///   (measured from a second thread, 5 s a case, the waits sampled): another buffer's creation,
-///   placed or not, waits on it in `AGX::Mempool<32>::RangeAllocation`, one placed at 16384 or
-///   100000 too, past the table of IDs Metal ends its process at ([`ID_LIMIT`]), and another
-///   reservation of type 5 in `AGX::Mempool<32>::reserve`. A device texture and a command queue
-///   wait too where they are the process's first, in `-[AGXG15XFamilyDevice setupDeferred]`, which
-///   core's command queues, made with the device, run before any reservation; buffers, textures
-///   over a buffer, heaps and their textures, sampler states, command buffers' creation, commit and
-///   wait, and texture reservations go on. No buffer lives while it spins: one made first makes
-///   Metal ignore the reservation. At the runtime's refusal the thread parks for good holding the
-///   lock of [`IDS`] ([`answered`], [`crate::answer::hang`]), as a hang stays a hang, so every
-///   later creation and
-///   reservation of type 5, on any thread, an isolated task's among them, waits on it for good,
-///   before any death of its own ([`new_indirect_command_buffer`]). After a buffer was made Metal
-///   ignores such a call, as any other;
-/// - one after a call of 0 alone is taken, and Metal then hands out IDs twice (measured, in order
-///   of making: 0 then 20, 21 to 31, 1 to 19, then 1 to 10; 0 then 10, 1 to 9, 11 to 31, then 1
-///   to 15; 0 then 100, 101 to 127, 1 to 31, then 1 to 82; 0 then 2^31 - 1, 1 to 31, then 1 to
-///   31 and 32 on), which the runtime does not copy, so it dies at the selector.
+/// alone it reserves nothing (plain IDs from 1), but a later reservation is taken beside the
+/// pool's first range, and Metal then hands out IDs twice (measured, in order of making: 0 then
+/// 20, 21 to 31, 1 to 19, then 1 to 10; 0 then 10, 1 to 9, 11 to 31, then 1 to 15; 0 then 100,
+/// 101 to 127, 1 to 31, then 1 to 82; 0 then 2^31 - 1, 1 to 31, then 1 to 31 and 32 on). The
+/// runtime does each of these, its late call logged as Metal's
+/// (`metal2vulkan-late-reservation`). A call Metal takes holding an ID of 2^31 to 2^32 - 1 never
+/// returns, which the runtime refuses, reserving nothing, as a call Metal hangs at
+/// (`Problem::ReservationHangs`): Metal spins in
+/// `AGX::Mempool<32u,0u,true,0u,0u,unsigned long long>::reserve` at full CPU (measured at 2^31,
+/// 2^31 + 5 and 2^32 - 1, the longest run 5 minutes, and at 2^31 + 5 after a call of 0 alone),
+/// where 2^31 - 1 is taken and hands out 1 next. While it spins it holds its pool's lock
+/// (measured from a second thread, 5 s a case, the waits sampled): another buffer's creation,
+/// placed or not, waits on it in `AGX::Mempool<32>::RangeAllocation`, one placed at 16384 or
+/// 100000 too, past the table of IDs Metal ends its process at ([`ID_LIMIT`]), and another
+/// reservation of type 5 in `AGX::Mempool<32>::reserve`. A device texture and a command queue
+/// wait too where they are the process's first, in `-[AGXG15XFamilyDevice setupDeferred]`, which
+/// core's command queues, made with the device, run before any reservation; buffers, textures
+/// over a buffer, heaps and their textures, sampler states, command buffers' creation, commit and
+/// wait, and texture reservations go on. No buffer lives while it spins: one made first makes
+/// Metal ignore the reservation. At the runtime's refusal the thread parks for good holding this
+/// lock ([`answered`], [`crate::answer::hang`]), as a hang stays a hang, so every later creation
+/// and reservation of type 5, on any thread, an isolated task's among them, waits on it for good,
+/// before any death of its own ([`new_indirect_command_buffer`]).
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
 /// command buffer blocked on an event, then completed): a compute or render encoder's execution
 /// or `useResource` of it keeps the buffer and its ID until the command buffer completes, or goes
 /// uncommitted; a blit's copy (from it or into it) or reset keeps neither, its ID free at once.
 /// The runtime holds its IDs so too.
-#[derive(Debug, Default)]
-struct Ids {
-    /// Whether a buffer was made, placed or not, or a reservation taken: Metal ignores a
-    /// reservation then.
-    started: bool,
-    /// Whether a call of 0 alone came before that: Metal takes a later reservation, then hands
-    /// out IDs twice.
-    lone_zero: bool,
-}
-
-static IDS: Mutex<Ids> = Mutex::new(Ids {
-    started: false,
-    lone_zero: false,
-});
+static RESERVING: Mutex<()> = Mutex::new(());
 
 /// Whether an encoder of any kind was made in the process ([`encoder_made`]).
 static ENCODED: AtomicBool = AtomicBool::new(false);
@@ -221,57 +207,18 @@ pub(crate) fn encoder_made() {
     }
 }
 
-impl Ids {
-    /// What Metal does with `ids` reserved: a call holding an ID of 2^32 or more is dropped
-    /// whole; any other is ignored once a buffer was made or a reservation taken. 0 is no ID: a
-    /// call of no other ID changes nothing, and one of 0 alone marks it. Any other call Metal
-    /// takes, or spins at, which the runtime's answer tells ([`answered`]); nothing here changes
-    /// until the runtime took it.
-    fn reserve(&mut self, ids: &[u64]) -> Reservation {
-        if self.started || ids.iter().any(|&id| id > u64::from(u32::MAX)) {
-            return Reservation::Ignored;
-        }
-        if ids.iter().all(|&id| id == 0) {
-            self.lone_zero |= !ids.is_empty();
-            return Reservation::Ignored;
-        }
-        if self.lone_zero {
-            return Reservation::HandsOutTwice;
-        }
-        Reservation::Taken
-    }
-}
-
-/// What Metal does with a reservation of indirect command buffer IDs ([`Ids`]), where it does
-/// not spin at it ([`answered`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reservation {
-    /// Its IDs are kept from plain allocation for good.
-    Taken,
-    /// Nothing: Metal ignores or drops it, or it holds no ID but 0.
-    Ignored,
-    /// Metal takes it, after a call of 0 alone, then hands out IDs twice.
-    HandsOutTwice,
-}
-
 /// `reserveResourceIndicesForResourceType:indices:indexCount:` (`sel`) of indirect command
-/// buffers (type 5) on `device`: the runtime's reservation of `ids` where Metal takes it, else
-/// nothing, as Metal ignores or drops it; the thread parks for good where Metal spins, which the
-/// runtime's refusal tells, and the process dies where Metal goes on to hand out IDs twice
-/// ([`Ids`], [`answered`]). The runtime takes every other reservation Metal takes, to
-/// 2^31 - 1; a refusal of its would die at the selector.
+/// buffers (type 5) on `device`: the runtime's reservation of `ids`, which takes, ignores or
+/// drops it as Metal does ([`RESERVING`]); the thread parks for good where Metal spins, which the
+/// runtime's refusal tells ([`answered`]). Another refusal of its would die at the selector.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
-    // The IDs stay held until the runtime has the reservation too, so no creation comes between
-    // the two; no stop of an ended task comes between them either, which would leave the
-    // reservation taken here without the runtime's for every later creation of the process.
-    let mut held = plain(|| IDS.lock());
-    let reservation = held.reserve(ids);
+    // The pool's lock stays held until the runtime answered, as a call Metal spins at holds it;
+    // no stop of an ended task comes between the two, so a call that took the lock reaches the
+    // runtime.
+    let held = plain(|| RESERVING.lock());
     #[cfg(test)]
     if let Some(amid) = AMID_RESERVATION.take() {
         amid();
-    }
-    if reservation == Reservation::Ignored {
-        return Ok(());
     }
     let ids: Vec<rt::ResourceId> = ids.iter().map(|&id| rt::ResourceId(id)).collect();
     let answer = unstopped_at(sel, || {
@@ -279,18 +226,16 @@ pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> 
             .raw
             .reserve_resource_ids(rt::ResourceIdKind::IndirectCommandBuffer, &ids)
     });
-    answered(sel, reservation, held, answer)
+    answered(sel, held, answer)
 }
 
-/// What the runtime's `answer` to a reservation (`reservation`, at `sel`) makes of it, `held`
-/// the IDs' lock: where it refuses the call as one Metal spins at (`Problem::ReservationHangs`,
-/// [`spins`]), this thread parks for good holding the lock, as Metal's spinning thread holds its
-/// pool's, so a later creation or reservation waits on it for good; another refusal dies at
-/// `sel`; one Metal hands out IDs twice after dies once taken; else the IDs are started.
+/// What the runtime's `answer` to a reservation at `sel` makes of it, `held` the pool's lock:
+/// where it refuses the call as one Metal spins at (`Problem::ReservationHangs`, [`spins`]), this
+/// thread parks for good holding the lock, as Metal's spinning thread holds its pool's, so a
+/// later creation or reservation waits on it for good; another refusal dies at `sel`.
 fn answered(
     sel: &'static str,
-    reservation: Reservation,
-    mut held: MutexGuard<'_, Ids>,
+    held: MutexGuard<'_, ()>,
     answer: Result<(), rt::Error>,
 ) -> RaiseResult<()> {
     match answer {
@@ -299,17 +244,7 @@ fn answered(
             hang()
         }
         Err(e) => decide(sel, Policy::Dies, e),
-        Ok(()) if reservation == Reservation::HandsOutTwice => fatal_with_detail(
-            DeathId::Platform {
-                kind: DeathKind::Abort,
-                call: sel,
-            },
-            "Metal takes a reservation after one of 0 alone, then hands out IDs twice",
-        ),
-        Ok(()) => {
-            held.started = true;
-            Ok(())
-        }
+        Ok(()) => Ok(()),
     }
 }
 
@@ -327,8 +262,8 @@ fn spins(e: &rt::Error) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// What a test runs in [`reserve`] on this thread once [`IDS`] took the reservation, before
-    /// the runtime takes it.
+    /// What a test runs in [`reserve`] on this thread once it holds [`RESERVING`], before the
+    /// runtime takes the reservation.
     static AMID_RESERVATION: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1222,7 +1157,7 @@ pub type VulkanIcb = Obj<IcbObject>;
 
 /// Another reference to each indirect command buffer of `list`, which a `useResource` form made
 /// resident: its command buffer holds them, and their IDs, until it has run (the docs of
-/// [`Ids`]).
+/// [`RESERVING`]).
 pub(crate) fn made_resident(list: &[Option<ResourceRef<'_, VulkanPlatform>>]) -> Vec<VulkanIcb> {
     list.iter()
         .flatten()
@@ -1318,10 +1253,10 @@ pub(crate) fn new_indirect_command_buffer(
 ) -> RaiseResult<Option<VulkanIcb>> {
     let sel = "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:";
     let overrun_shape = OverrunShape::of(desc, max_count, options);
-    // The IDs first, so every death here comes after the wait: Metal's creation waits on its
-    // pool's lock while a reservation spins, a placement past its table of IDs too ([`Ids`]).
-    // The runtime's buffer is made under it, so no reservation comes between the two.
-    let mut ids = plain(|| IDS.lock());
+    // The pool's lock first, so every death here comes after the wait: Metal's creation waits on
+    // it while a reservation spins, a placement past its table of IDs too ([`RESERVING`]). The
+    // runtime's buffer is made under it, so no reservation comes between the two.
+    let held = plain(|| RESERVING.lock());
     let mut d = descriptor(desc);
     let options = crate::gpu::resource_options(sel, options);
     let placed = desc
@@ -1345,8 +1280,7 @@ pub(crate) fn new_indirect_command_buffer(
             .new_indirect_command_buffer(&d, max_count, options)
     })?;
     let after_encoder = ENCODED.load(Ordering::SeqCst);
-    ids.started = true;
-    drop(ids);
+    drop(held);
     Ok(Some(Obj::new(IcbObject {
         raw,
         after_encoder,
@@ -2195,9 +2129,9 @@ mod tests {
         });
     }
 
-    /// An isolated task that ends while its reservation is under way, once [`IDS`] took it, still
-    /// gives it to the runtime, which then hands out Metal's IDs to the process's later buffers:
-    /// 1 then 3, 2 reserved
+    /// An isolated task that ends while its reservation is under way, once it holds
+    /// [`RESERVING`], still gives it to the runtime, which then hands out Metal's IDs to the
+    /// process's later buffers: 1 then 3, 2 reserved
     #[test]
     fn a_task_that_ends_amid_its_reservation_leaves_the_runtimes_ids_metals() {
         use reims_vgpu_core::tasks::isolation::life::TaskLife;
@@ -2236,13 +2170,13 @@ mod tests {
 
     /// The runtime refuses a reservation Metal spins at, of an ID of 2^31 to 2^32 - 1, as a hang
     /// (`Problem::ReservationHangs`), reserving nothing (plain IDs from 1), and at that refusal
-    /// the thread parks for good holding the lock of [`IDS`], as Metal's spinning thread holds its
-    /// pool's, so a creation or another reservation would wait on it for good: here the lock
-    /// stays held past 500 ms. One the runtime takes starts the IDs and lets the lock go. The
-    /// test leaves the parked thread behind, holding an [`Ids`] of its own (leaked, not the
-    /// process's), until the test's process exits
+    /// the thread parks for good holding the lock it is given, as Metal's spinning thread holds
+    /// its pool's ([`RESERVING`]), so a creation or another reservation would wait on it for good:
+    /// here the lock stays held past 500 ms. One the runtime takes lets the lock go. The test
+    /// leaves the parked thread behind, holding a lock of its own (leaked, not the process's),
+    /// until the test's process exits
     #[test]
-    fn a_reservation_the_runtime_says_metal_spins_at_holds_the_space() {
+    fn a_reservation_the_runtime_says_metal_spins_at_holds_the_pools_lock() {
         use std::time::Duration;
 
         const SEL: &str = "reserveResourceIndicesForResourceType:indices:indexCount:";
@@ -2258,16 +2192,16 @@ mod tests {
         assert!(spins(&refusal), "{refusal:?}");
         let made = make::<VulkanPlatform>(&d, &compute_desc(), 1);
         assert_eq!(made.gpu_resource_id(), 1);
-        let space = || -> &'static Mutex<Ids> { Box::leak(Box::new(Mutex::new(Ids::default()))) };
-        let taken = space();
-        answered(SEL, Reservation::Taken, taken.lock(), Ok(())).unwrap();
-        assert!(!taken.is_locked() && taken.lock().started);
-        let spun = space();
+        let lock = || -> &'static Mutex<()> { Box::leak(Box::new(Mutex::new(()))) };
+        let taken = lock();
+        answered(SEL, taken.lock(), Ok(())).unwrap();
+        assert!(!taken.is_locked());
+        let spun = lock();
         std::thread::Builder::new()
             .name("spun reservation".into())
             .spawn(move || {
                 // Parks for good: it never answers.
-                let _never = answered(SEL, Reservation::Taken, spun.lock(), Err(refusal));
+                let _never = answered(SEL, spun.lock(), Err(refusal));
             })
             .unwrap();
         // Up to 10 s for the thread to take the lock, which it then holds for good.
@@ -2277,44 +2211,6 @@ mod tests {
         });
         assert!(held, "never held");
         assert!(spun.try_lock_for(Duration::from_millis(500)).is_none());
-    }
-
-    /// What Metal does with each reservation, without a device, where the selector would ask the
-    /// runtime, whose answer tells a call Metal spins at ([`answered`]): an ID of 2^31 to
-    /// 2^32 - 1 in a call Metal takes reaches it, after a call of 0 alone too, where a call
-    /// Metal takes hands out twice; none starts the IDs before the runtime took it, and once a
-    /// buffer was made or a reservation taken every call is ignored, as is one holding an ID of
-    /// 2^32 or more, or none but 0
-    #[test]
-    fn the_ids_know_the_calls_metal_ignores_or_hands_out_twice_after() {
-        for ids in [
-            &[1 << 31][..],
-            &[0, (1 << 31) + 5],
-            &[3, u64::from(u32::MAX)],
-        ] {
-            let mut fresh = Ids::default();
-            assert_eq!(fresh.reserve(ids), Reservation::Taken, "{ids:?}");
-            assert!(!fresh.started);
-        }
-        let mut edge = Ids::default();
-        assert_eq!(edge.reserve(&[1 << 32, 3]), Reservation::Ignored);
-        assert_eq!(edge.reserve(&[(1 << 31) - 1]), Reservation::Taken);
-        edge.started = true;
-        assert_eq!(edge.reserve(&[1 << 31]), Reservation::Ignored);
-        assert_eq!(edge.reserve(&[20]), Reservation::Ignored);
-        let mut zero = Ids::default();
-        assert_eq!(zero.reserve(&[0, 0]), Reservation::Ignored);
-        assert_eq!(zero.reserve(&[(1 << 31) + 5]), Reservation::HandsOutTwice);
-        assert_eq!(zero.reserve(&[20]), Reservation::HandsOutTwice);
-        assert_eq!(zero.reserve(&[(1 << 31) - 1]), Reservation::HandsOutTwice);
-        assert!(!zero.started);
-        zero.started = true;
-        assert_eq!(zero.reserve(&[1 << 31]), Reservation::Ignored);
-        assert_eq!(zero.reserve(&[20]), Reservation::Ignored);
-        let mut none = Ids::default();
-        assert_eq!(none.reserve(&[]), Reservation::Ignored);
-        assert!(!none.lone_zero);
-        assert_eq!(none.reserve(&[0, 20]), Reservation::Taken);
     }
 
     /// The runtime's pipeline state of `add_one`, with indirect command buffer support, as core's

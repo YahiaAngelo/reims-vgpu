@@ -317,25 +317,21 @@ fn a_reservation_of_0_alone_reserves_nothing() {
     assert_eq!(ids::<VulkanPlatform>(&dev()), want);
 }
 
-/// A reservation after one of 0 alone dies at the selector: Metal takes it, then hands out
-/// IDs twice (0 then 20: 21 to 31, 1 to 19, then 1 to 10 again)
+/// A reservation after one of 0 alone is taken beside the pool's first range, and the IDs are
+/// then handed out twice, as Metal's are (0 then 20: 21 to 31, 1 to 19, then 1 to 10 again)
 #[test]
-fn a_reservation_after_one_of_0_alone_dies() {
-    let sel = "reserveResourceIndicesForResourceType:indices:indexCount:";
-    if let Some(md) = MetalPlatform::system_default_device() {
-        md.reserve_resource_indices(5, &[0]).unwrap();
-        md.reserve_resource_indices(5, &[20]).unwrap();
-        let live: Vec<_> = (0..40)
-            .map(|_| make::<MetalPlatform>(&md, &compute_desc(), 1))
-            .collect();
-        let ids: Vec<u64> = live.iter().map(|b| b.gpu_resource_id()).collect();
-        let twice: Vec<u64> = (21..=31).chain(1..=19).chain(1..=10).collect();
-        assert_eq!(ids, twice);
+fn a_reservation_after_one_of_0_alone_hands_out_ids_twice_as_metals() {
+    fn ids<P: Platform>(d: &P::Device) -> Vec<u64> {
+        d.reserve_resource_indices(5, &[0]).unwrap();
+        d.reserve_resource_indices(5, &[20]).unwrap();
+        let live: Vec<P::Icb> = (0..40).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
+        live.iter().map(|b| b.gpu_resource_id()).collect()
     }
-    let d = dev();
-    d.reserve_resource_indices(5, &[0]).unwrap();
-    let site = catch_death(|| d.reserve_resource_indices(5, &[20])).unwrap_err();
-    assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+    let twice: Vec<u64> = (21..=31).chain(1..=19).chain(1..=10).collect();
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(ids::<MetalPlatform>(&md), twice);
+    }
+    assert_eq!(ids::<VulkanPlatform>(&dev()), twice);
 }
 
 /// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, plain IDs
