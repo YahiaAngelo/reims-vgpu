@@ -10,6 +10,7 @@
 
 mod drawables;
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use std::sync::Weak;
@@ -395,12 +396,7 @@ pub(crate) fn recorded_mut<T>(
     change: impl FnOnce(&mut MadeOver) -> T,
 ) -> Option<T> {
     let key = key(surface)?;
-    let mut recorded = CLIENT_PAGES.lock();
-    recorded
-        .entries
-        .iter_mut()
-        .find(|(k, _)| *k == key)
-        .map(|(_, made)| change(made))
+    CLIENT_PAGES.lock().entries.get_mut(&key).map(change)
 }
 
 /// The key of a surface's record, its `IOSurfaceID`: every object over the same IOSurface
@@ -420,15 +416,16 @@ fn key(surface: &MetalSurface) -> Option<SurfaceKey> {
 /// into its allocation, was made over, by its `IOSurfaceID` ([`SurfaceKey`]). An ID names one
 /// live surface, so a surface made here drops the entry of one gone that had its ID
 /// ([`ClientPages::forget`]), and entries whose ID no surface holds are dropped as it grows.
+/// Each record a command's objects read at its encode is found by its ID.
 struct ClientPages {
-    entries: Vec<(SurfaceKey, MadeOver)>,
+    entries: BTreeMap<SurfaceKey, MadeOver>,
     /// The length at which the next record drops the entries of surfaces gone.
     prune_at: usize,
 }
 
 static CLIENT_PAGES: reims_vgpu_core::sync::Mutex<ClientPages> =
     reims_vgpu_core::sync::Mutex::new(ClientPages {
-        entries: Vec::new(),
+        entries: BTreeMap::new(),
         prune_at: 64,
     });
 
@@ -436,7 +433,7 @@ impl ClientPages {
     /// Drops the entry of `surface`'s ID, one of a surface gone where `surface` was just made.
     fn forget(&mut self, surface: &MetalSurface) {
         if let Some(key) = key(surface) {
-            self.entries.retain(|(k, _)| *k != key);
+            self.entries.remove(&key);
         }
     }
 
@@ -454,12 +451,12 @@ impl ClientPages {
             return;
         };
         let runs = page_runs(pages.iter().copied());
-        self.entries.retain(|(k, _)| *k != key);
+        self.entries.remove(&key);
         if self.entries.len() >= self.prune_at {
-            self.entries.retain(|&(id, _)| alive(id));
+            self.entries.retain(|&id, _| alive(id));
             self.prune_at = (self.entries.len() * 2).max(64);
         }
-        self.entries.push((
+        self.entries.insert(
             key,
             MadeOver {
                 pages: runs,
@@ -467,7 +464,7 @@ impl ClientPages {
                 gpu_read_only,
                 alias: Weak::new(),
             },
-        ));
+        );
     }
 }
 
