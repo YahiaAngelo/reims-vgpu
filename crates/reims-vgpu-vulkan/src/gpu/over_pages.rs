@@ -88,9 +88,12 @@ pub(crate) type Texture = Weak<dyn std::any::Any + Send + Sync>;
 /// them.
 #[derive(Debug, Default)]
 pub struct Seen {
-    /// The pages, and whether a detach left the object in no memory since its last replace.
+    /// The pages.
     paged: Mutex<Paged>,
-    /// Whether it is over the guest's pages now: `paged` has pages and is not zeroed.
+    /// Whether a detach left the object in no memory since its last replace, where the GPU reads
+    /// zeros through it: written with `paged` locked, and read without it, as each bind asks.
+    zeroed: AtomicBool,
+    /// Whether it is over the guest's pages now: `paged` has pages and it is not zeroed.
     guests: AtomicBool,
     /// The host memory commands used through it, those that meet merged.
     uses: Mutex<Vec<Range<u64>>>,
@@ -116,13 +119,10 @@ struct Paged {
     /// lengths up to it added up, so the run holding an object's byte is found by a search, not
     /// a walk from the first (a heap over scattered pages holds a run a page).
     ends: Vec<u64>,
-    /// Whether a detach left the object in no memory since, where the GPU reads zeros through
-    /// it.
-    zeroed: bool,
 }
 
 impl Paged {
-    /// `pages`, laid out in their order, a detach leaving none of them zeroed.
+    /// `pages`, laid out in their order.
     fn of(pages: Vec<Range<u64>>) -> Paged {
         let ends = (pages.iter())
             .scan(0u64, |at, run| {
@@ -130,11 +130,7 @@ impl Paged {
                 Some(*at)
             })
             .collect();
-        Paged {
-            pages,
-            ends,
-            zeroed: false,
-        }
+        Paged { pages, ends }
     }
 
     /// The host ranges that hold the object's bytes `bytes`, as a walk of `pages` from the first
@@ -171,8 +167,11 @@ impl Seen {
     /// The object is over `pages` from now on, its uses forgotten.
     pub(crate) fn set_pages(&self, pages: Vec<Range<u64>>) {
         let guests = !pages.is_empty();
-        *self.paged.lock() = Paged::of(pages);
+        let mut paged = self.paged.lock();
+        *paged = Paged::of(pages);
+        self.zeroed.store(false, Ordering::Release);
         self.guests.store(guests, Ordering::Release);
+        drop(paged);
         self.forget_uses();
     }
 
@@ -184,8 +183,10 @@ impl Seen {
     /// A detach left the object in no memory: the GPU reads zeros through it, and its writes
     /// reach no guest page.
     pub(crate) fn zero(&self) {
-        self.paged.lock().zeroed = true;
+        let paged = self.paged.lock();
+        self.zeroed.store(true, Ordering::Release);
         self.guests.store(false, Ordering::Release);
+        drop(paged);
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -199,22 +200,28 @@ impl Seen {
 
     /// The host memory of the object's bytes `bytes` in the guest's pages it is over now, read
     /// under its lock with no copy of the pages; `None` for one over memory of its own, or
-    /// detached.
+    /// detached, answered without the lock.
     pub(crate) fn in_pages(&self, bytes: &Range<u64>) -> Option<Vec<Range<u64>>> {
+        if !self.guests() {
+            return None;
+        }
         let paged = self.paged.lock();
-        (!paged.zeroed && !paged.pages.is_empty()).then(|| paged.in_runs(bytes))
+        (!self.zeroed() && !paged.pages.is_empty()).then(|| paged.in_runs(bytes))
     }
 
     /// Whether [`Seen::in_pages`] finds any memory of `bytes`, read as it reads it, with nothing
     /// collected; `None` where it answers `None`.
     pub(crate) fn meets_pages(&self, bytes: &Range<u64>) -> Option<bool> {
+        if !self.guests() {
+            return None;
+        }
         let paged = self.paged.lock();
-        (!paged.zeroed && !paged.pages.is_empty()).then(|| paged.meets(bytes))
+        (!self.zeroed() && !paged.pages.is_empty()).then(|| paged.meets(bytes))
     }
 
     /// Whether a detach left the object in no memory since its last replace.
     pub(crate) fn zeroed(&self) -> bool {
-        self.paged.lock().zeroed
+        self.zeroed.load(Ordering::Acquire)
     }
 
     /// Whether the object is over the guest's pages now.
@@ -226,7 +233,7 @@ impl Seen {
     /// no memory; `None` for one never given pages, over memory of its own.
     fn memory(&self, bytes: &Range<u64>) -> Option<Vec<Range<u64>>> {
         let paged = self.paged.lock();
-        if paged.zeroed {
+        if self.zeroed() {
             return Some(Vec::new());
         }
         (!paged.pages.is_empty()).then(|| paged.in_runs(bytes))
@@ -245,7 +252,7 @@ impl Seen {
             }
             let paged = self.paged.lock();
             let pages = &paged.pages;
-            if !paged.zeroed && !pages.is_empty() && pages.iter().all(|p| holding(&uses, p)) {
+            if !self.zeroed() && !pages.is_empty() && pages.iter().all(|p| holding(&uses, p)) {
                 self.all_used.store(true, Ordering::Release);
             }
         }

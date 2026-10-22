@@ -383,13 +383,15 @@ impl Backing {
     /// was made over, which it had when it was detached ([`Backing::detach`]); `None` for one
     /// attached, whose runtime object answers.
     pub(crate) fn kept_contents(&self) -> Option<NonNull<u8>> {
+        if !self.seen.zeroed() {
+            return None;
+        }
         let aliased = self.alias.lock();
-        let kept = match (&aliased.last, &aliased.own) {
+        match (&aliased.last, &aliased.own) {
             (Some(alias), _) => Some(alias.at),
             (None, Some(own)) => Some(own.at),
             (None, None) => None,
-        };
-        self.seen.zeroed().then_some(kept).flatten()
+        }
     }
 
     /// The object, a heap, was made over `alias`, the alias of `ranges` of the guest's pages
