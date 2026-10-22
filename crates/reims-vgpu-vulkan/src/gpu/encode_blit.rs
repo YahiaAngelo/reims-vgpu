@@ -123,14 +123,15 @@ pub struct EncoderObject<E> {
     open: Arc<AtomicUsize>,
     /// Its command buffer, held weakly: once it goes, nothing encoded here runs.
     command_buffer: Weak<CommandBufferObject>,
-    /// Metal's ID of the first indirect command buffer a compute encoder made resident for
-    /// writing whose ID is not the runtime's ([`crate::gpu::encode_compute`]).
+    /// Metal's ID of the first indirect command buffer a compute or render encoder made resident
+    /// for writing whose ID is not the runtime's ([`crate::gpu::encode_compute`],
+    /// [`crate::gpu::encode_render`]).
     pub(crate) icb_written: Mutex<Option<u64>>,
-    /// Whether the compute pipeline state a compute encoder set last can encode indirect
-    /// commands ([`crate::gpu::encode_compute`]).
+    /// Whether the pipeline state a compute or render encoder set last can encode indirect
+    /// commands (the runtime's `can_encode_indirect_commands`).
     pub(crate) encodes_icbs: AtomicBool,
-    /// The indirect command buffers a compute encoder made resident for writing, whose records a
-    /// dispatch of a kernel that can encode indirect commands may write
+    /// The indirect command buffers a compute or render encoder made resident for writing, whose
+    /// records work of a pipeline state that can encode indirect commands may write
     /// ([`crate::gpu::icb::IcbObject::may_be_written`]).
     pub(crate) writable_icbs: Mutex<Vec<crate::gpu::icb::VulkanIcb>>,
     /// The `uniqueIdentifier` of the pipeline state a compute or render encoder set last, 0 for

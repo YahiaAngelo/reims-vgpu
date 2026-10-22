@@ -400,15 +400,6 @@ pub struct RenderEncoderObject {
     /// Whether it drew primitive type 9, which Metal's GPU hangs at: its end holds what comes
     /// after it ([`VulkanRenderEncoder::hangs`]).
     hung: AtomicBool,
-    /// Whether the pipeline state it set last can encode indirect commands (the runtime's
-    /// `can_encode_indirect_commands`): its functions may write the commands of the indirect
-    /// command buffers it made resident for writing ([`VulkanRenderEncoder::encodes`]).
-    encodes_icbs: AtomicBool,
-    /// The indirect command buffers it made resident for writing.
-    writable_icbs: Mutex<Vec<VulkanIcb>>,
-    /// Metal's ID of the first of those whose ID is not the runtime's
-    /// ([`crate::gpu::icb::IcbObject::reaches_its_records`]).
-    icb_written: Mutex<Option<u64>>,
 }
 
 /// What a draw under a render state of `textureWriteRoundingMode` 2 whose fragment function may
@@ -2083,9 +2074,6 @@ fn opened(
         rounded: Mutex::new(RoundedTextures::default()),
         bfloat_loaded: bfloat_loaded(d),
         hung: AtomicBool::new(false),
-        encodes_icbs: AtomicBool::new(false),
-        writable_icbs: Mutex::new(Vec::new()),
-        icb_written: Mutex::new(None),
     });
     if let Some(what) = metal_aborts_at(d) {
         metal_aborts(sel, what);
@@ -2882,10 +2870,10 @@ impl VulkanRenderEncoder {
                 sel,
                 icb: icb.clone_ref(),
                 range,
-                guest_id: plain(|| *self.icb_written.lock()),
+                guest_id: plain(|| *self.encoder.icb_written.lock()),
                 points: Points::Own,
                 writable: plain(|| {
-                    let writable = self.writable_icbs.lock();
+                    let writable = self.encoder.writable_icbs.lock();
                     writable.iter().map(|icb| icb.clone_ref()).collect()
                 }),
             }
@@ -2910,15 +2898,15 @@ impl VulkanRenderEncoder {
     /// records of each buffer the encoder made resident for writing
     /// ([`crate::gpu::command::executions::gpu_writes`]).
     fn encodes(&self, sel: &'static str, what: &str) {
-        if !plain(|| self.encodes_icbs.load(Ordering::SeqCst)) {
+        if !plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
             return;
         }
-        if let Some(id) = plain(|| *self.icb_written.lock()) {
+        if let Some(id) = plain(|| *self.encoder.icb_written.lock()) {
             let what = format!("{what} of a pipeline state that can encode indirect commands");
             crate::gpu::encode_compute::encodes_through_guest_id(sel, &what, id);
         }
         let writable: Vec<VulkanIcb> = plain(|| {
-            let writable = self.writable_icbs.lock();
+            let writable = self.encoder.writable_icbs.lock();
             writable.iter().map(|icb| icb.clone_ref()).collect()
         });
         for icb in &writable {
@@ -2932,13 +2920,13 @@ impl VulkanRenderEncoder {
     /// records through.
     fn writable(&self, icbs: &[VulkanIcb]) {
         plain(|| {
-            let mut writable = self.writable_icbs.lock();
+            let mut writable = self.encoder.writable_icbs.lock();
             writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
         });
         if let Some(icb) = icbs.iter().find(|icb| !icb.reaches_its_records()) {
             let id = icb.gpu_resource_id();
             plain(|| {
-                self.icb_written.lock().get_or_insert(id);
+                self.encoder.icb_written.lock().get_or_insert(id);
             });
         }
     }
@@ -3655,7 +3643,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     self.encoder.nothing(sel)?;
                     plain(|| *self.nil_pipeline.lock() = true);
                     self.encoder.pipeline.store(0, Ordering::Relaxed);
-                    self.encodes_icbs.store(false, Ordering::SeqCst);
+                    self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
                     Ok(())
                 }
                 Some(state) => {
@@ -3664,7 +3652,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     self.encoder
                         .pipeline
                         .store(state.unique_identifier(), Ordering::Relaxed);
-                    self.encodes_icbs.store(f.encodes, Ordering::SeqCst);
+                    self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
                     plain(|| {
                         *self.nil_pipeline.lock() = false;
                         self.reach.lock().set(&state.reflection, f.writes);
