@@ -76,14 +76,20 @@
 //!   nothing of the batch the step recorded for or of those after it, where Metal draws the
 //!   command and fails none.
 //! - **A command whose buffer over the guest's pages was rebound before its command buffer was
-//!   submitted** (`CommandBufferError::EncodedUseRebound`) dies there too
-//!   ([`encoded_use_rebound`]): the runtime resolves a command's use of a buffer over the
-//!   caller's host pages as the command is encoded, so where the buffer is rebound (a backing
-//!   replaced, `crate::gpu::backing`) before the command buffer's first submission, it runs
-//!   nothing of each submission holding the command and fails the command buffer, where Metal
-//!   resolves the use as it submits and runs the command over the pages the buffer lies in then.
-//!   The runtime announces the first such failure (`EncodedUseRebound`, [`crate::answer::DIES`])
-//!   on the thread that makes the submission, where it dies first, ending the process.
+//!   submitted, in an encoder the runtime cannot encode again**
+//!   (`CommandBufferError::EncodedUseRebound`) dies there too ([`encoded_use_rebound`]): the
+//!   runtime resolves a command's use of a buffer over the caller's host pages as the command is
+//!   encoded, and where the buffer is rebound (a backing replaced, `crate::gpu::backing`) before
+//!   the command buffer's first submission, it encodes the compute, blit and render encoders
+//!   that named it again from their calls, so they reach the new pages as Metal's do. It fails
+//!   only an encoder it cannot encode again: a resource state encoder; one of a command buffer
+//!   that used command predication; a render pass recorded later (an execution of an indirect
+//!   command buffer, a draw whose pipeline was being made) or whose end captured its draws' tile
+//!   reach; and one a call of which it refused. Each submission holding such an encoder runs
+//!   nothing and the command buffer fails, where Metal resolves the use as it submits and runs
+//!   the command over the pages the buffer lies in then. The runtime announces the first such
+//!   failure (`EncodedUseRebound`, [`crate::answer::DIES`]) on the thread that makes the
+//!   submission, where it dies first, ending the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
 //!   there too, naming it ([`answered`]): an emulated mesh draw past the command buffer's mesh
 //!   records pool (`MeshRecordsOverflow`), or an emulated tessellation draw past the same pool
@@ -171,12 +177,13 @@
 //!   This platform differs from Metal where:
 //!   - the object is replaced after the command was encoded and before its command buffer's
 //!     first submission (committed after the replace, or committed before it and held behind an
-//!     event wait): Metal runs the submission over the new pages. The runtime resolved the
-//!     command's use as it encoded it, and fails the command buffer
-//!     (`CommandBufferError::EncodedUseRebound`), which dies ([`encoded_use_rebound`]). The
-//!     runtime decides each submission so as it submits it, after the check: one the check
-//!     fails, a use detached then, keeps code 8, as Metal's, and a later one rebound so dies all
-//!     the same, the command buffer keeping that code;
+//!     event wait), in an encoder the runtime cannot encode again (the failure above): Metal
+//!     runs the submission over the new pages. The runtime resolved the command's use as it
+//!     encoded it, and fails the command buffer (`CommandBufferError::EncodedUseRebound`), which
+//!     dies ([`encoded_use_rebound`]); a compute, blit or render encoder it encodes again
+//!     reaches the new pages, as Metal's. The runtime decides each submission so as it submits
+//!     it, after the check: one the check fails, a use detached then, keeps code 8, as Metal's,
+//!     and a later one rebound so dies all the same, the command buffer keeping that code;
 //!   - a submission that executes an indirect command buffer the GPU may write is checked again
 //!     once the runtime recorded what its commands reach, and failing then, only what had not
 //!     run yet runs nothing. Metal decides it once, before any of it runs.
@@ -1218,16 +1225,17 @@ fn host_step_object(sel: &'static str, object: rt::HostStepObject) -> ! {
 
 /// The death at `sel` of a command buffer the runtime failed as it was first submitted, as a
 /// command of it named a buffer over the guest's pages that was rebound after the command was
-/// encoded: the runtime resolved the use as the command was encoded, and ran nothing of each
-/// submission holding such a command, where Metal resolves it as it submits the command buffer
-/// and runs the command over the pages the buffer lies in then.
+/// encoded, in an encoder the runtime could not encode again (the module docs): the runtime
+/// resolved the use as the command was encoded, and ran nothing of each submission holding such
+/// a command, where Metal resolves it as it submits the command buffer and runs the command over
+/// the pages the buffer lies in then.
 fn encoded_use_rebound(sel: &'static str) -> ! {
     unrepresentable(
         sel,
         "a command naming a buffer over the guest's pages that was rebound after the command was \
-         encoded and before its command buffer was submitted, whose use the runtime resolved as \
-         it was encoded and ran nothing of, failing the command buffer, where Metal runs it over \
-         the pages the buffer lies in as it submits",
+         encoded and before its command buffer was submitted, in an encoder the runtime could \
+         not encode again, whose use it resolved as it was encoded and ran nothing of, failing \
+         the command buffer, where Metal runs it over the pages the buffer lies in as it submits",
     )
 }
 

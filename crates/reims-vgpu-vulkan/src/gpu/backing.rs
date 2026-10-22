@@ -43,10 +43,14 @@
 //!   command buffers made before it was released detached ([`submission_check`],
 //!   `crate::gpu::command`'s docs). A command that names the object, encoded before a replace,
 //!   and whose command buffer is first submitted after it (committed after it, or committed
-//!   before it and held behind an event wait), fails in the runtime, which resolved the use as
-//!   the command was encoded (`CommandBufferError::EncodedUseRebound`): that dies where its
-//!   failure is first read (`crate::gpu::command`), where Metal runs the command over the pages
-//!   the object lies in as it submits. The runtime decides each of the command buffer's
+//!   before it and held behind an event wait), reaches the new pages as Metal's does where the
+//!   runtime encodes its compute, blit or render encoder again from its calls; in an encoder it
+//!   cannot (a resource state encoder, a command buffer that used command predication, a render
+//!   pass recorded later or whose end captured its draws' tile reach, one with a refused call)
+//!   it fails, as the runtime resolved the use as the command was encoded
+//!   (`CommandBufferError::EncodedUseRebound`): that dies where its failure is first read
+//!   (`crate::gpu::command`), where Metal runs the command over the pages the object lies in as
+//!   it submits. The runtime decides each of the command buffer's
 //!   submissions as it submits it, after the submission check, so one the check fails keeps its
 //!   code: a use detached behind a wait, in the first submission or a later one (an event's
 //!   split), fails with code 8, as Metal's (`tests/detach_backing.rs`). A rebound use in a later

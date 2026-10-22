@@ -23,8 +23,9 @@
 //!   stores as Metal's does. Metal's draws in such a pass rasterize by what earlier maps left
 //!   (measured: nothing in one run, a corner of 1,018 fragments of a 64-pixel target after other
 //!   maps' passes in another; the runtime's measurement records rows 0 to 15 drawn as with no map
-//!   after a released map of one layer, here too), where the runtime's draw nothing, so a draw, an
-//!   execution of indirect commands and a tile dispatch in it die ([`crate::gpu::encode_render`]).
+//!   after a released map of one layer, here too), where the runtime's draw nothing, so a draw and
+//!   an execution of indirect commands in it die, and a tile dispatch, which only draws were
+//!   measured against, relays it, and dies in strict mode ([`crate::gpu::encode_render`]).
 //!   Its coordinate maps end Metal's process, so they die here
 //!   ([`unmapped`]).
 //! - **A mutable map** (`setMutability:` Mutable, 1) is not compiled until it is reset. Until then
@@ -48,8 +49,8 @@
 //!   are the map's tiles' exact lines, where Metal's are its fixed-point ones. The runtime
 //!   announces it as it compiles the map, at its creation or a
 //!   reset (`rasterization-rate-map`, [`Regions`]), which is relayed, and a draw, an execution of
-//!   indirect commands that is not empty and a tile dispatch in such a pass die
-//!   ([`crate::gpu::encode_render`]).
+//!   indirect commands that is not empty and a tile dispatch in such a pass relay it again, and
+//!   die in strict mode ([`crate::answer::Inexact::RateMap`], [`crate::gpu::encode_render`]).
 //! - **A pass of a mutable map not yet reset** rasterizes nothing, as on Metal (measured: a
 //!   full-screen triangle's vertex function writes its buffer, its fragment function never runs,
 //!   and the colour, depth and stencil attachments keep their clears), so its encoder keeps its
@@ -296,8 +297,8 @@ enum State {
 /// Whether a compiled map's rates vary, which the runtime announces as it compiles one
 /// (`rasterization-rate-map`, [`crate::answer::HEARD`]): a pass over such a map draws by regions
 /// whose lines are its tiles' exact lines, where Apple's are its fixed-point ones, so a draw, an
-/// execution of indirect commands that is not empty and a tile dispatch in it die
-/// ([`crate::gpu::encode_render`]). The runtime announces nothing for a map whose every tile spans
+/// execution of indirect commands that is not empty and a tile dispatch in it relay it, and die
+/// in strict mode ([`crate::answer::Inexact::RateMap`], [`crate::gpu::encode_render`]). The runtime announces nothing for a map whose every tile spans
 /// as many screen pixels as physical ones, whose passes draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Regions {

@@ -71,6 +71,10 @@ process there instead.
 | What runs instead of Metal's answer | Where |
 |---|---|
 | A line width other than 1 draws 1 pixel wide | `reims-vgpu-vulkan` draw encoding |
+| A `half` colour output stored past the bound its rounding was measured within, as blended or converted at its attachment, stores the runtime's `half` rounding | draw encoding |
+| A draw in a pass that loads and stores a bfloat colour attachment leaves the runtime's tiles of it: codes moved through `half` where no draw reaches, kept where one does | draw encoding |
+| A multisampled 32-bit float attachment cleared to a NaN other than the plain quiet one, in a pass whose only draws record nothing, resolves keeping the NaN's bits, where Metal's resolve stores `0x7fc00000` | render passes |
+| Under `textureWriteRoundingMode` 2, the alpha that alpha to coverage reads of an `RGBA16Float` colour 0 takes the device's conversion, and a half-float attachment of a sample count no one measured at the mode resolves by the runtime's rules | render states |
 | A provoking vertex with no exact rotation draws with the first vertex provoking | draw encoding |
 | A heap texture of unmeasured size or layout takes the runtime's size and layout | heaps |
 | A Metal-level answer for an unmeasured host release, or a format's description off macOS 26.7, comes from that release's description | device answers |

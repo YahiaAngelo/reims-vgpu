@@ -735,10 +735,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// dies at the selector too. A heap's placement of such a texture still
     /// dies where the runtime's size decides it, as its image needs that size in the heap
     /// (`crate::gpu::resource::Placements`).
-    /// It dies at the selector, too, naming the kind and the texture, for a texture whose layout
-    /// in Metal's heaps the runtime does not model, a PVRTC format, whose size and alignment the
-    /// runtime answers as its device's image's, larger or smaller than Metal's, and announces so
-    /// (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`];
+    /// It relays, naming the kind and the texture, and in strict mode dies at the selector, for a
+    /// texture whose layout in Metal's heaps the runtime does not model, a PVRTC format, whose
+    /// size and alignment the runtime answers as its device's image's, larger or smaller than
+    /// Metal's, and announces so (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`];
     /// [`metal_space::unmeasured_size`]): the guest reads the answer, and no suite case or guest
     /// run asks it of such a texture. The runtime refuses 8 samples first on every device, as
     /// Metal stops them, so the query dies at that refusal. The runtime models a mipmapped texture

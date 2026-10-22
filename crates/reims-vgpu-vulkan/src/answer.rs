@@ -1227,8 +1227,9 @@ pub const DIES: [rt::Degradation; 124] = [
 ///   Metal's, and so are a pass's loads, clears and stores over it. Announced as the runtime
 ///   compiles the map, inside `newRasterizationRateMapWithDescriptor:` or `resetUsingDescriptor:`,
 ///   which hear it ([`crate::gpu::rate_map`]): a draw or an execution of indirect commands that is
-///   not empty, and a tile dispatch, in a pass over such a map die at their selector
-///   ([`crate::gpu::encode_render`]). Relayed the first time alone ([`RELAYED_ONCE`]);
+///   not empty, and a tile dispatch, in a pass over such a map relay it as [`Inexact::RateMap`]
+///   (in strict mode die at their selector, [`crate::gpu::encode_render`]). Relayed the first
+///   time alone ([`RELAYED_ONCE`]);
 /// - `HeapTextureUntiledLayout`, a texture in a heap over the guest's pages that the runtime does
 ///   not lay out in Metal's tiles: a multisample texture, a two-aspect depth and stencil format, a
 ///   PVRTC format, an image that holds other bytes than Metal's elements, or one past the device's
@@ -1254,8 +1255,9 @@ pub const DIES: [rt::Degradation; 124] = [
 ///   only another resource over its bytes meets other bytes. Announced at each such texture, inside
 ///   `newTextureWithDescriptor:offset:`, which hears it. A single-sample one is made and the notice
 ///   relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A multisample one
-///   dies there, named: a buffer or texture over its bytes, which
-///   on Metal sees and changes them, would neither see nor change its image;
+///   is made too, and relayed as [`Inexact::HeapLayout`] (in strict mode it dies there, named):
+///   a buffer or texture over its bytes, which on Metal sees and changes them, would neither see
+///   nor change its image;
 /// - `UnmeasuredHeapTextureSize`, a texture whose layout in Metal's heaps the runtime does not
 ///   model, whose size and alignment it answers as its device's image's, larger or smaller than
 ///   Metal's: at the pinned runtime a PVRTC format. The runtime names 8 samples too, but no
@@ -1267,10 +1269,11 @@ pub const DIES: [rt::Degradation; 124] = [
 ///   inside `heapTextureSizeAndAlignWithDescriptor:`, a heap's `newTextureWithDescriptor:offset:`
 ///   and `newTextureWithDescriptor:`, whose texture of memory of its own takes a range of Metal's
 ///   space of the runtime's size ([`crate::gpu::metal_space::own_heap_size`]). Each hears it and
-///   dies at its selector, naming the kind and the texture
-///   ([`crate::gpu::metal_space::unmeasured_size`]), every PVRTC texture of memory of its own
-///   among them, at every shape, but for a heap's nil at or past its end, Metal's whatever the
-///   size. Relayed the first time alone ([`RELAYED_ONCE`]) where nothing takes the size;
+///   relays it as [`Inexact::HeapLayout`], naming the kind and the texture (in strict mode it
+///   dies at its selector, [`crate::gpu::metal_space::unmeasured_size`]), every PVRTC texture of
+///   memory of its own among them, at every shape, but for a heap's nil at or past its end,
+///   Metal's whatever the size. Relayed the first time alone ([`RELAYED_ONCE`]) where nothing
+///   takes the size;
 /// - `HalfOutputPrecision`, a fragment function's `half` colour output, of a module compiled
 ///   without fast math or naming no math mode (one compiled with fast math notes
 ///   `HalfOutputFastMathBlend` in its place, relayed in the accepted class of fast-math
