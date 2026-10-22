@@ -228,9 +228,7 @@ use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Regions;
-use crate::gpu::resource::{
-    Named, RenderDescriptor, VulkanBuffer, VulkanTexture, reach,
-};
+use crate::gpu::resource::{Named, RenderDescriptor, VulkanBuffer, VulkanTexture, reach};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
@@ -2582,7 +2580,8 @@ impl VulkanRenderEncoder {
             let kept = (crate::os::TWINS_READ_ONLY)
                 .then(|| reach.kept(inherits))
                 .flatten();
-            let written = (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
+            let written =
+                (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
             (kept, written)
         });
         if let Some(whether) = kept {
@@ -4709,7 +4708,8 @@ pub(crate) mod tests {
             let length = usize::try_from(b.length()).unwrap();
             assert!(length >= 4 * n, "{listed:?} of {count}");
             // SAFETY: a Shared buffer of `length` bytes, which nothing writes after it is made.
-            let bytes = unsafe { std::slice::from_raw_parts(b.contents().unwrap().as_ptr(), length) };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(b.contents().unwrap().as_ptr(), length) };
             let held: Vec<u32> = (bytes.as_chunks::<4>().0.iter().take(n))
                 .map(|w| u32::from_ne_bytes(*w))
                 .collect();
