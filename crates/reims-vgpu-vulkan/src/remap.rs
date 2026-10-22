@@ -98,16 +98,25 @@
 //!   a command buffer submitted before a texture over them was released still holds the import,
 //!   until it completes. Ground: MoltenVK's no-copy buffer keeps the pages it was made over,
 //!   which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a remap under
-//!   one), and NVIDIA's host-pointer import pins its pages as it imports them (Linux drivers pin
-//!   imported pages, the runtime's `host_memory`; `tests/no_copy_remap_linux.rs` measures a remap
-//!   under one on an RTX 5080 Laptop GPU), so on those devices the GPU still reads the pages it
-//!   imported, as Metal's reads those it wired. A driver that validates such pages again
-//!   at each submission fails a submission that lists the import in that window: on Linux the
-//!   surface stand-in's own memory and views (`os::linux::surface`) are therefore held until the
-//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`). A
-//!   surface over a single range of the guest's pages maps nothing: core makes one only over a
-//!   page of the host's own RAM ("Not reported", above), which no hold defers, and the
-//!   [`UnmapHold`] its hold carries defers an unmap only of pages [`VulkanVm`] maps.
+//!   one), and so do NVIDIA's host-pointer import and an import of dma-bufs of a file's pages,
+//!   which the dma-buf pinned (RADV's, for any page with a file behind it):
+//!   `tests/no_copy_remap_linux.rs` measures a remap under each, on an RTX 5080 Laptop GPU and
+//!   on RADV's Radeon 780M and RX 7900 XTX. On those devices the GPU still reads the pages it
+//!   imported, as Metal's reads those it wired. Other drivers' host-pointer imports follow their
+//!   address (the runtime's `DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV,
+//!   lavapipe), and one that validates the pages again at each submission fails a submission
+//!   that lists the import in that window. RADV's pointer imports take only pages with no file
+//!   behind them (amdgpu's userptr), and it lists every import in every submission: once a file's
+//!   pages are mapped under one, every submission of the device fails, the runtime answering
+//!   `DeviceLost`, and other pages with no file behind them are what the GPU reads from then
+//!   (measured on both, Mesa 26.2.4). So on RADV a host of the blocks setup whose task memory
+//!   has no file behind it has the GPU read what it maps under a live buffer, and loses the
+//!   device where that is a file's pages. On Linux the surface stand-in's own memory and views
+//!   (`os::linux::surface`) are held until the free, by the keep-alive of a buffer over a surface
+//!   at no offset (`surface_memory_hold`). A surface over a single range of the guest's pages
+//!   maps nothing: core makes one only over a page of the host's own RAM ("Not reported",
+//!   above), which no hold defers, and the [`UnmapHold`] its hold carries defers an unmap only of
+//!   pages [`VulkanVm`] maps.
 //!   Measured on an Iris Xe (Mesa 26.2.4's ANV, i915) before that hold: ANV lists every live
 //!   import in each execbuffer, and one listing an import whose pages a surface's release had
 //!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
