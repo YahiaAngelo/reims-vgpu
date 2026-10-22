@@ -2448,9 +2448,8 @@ mod tests {
     fn a_reservation_metal_spins_at_holds_the_space() {
         use std::time::Duration;
 
-        let space = || -> &'static Mutex<Space> {
-            Box::leak(Box::new(Mutex::new(Space { pool: None })))
-        };
+        let space =
+            || -> &'static Mutex<Space> { Box::leak(Box::new(Mutex::new(Space { pool: None }))) };
         let taken = space();
         let (reservation, held) = reserve_in(taken, &[10]);
         assert_eq!(reservation, Reservation::Taken);
