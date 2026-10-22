@@ -6,8 +6,10 @@
 //!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
 //!   code of the isolated task that added it, if one did: once that task ended, nothing dies
 //!   there, as core's handlers of the task run none ([`completed_handler`]).
-//! - **`encodeSignalEventScheduled:value:`** has no runtime call: it is a scheduled handler that
-//!   sets the event's value, which is what Metal's does when the buffer is scheduled.
+//! - **`encodeSignalEventScheduled:value:`** is the runtime's: the event's value is set as the
+//!   buffer is scheduled, before its status reads `Scheduled` and before `waitUntilScheduled`
+//!   returns, as Metal's; sent once the buffer is committed, it sets nothing, as Metal's, and once
+//!   it completed it dies, where Metal's ends the process.
 //! - **A nil event**, which the runtime's calls cannot take, dies at the send.
 //! - **An open encoder** kills the command buffer's sends that Metal asserts at while one is
 //!   ("with uncommitted encoder"): a new encoder, an event, `setProtectionOptions:`, `commit`.
@@ -1317,8 +1319,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         })
     }
 
-    /// A scheduled handler that sets the event's value: refused after the commit, as every
-    /// handler is.
+    /// The runtime's: the event's value becomes at least `value` as the command buffer is
+    /// scheduled, before its status reads `Scheduled` and before `waitUntilScheduled` returns, as
+    /// Metal's (the runtime's measurement on an M3 Max under macOS 27.0.1). Sent once the command
+    /// buffer is committed it sets nothing, as Metal's; once it completed, it dies, where Metal's
+    /// ends the process with a segmentation fault and the runtime's sets nothing
+    /// (`a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals`, measured on the M3 Max
+    /// under macOS 27.0.1 after a `Completed` and an `Error` completion). While an encoder is open
+    /// it dies, as Metal asserts. Core sends it before the commit alone.
     fn encode_signal_when_scheduled(
         &self,
         signal_event_scheduled: Option<&VulkanSharedEvent>,
@@ -1328,16 +1336,24 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let traced = signal_event_scheduled.map_or(0, event_id);
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
+        let status = plain(|| self.raw.status());
+        if matches!(
+            status,
+            rt::CommandBufferStatus::Completed | rt::CommandBufferStatus::Error
+        ) {
+            fatal_with_detail(
+                DeathId::Platform {
+                    kind: DeathKind::OutOfBounds,
+                    call: sel,
+                },
+                "Metal ends the process with a segmentation fault at a scheduled signal of a \
+                 command buffer that completed",
+            );
+        }
         encoding(sel, Policy::Dies, || {
-            let event = signal_event_scheduled
-                .map(|e| rt::SharedEvent::clone(e))
-                .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-            let handler: rt::Handler = Box::new(move |_| {
-                // evschedset: event, value: the scheduled handler sets it
-                reims_vgpu_core::trace::event("evschedset", &[traced, value]);
-                event.set_signaled_value(value)
-            });
-            self.raw.add_scheduled_handler(handler)
+            let event =
+                signal_event_scheduled.unwrap_or_else(|| unrepresentable(sel, "a nil event"));
+            self.raw.encode_signal_event_scheduled(event, value)
         })
     }
 
@@ -1562,6 +1578,45 @@ mod tests {
             })
             .unwrap_err();
             assert_eq!(site.file, "commit");
+        }
+    }
+
+    /// `encodeSignalEventScheduled:value:` sets the event's value as its command buffer is
+    /// scheduled, behind an event wait once the wait is met, and, sent after the commit while the
+    /// command buffer waits, sets nothing, as Metal's: the value does not rise, and nothing dies.
+    /// Sent once the command buffer completed, it dies, where Metal's ends the process with a
+    /// segmentation fault
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
+        use reims_vgpu_core::platform::Platform;
+        use reims_vgpu_metal::MetalPlatform;
+
+        /// Whether the value reached the scheduled signal's 1 and the late one's 7, once the
+        /// command buffer completed.
+        fn reached<P: Platform>(d: &P::Device) -> ([bool; 2], P::CommandBuffer) {
+            let q = d.new_command_queue().unwrap();
+            let (event, held) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
+            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+            cb.encode_wait(Some(EventRef::Shared(&held)), 1).unwrap();
+            cb.encode_signal_when_scheduled(Some(&event), 1).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.encode_signal_when_scheduled(Some(&event), 7).unwrap();
+            held.set_signaled_value(1).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            let values = [1, 7].map(|value| event.wait_until_signaled_value(value, 0));
+            (values, cb)
+        }
+        let (vulkan, cb) = reached::<VulkanPlatform>(&dev());
+        assert_eq!(vulkan, [true, false]);
+        let event = dev().new_shared_event().unwrap();
+        let site = catch_death(|| cb.encode_signal_when_scheduled(Some(&event), 3)).unwrap_err();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::OutOfBounds, "encodeSignalEventScheduled:value:")
+        );
+        if let Some(md) = MetalPlatform::system_default_device() {
+            assert_eq!(reached::<MetalPlatform>(&md).0, vulkan);
         }
     }
 
