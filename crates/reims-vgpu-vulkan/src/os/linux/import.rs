@@ -150,10 +150,12 @@ impl ImportView {
 pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
-    let source: rt::DmaBufSource = Arc::new(|request: rt::DmaBufRequest| {
+    // The import's files of zeros, which every request of its source over the same pages takes.
+    let zeros = super::dma_buf::Zeros::default();
+    let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
-        match super::dma_buf::of_pages(first, length, granule) {
+        match super::dma_buf::of_pages(first, length, granule, &zeros) {
             Ok(chunks) => {
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as {} dma-bufs at a granule of {granule:#x}",

@@ -36,15 +36,20 @@
 //! at page offsets. The device node is the `kvm` group's on Ubuntu.
 //!
 //! Pieces of the block of zeros read-only aliases share ([`super::import::allocate_zeros`]) are
-//! made of a file of zeros of the import's own instead, as an import's twin maps private zeros
-//! there: the GPU's writes stay in it and never reach the block.
+//! made of files of zeros of the import's own instead ([`Zeros`]), as an import's twin maps private
+//! zeros there: the GPU's writes stay in them and never reach the block. Its source answers the
+//! same pieces of the same files for every request over the same pages, as the runtime's contract
+//! asks (`rt::HostMemory::with_dma_buf`), so a texture's dma-buf over the import's pages shows
+//! what the GPU wrote there through the import's.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_runtime::DmaBufChunk;
+use reims_vgpu_core::sync::Mutex;
 
 use super::files::{self, Backing};
 use super::vm;
@@ -226,46 +231,83 @@ fn padded<F: Clone>(
     chunks(runs, granule, limits)
 }
 
+/// The files of zeros one import's dma-buf source answers the block of zeros' pages with
+/// ([`of_pages`]), each by the first address of the pages it holds: a page asked for again is
+/// answered by the same piece of the same file, and pages asked for the first time by a file made
+/// for them, so every request over the same pages answers the same files (module docs).
+#[derive(Debug, Default)]
+pub(crate) struct Zeros(Mutex<BTreeMap<u64, (u64, Arc<OwnedFd>)>>);
+
+impl Zeros {
+    /// The pieces of its files that answer the `length` bytes of the block of zeros at `at`, in
+    /// order, each with its length: those its files hold already, and a new file for each run of
+    /// the rest.
+    fn pieces(&self, at: u64, length: u64) -> Vec<(Backing, u64)> {
+        let end = at.saturating_add(length);
+        let mut files = self.0.lock();
+        let held: Vec<(u64, u64, Arc<OwnedFd>)> = (files.range(..end))
+            .filter(|&(&first, &(bytes, _))| first.saturating_add(bytes) > at)
+            .map(|(&first, (bytes, fd))| (first, *bytes, Arc::clone(fd)))
+            .collect();
+        let made = |files: &mut BTreeMap<u64, (u64, Arc<OwnedFd>)>, first: u64, bytes: u64| {
+            let fd = vm::memfd(bytes);
+            files.insert(first, (bytes, Arc::clone(&fd)));
+            (Backing { fd, offset: 0 }, bytes)
+        };
+        let mut pieces = Vec::new();
+        let mut next = at;
+        for (first, bytes, fd) in held {
+            if first > next {
+                pieces.push(made(&mut files, next, first - next));
+            }
+            let from = first.max(next);
+            let to = first.saturating_add(bytes).min(end);
+            let offset = from - first;
+            pieces.push((Backing { fd, offset }, to - from));
+            next = to;
+        }
+        if next < end {
+            pieces.push(made(&mut files, next, end - next));
+        }
+        pieces
+    }
+}
+
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
-/// the block of zeros' pieces from a file of zeros of the import's own, cut into chunks within
-/// udmabuf's limits at multiples of `granule` from `first` (module docs).
-pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaBufChunk>, Refusal> {
+/// the block of zeros' pieces from `zeros`, the files of zeros of the import's own, cut into
+/// chunks within udmabuf's limits at multiples of `granule` from `first` (module docs).
+pub(crate) fn of_pages(
+    first: u64,
+    length: u64,
+    granule: u64,
+    zeros: &Zeros,
+) -> Result<Vec<DmaBufChunk>, Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
     let of_zeros = super::import::of_zeros(&resolved);
-    let zero_bytes: u64 = (resolved.iter().zip(&of_zeros))
-        .filter(|&(_, &zeros)| zeros)
-        .map(|(p, _)| p.length)
-        .sum();
-    let zeros = (zero_bytes > 0).then(|| vm::memfd(zero_bytes));
-    let mut zeros_at = 0;
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
     for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
-        let backing = match &zeros {
-            Some(zeros) if of_zeros => {
-                let backing = Backing {
-                    fd: Arc::clone(zeros),
-                    offset: zeros_at,
-                };
-                zeros_at += piece.length;
-                backing
-            }
-            _ => piece.backing,
+        let backings = if of_zeros {
+            zeros.pieces(first + piece.at, piece.length)
+        } else {
+            vec![(piece.backing, piece.length)]
         };
-        match runs.last_mut() {
-            Some(last)
-                if Arc::ptr_eq(&last.file, &backing.fd)
-                    && last.offset + last.length == backing.offset =>
-            {
-                last.length += piece.length;
+        for (backing, bytes) in backings {
+            match runs.last_mut() {
+                Some(last)
+                    if Arc::ptr_eq(&last.file, &backing.fd)
+                        && last.offset + last.length == backing.offset =>
+                {
+                    last.length += bytes;
+                }
+                _ => runs.push(Run {
+                    file: backing.fd,
+                    offset: backing.offset,
+                    length: bytes,
+                }),
             }
-            _ => runs.push(Run {
-                file: backing.fd,
-                offset: backing.offset,
-                length: piece.length,
-            }),
         }
     }
     let device = device()?;
@@ -353,6 +395,85 @@ mod tests {
             libc::munmap(at, length);
             byte
         }
+    }
+
+    /// Writes `byte` at `offset` of the dma-buf, through a mapping of it, as the GPU writes
+    /// through its import.
+    fn write_through(chunk: &DmaBufChunk, offset: u64, byte: u8) {
+        let length = usize::try_from(chunk.length).unwrap();
+        // SAFETY: a fresh shared mapping of the dma-buf, written once and unmapped.
+        unsafe {
+            let at = libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                chunk.fd.as_raw_fd(),
+                0,
+            );
+            assert_ne!(at, libc::MAP_FAILED);
+            (at.cast::<u8>())
+                .add(usize::try_from(offset).unwrap())
+                .write_volatile(byte);
+            libc::munmap(at, length);
+        }
+    }
+
+    /// A source's files of zeros answer pages asked for again with the same pieces of the same
+    /// files, whatever the requests' extents, and pages asked for the first time with files of
+    /// their own
+    #[test]
+    fn zero_pages_asked_again_take_the_same_pieces() {
+        let zeros = Zeros::default();
+        let shape = |pieces: &[(Backing, u64)]| -> Vec<(u64, u64)> {
+            pieces.iter().map(|(b, n)| (b.offset, *n)).collect()
+        };
+        let middle = zeros.pieces(0x3000, 0x2000);
+        assert_eq!(shape(&middle), [(0, 0x2000)]);
+        let inside = zeros.pieces(0x4000, 0x1000);
+        assert_eq!(shape(&inside), [(0x1000, 0x1000)]);
+        assert!(Arc::ptr_eq(&inside[0].0.fd, &middle[0].0.fd));
+        // Pages on both sides, asked for the first time, take files of their own around it.
+        let around = zeros.pieces(0x1000, 0x6000);
+        assert_eq!(shape(&around), [(0, 0x2000), (0, 0x2000), (0, 0x2000)]);
+        assert!(Arc::ptr_eq(&around[1].0.fd, &middle[0].0.fd));
+        assert!(!Arc::ptr_eq(&around[0].0.fd, &around[2].0.fd));
+        let again = zeros.pieces(0x2000, 0x4000);
+        assert_eq!(shape(&again), [(0x1000, 0x1000), (0, 0x2000), (0, 0x1000)]);
+        for (a, b) in again.iter().zip(&around) {
+            assert!(Arc::ptr_eq(&a.0.fd, &b.0.fd));
+        }
+        // Another import's source answers files of its own.
+        let other = Zeros::default().pieces(0x3000, 0x2000);
+        assert!(!Arc::ptr_eq(&other[0].0.fd, &middle[0].0.fd));
+    }
+
+    /// Every request of an import's source over the same pages of the block of zeros answers the
+    /// same pieces of the same files, as the runtime's contract asks
+    /// (`rt::HostMemory::with_dma_buf`): a write through the import's dma-buf there is what the
+    /// dma-buf of a texture's pages inside it reads. The write never reaches the block, nor
+    /// another import's dma-buf of the same pages
+    #[test]
+    fn a_sources_requests_over_zero_pages_answer_the_same_files() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let at = super::super::import::allocate_zeros(4 * page).unwrap();
+        let first = at.addr().to_u64();
+        let zeros = Zeros::default();
+        let whole = of_pages(first, 4 * page, page, &zeros).unwrap();
+        let texture = of_pages(first + page, 2 * page, 2 * page, &zeros).unwrap();
+        let other = of_pages(first, 4 * page, page, &Zeros::default()).unwrap();
+        assert_eq!((whole.len(), texture.len(), other.len()), (1, 1, 1));
+        write_through(&whole[0], 2 * page, 0x5a);
+        assert_eq!(read_through(&texture[0], page), 0x5a, "the same pages");
+        assert_eq!(read_through(&other[0], 2 * page), 0, "another import's");
+        // SAFETY: the block's page, mapped readable, which nothing writes now.
+        let block = unsafe { vm::ptr(first + 2 * page).cast::<u8>().read_volatile() };
+        assert_eq!(block, 0);
+        let vm = super::super::LinuxVm::new();
+        assert!(vm.deallocate(at, 4 * page).is_success());
     }
 
     fn run(file: u32, offset: u64, length: u64) -> Run<u32> {
@@ -499,7 +620,7 @@ mod tests {
                     .write_volatile(0x10 + i as u8)
             };
         }
-        let chunks = of_pages(at + page, 2 * page, page).unwrap();
+        let chunks = of_pages(at + page, 2 * page, page, &Zeros::default()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].length, 2 * page);
         assert_eq!(read_through(&chunks[0], 0), 0x11);
@@ -513,7 +634,7 @@ mod tests {
         );
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         assert!(matches!(
-            of_pages(private, page, page),
+            of_pages(private, page, page, &Zeros::default()),
             Err(Refusal::Unresolved)
         ));
     }
@@ -543,7 +664,7 @@ mod tests {
             );
             assert!(host.remap_shared_overwrite(to, from, page).is_ok());
         }
-        let chunks = of_pages(view.addr().to_u64(), count * page, page).unwrap();
+        let chunks = of_pages(view.addr().to_u64(), count * page, page, &Zeros::default()).unwrap();
         assert!(chunks.len() >= 2);
         assert_eq!(chunks.iter().map(|c| c.length).sum::<u64>(), count * page);
         let mut at = 0;
