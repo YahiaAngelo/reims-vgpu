@@ -145,20 +145,6 @@ fn stand_ins_are_the_metal_platforms_here() {
     };
     let m = metal.caps();
     let ours = dev().caps();
-    for (theirs, name) in [
-        (
-            m.limits.device_linear_texture_alignment_bytes,
-            "device linear",
-        ),
-        (m.limits.linear_texture_alignment_bytes, "linear"),
-        (m.limits.iosurface_texture_alignment_bytes, "iosurface"),
-        (
-            m.limits.iosurface_read_only_texture_alignment_bytes,
-            "iosurface read-only",
-        ),
-    ] {
-        assert_eq!(theirs, stand_in::TEXTURE_ALIGNMENT_BYTES, "{name}");
-    }
     let f = &m.flags;
     assert_eq!(f.is_large_mrt_supported, stand_in::LARGE_MRT);
     assert_eq!(f.is_rgb10a2_gamma_supported, stand_in::RGB10A2_GAMMA);
@@ -243,6 +229,21 @@ fn stand_ins_are_the_metal_platforms_here() {
         m.limits.max_compute_buffers
     );
     assert_eq!(ours.limits.max_texture_layers, m.limits.max_texture_layers);
+    assert_eq!(
+        (
+            ours.limits.device_linear_texture_alignment_bytes,
+            ours.limits.linear_texture_alignment_bytes,
+            ours.limits.iosurface_texture_alignment_bytes,
+            ours.limits.iosurface_read_only_texture_alignment_bytes,
+        ),
+        (
+            m.limits.device_linear_texture_alignment_bytes,
+            m.limits.linear_texture_alignment_bytes,
+            m.limits.iosurface_texture_alignment_bytes,
+            m.limits.iosurface_read_only_texture_alignment_bytes,
+        ),
+        "the runtime's alignments"
+    );
     assert_eq!(
         ours.limits.max_threadgroup_memory_length,
         m.limits.max_threadgroup_memory_length

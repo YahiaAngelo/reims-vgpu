@@ -2477,10 +2477,10 @@ mod tests {
         const ACCEPTED: [D; 1] = [D::DeviceUnorm8LinearFilter];
         // No value the guest or the host sees: `PrivatePropertiesUnknown`, Apple's private device
         // properties the runtime has no answer of the device's for, announced where
-        // `rt::Device::private_properties` is first read. The runtime gives none there
-        // (`rt::PrivateAnswer::value` is `None`), never a value of its own, and this platform reads
-        // no private property of the runtime's: it answers each of core's from the device's facts
-        // or a stand-in its table names ([`crate::gpu::caps`]).
+        // `rt::Device::private_properties` is first read, as a device's caps are. The runtime
+        // gives none there (`rt::PrivateAnswer::value` is `None`), never a value of its own, and
+        // this platform answers each of those from a stand-in its table names
+        // ([`crate::gpu::caps`]).
         const UNSEEN: [D; 1] = [D::PrivatePropertiesUnknown];
         let relayed: Vec<D> = exact
             .chain(one_of_metals)
