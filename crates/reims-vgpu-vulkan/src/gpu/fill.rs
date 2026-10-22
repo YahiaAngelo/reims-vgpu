@@ -42,7 +42,11 @@
 //!   runs (a 550 colour into a 550 texture, paged out by core's XR10 kernel: plane 0 `77 d7 44
 //!   c7` in one process and `00 00 00 c0` in another, whatever the colour, NaN included). They
 //!   are Metal's state, which nothing here holds, so these die too
-//!   (`metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`).
+//!   (`metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`). A colour in a
+//!   compressed, 4:2:2, YCbCr or padded format writes the same earlier fill's bytes, whatever the
+//!   colour (measured for BC1, BC4, BC6H, BC7, PVRTC, EAC, ETC2, ASTC LDR, sRGB and HDR, both
+//!   4:2:2 formats, 500, 505, 508 and 576 to 579), where the runtime's fill writes zero bytes:
+//!   these die too (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`).
 //! - **Where** ([`place`]): a level past the texture's writes nothing; the region is cut at the
 //!   level's extent. A 3D texture takes the region's depth and ignores the slice; every other
 //!   type ignores the region's `z` and depth. A 1D or 2D texture ignores the slice; an array
@@ -179,9 +183,9 @@ pub const RGBX: [PixelFormat; 11] = [
 
 /// The pixel format `raw` a colour fill for `sel` packs its colour in: one of [`PACKED`] or
 /// [`OWN_FORMAT_PACKED`]. Another dies: one of [`LEFTOVER_FORMATS`], for which Metal writes bytes
-/// of its own state, and any other (a compressed, 4:2:2, YCbCr or padded format, for which the
-/// runtime's fill writes zeroes, one constant for every colour, where nothing measured Metal's;
-/// a value no format is).
+/// of its own state, and any other (a compressed, 4:2:2, YCbCr or padded format, for which Metal
+/// writes the same bytes of its own state and the runtime's fill writes zeroes; a value no
+/// format is).
 pub fn colour_format(sel: &'static str, raw: u64) -> PixelFormat {
     let format = u32::try_from(raw)
         .ok()
