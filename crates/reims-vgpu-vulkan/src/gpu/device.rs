@@ -1735,7 +1735,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 // Only a heap over address ranges detaches ([`crate::gpu::backing`]).
                 let backing = match &desc.address_ranges {
                     Some(ranges) => {
-                        let backing = Backing::heap(read_only, raw.object_id());
+                        let backing = Backing::new(read_only, raw.object_id());
                         backing.made_over(&ranges.ranges, made_over);
                         backing
                     }

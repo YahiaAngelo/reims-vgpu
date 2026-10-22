@@ -1944,7 +1944,7 @@ fn detached_in_flight_on_metal() {
 
 /// [`in_flight`] on this crate, as on Metal ([`expected_in_flight`]): a detach answers NO while a
 /// command buffer the runtime submitted took the object, a buffer's once each such command
-/// buffer completed (`src/gpu/backing.rs`'s `in_flight`)
+/// buffer completed (the runtime's detach, `src/gpu/backing.rs`'s docs, "In flight")
 #[test]
 fn detached_in_flight_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
