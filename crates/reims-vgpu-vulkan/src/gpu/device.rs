@@ -249,6 +249,15 @@ pub fn adopt(sel: &'static str, raw: rt::Device) -> VulkanDevice {
     made
 }
 
+/// The handle of the device made in the process whose registry ID, as this platform answers it
+/// ([`registry_id`]), is `registry_id`, where one was made ([`DEVICES`]): the object [`adopt`]
+/// answers for that device again.
+pub fn kept(registry_id: u64) -> Option<VulkanDevice> {
+    let devices = DEVICES.lock();
+    let (_, device) = devices.iter().find(|(at, _)| *at == registry_id)?;
+    Some(device.clone_ref())
+}
+
 /// Tells every device made in the process that the pages under the `length` host bytes at
 /// `bytes` were replaced (`rt::Device::host_range_remapped`, [`crate::remap`]): a no-copy buffer
 /// made over any of them after this imports the pages there then. Not a Metal call, so it never
@@ -2253,6 +2262,19 @@ pub(crate) mod tests {
         let again = adopt("MTLCopyAllDevices()", d.raw.clone());
         assert_eq!(again.id(), d.id());
         assert!(!d.raw.name().is_empty());
+    }
+
+    /// A device made in the process is found by the registry ID the platform answers for it, as
+    /// the one object every handle to it is, which an open answers with no enumeration; an ID no
+    /// device made answers none
+    #[test]
+    fn a_made_device_is_kept_by_its_registry_id() {
+        use reims_vgpu_core::platform::Platform as _;
+        let d = dev();
+        assert_eq!(kept(d.registry_id).map(|k| k.id()), Some(d.id()));
+        assert!(kept(d.registry_id ^ 0xdead_beef).is_none());
+        let opened = crate::platform::tests::platform().open_device(d.registry_id);
+        assert_eq!(opened.map(|o| o.id()), Some(d.id()));
     }
 
     /// The debug line of a texture over a surface names the descriptor's format, raw and by

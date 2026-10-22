@@ -598,8 +598,15 @@ impl Platform for VulkanPlatform {
     /// The device of the runtime's `Device::all_with` (`MTLCopyAllDevices`) whose registry ID, as
     /// this platform answers it ([`device::registry_id`]: Metal's for the default device), is
     /// `registry_id` (+1), or `None`, as where there is no Vulkan loader. In one process it is the
-    /// object every other handle to that device is ([`device::adopt`]).
+    /// object every other handle to that device is ([`device::adopt`]). A device made before is
+    /// that object, answered with no enumeration ([`device::kept`]): `Device::all_with` makes a
+    /// device of every other physical device it lists that no handle holds (another GPU, waking
+    /// it, or a CPU implementation such as lavapipe), each torn down as the call returns, and
+    /// every guest task's handshake opens its device here.
     fn open_device(&self, registry_id: u64) -> Option<VulkanDevice> {
+        if let Some(kept) = device::kept(registry_id) {
+            return Some(kept);
+        }
         let all = made_devices("MTLCopyAllDevices()", || {
             rt::Device::all_with(device_options())
         });
