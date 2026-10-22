@@ -3181,9 +3181,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.use_resources(&some, usage, VERTEX_AND_FRAGMENT))?;
                 if usage.contains(ResourceUsage::WRITE) {
                     // A function of the encoder's may write their records.
-                    for icb in &icbs {
-                        icb.may_be_written(self.encoder.progress(sel));
-                    }
                     self.writable(&icbs);
                 }
                 if !icbs.is_empty() {
@@ -3210,9 +3207,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.use_resources(&some, usage, stages))?;
                 if usage.contains(ResourceUsage::WRITE) {
                     // A function of the encoder's may write their records.
-                    for icb in &icbs {
-                        icb.may_be_written(self.encoder.progress(sel));
-                    }
                     self.writable(&icbs);
                 }
                 if !icbs.is_empty() {

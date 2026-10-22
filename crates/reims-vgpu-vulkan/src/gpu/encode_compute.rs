@@ -20,15 +20,12 @@
 //!   where they inherit the encoder's pipeline, the execution decides at its call, as a dispatch;
 //!   where they name their own, the commit reads their records, or, for records the GPU may have
 //!   written, the runtime's host step asks them ([`crate::gpu::command::executions`]). A render
-//!   encoder's functions go alike ([`crate::gpu::encode_render`]). A dispatch of such a pipeline,
-//!   and every execution, whose
-//!   commands' pipelines (their own or the encoder's) nothing here reads, opens on each buffer
-//!   the encoder made resident for writing a span in which the GPU may write its records
-//!   ([`may_write_resident`]), which decides the pipeline state a record names
-//!   ([`crate::gpu::icb`]); the encoder's making the buffer resident for writing marks the
-//!   runtime's buffer written for good (`gpu_written`), so a later execution's commands are asked
-//!   at the runtime's host step, and where the pipeline can encode, a command buffer that
-//!   executes the buffer as its commit read it dies at the write (`executions::gpu_writes`).
+//!   encoder's functions go alike ([`crate::gpu::encode_render`]). The encoder's making a buffer
+//!   resident for writing marks the runtime's buffer written for good (`gpu_written`), so a later
+//!   execution's commands are asked at the runtime's host step, and the runtime keeps when the
+//!   GPU may write its records, which decides the pipeline state a record names
+//!   ([`crate::gpu::icb`]); where the pipeline can encode, a command buffer that executes the
+//!   buffer as its commit read it dies at the write (`executions::gpu_writes`).
 //! - **Command predication** (`encodeStart*`, `encodeEnd*`) is the adapter's ([`predication`]):
 //!   every command passes it
 //!   first, and the dispatches and executions are sent through it. The runtime's own
@@ -105,19 +102,6 @@ fn resources<'a>(
         .collect()
 }
 
-/// Work `sel` of `encoder` may write the records of each indirect command buffer the encoder made
-/// resident for writing: a span on each, to its command buffer's end
-/// (`may_be_written`, [`crate::gpu::icb`]).
-fn may_write_resident(encoder: &VulkanComputeEncoder, sel: &'static str) {
-    let writable: Vec<_> = plain(|| {
-        let writable = encoder.writable_icbs.lock();
-        writable.iter().map(|icb| icb.clone_ref()).collect()
-    });
-    for icb in writable {
-        icb.may_be_written(encoder.progress(sel));
-    }
-}
-
 /// A direct dispatch `sel` of `encoder`: where its pipeline can encode indirect commands, its
 /// kernel may write the records of each buffer the encoder made resident for writing (the module
 /// docs).
@@ -131,7 +115,6 @@ fn dispatchable(encoder: &VulkanComputeEncoder, sel: &'static str) {
 /// indirect commands: it may write the records of each buffer the encoder made resident for
 /// writing ([`crate::gpu::command::executions::gpu_writes`]).
 fn encodes_resident(encoder: &VulkanComputeEncoder, sel: &'static str) {
-    may_write_resident(encoder, sel);
     for icb in writable(encoder) {
         executions::gpu_writes(sel, &icb);
     }
@@ -212,13 +195,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 | ComputeCmd::DispatchThreadsIndirect { .. }
         ) {
             dispatchable(self, sel);
-        }
-        if matches!(
-            cmd,
-            ComputeCmd::ExecuteCommandsInBuffer { .. } | ComputeCmd::ExecuteCommandsIndirect { .. }
-        ) {
-            // Its commands' pipelines, their own or the encoder's, may encode commands.
-            may_write_resident(self, sel);
         }
         match cmd {
             ComputeCmd::DispatchThreadgroups {

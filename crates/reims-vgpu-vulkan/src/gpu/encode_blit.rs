@@ -144,7 +144,7 @@ pub struct EncoderObject<E> {
     pub(crate) encodes_icbs: AtomicBool,
     /// The indirect command buffers a compute or render encoder made resident for writing, whose
     /// records work of a pipeline state that can encode indirect commands may write
-    /// ([`crate::gpu::icb::IcbObject::may_be_written`]).
+    /// ([`crate::gpu::command::executions::gpu_writes`]).
     pub(crate) writable_icbs: Mutex<Vec<crate::gpu::icb::VulkanIcb>>,
     /// The `uniqueIdentifier` of the pipeline state a compute or render encoder set last, 0 for
     /// none, which a slow command's debug line names ([`crate::gpu::timing::encoder_call`]).

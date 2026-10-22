@@ -3,8 +3,7 @@
 //! ([`resource`]) and the guest's pages under them ([`backing`]), the descriptors ([`desc`]) and
 //! Apple's serialized pipeline descriptors ([`serialized`]), the
 //! encoders, the indirect command buffers, rate maps, the command queue and buffer, and the
-//! events; the pipeline states' unique identifiers ([`unique_id`]), which the runtime has none
-//! of; Metal's GPU address space, which buffers and heaps are placed by ([`metal_space`]); the
+//! events; Metal's GPU address space, which buffers and heaps are placed by ([`metal_space`]); the
 //! two-plane YCbCr formats ([`ycbcr`]) and the formats it makes no texture of
 //! ([`no_texture`]); what GPU work may write, where a write that never reaches a surface's memory
 //! dies ([`writes`]); and the debug lines that time the runtime's compiles ([`timing`]).
@@ -52,7 +51,6 @@ pub mod timing;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod undefined;
-pub mod unique_id;
 pub mod writes;
 pub mod ycbcr;
 

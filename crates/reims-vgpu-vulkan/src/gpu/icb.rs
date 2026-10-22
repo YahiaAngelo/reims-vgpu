@@ -16,42 +16,19 @@
 //!   which Metal keeps for its getter alone, as the runtime does: 38 a command, an index of 38 or
 //!   more reaching a later command's, as Metal's, which the runtime's blits move with the
 //!   records.
-//! - **What Metal answers that a record does not hold** is kept beside the commands
-//!   ([`CommandSide`]), as Metal's getters answer it on this host without the API validation
-//!   layer (measured, macOS 26.7, M3 Max): the pipeline state core set on each command, by its
-//!   numbers, whose `uniqueIdentifier` the getter answers. The numbers, not the handle: the
-//!   guest's release of the state lets it go, as Metal's indirect command keeps no state alive
-//!   ([`SetPipeline`]).
-//!   A record the GPU wrote (a kernel's, or a blit's copy) names a state no setter gave the
-//!   command, by its resource ID: the getter answers the runtime's identifier of the state made
-//!   with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
-//!   (measured: a kernel's set of a compute and of a render state read from an argument
-//!   buffer). A record names its state by the state's resource ID, which the runtime reads
-//!   whether or not the state still lives (`pipeline_id`), and one naming none answers 0, as
-//!   Metal's does. Metal answers the identifier of the state the record was written with, a
-//!   released one included, though a state made later took its ID (measured), and the record
-//!   does not say which state of its ID it was written with. So the getter answers the state
-//!   that held the ID when the record can have been written ([`named_state`]): core's set,
-//!   and each state that held the ID during a span since core's set in which the GPU may have
-//!   written the buffer's records ([`Window`]: from a dispatch of a kernel that can encode
-//!   indirect commands, or any execution of an indirect command buffer, in a compute encoder
-//!   that made the buffer resident for writing, or from a render encoder's making it so, to the
-//!   end of its command buffer; a blit's copy carries the source's spans). Where those name one
-//!   state, it answers that state's identifier;
-//!   where they name two or more, or a state no longer kept
-//!   ([`crate::gpu::unique_id::HISTORY`]), it dies. Core's set keeps the state's numbers
-//!   ([`CommandSide`]), not the state, and the runtime's command names its state without
-//!   holding it, as Metal's does: the guest's release gives the ID back, and a state made later
-//!   takes it, with the released one's identifier too, as on Metal (measured), which the
-//!   command then answers ([`IcbObject::pipeline_identifier`]).
-//! - **A blit's copy and reset of commands** move and reset what is kept beside them once the
-//!   blit's command buffer completed, as Metal's GPU has run the blit by then. Until it commits,
-//!   the GPU ran none of it: a getter answers what stands, and a setter comes before the blit.
-//!   While it may run, Metal's answer depends on whether the GPU ran the blit yet, and a getter
-//!   of what a blit writes dies, as does a setter of what one copies or writes ([`Blit`]). Once
-//!   its command buffer failed, which may or may not have run the blit, each value the blit would
-//!   have changed is unknown, and its getter dies until core sets it again or resets the command,
-//!   or a blit that completed resets it or copies a known one over it ([`Unknown`]).
+//! - **The pipeline state's `uniqueIdentifier`** a command's getter answers is the runtime's
+//!   (`pipeline_unique_identifier`): that of the state its record names by the state's resource
+//!   ID, which a record the GPU wrote (a kernel's, or a blit's copy) names with no setter's, as
+//!   Metal's answers that state's own (measured: a kernel's set of a compute and of a render
+//!   state read from an argument buffer); 0 for none, as Metal's. Metal answers the identifier
+//!   of the state the record was written with, a released one included, though a state made
+//!   later took its ID (measured), and so does the runtime: the state the CPU set, unless the GPU
+//!   may have written the record while another state held the ID, and for a record the GPU
+//!   wrote, the state that held the ID as the GPU last could write it. Where it cannot tell
+//!   which state the record names, it answers none, and the getter dies. The runtime's command
+//!   names its state without holding it, as Metal's does: the guest's release gives the ID back,
+//!   and a state made later takes it, with the released one's identifier too, as on Metal
+//!   (measured), which the command then answers.
 //! - **A blit's copy past the destination's end** lands the commands that fit, as Metal's does,
 //!   and takes every command before the index as written over ([`IcbObject::overrun`]): Metal
 //!   writes over some of those records in its own layout, by a shape this platform does not
@@ -91,10 +68,10 @@
 //!   layer raises at none of them, and goes on at those measured (an index at or past the size,
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
 use metal2vulkan_runtime as rt;
@@ -106,11 +83,9 @@ use reims_vgpu_core::platform::icb::{
     DrawIndexedPatchesArgs, DrawPatchesArgs, IcbComputeCmd, IcbRenderCmd, ImageBlockArgs,
     IndirectCommandBuffer, IndirectComputeCommand, IndirectRenderCommand, TessellationFactorArgs,
 };
-use reims_vgpu_core::platform::resource::{ComputePipeline as _, RenderPipeline as _};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::platform::values::IcbDesc;
 use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
@@ -120,7 +95,6 @@ use crate::answer::{
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_value;
-use crate::gpu::resource::{VulkanComputePipeline, VulkanRenderPipeline};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// The address Metal's patch and control-point index getters answer for a nil buffer (measured:
@@ -276,136 +250,6 @@ thread_local! {
 
 // ---- The buffer.
 
-/// What Metal answers of one command that its record does not hold (the module docs).
-#[derive(Debug, Default)]
-struct CommandSide {
-    /// The pipeline state core set on the command.
-    pipeline: Option<SetPipeline>,
-    /// The point of [`crate::gpu::unique_id::now`]'s order at which core set it.
-    pipeline_at: u64,
-    /// What of the above a blit of a failed command buffer may or may not have changed.
-    unknown: Unknown,
-    /// Whether Metal's copy of commands past the buffer's end may have written over the record
-    /// in its own layout ([`IcbObject::overrun`]): a getter, an execution or a copy of the command
-    /// dies until a reset or a copy writes the whole record again.
-    corrupted: bool,
-}
-
-impl CommandSide {
-    /// A copy.
-    fn copy(&self) -> CommandSide {
-        CommandSide {
-            pipeline: self.pipeline,
-            pipeline_at: self.pipeline_at,
-            unknown: self.unknown.clone(),
-            corrupted: self.corrupted,
-        }
-    }
-
-    /// What the getters may answer apart for this command and `other`: what either does not
-    /// know, and the pipeline state where they keep it differently, one core never set counting
-    /// as a fresh command's (none).
-    fn differs(&self, other: &CommandSide) -> Unknown {
-        let mut unknown = self.unknown.clone();
-        unknown.join(&other.unknown);
-        unknown.pipeline |= match (&self.pipeline, &other.pipeline) {
-            (None, None) => false,
-            (Some(a), Some(b)) => a != b,
-            _ => true,
-        };
-        unknown
-    }
-}
-
-/// What is kept of a command, by value, that a blit of a failed command buffer may or may not
-/// have changed: Metal's answer depends on whether its GPU ran the blit before the command buffer
-/// failed, which nothing here tells (the runtime's records answer as its GPU left them, and
-/// Metal's failure is not measured, which only a GPU fault brings). Its getter dies until core
-/// sets it again or resets the command, or a blit that completed resets it or copies a known one
-/// over it; one that copies an unknown one over it carries what is unknown.
-#[derive(Debug, Clone, Default)]
-struct Unknown {
-    pipeline: bool,
-}
-
-impl Unknown {
-    /// `other`'s are unknown too.
-    fn join(&mut self, other: &Unknown) {
-        self.pipeline |= other.pipeline;
-    }
-
-    /// Whether `kept` is unknown.
-    fn holds(&self, kept: Kept) -> bool {
-        match kept {
-            Kept::Pipeline => self.pipeline,
-            Kept::All => !self.is_empty(),
-        }
-    }
-
-    /// `kept` is known again: core set it.
-    fn settle(&mut self, kept: Kept) {
-        match kept {
-            Kept::Pipeline => self.pipeline = false,
-            Kept::All => *self = Unknown::default(),
-        }
-    }
-
-    /// Whether nothing is unknown.
-    fn is_empty(&self) -> bool {
-        !self.pipeline
-    }
-}
-
-/// What a getter reads of what is kept of a command, or a setter writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kept {
-    /// The pipeline state.
-    Pipeline,
-    /// All of it: a reset of the command.
-    All,
-}
-
-/// A pipeline state core set on a command, by its numbers: its runtime state's resource ID and
-/// its `uniqueIdentifier`, no other live state's, which a state made after its release may take,
-/// as on Metal, where the getters answer the two alike. Keeping no
-/// handle lets the guest's release of the state drop this platform's object of it, as Metal's
-/// indirect command keeps no state alive, so the release is noted
-/// ([`crate::gpu::unique_id::released`]), which decides which state a record names once a
-/// state made after it took its ID. The runtime's command names the runtime's state without
-/// holding it too, as Metal's does, so the resource ID goes back at the release: a state made
-/// after the guest released one a command still names takes its ID, as on Metal (measured
-/// through core on the M3 Max).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SetPipeline {
-    /// The runtime state's resource ID.
-    id: u64,
-    /// Its `uniqueIdentifier`.
-    identifier: u64,
-}
-
-impl SetPipeline {
-    /// `state`'s numbers.
-    fn compute(state: &VulkanComputePipeline) -> SetPipeline {
-        SetPipeline {
-            id: state.raw.gpu_resource_id().0,
-            identifier: state.unique_identifier(),
-        }
-    }
-
-    /// `state`'s numbers.
-    fn render(state: &VulkanRenderPipeline) -> SetPipeline {
-        SetPipeline {
-            id: state.raw.gpu_resource_id().0,
-            identifier: state.unique_identifier(),
-        }
-    }
-
-    /// Its resource ID and its `uniqueIdentifier`.
-    fn numbers(self) -> (u64, u64) {
-        (self.id, self.identifier)
-    }
-}
-
 /// What an indirect command buffer's commands take of the encoder that executes them: the
 /// textures always, as no command sets one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,8 +260,8 @@ pub struct Inherits {
     pub buffers: bool,
 }
 
-/// An indirect command buffer: the runtime's, with what Metal answers of its commands that their
-/// records do not hold.
+/// An indirect command buffer: the runtime's, with the commands Metal's copies past its end may
+/// have written over ([`IcbObject::overrun`]).
 #[derive(Debug)]
 pub struct IcbObject {
     /// The runtime's buffer.
@@ -428,7 +272,7 @@ pub struct IcbObject {
     strides: bool,
     /// What its commands take of the encoder that executes them.
     pub(crate) inherits: Inherits,
-    /// What Metal answers of its commands that their records do not hold.
+    /// The commands Metal's copies past its end may have written over.
     sides: Arc<Mutex<Sides>>,
     /// Which shape of those Metal's copies past a buffer's end were measured at it is, if any
     /// ([`OverrunShape::of`]).
@@ -490,139 +334,18 @@ impl OverrunShape {
     }
 }
 
-/// What Metal answers of a buffer's commands that their records do not hold, and the blits of
-/// them that may still change it.
+/// The commands of a buffer that Metal's copies past its end may have written over in its own
+/// layout, and what decides it ([`IcbObject::overrun`]).
 #[derive(Debug, Default)]
 struct Sides {
-    /// What Metal answers of each command core reached, by index.
-    commands: BTreeMap<u32, CommandSide>,
-    /// The blits that copy or reset commands of the buffer, until they can change no answer.
+    /// Each command taken as written over: a getter, an execution or a copy of it dies until a
+    /// reset or a copy writes its whole record again.
+    corrupted: BTreeSet<u32>,
+    /// The copies past the buffer's end of command buffers the GPU may still run.
     blits: Vec<Blit>,
     /// The progress of each command buffer that executes the buffer or makes it resident, once
     /// each, while the GPU may run it ([`IcbObject::executed`], [`IcbObject::resident`]).
     executions: Vec<std::sync::Weak<Progress>>,
-    /// The spans in which the GPU may have written its records, oldest first.
-    writes: Vec<Window>,
-    /// The registry ID of the runtime's device the buffer was made on, whose states its records
-    /// name.
-    device: u64,
-    /// Whether a command was ever taken as written over by Metal's copy past the buffer's end
-    /// ([`CommandSide::corrupted`]): until one is, no command is, and an execution, a residency
-    /// or a copy asks none ([`Sides::overrun`]).
-    overran: bool,
-}
-
-/// A span of [`crate::gpu::unique_id::now`]'s order in which the GPU may write a buffer's records:
-/// from the encoding of a command that may write them to its command buffer's end, as it
-/// completed, failed or went ([`IcbObject::may_be_written`]). A record the GPU wrote in it names
-/// a state that held its resource ID during it.
-#[derive(Debug, Clone)]
-struct Window {
-    /// Where it starts.
-    start: u64,
-    /// Where it ends: [`OPEN`] until its command buffer ended ([`Closes`]).
-    end: Arc<AtomicU64>,
-    /// Its command buffer's progress, by address, which tells a second command of that command
-    /// buffer from one of another while it is open; 0 for spans joined into one.
-    of: usize,
-}
-
-/// The end of a [`Window`] whose command buffer has not ended.
-const OPEN: u64 = u64::MAX;
-
-/// How many [`Window`]s a buffer keeps apart: past them, two that ended are joined into one span
-/// covering both where that names the same states for every record ([`Sides::write`]).
-const WINDOWS: usize = 64;
-
-impl Window {
-    /// Its start and its end.
-    fn span(&self) -> (u64, u64) {
-        (self.start, self.end.load(Ordering::SeqCst))
-    }
-}
-
-/// Ends a [`Window`] as its command buffer's [`Progress`] lets go of what it holds: once the
-/// command buffer completed, failed or went.
-struct Closes(Arc<AtomicU64>);
-
-impl Drop for Closes {
-    fn drop(&mut self) {
-        self.0.store(crate::gpu::unique_id::now(), Ordering::SeqCst);
-    }
-}
-
-/// The `uniqueIdentifier` of the state a record names by resource ID `id`, the module docs'
-/// rule: of `own`, the numbers (resource ID, identifier) of the state core set on the command
-/// and the point it set it at; `writes`, the spans in which the GPU may have written the
-/// buffer's records ([`Window::span`]); and `history`, the states made with `id` on the record's
-/// device, each holding it from its creation to its release. Where that names no state, the only
-/// state ever made with `id`; else `Err` names why it cannot tell.
-fn named_state(
-    own: Option<((u64, u64), u64)>,
-    writes: &[(u64, u64)],
-    id: u64,
-    history: Option<&crate::gpu::unique_id::History>,
-) -> Result<u64, &'static str> {
-    let mut states = BTreeSet::new();
-    // Core's set is one candidate, and each span that ends after it adds the states that held the
-    // ID during it; with no set, every span counts.
-    let set_at = own.map_or(0, |(_, at)| at);
-    if let Some(((own_id, identifier), _)) = own
-        && own_id == id
-    {
-        states.insert(identifier);
-    }
-    if let Some(history) = history {
-        for &(start, end) in writes.iter().filter(|&&(_, end)| end > set_at) {
-            if start < history.lost_until {
-                return Err(
-                    "the pipeline state a record the GPU may have written names, by a resource ID \
-                     whose states that held it while it may have been written are no longer kept",
-                );
-            }
-            // Each state that held the ID during the span, from its creation to its release.
-            for holder in &history.holders {
-                if holder.made < end && start < holder.gone {
-                    states.insert(holder.identifier);
-                }
-            }
-        }
-    }
-    match (states.len(), history) {
-        (1, _) => Ok(states.into_iter().next().unwrap_or_default()),
-        (0, Some(history)) if history.lost_until == 0 && history.holders.len() == 1 => {
-            Ok(history.holders[0].identifier)
-        }
-        (0, None) => Err("a pipeline state this platform did not make"),
-        (0, Some(_)) => Err(
-            "the pipeline state a record names, by a resource ID several states held, where \
-             neither core's set nor a span in which the GPU may have written the record tells \
-             which",
-        ),
-        _ => Err(
-            "the pipeline state a record the GPU may have written names, by a resource ID two or \
-             more states held while it may have been written, whose identifiers Metal answers \
-             apart",
-        ),
-    }
-}
-
-/// Whether two ended spans `a` and `b` of a buffer of the device of registry ID `device`, `a`
-/// starting first, name the same states for every record as the span covering both
-/// ([`named_state`]): no state of the device was made and released between them, which only the
-/// covering span would overlap, and no command's set (`sets`, core's points) lies between their
-/// ends, which counts a span only where it ends after the set.
-fn joinable(
-    device: u64,
-    (_, a_end): (u64, u64),
-    (b_start, b_end): (u64, u64),
-    sets: &[u64],
-) -> bool {
-    let (low, high) = (a_end.min(b_end), a_end.max(b_end));
-    if sets.iter().any(|&at| low <= at && at < high) {
-        return false;
-    }
-    b_start <= a_end || !plain(|| crate::gpu::unique_id::held_within(device, a_end, b_start))
 }
 
 /// The death of a getter, an execution or a copy of a command whose record Metal's copy past the
@@ -639,148 +362,60 @@ const RESIDENT_OVERRUN: &str = "an indirect command buffer made resident for the
                                 over in its own layout, where this platform's copy carries the \
                                 intact record";
 
-/// A blit that copies commands from a buffer, into one or resets them, kept by that buffer's
-/// [`Sides`] while its command buffer may run it: it moves what Metal answers of them once its
-/// command buffer completed, and leaves what it may have moved unknown once it failed
-/// ([`Unknown`]).
+/// A blit's copy of commands past a buffer's end, kept by that buffer's [`Sides`] while its
+/// command buffer may run it, which may write over `commands` in Metal's own layout
+/// ([`IcbObject::overrun`]).
 #[derive(Debug)]
 struct Blit {
     /// Its command buffer's progress.
     progress: Arc<Progress>,
-    /// The commands it reaches.
+    /// The commands it may write over.
     commands: Range<u64>,
-    /// Whether it writes them (a copy's destination, a reset), not only reads them.
-    writes: bool,
-    /// Whether it may write over them in Metal's own layout: a copy past the buffer's end
-    /// ([`IcbObject::overrun`]).
-    corrupts: bool,
-}
-
-/// Whether a getter reads what is kept of a command, or a setter writes it, and what.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Access {
-    Read(Kept),
-    Write(Kept),
 }
 
 impl Blit {
-    /// Whether it can still change an answer: its command buffer may run it. Once that failed,
-    /// what it may have changed is unknown ([`Unknown`]), and it no longer counts.
+    /// Whether it may still write over them: its command buffer may run it. Once that completed
+    /// or failed, they are taken as written over ([`Sides::corrupted`]).
     fn matters(&self) -> bool {
         matches!(self.progress.stage(), Stage::Encoding | Stage::Committed)
-    }
-
-    /// What Metal's answer to `access` of command `index` depends on, if it depends on this
-    /// blit: whether the GPU ran it yet, while its command buffer may run. Before the commit the
-    /// GPU ran none of it: a read answers what stands, and a write comes before it.
-    fn races(&self, access: Access, index: u32) -> Option<&'static str> {
-        if !self.commands.contains(&u64::from(index)) {
-            return None;
-        }
-        match (self.progress.stage(), access, self.writes) {
-            (Stage::Committed, Access::Read(_), true) => Some(
-                "a read of a command a blit of a committed command buffer may be writing, whose \
-                 answer on Metal depends on when the GPU runs it",
-            ),
-            (Stage::Committed, Access::Write(_), _) => Some(
-                "a write of a command a blit of a committed command buffer may be reaching, whose \
-                 answer on Metal depends on when the GPU runs it",
-            ),
-            _ => None,
-        }
     }
 }
 
 impl Sides {
-    /// Keeps `window`; one whose end is already kept, a copy's, is kept once. Past [`WINDOWS`],
-    /// two spans that ended and are next to each other by their starts are joined into the span
-    /// covering both, where that names the same states for every record ([`joinable`]); where no
-    /// two can be, they stay apart. What keeps two apart is a state made and released between
-    /// them or core's set of a command between their ends, so few stay apart.
-    fn write(&mut self, window: Window) {
-        if self.writes.iter().any(|w| Arc::ptr_eq(&w.end, &window.end)) {
-            return;
-        }
-        self.writes.push(window);
-        if self.writes.len() <= WINDOWS {
-            return;
-        }
-        let mut ended: Vec<(u64, u64, usize)> = (self.writes.iter().enumerate())
-            .map(|(i, w)| {
-                let (start, end) = w.span();
-                (start, end, i)
-            })
-            .filter(|&(_, end, _)| end != OPEN)
-            .collect();
-        ended.sort_unstable();
-        let sets: Vec<u64> = (self.commands.values())
-            .filter(|side| side.pipeline.is_some())
-            .map(|side| side.pipeline_at)
-            .collect();
-        let pair = ended.windows(2).find(|pair| {
-            let [(a_start, a_end, _), (b_start, b_end, _)] = [pair[0], pair[1]];
-            joinable(self.device, (a_start, a_end), (b_start, b_end), &sets)
-        });
-        if let Some(&[(a_start, a_end, a), (_, b_end, b)]) = pair {
-            self.writes[a] = Window {
-                start: a_start,
-                end: Arc::new(AtomicU64::new(a_end.max(b_end))),
-                of: 0,
-            };
-            self.writes.remove(b);
-        }
-    }
-
-    /// Copies of what is kept of commands `from`.
-    fn copies(&self, from: Range<u64>) -> Vec<(u64, Option<CommandSide>)> {
+    /// Whether each of commands `from` is taken as written over.
+    fn copies(&self, from: Range<u64>) -> Vec<(u64, bool)> {
         from.map(|i| {
-            let side = u32::try_from(i).ok().and_then(|i| self.commands.get(&i));
-            (i, side.map(CommandSide::copy))
+            let corrupted = u32::try_from(i).is_ok_and(|i| self.corrupted.contains(&i));
+            (i, corrupted)
         })
         .collect()
     }
 
-    /// Commands from `to` are `moved`, copies of commands from `from`.
-    fn take(&mut self, from: u64, to: u64, moved: Vec<(u64, Option<CommandSide>)>) {
-        for (i, side) in moved {
+    /// Commands from `to` are `moved`, copies of commands from `from`: each is written over
+    /// where its source was, and whole where it was not.
+    fn take(&mut self, from: u64, to: u64, moved: Vec<(u64, bool)>) {
+        for (i, corrupted) in moved {
             let Ok(at) = u32::try_from(to + (i - from)) else {
                 continue;
             };
-            match side {
-                Some(side) => {
-                    self.overran |= side.corrupted;
-                    self.commands.insert(at, side)
-                }
-                None => self.commands.remove(&at),
-            };
-        }
-    }
-
-    /// Commands from `to` may or may not be `moved`, copies of commands from `from`: a blit of a
-    /// failed command buffer may have copied them. What the two would answer apart is unknown.
-    fn unsettle(&mut self, from: u64, to: u64, moved: Vec<(u64, Option<CommandSide>)>) {
-        for (i, side) in moved {
-            if let Ok(at) = u32::try_from(to + (i - from)) {
-                self.may_be(at, side.as_ref());
+            if corrupted {
+                self.corrupted.insert(at);
+            } else {
+                self.corrupted.remove(&at);
             }
         }
     }
 
-    /// Command `at` may or may not be `side` (none for a fresh command's): what the two would
-    /// answer apart is unknown.
-    fn may_be(&mut self, at: u32, side: Option<&CommandSide>) {
-        let fresh = CommandSide::default();
-        let unknown = self
-            .commands
-            .get(&at)
-            .unwrap_or(&fresh)
-            .differs(side.unwrap_or(&fresh));
-        let corrupted = side.is_some_and(|s| s.corrupted);
-        self.overran |= corrupted;
-        if !unknown.is_empty() || corrupted || self.commands.contains_key(&at) {
-            let kept = self.commands.entry(at).or_default();
-            kept.unknown = unknown;
-            kept.corrupted |= corrupted;
+    /// Commands from `to` may or may not be `moved`, copies of commands from `from`: a blit of a
+    /// failed command buffer may have copied them. Each whose source was written over may be
+    /// too, and one written over stays so.
+    fn unsettle(&mut self, from: u64, to: u64, moved: Vec<(u64, bool)>) {
+        for (i, corrupted) in moved {
+            if let Ok(at) = u32::try_from(to + (i - from))
+                && corrupted
+            {
+                self.corrupted.insert(at);
+            }
         }
     }
 
@@ -792,10 +427,8 @@ impl Sides {
         let reaches = |commands: &Range<u64>| {
             range.is_none_or(|r| r.start < commands.end && commands.start < r.end)
         };
-        let marked = self.overran
-            && (self.commands.iter())
-                .any(|(&i, side)| side.corrupted && reaches(&(u64::from(i)..u64::from(i) + 1)));
-        marked || (self.blits.iter()).any(|b| b.corrupts && reaches(&b.commands))
+        let marked = (self.corrupted.iter()).any(|&i| reaches(&(u64::from(i)..u64::from(i) + 1)));
+        marked || self.blits.iter().any(|b| reaches(&b.commands))
     }
 }
 
@@ -807,50 +440,6 @@ impl std::ops::Deref for IcbObject {
 }
 
 impl IcbObject {
-    /// Runs `edit`, `sel`'s `access`, on what Metal answers of command `index`; a write leaves
-    /// what it writes known. Where Metal's answer depends on whether the GPU ran a blit of the
-    /// command yet ([`Blit::races`]), or a read's on whether it ran one of a failed command
-    /// buffer ([`Unknown`]), it dies instead.
-    fn side<T>(
-        &self,
-        sel: &'static str,
-        access: Access,
-        index: u32,
-        edit: impl FnOnce(&mut CommandSide) -> T,
-    ) -> T {
-        let edited = plain(|| {
-            let mut sides = self.sides.lock();
-            sides.blits.retain(Blit::matters);
-            if let Some(race) = sides.blits.iter().find_map(|b| b.races(access, index)) {
-                return Err(race);
-            }
-            let side = sides.commands.entry(index).or_default();
-            match access {
-                Access::Read(_) if side.corrupted => Err(OVERRUN),
-                Access::Read(kept) if side.unknown.holds(kept) => Err(
-                    "a read of what a blit of a failed command buffer may or may not have \
-                     changed, whose answer on Metal depends on whether the GPU ran it before the \
-                     command buffer failed",
-                ),
-                Access::Read(_) => Ok(edit(side)),
-                Access::Write(kept) => {
-                    let edited = edit(side);
-                    side.unknown.settle(kept);
-                    Ok(edited)
-                }
-            }
-        });
-        edited.unwrap_or_else(|why| {
-            fatal_with_detail(
-                DeathId::Platform {
-                    kind: DeathKind::Abort,
-                    call: sel,
-                },
-                why,
-            )
-        })
-    }
-
     /// The stride getter's answer where the runtime's getter has none (past the descriptor's
     /// count, which core never asks for): all ones on a buffer without dynamic attribute
     /// strides, as Metal answers every stride there, else 0.
@@ -858,68 +447,10 @@ impl IcbObject {
         if self.strides { 0 } else { u64::MAX }
     }
 
-    /// The `uniqueIdentifier` of the pipeline state a record names by `id`, made on the device
-    /// of registry ID `device`, by core's set on command `index`, the spans in which the GPU may
-    /// have written the buffer's records and the states made with `id` ([`named_state`]); where
-    /// those do not tell which state, it dies. A released state's identifier may be a later
-    /// state's, the runtime reusing it as Metal does, so core's map of identifiers to the guest's
-    /// references, the newest registration winning, answers the newer state, as on Metal.
-    fn pipeline_identifier(&self, sel: &'static str, index: u32, (device, id): (u64, u64)) -> u64 {
-        let own = self.side(sel, Access::Read(Kept::Pipeline), index, |s| {
-            s.pipeline.map(|p| (p.numbers(), s.pipeline_at))
-        });
-        let writes: Vec<_> = plain(|| self.sides.lock().writes.iter().map(Window::span).collect());
-        let history = plain(|| crate::gpu::unique_id::holders(device, id));
-        named_state(own, &writes, id, history.as_ref())
-            .unwrap_or_else(|why| unrepresentable(sel, why))
-    }
-
-    /// The `uniqueIdentifier` getter `sel`'s answer for command `index`, whose record names no
-    /// live pipeline state: by `named`, the resource ID it names (the runtime's `pipeline_id`), a
-    /// released state's identifier ([`IcbObject::pipeline_identifier`]), as Metal's getter
-    /// answers it; 0 where it names none, as Metal's.
-    fn released_pipeline(
-        &self,
-        sel: &'static str,
-        index: u32,
-        named: Option<rt::ResourceId>,
-    ) -> u64 {
-        named.map_or(0, |id| {
-            let device = self.raw.device().registry_id();
-            self.pipeline_identifier(sel, index, (device, id.0))
-        })
-    }
-
-    /// A command of the command buffer of `progress` (none once core let go of it, when it runs
-    /// nothing) may write the buffer's records: a span from now to the command buffer's end
-    /// ([`Window`]), one for each command buffer.
-    pub(crate) fn may_be_written(&self, progress: Option<Arc<Progress>>) {
-        let Some(progress) = progress else {
-            return;
-        };
-        let of = Arc::as_ptr(&progress).addr();
-        let opened = plain(|| {
-            let mut sides = self.sides.lock();
-            let open = |w: &Window| w.of == of && w.end.load(Ordering::SeqCst) == OPEN;
-            if sides.writes.iter().any(open) {
-                return None;
-            }
-            let end = Arc::new(AtomicU64::new(OPEN));
-            sides.write(Window {
-                start: crate::gpu::unique_id::now(),
-                end: Arc::clone(&end),
-                of,
-            });
-            Some(end)
-        });
-        if let Some(end) = opened {
-            progress.hold(Closes(end));
-        }
-    }
-
     /// A blit of the command buffer of `progress` (none once it went) copies commands `from` over
-    /// the commands from `to` of `destination`: the GPU writes those, and what Metal answers of
-    /// them moves with them once it completed, or is unknown where it would move once it failed.
+    /// the commands from `to` of `destination`: once it completed, each landed command is taken
+    /// as written over where its source was ([`IcbObject::overrun`]), and as whole where it was
+    /// not; once it failed, each whose source was written over may be.
     pub(crate) fn copied(
         &self,
         progress: Option<Arc<Progress>>,
@@ -930,56 +461,39 @@ impl IcbObject {
         let Some(progress) = &progress else {
             return;
         };
-        let reached = to..to + (from.end - from.start);
-        self.blit(progress, from.clone(), false);
-        destination.blit(progress, reached, true);
-        type Land = fn(&mut Sides, u64, u64, Vec<(u64, Option<CommandSide>)>);
+        type Land = fn(&mut Sides, u64, u64, Vec<(u64, bool)>);
         let copy = |land: Land| {
             let (source, destination) = (Arc::clone(&self.sides), Arc::clone(&destination.sides));
             let from = from.clone();
             move || {
-                let (moved, writes) = {
-                    let source = source.lock();
-                    (source.copies(from.clone()), source.writes.clone())
-                };
-                let mut destination = destination.lock();
-                land(&mut destination, from.start, to, moved);
-                // A copied record may name a state the GPU wrote it with in the source.
-                for window in writes {
-                    destination.write(window);
-                }
+                let moved = source.lock().copies(from.clone());
+                land(&mut destination.lock(), from.start, to, moved);
             }
         };
         progress.at_completion(copy(Sides::take));
         progress.at_failure(copy(Sides::unsettle));
     }
 
-    /// A blit of the command buffer of `progress` (none once it went) resets commands `range`: the
-    /// GPU writes them, and what Metal answers of them is a fresh command's once it completed, or
-    /// unknown where that differs once it failed.
+    /// A blit of the command buffer of `progress` (none once it went) resets commands `range`:
+    /// once it completed, their whole records are written again.
     pub(crate) fn reset(&self, progress: Option<Arc<Progress>>, range: Range<u64>) {
         let Some(progress) = &progress else {
             return;
         };
-        self.blit(progress, range.clone(), true);
-        let (sides, failed) = (Arc::clone(&self.sides), Arc::clone(&self.sides));
-        let reached = range.clone();
+        let sides = Arc::clone(&self.sides);
         progress.at_completion(move || {
             let mut sides = sides.lock();
             for i in range {
                 if let Ok(i) = u32::try_from(i) {
-                    sides.commands.remove(&i);
+                    sides.corrupted.remove(&i);
                 }
             }
         });
-        progress.at_failure(move || {
-            let mut sides = failed.lock();
-            for i in reached {
-                if let Ok(i) = u32::try_from(i) {
-                    sides.may_be(i, None);
-                }
-            }
-        });
+    }
+
+    /// Command `index` was reset on the CPU: its whole record is written again.
+    fn rewritten(&self, index: u32) {
+        plain(|| self.sides.lock().corrupted.remove(&index));
     }
 
     /// A blit `sel` of the command buffer of `progress` (none once it went) copies commands into
@@ -990,10 +504,9 @@ impl IcbObject {
     /// stay whole, and no other buffer changes). Every command of `range` is taken as overwritten
     /// once the command buffer completed or failed: a getter of one dies, as do an execution and
     /// a copy that reach one, until a reset or a copy writes its whole record again. While the
-    /// GPU may run the blit, a getter of one races it and dies, and so does a setter of what is
-    /// kept of it beside its record (`side`): its pipeline state, a buffer and its attribute
-    /// stride, a threadgroup memory length, and a reset; the setters of its record alone (a
-    /// dispatch or a draw, `setBarrier` and the like) check nothing. An execution or a copy that
+    /// GPU may run the blit, a getter of one races it and dies; a setter checks nothing, as each
+    /// command is taken as written over once the blit ran, one reset before too. An execution or a
+    /// copy that
     /// reaches one dies too, which Metal may run before or after it. An execution of the buffer,
     /// or a residency ([`IcbObject::resident`]), that another command buffer holds while the GPU
     /// may run it, which may run after the blit, dies here.
@@ -1017,8 +530,6 @@ impl IcbObject {
             sides.blits.push(Blit {
                 progress: Arc::clone(progress),
                 commands: range.clone(),
-                writes: true,
-                corrupts: true,
             });
             elsewhere
         });
@@ -1033,10 +544,9 @@ impl IcbObject {
         let mark = |sides: Arc<Mutex<Sides>>, range: Range<u64>| {
             move || {
                 let mut sides = sides.lock();
-                sides.overran = true;
                 for i in range {
                     if let Ok(i) = u32::try_from(i) {
-                        sides.commands.entry(i).or_default().corrupted = true;
+                        sides.corrupted.insert(i);
                     }
                 }
             }
@@ -1054,11 +564,9 @@ impl IcbObject {
         let overrun = plain(|| {
             let mut sides = self.sides.lock();
             sides.blits.retain(Blit::matters);
-            let committed = |b: &Blit| {
-                b.corrupts && b.progress.stage() == Stage::Committed && b.commands.contains(&at)
-            };
-            sides.commands.get(&index).is_some_and(|s| s.corrupted)
-                || sides.blits.iter().any(committed)
+            let committed =
+                |b: &Blit| b.progress.stage() == Stage::Committed && b.commands.contains(&at);
+            sides.corrupted.contains(&index) || sides.blits.iter().any(committed)
         });
         if overrun {
             unrepresentable(sel, OVERRUN);
@@ -1123,21 +631,6 @@ impl IcbObject {
         if plain(|| self.sides.lock().overrun(Some(range))) {
             unrepresentable(sel, OVERRUN);
         }
-    }
-
-    /// Keeps a blit of `progress`'s command buffer that reaches `commands`, and `writes` them or
-    /// not, until it can change no answer.
-    fn blit(&self, progress: &Arc<Progress>, commands: Range<u64>, writes: bool) {
-        plain(|| {
-            let mut sides = self.sides.lock();
-            sides.blits.retain(Blit::matters);
-            sides.blits.push(Blit {
-                progress: Arc::clone(progress),
-                commands,
-                writes,
-                corrupts: false,
-            });
-        });
     }
 }
 
@@ -1278,10 +771,7 @@ pub(crate) fn new_indirect_command_buffer(
             pipeline: d.inherit_pipeline_state,
             buffers: d.inherit_buffers,
         },
-        sides: Arc::new(Mutex::new(Sides {
-            device: device.raw.registry_id(),
-            ..Sides::default()
-        })),
+        sides: Arc::default(),
         overrun_shape,
         readers: Arc::default(),
     })))
@@ -1393,6 +883,11 @@ fn another_kind(sel: &'static str) -> ! {
     unrepresentable(sel, "Metal's reading of a command of another kind")
 }
 
+/// What a pipeline state identifier's getter dies naming where the runtime answers none of it.
+const UNTOLD_STATE: &str = "the pipeline state a record names by a resource ID two or more states \
+                            held, where the runtime cannot tell which of them the record was \
+                            written with";
+
 /// The address an arguments getter answers for a buffer of a record: Metal's for nil.
 fn address_or_nil(address: Option<rt::GpuAddress>) -> u64 {
     address.map_or(NIL_BUFFER_ADDRESS, |a| a.0)
@@ -1408,17 +903,6 @@ impl CommandObject<rt::IndirectRenderCommand> {
             Some(rt::IndirectCommand::Render(c)) => c,
             _ => unrepresentable(sel, "a render command the runtime reads as none"),
         }
-    }
-
-    /// A pipeline state core set with `sel`: the record names it, and Metal answers its
-    /// identifier.
-    fn set_pipeline(&self, sel: &'static str, state: &VulkanRenderPipeline) {
-        let set = SetPipeline::render(state);
-        self.icb
-            .side(sel, Access::Write(Kept::Pipeline), self.index, |s| {
-                s.pipeline = Some(set);
-                s.pipeline_at = crate::gpu::unique_id::now();
-            });
     }
 }
 
@@ -1569,10 +1053,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
             }
             IcbRenderCmd::Reset => {
                 set(sel, || c.reset())?;
-                self.icb
-                    .side(sel, Access::Write(Kept::All), self.index, |s| {
-                        *s = CommandSide::default();
-                    });
+                self.icb.rewritten(self.index);
                 Ok(())
             }
             IcbRenderCmd::SetFragmentBuffer {
@@ -1588,9 +1069,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
             }
             IcbRenderCmd::SetRenderPipelineState { pipeline_state } => {
                 let state = some(sel, pipeline_state, "pipeline state");
-                set(sel, || c.set_render_pipeline_state(&state.raw))?;
-                self.set_pipeline(sel, state);
-                Ok(())
+                set(sel, || c.set_render_pipeline_state(&state.raw))
             }
             IcbRenderCmd::SetVertexBuffer {
                 buffer,
@@ -1640,20 +1119,13 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
         Ok(self.record(sel).fragment_buffer_address(index).unwrap_or(0))
     }
 
-    /// The identifier of the pipeline state the record names, live or released; 0 for none
-    /// ([`IcbObject::released_pipeline`]).
+    /// The runtime's identifier of the pipeline state the record names, live or released; 0 for
+    /// none (the module docs).
     fn pipeline_state_unique_identifier(&self) -> u64 {
         let sel = "getPipelineStateUniqueIdentifier";
-        let record = self.record(sel);
-        match record.pipeline {
-            None => self
-                .icb
-                .released_pipeline(sel, self.index, record.pipeline_id),
-            Some(state) => {
-                let named = (state.device().registry_id(), state.gpu_resource_id().0);
-                self.icb.pipeline_identifier(sel, self.index, named)
-            }
-        }
+        self.icb.intact(sel, self.index);
+        let answer = get(sel, || self.raw.pipeline_unique_identifier());
+        answer.unwrap_or_else(|| unrepresentable(sel, UNTOLD_STATE))
     }
 
     fn vertex_attribute_stride(&self, index: u64) -> RaiseResult<u64> {
@@ -1821,23 +1293,13 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             }),
             IcbComputeCmd::Reset => {
                 set(sel, || c.reset())?;
-                self.icb
-                    .side(sel, Access::Write(Kept::All), self.index, |s| {
-                        *s = CommandSide::default();
-                    });
+                self.icb.rewritten(self.index);
                 Ok(())
             }
             IcbComputeCmd::SetBarrier => set(sel, || c.set_barrier()),
             IcbComputeCmd::SetComputePipelineState { pipeline_state } => {
                 let state = some(sel, pipeline_state, "pipeline state");
-                set(sel, || c.set_compute_pipeline_state(&state.raw))?;
-                let pipeline = SetPipeline::compute(state);
-                self.icb
-                    .side(sel, Access::Write(Kept::Pipeline), self.index, |s| {
-                        s.pipeline = Some(pipeline);
-                        s.pipeline_at = crate::gpu::unique_id::now();
-                    });
-                Ok(())
+                set(sel, || c.set_compute_pipeline_state(&state.raw))
             }
             IcbComputeCmd::SetImageblockWidth { width, height } => {
                 set(sel, || c.set_imageblock_size(width, height))
@@ -1905,21 +1367,13 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
         Ok(self.record(sel).kernel_buffer_address(index).unwrap_or(0))
     }
 
-    /// The identifier of the pipeline state the record names, live or released; 0 for none, a
-    /// reset's retained one included, as Metal's getter reports it
-    /// ([`IcbObject::released_pipeline`]).
+    /// The runtime's identifier of the pipeline state the record names, live or released; 0 for
+    /// none, a reset's retained one included, as Metal's getter reports it (the module docs).
     fn pipeline_state_unique_identifier(&self) -> u64 {
         let sel = "getPipelineStateUniqueIdentifier";
-        let record = self.record(sel);
-        match record.pipeline {
-            None => self
-                .icb
-                .released_pipeline(sel, self.index, record.pipeline_id),
-            Some(state) => {
-                let named = (state.device().registry_id(), state.gpu_resource_id().0);
-                self.icb.pipeline_identifier(sel, self.index, named)
-            }
-        }
+        self.icb.intact(sel, self.index);
+        let answer = get(sel, || self.raw.pipeline_unique_identifier());
+        answer.unwrap_or_else(|| unrepresentable(sel, UNTOLD_STATE))
     }
 
     fn stage_in_region(&self) -> MtlRegion {
@@ -1995,9 +1449,8 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
 
 /// The tests of identifiers need a process each, as `cargo nextest` (the repository's runner,
 /// `cargo xtask check`) gives them: what a record names is decided by process-wide state (the
-/// states kept by resource ID, the devices a state was released on, [`crate::gpu::unique_id`])
-/// over the one runtime device of the process, so under `cargo test`'s threads one test's states,
-/// releases and spans reach another's.
+/// runtime's holders of each resource ID, and its pools of IDs) over the one runtime device of
+/// the process, so under `cargo test`'s threads one test's states and releases reach another's.
 #[cfg(test)]
 mod tests {
     use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
@@ -2006,7 +1459,7 @@ mod tests {
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::platform::resource::{Buffer as _, ComputePipeline as _};
     use reims_vgpu_core::platform::types::NsRange;
     use reims_vgpu_core::raise::OnFault;
     use reims_vgpu_core::raise::death::DeathKind;
@@ -2015,7 +1468,7 @@ mod tests {
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
     use crate::gpu::device::tests::dev;
-    use crate::gpu::resource::VulkanBuffer;
+    use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline};
 
     const ADD: &[u8] =
         include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
@@ -2472,133 +1925,6 @@ mod tests {
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
         assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
-    }
-
-    /// Past [`WINDOWS`], two spans that ended are joined only where the span covering both names
-    /// the same states for every record: not across a state made and released between them, nor
-    /// across core's set of a command between their ends
-    #[test]
-    fn spans_are_joined_only_where_that_names_the_same_states() {
-        use crate::gpu::unique_id::{made, now, released};
-        // A registry ID no device answers, so no other test's states meet these.
-        let device = u64::MAX - 9;
-        assert!(joinable(device, (10, 20), (15, 30), &[]));
-        assert!(!joinable(device, (10, 20), (30, 40), &[25]));
-        assert!(joinable(device, (10, 20), (30, 40), &[19, 40]));
-        assert!(!joinable(device, (10, 20), (30, 40), &[20]));
-        let before = now();
-        made(device, 5, 0x100);
-        released(device, 5, 0x100);
-        let after = now();
-        assert!(!joinable(device, (0, before), (after, after + 1), &[]));
-        assert!(joinable(
-            device,
-            (after, after + 1),
-            (after + 2, after + 3),
-            &[]
-        ));
-        let ended = |start: u64| Window {
-            start,
-            end: Arc::new(AtomicU64::new(start + 1)),
-            of: 0,
-        };
-        let mut sides = Sides {
-            device,
-            ..Sides::default()
-        };
-        let base = now();
-        for i in 0..=WINDOWS as u64 {
-            sides.write(ended(base + 10 * i));
-        }
-        assert_eq!(sides.writes.len(), WINDOWS);
-        let joined = sides.writes[0].span();
-        assert_eq!(joined, (base, base + 11));
-        // A state made and released between two spans keeps them apart.
-        let mut apart = Sides {
-            device,
-            ..Sides::default()
-        };
-        apart.write(ended(0));
-        apart.write(ended(before - 1));
-        apart.write(ended(after + 1));
-        for i in 0..WINDOWS as u64 - 2 {
-            apart.write(Window {
-                start: after + 10 + i,
-                end: Arc::new(AtomicU64::new(OPEN)),
-                of: usize::try_from(i + 1).unwrap(),
-            });
-        }
-        // The first two were joined, and the state lies between what is left of them.
-        assert_eq!(apart.writes.len(), WINDOWS);
-        let spans: Vec<_> = apart.writes[..2].iter().map(Window::span).collect();
-        assert_eq!(spans, [(0, before), (after + 1, after + 2)]);
-        apart.write(Window {
-            start: after + 10 + WINDOWS as u64,
-            end: Arc::new(AtomicU64::new(OPEN)),
-            of: WINDOWS,
-        });
-        assert_eq!(apart.writes.len(), WINDOWS + 1);
-    }
-
-    /// The states a record can name by its resource ID, by when core set it and when the GPU may
-    /// have written it: one names its identifier, two or more, or one past those kept, none
-    #[test]
-    fn a_record_names_the_state_that_held_its_id_when_it_was_written() {
-        use crate::gpu::unique_id::{History, Holder, LIVE};
-        let history = |holders: &[(u64, u64, u64)], lost_until| History {
-            holders: (holders.iter())
-                .map(|&(identifier, made, gone)| Holder {
-                    identifier,
-                    made,
-                    gone,
-                })
-                .collect(),
-            lost_until,
-        };
-        // States A and B held ID 7, A from point 10 to its release at 18 and B from point 20.
-        let ab = history(&[(0xa, 10, 18), (0xb, 20, LIVE)], 0);
-        let ab = Some(&ab);
-        let set_a = Some(((7, 0xa), 15));
-        // Core's set alone, though B took the ID since: the record is core's.
-        assert_eq!(named_state(set_a, &[], 7, ab), Ok(0xa));
-        // A span that ended before core's set changes nothing.
-        assert_eq!(named_state(set_a, &[(11, 14)], 7, ab), Ok(0xa));
-        // A span after core's set while A alone held the ID.
-        assert_eq!(named_state(set_a, &[(16, 18)], 7, ab), Ok(0xa));
-        // One while B held it: the GPU may have written B over core's A.
-        assert!(named_state(set_a, &[(16, 22)], 7, ab).is_err());
-        assert!(named_state(set_a, &[(21, OPEN)], 7, ab).is_err());
-        // No set: the spans decide, each naming the states that held the ID during it.
-        assert_eq!(named_state(None, &[(11, 19)], 7, ab), Ok(0xa));
-        assert_eq!(named_state(None, &[(21, 30)], 7, ab), Ok(0xb));
-        assert!(named_state(None, &[(11, 19), (21, 30)], 7, ab).is_err());
-        assert!(named_state(None, &[(17, 21)], 7, ab).is_err());
-        // A span from A's release to B's creation, when no state held the ID, names neither.
-        assert!(named_state(None, &[(18, 20)], 7, ab).is_err());
-        assert!(named_state(None, &[(11, OPEN)], 7, ab).is_err());
-        // A set of another state, which the record no longer names: the GPU wrote it since.
-        assert_eq!(
-            named_state(Some(((8, 0xc), 15)), &[(16, 18)], 7, ab),
-            Ok(0xa)
-        );
-        // Nothing tells which: the only state of the ID, else none.
-        let a = history(&[(0xa, 10, LIVE)], 0);
-        assert_eq!(named_state(None, &[], 7, Some(&a)), Ok(0xa));
-        assert!(named_state(None, &[], 7, ab).is_err());
-        assert!(named_state(None, &[], 7, None).is_err());
-        assert_eq!(named_state(set_a, &[], 7, None), Ok(0xa));
-        // A span from before a dropped state's release, of a history that dropped older ones.
-        let kept = history(&[(0xa, 10, 18), (0xb, 20, LIVE)], 10);
-        assert!(named_state(None, &[(5, 12)], 7, Some(&kept)).is_err());
-        assert_eq!(named_state(None, &[(21, 30)], 7, Some(&kept)), Ok(0xb));
-        let dropped = history(&[(0xa, 10, LIVE)], 10);
-        assert!(named_state(None, &[], 7, Some(&dropped)).is_err());
-        // A state placed at the ID of one still live holds it beside that one: a span after both
-        // were made names both, and core's set no longer tells.
-        let placed = history(&[(0xa, 10, LIVE), (0xb, 20, LIVE)], 0);
-        assert!(named_state(None, &[(21, 30)], 7, Some(&placed)).is_err());
-        assert!(named_state(set_a, &[(21, 30)], 7, Some(&placed)).is_err());
-        assert_eq!(named_state(set_a, &[], 7, Some(&placed)), Ok(0xa));
     }
 
     /// A command a kernel may have encoded after a state made later took the resource ID of the
@@ -3346,29 +2672,6 @@ mod tests {
         assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
         assert_eq!((barriers(&a), barriers(&b)), ([true, false], [false, true]));
         assert_eq!((lengths(&a), lengths(&b)), ([24, 0], [0, 24]));
-    }
-
-    /// What two commands would answer apart is unknown: a pipeline state of another handle or of
-    /// none, and what either does not know; a value set again is known
-    #[test]
-    fn what_commands_would_answer_apart_is_unknown() {
-        let d = dev();
-        let (p, q) = (icb_pipeline(&d), icb_pipeline(&d));
-        let side = |pipeline: Option<&VulkanComputePipeline>| CommandSide {
-            pipeline: pipeline.map(SetPipeline::compute),
-            ..CommandSide::default()
-        };
-        assert!(side(Some(&p)).differs(&side(Some(&p))).is_empty());
-        assert!(side(None).differs(&CommandSide::default()).is_empty());
-        let apart = side(Some(&p)).differs(&side(Some(&q)));
-        assert!(apart.holds(Kept::Pipeline));
-        let mut unknown = side(None).differs(&side(Some(&p)));
-        assert!(unknown.holds(Kept::Pipeline) && unknown.holds(Kept::All));
-        let mut joined = side(None);
-        joined.unknown = apart;
-        assert!(joined.differs(&joined.copy()).holds(Kept::Pipeline));
-        unknown.settle(Kept::Pipeline);
-        assert!(unknown.is_empty());
     }
 
     #[cfg(target_os = "macos")]

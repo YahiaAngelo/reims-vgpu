@@ -2100,7 +2100,7 @@ pub enum Inexact {
     /// allocation of such states, where Metal's is an address of its allocation that no measured
     /// rule gives (`unmeasured-unique-identifier`). The runtime keeps the relations a guest can
     /// rely on, as Metal's: one value for the state's life, no other live state's, the last
-    /// released taken again first by kind ([`crate::gpu::unique_id`]).
+    /// released taken again first by kind (`crate::gpu::resource`'s `identified`).
     UniqueIdentifier,
 }
 
@@ -2327,7 +2327,8 @@ mod tests {
         // - `PlainStateUniqueIdentifier`: the `uniqueIdentifier` of a pipeline state made without
         //   indirect command buffer support, which Metal answers as an address that differs from
         //   run to run, and the runtime as one of a process-wide count. The guest reads it (info
-        //   command 460, [`crate::gpu::unique_id`]): Metal's own answer is not one value.
+        //   command 460, `crate::gpu::resource`'s `identified`): Metal's own answer is not one
+        //   value.
         // - `AbsentArgumentRead`: a pipeline state whose function may read an argument its
         //   function constants removed, announced as it is made. The runtime takes zero for such a
         //   read and the command buffer completes, where Metal's compiler drops or folds the read
@@ -2361,7 +2362,8 @@ mod tests {
         // - `UnmeasuredUniqueIdentifier`: the difference dies where it shows. The runtime
         //   announces it where a call answers an identifier it has not measured to be Metal's
         //   number: a state's with indirect command buffer support, which this platform reads as
-        //   each state is made ([`crate::gpu::unique_id`]), a buffer's made after an encoder, and
+        //   each state is made (`crate::gpu::resource`'s `identified`), a buffer's made after an
+        //   encoder, and
         //   an indirect command's state identifier, which its read-back of the commands answers at
         //   every getter of a command (`IndirectCommandBuffer::commands`, [`crate::gpu::icb`]).
         //   The guest sees a command's only as the state core's map reaches by it, which the

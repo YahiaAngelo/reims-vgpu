@@ -945,7 +945,7 @@ pub type VulkanLibrary = Obj<LibraryObject>;
 pub type VulkanFunction = Obj<rt::Function>;
 
 /// A runtime compute pipeline state, with the runtime's `uniqueIdentifier` of it, read when it
-/// was made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
+/// was made (`identified`). It derefs to the runtime's state.
 #[derive(Debug)]
 pub struct ComputePipelineObject {
     /// The runtime's state.
@@ -960,12 +960,9 @@ pub struct ComputePipelineObject {
 impl ComputePipelineObject {
     /// `raw`, just made, with the runtime's identifier of it: one per creation, as Metal gives a
     /// pipeline made from an identical record a new one, and as the runtime makes a new state of
-    /// each request. It is kept by the state's resource ID, which an indirect command's record
-    /// names it by ([`crate::gpu::unique_id::made`]).
+    /// each request (`identified`).
     pub fn new(raw: rt::ComputePipelineState) -> ComputePipelineObject {
-        let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
-            raw.unique_identifier()
-        });
+        let unique_identifier = identified(|| raw.unique_identifier());
         ComputePipelineObject {
             raw,
             unique_identifier,
@@ -996,7 +993,7 @@ pub type VulkanComputePipeline = Obj<ComputePipelineObject>;
 pub struct RenderPipelineObject {
     /// The runtime's state.
     pub raw: rt::RenderPipelineState,
-    /// The runtime's identifier of it, read when it was made ([`crate::gpu::unique_id`]).
+    /// The runtime's identifier of it, read when it was made (`identified`).
     unique_identifier: u64,
     /// Its descriptor's `inputPrimitiveTopology`, which decides whether Metal sizes the points
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
@@ -1010,37 +1007,20 @@ pub struct RenderPipelineObject {
     pub(crate) drawn: std::sync::OnceLock<crate::gpu::encode_render::StateFacts>,
 }
 
-impl Drop for ComputePipelineObject {
-    /// A state of a nonzero resource ID that goes is noted: it no longer holds the ID, and Metal
-    /// may give a state made later its identifier ([`crate::gpu::unique_id::released`]).
-    fn drop(&mut self) {
-        let (device, id) = (
-            self.raw.device().registry_id(),
-            self.raw.gpu_resource_id().0,
-        );
-        crate::gpu::unique_id::released(device, id, self.unique_identifier);
-    }
-}
-
-impl Drop for RenderPipelineObject {
-    /// As a compute state's ([`ComputePipelineObject`]'s drop).
-    fn drop(&mut self) {
-        let (device, id) = (
-            self.raw.device().registry_id(),
-            self.raw.gpu_resource_id().0,
-        );
-        crate::gpu::unique_id::released(device, id, self.unique_identifier);
-    }
-}
-
-/// The runtime's `uniqueIdentifier` of a state it just made on `device` with resource ID `id`,
-/// `identifier`'s answer, which relays the runtime's notice of it once a device
-/// (`plain-state-unique-identifier`, `unmeasured-unique-identifier`, [`crate::answer`]): kept by
-/// the ID ([`crate::gpu::unique_id::made`]).
-fn made_with(device: &rt::Device, id: rt::ResourceId, identifier: impl FnOnce() -> u64) -> u64 {
-    let identifier = plain(identifier);
-    crate::gpu::unique_id::made(device.registry_id(), id.0, identifier);
-    identifier
+/// The runtime's `uniqueIdentifier` of a state it just made
+/// (`ComputePipelineState::unique_identifier`, `RenderPipelineState::unique_identifier`),
+/// `identifier`'s answer, read once as the state is made, which relays the runtime's notice of it
+/// once a device (`plain-state-unique-identifier`, `unmeasured-unique-identifier`,
+/// [`crate::answer`]): one nonzero value for the state's life, no other live state's, and a second
+/// state made from an identical record a new one. A state made without
+/// `supportIndirectCommandBuffers` answers one of a process-wide count, where Metal's is an address
+/// that differs from run to run (`plain-state-unique-identifier`); one made with it answers 2^36
+/// plus an offset in the runtime's allocation of such states, which reuses a released state's
+/// identifier, the last released first, by kind, as Metal's does, at offsets that are not Metal's
+/// (`unmeasured-unique-identifier`: Metal's follow its allocator and the process's history, as how
+/// the process was started). The guest's read of such a state's is relayed ([`guest_identifier`]).
+fn identified(identifier: impl FnOnce() -> u64) -> u64 {
+    plain(identifier)
 }
 
 /// What the guest reads (info command 460) of a pipeline state's runtime `uniqueIdentifier`,
@@ -1091,9 +1071,7 @@ pub(crate) fn render_pipeline_of(
     input_primitive_topology: PrimitiveTopologyClass,
     descriptor: Option<RenderDescriptor>,
 ) -> VulkanRenderPipeline {
-    let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
-        raw.unique_identifier()
-    });
+    let unique_identifier = identified(|| raw.unique_identifier());
     Obj::new(RenderPipelineObject {
         raw,
         unique_identifier,
