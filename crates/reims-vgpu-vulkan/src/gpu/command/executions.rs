@@ -21,6 +21,11 @@
 //!   names, where that state's identifier is the one the record answers; else the runtime runs
 //!   the state the program set on the command and released since, of which nothing here holds
 //!   what decides, and a command a death would ask of dies.
+//!
+//!   A buffer into whose records no route wrote a draw or a dispatch runs nothing
+//!   (`IndirectCommandBuffer::command_writes`, every route's writes so far), and the commit
+//!   reads none of them: a buffer of no command types among them, whose execution in a pass
+//!   Metal runs nothing of, and whose records the runtime refuses to read.
 //! - **Records the GPU may write** ([`gpu_writes`]): a blit's copy into a buffer or reset of
 //!   it, and a command, direct or executed, whose state can encode indirect commands in an
 //!   encoder that made the buffer resident for writing, may write its records as the GPU runs,
@@ -43,6 +48,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::PrimitiveType;
+use metal2vulkan::pipeline::CommandWrites;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 use reims_vgpu_core::sync::Mutex;
@@ -50,6 +56,15 @@ use reims_vgpu_core::sync::Mutex;
 use crate::answer::{get, plain, unrepresentable};
 use crate::gpu::command::Progress;
 use crate::gpu::icb::{IcbObject, VulkanIcb};
+
+/// The operations of a record that runs something: a draw of any kind or a dispatch
+/// (`rt::IndirectCommandBuffer::command_writes`). A record of none runs nothing, and [`ask`] asks
+/// nothing of it.
+const RUNS: u32 = CommandWrites::DRAW
+    | CommandWrites::DRAW_INDEXED
+    | CommandWrites::DRAW_PATCHES
+    | CommandWrites::DRAW_MESH
+    | CommandWrites::DISPATCH;
 
 /// Which states size the points an execution's commands draw ([`Execution::check`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +130,12 @@ impl Execution {
             // ([`Execution::host_step_check`]); here they are not known: any of them may write.
             writable.iter().for_each(|w| gpu_writes("commit", w));
             return None;
+        }
+        // Records no route wrote a draw or a dispatch into run nothing, and ask nothing: a buffer
+        // of no command types among them, whose execution in a pass Metal runs nothing of, and
+        // whose records the runtime refuses to read.
+        if !plain(|| icb.raw.command_writes()).may(RUNS) {
+            return decides.then_some(icb);
         }
         let range = range.unwrap_or(0..icb.size());
         let commands = get("commit", || icb.raw.commands(range.clone()));
@@ -341,5 +362,44 @@ struct Read(Arc<Records>);
 impl Drop for Read {
     fn drop(&mut self) {
         self.0.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+    use reims_vgpu_core::platform::types::NsRange;
+    use reims_vgpu_core::platform::values::IcbDesc;
+    use reims_vgpu_core::raise::OnFault;
+
+    use crate::gpu::device::tests::dev;
+
+    /// A render pass's execution of a buffer of no command types runs nothing, as Metal's does,
+    /// whose records the runtime refuses to read: its commit reads none and completes
+    #[test]
+    fn an_execution_of_a_buffer_of_no_command_types_runs_nothing() {
+        let (p, d) = (crate::platform::tests::platform(), dev());
+        let icb = d
+            .new_indirect_command_buffer(&IcbDesc::default(), 2, 0)
+            .unwrap()
+            .unwrap();
+        let (_dst, pass) = crate::gpu::encode_render::tests::pass_of(&p, &d, (4, 4));
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        for cmd in [
+            RenderCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: &icb,
+                execution_range: NsRange::new(0, 2),
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
     }
 }
