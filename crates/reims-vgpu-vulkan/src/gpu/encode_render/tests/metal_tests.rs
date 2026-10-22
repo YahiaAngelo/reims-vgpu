@@ -656,6 +656,67 @@ fn private_primitive_types_draw_as_on_metal() {
     assert!(drawn > 40, "{drawn} draws drew anything");
 }
 
+/// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
+/// restarts at after `setPrimitiveRestartEnabled:index:` of 3 and the other private types take as
+/// a vertex; and of twelve with the 16-bit all-ones index (the 32-bit one at the same place)
+/// after six, which a quad strip restarts at.
+const SCRAMBLED: &[u32] = &[5, 0, 9, 1, 7, 3, 2, 8, 4, 10, 11, 6];
+const SCRAMBLED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 3, 7, 8, 9, 10, 11];
+const QUADS_RESTARTED: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff, 6, 7, 8, 9, 10, 11];
+const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9, 10, 11];
+
+/// Metal's private types 5 to 8 draw what Metal draws over 16- and 32-bit indices, from a base
+/// vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad strip restarting at
+/// its index type's all-ones index, and from indirect arguments, over indices too, at
+/// `setProvokingVertexMode:` 0 and 1, but the line loop's lines at 1
+/// (`lines_take_metals_flat_inputs_at_the_last_vertex`): under a state whose colour is each
+/// vertex's, flat, and one whose colour is its provoking vertex's `[[vertex_id]]`. All but a
+/// fan or quads after the restart index set draw something
+#[test]
+fn private_types_draw_over_indices_and_arguments_as_metals() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    let mut blank = 0;
+    for t in 5..=8 {
+        let mut cases = vec![
+            (over((t, U16), SCRAMBLED, (1, 2)), None),
+            (over((t, U32), SCRAMBLED, (0, 1)), None),
+            (over((t, U16), SCRAMBLED_AT_3, (0, 1)), Some((true, 3))),
+            (Provoked::Indirect(t, [10, 1, 2, 0]), None),
+            (Provoked::Indirect(t, [9, 2, 0, 0]), None),
+            (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
+            (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+        ];
+        if t == 8 {
+            cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
+            cases.push((over((t, U32), QUADS_RESTARTED_WIDE, (0, 1)), None));
+        }
+        let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
+        for (draw, restart) in cases {
+            for functions in [FLAT, ids] {
+                for &mode in modes {
+                    let ours = provoked(&p, &d, functions, (mode, restart), draw);
+                    blank += usize::from(ours == clear);
+                    if let Some((mp, md)) = &metal {
+                        let theirs = provoked(mp, md, functions, (mode, restart), draw);
+                        assert!(ours == theirs, "{draw:?} of {functions:?} at mode {mode}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(blank <= 8, "{blank} draws drew nothing");
+}
+
 /// The pixels of [`pass_pixels`] after `instances` instances of `count` of [`scattered`]'s
 /// vertices from `start`, as `primitive_type`, under `setProvokingVertexMode:` of `mode` and
 /// a state of the fixtures `functions`, over [`flat_vertices`] in buffers 0 and 1.
@@ -1301,10 +1362,9 @@ fn modes_past_1_draw_metals_third_way() {
     }
 }
 
-/// A draw over indices of its own, of a private type or of a list or strip of triangles at
-/// the last vertex under a state that reads a flat input, gives each vertex's
-/// `[[vertex_id]]` as Metal's non-indexed draw gives it, its indices relative to its first
-/// vertex, its base vertex
+/// A draw the runtime draws over a list of its own, of a private type, or of a list or strip of
+/// triangles at the last vertex under a state that reads a flat input without the device's last
+/// vertex, gives each vertex's `[[vertex_id]]` as Metal's non-indexed draw gives it
 #[test]
 fn re_indexed_draws_keep_metals_vertex_ids() {
     let (p, d) = (platform(), dev());
@@ -1848,9 +1908,9 @@ fn vertex_runs<P: Platform>(
         .collect()
 }
 
-/// A draw over indices of the platform's own (a private type's) or of the runtime's (a strip at
-/// the last vertex, without the device's) runs its vertex function as many times at each vertex
-/// as Metal's draw, as a draw as it stands does: once for each primitive the vertex is in, on both
+/// A draw the runtime draws over a list of its own (a private type's, or a strip's at the last
+/// vertex without the device's) runs its vertex function as many times at each vertex as Metal's
+/// draw, as a draw as it stands does: once for each primitive the vertex is in, on both
 #[test]
 fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     let (p, d) = (platform(), dev());
@@ -7793,9 +7853,8 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
     let q = d.new_command_queue().unwrap();
-    // A draw, of a public type, over indices of the platform's own (a triangle fan and quads)
-    // and of primitive type 9 that hangs the GPU, named by the map; and a tile dispatch, by its
-    // own line.
+    // A draw, of a public type, of a private one (a triangle fan and quads) and of primitive
+    // type 9 that hangs the GPU, named by the map; and a tile dispatch, by its own line.
     let deaths = [
         (3, 3, "rate map of no layers"),
         (6, 4, "rate map of no layers"),
