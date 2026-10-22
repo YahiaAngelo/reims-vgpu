@@ -118,19 +118,20 @@
 //!   which it announces as `device-rounded-resolve`; Metal's device here makes none of 8
 //!   samples, so nothing measured them). A blend of other factors the device's blend rounds by
 //!   its own rule, which the runtime announces at the draw (`blended-write-rounding`); the alpha
-//!   alpha to coverage reads at colour 0 the function rounds as the other channels, as Metal
-//!   stores it, and the coverage reads the rounded alpha, where Metal's reads it before rounding,
-//!   which the runtime announces at the draw (`coverage-reads-rounded-alpha`). A fragment
-//!   function's texture write of a half-float or small-float format it refuses, not built: as the
-//!   state is made where the function's slot declares the format, else at a draw or an execution
-//!   that binds such a texture at a slot the function writes, or reaches one through a heap or an
-//!   argument buffer. So a mode 2 state is decided once the runtime made it, as Metal's compile
-//!   answers a refusal with the `NSError` first, and relays there, or dies in strict mode
-//!   ([`rounded_writes_inexact`]), where a half-float colour attachment it writes
+//!   alpha to coverage reads at colour 0 the function rounds as the other channels where the write
+//!   mask stores it, as Metal stores it, and the coverage reads the rounded alpha, where Metal's
+//!   reads it before rounding, which the runtime announces at the draw
+//!   (`coverage-reads-rounded-alpha`); one the mask leaves out the coverage reads before rounding,
+//!   as Metal's. A fragment function's texture write of a half-float or small-float format it
+//!   refuses, not built: as the state is made where the function's slot declares the format, else
+//!   at a draw or an execution that binds such a texture at a slot the function writes, or reaches
+//!   one through a heap or an argument buffer. So a mode 2 state is decided once the runtime made
+//!   it, as Metal's compile answers a refusal with the `NSError` first, and relays there, or dies
+//!   in strict mode ([`rounded_writes_inexact`]), where a half-float colour attachment it writes
 //!   ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an index the function has
-//!   an output for: `fragment_color_outputs`) is of a sample count whose resolve nothing
-//!   measured at this mode ([`rounded_writes`]). Every other state of a mode the device supports
-//!   is made as at the default.
+//!   an output for: `fragment_color_outputs`) is of a sample count whose resolve nothing measured
+//!   at this mode ([`rounded_writes`]). Every other state of a mode the device supports is made as
+//!   at the default.
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.

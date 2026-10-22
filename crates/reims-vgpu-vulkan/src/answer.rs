@@ -337,21 +337,22 @@ pub fn create<T>(
 ///   not measured, and the exact form is a measured one or the blend in the function;
 /// - `EncodedUseRebound`: a command buffer's command named a buffer or heap over the guest's
 ///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
-///   before the command buffer's first submission, in an encoder the rebind could not encode
-///   again (a predicated command buffer's, a render pass recorded later or
-///   whose end captured its draws' tile reach, a call refused again; every other compute, blit
-///   and render encoder it encodes again over the new pages, as Metal runs it), and neither the
-///   submission check nor the failure the command buffer was committed with (`commit_failed`)
-///   failed the submission holding it: the runtime runs nothing of that submission and fails the
-///   command buffer, where Metal runs the command over the pages the object lies in as it submits.
-///   A command buffer an earlier submission failed already (a use detached behind an event wait,
-///   Metal's code 8) keeps that code. A submission the check fails keeps that code and announces
-///   nothing. Announced once per device, whatever `announce_each` says, as the submission is made,
-///   on the thread that makes it: the runtime's scheduler thread, outside every call here, or a
-///   thread inside a later command buffer's `commit`, in which the runtime submits every batch
-///   ready then. It dies there and ends the process. The failure it leaves dies where it is first
-///   read too (`crate::gpu::command`), so a later one, which the device does not announce again,
-///   dies;
+///   before the command buffer's first submission, in an encoder the rebind could not encode again
+///   (a predicated command buffer's, a render pass recorded later or whose end captured its draws'
+///   tile reach, a call that answers otherwise than at its encoding; every other compute, blit and
+///   render encoder it encodes again over the new pages, as Metal runs it, a call refused at its
+///   encoding refused again and the calls after it running, and a resource state encoder takes no
+///   pages), and neither the submission check nor the failure the command buffer was committed with
+///   (`commit_failed`) failed the submission holding it: the runtime runs nothing of that
+///   submission and fails the command buffer, where Metal runs the command over the pages the
+///   object lies in as it submits. A command buffer an earlier submission failed already (a use
+///   detached behind an event wait, Metal's code 8) keeps that code. A submission the check fails
+///   keeps that code and announces nothing. Announced once per device, whatever `announce_each`
+///   says, as the submission is made, on the thread that makes it: the runtime's scheduler thread,
+///   outside every call here, or a thread inside a later command buffer's `commit`, in which the
+///   runtime submits every batch ready then. It dies there and ends the process. The failure it
+///   leaves dies where it is first read too (`crate::gpu::command`), so a later one, which the
+///   device does not announce again, dies;
 /// - `ZeroLayerMapAfterRelease`: a draw in a pass over a rasterization rate map of no layers made
 ///   after the device released a map of layers, which writes nothing where Metal draws rows of
 ///   the pass. Announced at the draw, inside its call, which dies at its selector. No draw over a
@@ -680,10 +681,11 @@ pub fn create<T>(
 ///   pixel interlock's storage form (MoltenVK, RADV and ANV, the runtime's statement),
 ///   the blend of an attachment the fragment function reads, of a format whose Metal blend
 ///   arithmetic the runtime has not built (a 32-bit float, 16-bit normalized, 8-bit signed
-///   normalized, 10-bit, packed float or `A8Unorm` format, among others, or an 8-bit unorm one
-///   written by fewer than four lanes): the shader's generic blend, in `float`, each step rounded,
-///   the source and the blend colour clamped to a normalized format's range, the device's
-///   conversion storing the result, where Metal's blend for these formats is not measured.
+///   normalized, 10-bit, packed float or `A8Unorm` format, among others, an 8-bit unorm one
+///   written by fewer than four lanes, or a 16-bit float or 8-bit unorm one under a blend of the
+///   second source): the shader's generic blend, in `float`, each step rounded, the sources and
+///   the blend colour clamped to a normalized format's range, the device's conversion storing the
+///   result, where Metal's blend for these formats is not measured.
 ///   Announced at each draw that binds the pipeline's variant, inside its call, which dies at its
 ///   selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
@@ -2488,8 +2490,9 @@ mod tests {
         // And `DeviceColorConversion`: a colour channel the device converts, which on MoltenVK,
         // whose device stores Metal's codes, is a half-float channel the function does not round
         // itself: the alpha that alpha to coverage reads at colour 0 at the default rounding
-        // mode (under `textureWriteRoundingMode` 2 the function rounds it, and the coverage reads
-        // it rounded, `CoverageReadsRoundedAlpha` of [`DIES`]), and under mode 2 a half-float
+        // mode, and under `textureWriteRoundingMode` 2 where the write mask leaves it out (under
+        // mode 2 the function rounds one the mask stores, and the coverage reads it rounded,
+        // `CoverageReadsRoundedAlpha` of [`DIES`]), and under mode 2 a half-float
         // attachment blended by other factors than one and zero (`BlendedWriteRounding`, of
         // [`DIES`], too). Its conversion is measured as Metal's, byte for byte over sweeps
         // through unorm values, past 1 by float steps and past the largest half, by

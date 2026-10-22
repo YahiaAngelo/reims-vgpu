@@ -4431,12 +4431,9 @@ fn bfloat_draws_store_metals_codes() {
 /// A render state of `textureWriteRoundingMode` 2 made of what no other test compares rounds
 /// as Metal's, byte for byte, over the sweeps through unorm values, past 1 by float steps
 /// and past the largest half, and so does one of mode 0 of it: `R16Float` and `RG16Float` at
-/// colour 0 under alpha to coverage; and `R16Float`, `RG16Float` and `RGBA16Float` at colours 1
-/// and 3, beside an `RGBA8Unorm` colour 0. `RGBA16Float` at colour 0 under alpha to coverage of a
-/// write mask without alpha rounds so at mode 0; at mode 2 the runtime rounds the alpha, which
-/// the attachment does not store, and the coverage reads it rounded, where Metal's reads it
-/// before rounding: its draw dies naming the runtime's notice (`coverage-reads-rounded-alpha`),
-/// and by default stores Metal's past 1 and past the largest half, not through unorm values
+/// colour 0 under alpha to coverage; `RGBA16Float` at colour 0 under alpha to coverage of a
+/// write mask without alpha, whose coverage reads the alpha before rounding, as Metal's; and
+/// `R16Float`, `RG16Float` and `RGBA16Float` at colours 1 and 3, beside an `RGBA8Unorm` colour 0
 #[test]
 fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -4451,15 +4448,16 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
         render: coverage,
         ..PLAIN
     };
-    let unstored = Drawn {
-        colour: &[(9, 0xe)],
-        ..covered
-    };
-    let both: &[u32] = &[0, NEAREST_EVEN];
     let mut cases = vec![
-        ((25, 2), covered, both),
-        ((65, 4), covered, both),
-        ((115, 8), unstored, &[0][..]),
+        ((25, 2), covered),
+        ((65, 4), covered),
+        (
+            (115, 8),
+            Drawn {
+                colour: &[(9, 0xe)],
+                ..covered
+            },
+        ),
     ];
     for format in [(25, 2), (65, 4), (115, 8)] {
         for index in [1, 3] {
@@ -4468,12 +4466,12 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
                 index,
                 ..PLAIN
             };
-            cases.push((format, four, both));
+            cases.push((format, four));
         }
     }
     let mut differ = Vec::new();
-    for (format, how, modes) in cases {
-        for &mode in modes {
+    for (format, how) in cases {
+        for mode in [0, NEAREST_EVEN] {
             for kind in [0, 1, 3] {
                 let ours = swept(&p, &d, (false, mode), format, kind, how);
                 let theirs = swept(&mp, &md, (false, mode), format, kind, how);
@@ -4484,23 +4482,6 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
                     ));
                 }
             }
-        }
-    }
-    let draw = "drawPrimitives:vertexStart:vertexCount:";
-    let line = died_at(draw, || {
-        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, unstored)
-    });
-    assert!(line.contains("coverage-reads-rounded-alpha"), "{line}");
-    for (kind, metals) in [(0, false), (1, true), (3, true)] {
-        let ours = crate::answer::relaxed(|| {
-            swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, unstored)
-        });
-        let theirs = swept(&mp, &md, (false, NEAREST_EVEN), (115, 8), kind, unstored);
-        if (ours == theirs) != metals {
-            differ.push(format!(
-                "{unstored:?} mode 2 sweep {kind}: Metal's {}",
-                !metals
-            ));
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");

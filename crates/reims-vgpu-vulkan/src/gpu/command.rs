@@ -61,27 +61,26 @@
 //!   (`CommandBufferError::EncodedUseRebound`) dies there too ([`encoded_use_rebound`]): the
 //!   runtime resolves a command's use of a buffer over the caller's host pages as the command is
 //!   encoded, and where the buffer is rebound (a backing replaced, `crate::gpu::backing`) before
-//!   the command buffer's first submission, it encodes the compute, blit and render encoders
-//!   that named it again from their calls, so they reach the new pages as Metal's do. It fails
-//!   only an encoder it cannot encode again: a resource state encoder; one of a command buffer
-//!   that used command predication; a render pass recorded later (an execution of an indirect
-//!   command buffer, a draw whose pipeline was being made) or whose end captured its draws' tile
-//!   reach; and one a call of which it refused. Each submission holding such an encoder runs
-//!   nothing and the command buffer fails, where Metal resolves the use as it submits and runs
-//!   the command over the pages the buffer lies in then. The runtime announces the first such
-//!   failure (`EncodedUseRebound`, [`crate::answer::DIES`]) on the thread that makes the
-//!   submission, where it dies first, ending the process.
+//!   the command buffer's first submission, it encodes the compute, blit and render encoders that
+//!   named it again from their calls, so they reach the new pages as Metal's do (a call refused at
+//!   its encoding is refused again, and the calls after it run), and a resource state encoder takes
+//!   no pages (an indirect mapping update reads its buffer as it runs). It fails only an encoder it
+//!   cannot encode again: one of a command buffer that used command predication; a render pass
+//!   recorded later (an execution of an indirect command buffer, a draw whose pipeline was being
+//!   made) or whose end captured its draws' tile reach; and one a call of which answers otherwise
+//!   than at its encoding. Each submission holding such an encoder runs nothing and the command
+//!   buffer fails, where Metal resolves the use as it submits and runs the command over the pages
+//!   the buffer lies in then. The runtime announces the first such failure (`EncodedUseRebound`,
+//!   [`crate::answer::DIES`]) on the thread that makes the submission, where it dies first, ending
+//!   the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
 //!   there too, naming it ([`answered`]): an emulated mesh draw past the command buffer's mesh
 //!   records pool (`MeshRecordsOverflow`), or an emulated tessellation draw past the same pool
 //!   (`TessellationRecordsOverflow`, an indirect patch draw on a device without
 //!   `tessellationShader`), which it draws nothing of; a sparse mapping update it
-//!   applied none of (`SparseHeapSplit`, `SparseMappingArguments`, `SparseMappingSplit`); a
-//!   Vulkan failure of a submission other than a lost device or memory
-//!   (`Internal`); a command-predication loop the runtime stopped, past the copies it laid down
-//!   (`PredicatedLoopPastCopies`) or once the program held no handle of its queue
-//!   (`PredicatedLoopLetGo`), where Metal runs it on without bound, until the process ends; and
-//!   any other the runtime gives, whatever origin it states, until one is reviewed here. Metal's
+//!   applied none of (`SparseHeapSplit`, `SparseMappingSplit`); a Vulkan failure of a submission
+//!   other than a lost device or memory (`Internal`); and any other the runtime gives, whatever
+//!   origin it states, until one is reviewed here. Metal's
 //!   own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
 //!   platform lists, reach core as Metal's: those this platform commits a command buffer with as
 //!   Metal's GPU fails it (below), a lost device, memory, an address fault, a GPU hang
@@ -903,10 +902,9 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// and dies naming it: an indirect draw's indices the index pool could not hold
 /// ([`pool_overflow`]), a sample through a cubic sampler an argument buffer holds
 /// ([`cubic_argument_sampler`]), a command's buffer rebound before the command buffer was submitted
-/// ([`encoded_use_rebound`]), a command-predication loop the runtime stopped ([`predicated_loop`]),
-/// an emulated mesh or tessellation draw past the records pool ([`mesh_records_overflow`],
-/// [`tessellation_records_overflow`]), a sparse mapping update the runtime applied none of
-/// ([`sparse_heap_split`], [`sparse_mapping_arguments`], [`sparse_mapping_split`]), a Vulkan
+/// ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the records pool
+/// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a sparse mapping update the
+/// runtime applied none of ([`sparse_heap_split`], [`sparse_mapping_split`]), a Vulkan
 /// failure of a submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
 /// [`failed_pipeline`]). A relayed failure's death names Metal's description of it, which `cb`, the
@@ -931,8 +929,6 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         rt::CommandBufferError::IndexPoolOverflow => pool_overflow(sel),
         rt::CommandBufferError::CubicArgumentSampler => cubic_argument_sampler(sel),
         rt::CommandBufferError::EncodedUseRebound => encoded_use_rebound(sel),
-        rt::CommandBufferError::PredicatedLoopPastCopies
-        | rt::CommandBufferError::PredicatedLoopLetGo => predicated_loop(sel, e),
         rt::CommandBufferError::MeshRecordsOverflow(overflow) => {
             mesh_records_overflow(sel, overflow)
         }
@@ -940,9 +936,6 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
             tessellation_records_overflow(sel, overflow)
         }
         rt::CommandBufferError::SparseHeapSplit => sparse_heap_split(sel),
-        rt::CommandBufferError::SparseMappingArguments(problem) => {
-            sparse_mapping_arguments(sel, problem)
-        }
         rt::CommandBufferError::SparseMappingSplit => sparse_mapping_split(sel),
         rt::CommandBufferError::Internal(code) => vulkan_failure(sel, code),
         e => unanswered(sel, e),
@@ -1002,22 +995,6 @@ fn sparse_heap_split(sel: &'static str) -> ! {
     )
 }
 
-/// The death at `sel` of a command buffer whose indirect sparse mapping update's arguments, as
-/// the host read them, are what Metal's validation stops (`problem`: a level, slice or region
-/// past the texture's, or arguments past the buffer): the runtime applied none of the batch's
-/// mappings and ran nothing of the command buffer from there, where what Metal maps without
-/// validation is not measured.
-fn sparse_mapping_arguments(sel: &'static str, problem: rt::SparseProblem) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "an indirect sparse mapping update whose arguments Metal's validation stops \
-             ({problem:?}), which the runtime applied nothing of the batch of and ran nothing of \
-             the command buffer from, where what Metal maps without validation is not measured"
-        ),
-    )
-}
-
 /// The death at `sel` of a command buffer whose indirect sparse mapping update's regions, as the
 /// host read them, bind or unbind part of one of the device's sparse units of a texture whose
 /// texels no copy writes: the runtime applied none of the batch's mappings and ran nothing of
@@ -1068,22 +1045,6 @@ fn cubic_argument_sampler(sel: &'static str) -> ! {
         sel,
         "a sample through a cubic sampler an argument buffer holds, which the runtime does not \
          filter bicubically there and fails the command buffer of, where Metal samples it",
-    )
-}
-
-/// The death at `sel` of a command buffer the runtime failed for a command-predication loop it
-/// stopped, `e`: one that would have run past the copies of its commands the runtime laid down,
-/// whose commands it records apart (`PredicatedLoopPastCopies`), or one still running once the
-/// program held no handle of its queue (`PredicatedLoopLetGo`), where Metal runs the loop on
-/// without bound, until the process ends. No record of the runtime's command predication reaches
-/// it here ([`predication`]), so neither is reached.
-fn predicated_loop(sel: &'static str, e: rt::CommandBufferError) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "a command-predication loop the runtime stopped ({e:?}), where Metal runs it on \
-             without bound"
-        ),
     )
 }
 
@@ -2211,10 +2172,10 @@ mod tests {
     /// A command buffer's failure that is one of Metal's reaches core; every failure of the
     /// runtime's own dies at the selector that reads it first, at the commit's and at the wait, its
     /// line naming it: a sparse mapping update the runtime applied none of, a Vulkan failure of a
-    /// submission, one nothing here matched to Metal's, an indirect draw's indices past the index
-    /// pool, and a command-predication loop the runtime stopped. The thirteen this platform lists
-    /// as Metal's are those the runtime states as Metal's, and the others it names its own: a
-    /// change of either at a new pin fails here, for review
+    /// submission, one nothing here matched to Metal's, and an indirect draw's indices past the
+    /// index pool. The thirteen this platform lists as Metal's are those the runtime states as
+    /// Metal's, and the others it names its own: a change of either at a new pin fails here, for
+    /// review
     #[test]
     fn failures_metal_has_none_of_die_named() {
         use rt::CommandBufferError as E;
@@ -2242,15 +2203,9 @@ mod tests {
                 E::SparseHeapSplit,
                 "filled its heap inside one of the device's sparse units",
             ),
-            (
-                E::SparseMappingArguments(rt::SparseProblem::Lengths),
-                "Metal's validation stops (Lengths)",
-            ),
             (E::SparseMappingSplit, "regions bind or unbind part of one"),
             (E::Internal(rt::VkResultCode(-13)), "VkResult -13"),
             (E::IndexPoolOverflow, "index pool"),
-            (E::PredicatedLoopPastCopies, "loop the runtime stopped"),
-            (E::PredicatedLoopLetGo, "loop the runtime stopped"),
         ];
         for (e, _) in named {
             assert_eq!(e.origin(), rt::FailureOrigin::Runtime, "{e:?}");
