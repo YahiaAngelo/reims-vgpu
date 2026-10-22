@@ -34,20 +34,20 @@
 //! fence, up to [`WAIT_NS`]: that is the render thread's wait for the compositor, as `nextDrawable`
 //! is on the Metal platform's window. Where the presentation engine has no image to give (every one
 //! queued or shown, as a FIFO-only surface's are when frames come faster than the screen shows
-//! them), the take waits for one in the window system, in calls of up to [`TAKE_NS`], for up to
-//! [`WAIT_NS`] in all ([`take_image`]): the draw goes on as the engine gives one back, at the
-//! screen's own pace, rather than after the window's fixed retry (8 ms, longer than a refresh at
-//! 144 Hz and above, by when the frames queued before the draw may all have been shown, and the
-//! screen shows one twice). Where none comes in that time, the draw is tried again. MoltenVK's take
-//! answers an image at once whatever the time it is given, and its fence does the waiting. The
-//! frame's command buffer waits on no semaphore of the compositor's, so a frame the display counts
-//! as in flight completes when the GPU does, never when the compositor gives an image back: a
-//! window the compositor stops showing (a closed lid, a minimized window) slows its own render
-//! thread, never the guest's presents. A fence wait that runs out gives [`Acquired::Retry`]: the
-//! image stays taken, and the next draw waits for it again. Where the OS has an image's drawable to
-//! fetch (MoltenVK's `CAMetalDrawable`, [`crate::os::Drawables`]), the render thread fetches it
-//! once the image is taken, so any wait for one is its own, never the frame's submission's; where
-//! none comes, the draw is tried again likewise.
+//! them), the take waits for one in the window system, in calls of [`TAKE_NS`] each, for up to
+//! [`WAIT_NS`] in all, read on the monotonic clock ([`take_image`]): the draw goes on as the engine
+//! gives one back, at the screen's own pace, rather than after the window's fixed retry (8 ms,
+//! longer than a refresh at 144 Hz and above, by when the frames queued before the draw may all
+//! have been shown, and the screen shows one twice). Where none comes in that time, the draw is
+//! tried again. MoltenVK's take answers an image at once whatever the time it is given, and its
+//! fence does the waiting. The frame's command buffer waits on no semaphore of the compositor's, so
+//! a frame the display counts as in flight completes when the GPU does, never when the compositor
+//! gives an image back: a window the compositor stops showing (a closed lid, a minimized window)
+//! slows its own render thread, never the guest's presents. A fence wait that runs out gives
+//! [`Acquired::Retry`]: the image stays taken, and the next draw waits for it again. Where the OS
+//! has an image's drawable to fetch (MoltenVK's `CAMetalDrawable`, [`crate::os::Drawables`]), the
+//! render thread fetches it once the image is taken, so any wait for one is its own, never the
+//! frame's submission's; where none comes, the draw is tried again likewise.
 //!
 //! **Each frame.** The command buffer signals the image's own semaphore after the present pass
 //! ([`Swapchain::encode_ready`]); once the runtime has scheduled it, the image is presented on
@@ -93,10 +93,10 @@
 //! 615.71.09, KWin on Wayland, two windows): `vkQueuePresentKHR` on one window's render thread
 //! crashed inside the driver while the other's made its swapchain, though Vulkan allows both at
 //! once. The lock is held for those calls alone, never while a draw waits for a fence or a frame
-//! for the GPU. A take waits at most [`TAKE_NS`] in one call, and between its calls the lock is
-//! handed to a window waiting for it, so no window waits on another for more than a call. A
-//! present takes it before the presenting queue's own lock, which the runtime's submissions take
-//! without it.
+//! for the GPU. A take asks for at most [`TAKE_NS`] in one call, and between its calls the lock is
+//! handed to a window waiting for it, so no window waits on another for more than a call (NVIDIA's
+//! driver returns from such a call later than asked: [`TAKE_NS`]). A present takes it before the
+//! presenting queue's own lock, which the runtime's submissions take without it.
 //!
 //! **The commands.** `VK_KHR_swapchain`'s, and the OS's drawable fetch, are looked up as each
 //! swapchain is made ([`SwapchainFns`]), through the runtime's look-up
@@ -119,6 +119,7 @@ use ash::{khr, vk};
 use metal2vulkan::metal::{PixelFormat, TextureUsage};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
+use reims_vgpu_core::platform::os::Clock as _;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
@@ -130,9 +131,13 @@ use crate::gpu::resource::VulkanTexture;
 /// at 60 Hz.
 pub const WAIT_NS: u64 = 33_000_000;
 
-/// How long one take of an image waits in the window system, in nanoseconds ([`take_image`]):
-/// the take runs under the lock every call into the window system holds ([`WSI`]), so another
-/// window's call waits at most this long for it.
+/// How long one take of an image asks to wait in the window system, in nanoseconds
+/// ([`take_image`]): the take runs under the lock every call into the window system holds
+/// ([`WSI`]), so another window's call waits for it about this long. NVIDIA's driver returns from
+/// such a call with no image later than asked: after 1.9 ms on average on a nested KWin's virtual
+/// output, and about 3.9 ms on KWin whose only output was off (measured on an RTX 5080 Laptop
+/// GPU, NVIDIA 615.71.09, Wayland, FIFO, 2026-10-22). So the take counts its wait on the
+/// monotonic clock as well as in calls.
 const TAKE_NS: u64 = 1_000_000;
 
 /// How long a swapchain's end waits for an image the compositor has yet to give, in
@@ -525,22 +530,25 @@ fn refused(what: &str, result: vk::Result) -> Refused {
 }
 
 /// An image taken with `take`, a call of `vkAcquireNextImageKHR` that waits in the window system
-/// up to the nanoseconds it is given: each call waits up to [`TAKE_NS`], and one that answers no
+/// up to the nanoseconds it is given: each call asks for [`TAKE_NS`], and one that answers no
 /// image is made again, up to [`WAIT_NS`] in all (the module doc). So the draw goes on as soon as
 /// the presentation engine gives an image back, rather than a retry after a sleep that knows
-/// nothing of when it does. The wait is counted in calls, so a window system that answers at once
-/// whatever the time it is given is asked at most `WAIT_NS / TAKE_NS` times before the draw is
-/// tried again. What the last call answered: a timeout, or `NOT_READY`, where none came in that
-/// time.
+/// nothing of when it does. The wait ends at whichever comes first of `WAIT_NS / TAKE_NS` calls,
+/// so a window system that answers at once whatever the time it is given is asked no more often,
+/// and [`WAIT_NS`] passed since the take began, as `elapsed` reads it in nanoseconds, so one that
+/// returns later than asked (NVIDIA's, [`TAKE_NS`]) is asked no longer. What the last call
+/// answered: a timeout, or `NOT_READY`, where none came in that time.
 fn take_image(
     mut take: impl FnMut(u64) -> Result<(u32, bool), vk::Result>,
+    mut elapsed: impl FnMut() -> u64,
 ) -> Result<(u32, bool), vk::Result> {
-    let mut waited = 0;
+    let mut calls = 0;
     loop {
         let taken = take(TAKE_NS);
-        waited += TAKE_NS;
+        calls += 1;
         match taken {
-            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) if waited < WAIT_NS => {}
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY)
+                if calls < WAIT_NS / TAKE_NS && elapsed() < WAIT_NS => {}
             taken => return taken,
         }
     }
@@ -770,22 +778,31 @@ impl Swapchain {
         let Some(chain) = &self.chain else {
             return Acquired::Failed;
         };
-        let taken = take_image(|timeout| {
-            let wsi = WSI.lock();
-            // SAFETY: the swapchain and fence are live, and the fence unsignalled with nothing
-            // pending on it: a take that answers no image leaves it so.
-            let taken = unsafe {
-                self.swapchain_api.acquire_next_image(
-                    chain.raw,
-                    timeout,
-                    vk::Semaphore::null(),
-                    self.fence,
-                )
-            };
-            // Handed to a window waiting for it, if any, before this one takes it again.
-            MutexGuard::unlock_fair(wsi);
-            taken
-        });
+        let clock = crate::os::OsClock::new();
+        let began = clock.now_mono();
+        let elapsed = || {
+            let waited = clock.now_mono().saturating_duration_since(began).as_nanos();
+            u64::try_from(waited).unwrap_or(u64::MAX)
+        };
+        let taken = take_image(
+            |timeout| {
+                let wsi = WSI.lock();
+                // SAFETY: the swapchain and fence are live, and the fence unsignalled with nothing
+                // pending on it: a take that answers no image leaves it so.
+                let taken = unsafe {
+                    self.swapchain_api.acquire_next_image(
+                        chain.raw,
+                        timeout,
+                        vk::Semaphore::null(),
+                        self.fence,
+                    )
+                };
+                // Handed to a window waiting for it, if any, before this one takes it again.
+                MutexGuard::unlock_fair(wsi);
+                taken
+            },
+            elapsed,
+        );
         match taken {
             Ok((index, suboptimal)) => {
                 self.stale |= suboptimal;
@@ -1444,13 +1461,25 @@ mod tests {
     fn takes(
         answers: &[Result<(u32, bool), vk::Result>],
     ) -> (Result<(u32, bool), vk::Result>, Vec<u64>) {
-        let mut asked = Vec::new();
-        let taken = take_image(|timeout| {
-            let answer = answers[asked.len().min(answers.len() - 1)];
-            asked.push(timeout);
-            answer
-        });
-        (taken, asked)
+        takes_of(answers, 0)
+    }
+
+    /// [`takes`], each call taking `call_ns` of the clock the take reads.
+    fn takes_of(
+        answers: &[Result<(u32, bool), vk::Result>],
+        call_ns: u64,
+    ) -> (Result<(u32, bool), vk::Result>, Vec<u64>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let taken = take_image(
+            |timeout| {
+                let mut asked = asked.borrow_mut();
+                let answer = answers[asked.len().min(answers.len() - 1)];
+                asked.push(timeout);
+                answer
+            },
+            || asked.borrow().len() as u64 * call_ns,
+        );
+        (taken, asked.into_inner())
     }
 
     /// Where the presentation engine has no image free, the take waits for one in the window
@@ -1474,6 +1503,18 @@ mod tests {
             assert_eq!(asked.len() as u64, WAIT_NS.div_ceil(TAKE_NS));
             assert!(asked.iter().all(|&timeout| timeout == TAKE_NS));
         }
+    }
+
+    /// A window system that returns from each call later than asked, as NVIDIA's does
+    /// ([`TAKE_NS`]), is asked until `WAIT_NS` of the clock has passed, not `WAIT_NS / TAKE_NS`
+    /// times
+    #[test]
+    fn a_take_ends_once_its_wait_has_passed_on_the_clock() {
+        let (taken, asked) = takes_of(&[Err(vk::Result::TIMEOUT)], 4 * TAKE_NS);
+        assert_eq!(taken, Err(vk::Result::TIMEOUT));
+        assert_eq!(asked.len() as u64, WAIT_NS.div_ceil(4 * TAKE_NS));
+        let (taken, asked) = takes_of(&[Err(vk::Result::TIMEOUT), Ok((1, false))], 4 * TAKE_NS);
+        assert_eq!((taken, asked.len()), (Ok((1, false)), 2));
     }
 
     /// An image, a suboptimal one included, and every other answer end the take at once
