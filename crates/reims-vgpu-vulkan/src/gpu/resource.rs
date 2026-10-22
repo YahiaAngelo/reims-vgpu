@@ -2028,9 +2028,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                         )
                     });
                 }
-                // Its bytes in the heap; the rest of the heap where the size is not answered.
-                let size = plain_at(sel, || self.device.raw.heap_texture_size_and_align(&desc));
-                let size = size.ok().map(|size| size.size);
+                // Its bytes in the heap, the size the runtime placed it by, which its
+                // `allocatedSize` answers with no query; the rest of the heap where it has none.
+                let size = plain(|| raw.allocated_size());
                 let end = size.map_or(u64::MAX, |size| offset.saturating_add(size));
                 let heap_size = plain(|| self.raw.size());
                 if optimized {
