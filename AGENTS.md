@@ -186,15 +186,18 @@ The suite's inputs:
 
 ## Working in parallel
 
-- **Each agent works in a worktree of its own** (`git worktree add`), from
-  its first edit, docs included, on a branch of its own. The main checkout
-  is the owner's: agents do not edit it. Finished work is merged on an
-  integration worktree, and the owner's branch is fast-forwarded to it once
-  the merge's checks pass.
+- **Each agent works in a worktree of its own**, from its first edit, docs
+  included, on a branch of its own. The main checkout is the owner's: agents
+  do not edit it. Finished work is merged on an integration worktree, and
+  the owner's branch is fast-forwarded to it once the merge's checks pass.
+  - Make it with `scripts/new-worktree.sh PATH BRANCH [START]`, not `git
+    worktree add`. It clones the main checkout's `tests/suite`, 257 of the
+    tree's 278 MiB, and git writes only the files that differ from START.
 - **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
   can run another tree's `xtask` from a shared one
   ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
-  - Seed it before its first build with `scripts/seed-target.sh`. The seed
+  - Seed it before its first build with `scripts/seed-target.sh`, which
+    `scripts/new-worktree.sh` runs when `CARGO_TARGET_DIR` is set. The seed
     is an APFS clone of the host's warm build of the dependencies, which
     writes nothing until a file changes, so the first build compiles only
     the workspace's crates.

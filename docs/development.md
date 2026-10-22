@@ -21,6 +21,8 @@ tests/
 scripts/
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
+  new-worktree.sh           a new worktree, its tests/suite cloned from the
+                            main checkout's, and its target directory seeded
   run_vmapple.sh            boots a macOS VM on make qemu's QEMU
   seed-target.sh            a new worktree's target directory as a clone of
                             the host's warm build of the dependencies
