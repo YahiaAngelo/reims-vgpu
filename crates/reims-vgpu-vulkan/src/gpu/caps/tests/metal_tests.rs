@@ -146,7 +146,7 @@ fn stand_ins_are_the_metal_platforms_here() {
     let m = metal.caps();
     let ours = dev().caps();
     let f = &m.flags;
-    assert_eq!(f.is_large_mrt_supported, stand_in::LARGE_MRT);
+    assert_eq!(f.is_large_mrt_supported, ours.flags.is_large_mrt_supported);
     assert_eq!(f.is_rgb10a2_gamma_supported, stand_in::RGB10A2_GAMMA);
     assert_eq!(
         (
@@ -161,11 +161,11 @@ fn stand_ins_are_the_metal_platforms_here() {
     );
     assert_eq!(
         f.supports_compute_compressed_texture_write,
-        stand_in::COMPUTE_COMPRESSED_TEXTURE_WRITE
+        ours.flags.supports_compute_compressed_texture_write
     );
     assert_eq!(
         f.supports_conditional_load_store,
-        stand_in::CONDITIONAL_LOAD_STORE
+        ours.flags.supports_conditional_load_store
     );
     assert_eq!(
         f.supports_float16_bcubic_filtering,
@@ -193,11 +193,11 @@ fn stand_ins_are_the_metal_platforms_here() {
     );
     assert_eq!(
         m.limits.max_compute_threadgroup_memory,
-        stand_in::MAX_COMPUTE_THREADGROUP_MEMORY
+        ours.limits.max_compute_threadgroup_memory
     );
     assert_eq!(
         m.max_vertex_amplification_count,
-        stand_in::MAX_VERTEX_AMPLIFICATION_COUNT
+        ours.max_vertex_amplification_count
     );
     assert_eq!(
         (f.supports_tile_shaders, f.supports_non_square_tile_shaders),

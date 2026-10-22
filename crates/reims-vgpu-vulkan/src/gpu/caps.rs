@@ -31,13 +31,13 @@
 //! | `registryID` of the runtime's system default device | Metal's system default device's, asked at run time on macOS ([`crate::os::default_registry_id`]; `0x10000043f` on the M3 Max) | the runtime's is folded from the device UUID, which MoltenVK fills with the vendor and device IDs alone (`0x0902061a6b100000` on the M3 Max), and a host names its device by Metal's (`open_device`, the handshake); another device, and a host where Metal has none, answer the runtime's |
 //! | `supportsFamily:` of Apple5 to Apple10, -1009 | yes, yes, yes, yes, yes, no, no | the runtime claims a family only where every row of Apple's table is exact, and claims none on MoltenVK. **Pending support** (below): what a family promises that the runtime refuses dies at its selector |
 //! | `supportsExtendedXR10Formats` | yes | **pending support** (below): the runtime makes textures of the XR10 formats (550 to 555), in heaps too, and of format 84 (plane 1's view format of the two-plane XR10 textures, 550 and 551), reads and writes them in kernels, samples them in 2D and gathers 552 to 555 as floats, unswizzled and under the four swizzles of the texture or a view the tests read through (`rgbx`'s `XR_SWIZZLES`, which move, repeat, drop and replace channels; no other swizzle is measured), as Metal does on the M3 (`rgbx`'s `extended_range_textures_read_as_metals`), reads 552 and 554 through an argument buffer as Metal does, and samples and gathers them so as Metal does through a sampler of one filter and no mip filter, samples other textures through one as Metal does while one lives that the command does not reach, and dies, naming the runtime's refusal, at a command that samples or gathers one it reaches (names or makes resident) through an argument buffer otherwise (a sampler of a mip filter among them), or reads an `_sRGB` twin or a swizzled one so (`rgbx`'s `extended_range_textures_an_argument_buffer_holds_read_as_metals`), copies 550's and 551's colour words to and from the CPU and buffers as Metal does, and renders to one where the fragment function writes all of its channels or none. It blends a `half4` output, and a `float4` one, into one in the shader, by its model of Metal's blend, and reads one it blends by framebuffer fetch. The model holds without fast math, each product rounded to `half` as Metal's compiler does there (`encode_render`'s `float4_extended_range_blends_are_metals_here` and `half4_extended_range_blends_are_metals_without_fast_math` compare `float4` and `half4` outputs with Metal across passes, into each linear form and each `_sRGB` twin), and under fast math for an output each of whose lanes is a load; where Metal may round the blend's source otherwise, under fast math an output the function computes, or a module that names no math mode, the render state announces the output's kind: for a `half4` one `extended-range-blend-source`, which the device relays for its reach ([`crate::answer`]): a computed `half4` misses Metal's by one code of a channel at 13 of the 66 blended configurations the tests draw, at 130 to 483 of 4096 texels each (`half4_extended_range_blends_announce_their_source`); for a `float4` one `extended-range-float-blend-source`, which the runtime announces at each draw that binds the state's variant, where the draw dies (the state is made), where a computed `float4` missed Metal's at 17 of the 66 (`float4_extended_range_blends_die_naming_their_source`). The tests draw the 22 blends of `XR_BLENDS` into each linear form and the 8 of `XR_SRGB_BLENDS` into each `_sRGB` twin; without fast math, where the runtime also draws a blend by the blend colour under a difference, and any blend into an `_sRGB` twin, they draw those of `XR_CONSTANT_DIFFERENCES` into each form and the rest of `XR_BLENDS` into each twin as Metal does (`extended_range_blends_drawn_without_fast_math_alone_are_metals`), and into each form and twin six blends under write masks of one colour channel and of two as Metal does, and a function's two outputs into colour 0, unblended, storing the first output's values as Metal does, the second nowhere, and without fast math under six blends of the second source as Metal does (`extended_range_masked_blends_and_two_output_states_are_metals`); the others are not measured. A draw that blends into or reads an attachment an earlier draw of its pass may have written, or that its `Clear` left between two codes, reads the `half` values the runtime holds through a pass of one sample and one layer without a rasterization-rate map, as Metal's tile memory does, announcing nothing, so its blends in one pass are Metal's (`encode_render`'s `float4_extended_range_blends_are_metals_here`, `a_blend_onto_a_clear_between_codes_is_metals`); otherwise (another such pass, after an execution of render commands or a tile dispatch, where an earlier render pass instance of the pass wrote the attachment, or a draw whose pipeline has no shadowed form) it sees the codes the runtime stored, where Metal holds the value through the pass, which the runtime announces and the device relays (`extended-range-blends-stored-codes`). The runtime refuses the rest, which dies at its selector; among it a render target of one resolved, unblended under a mask of some of its channels, blended under fast math under a mask of one colour channel, by a factor of the second source, by the blend colour under a difference, into an `_sRGB` form beyond the blends the runtime measured, or a `float4` output into one but by a blend whose colour lanes take one term alone, or from an output other than four `half` or `float` lanes; a state of a function that returns two outputs into colour 0 (a second, index 1, as a blend of the second source reads), blended by factors of the second source under fast math (`ExtendedRangeBlend(DualSource)`); a gather of 550 or 551, or as halves; and 550's and 551's views of another format, mipmaps, textures over a buffer and copies of a layout it has not measured; a copy between two textures of 550 or 551 dies at its selector too, whose alpha plane the runtime copies otherwise than Metal ([`crate::gpu::encode_blit`]) |
-//! | `is_large_mrt_supported`, `supports_conditional_load_store`, `supports_float16_bcubic_filtering` | yes | undocumented, unmeasured |
+//! | `supports_float16_bcubic_filtering` | yes | undocumented, unmeasured |
 //! | `is_rgb10a2_gamma_supported` (key 8) | yes | **pending support** (below): the runtime holds no texture of `RGB10A2Unorm_sRGB` (586), which Metal makes, so it answers no on every device (`Device::private_properties`), and a texture of it dies where it is made (measured on the M3 Max, of `ShaderRead` usage and of `ShaderRead` and `RenderTarget`) |
-//! | `supports_compute_compressed_texture_write` | no | undocumented, unmeasured |
+//! | `is_large_mrt_supported`, `supports_conditional_load_store`, `supports_compute_compressed_texture_write` | yes, yes, no: Metal's answers at the device's Metal level, as the runtime records them (`MetalLevel::private_flag`, its `PrivateAnswer::Metal`) | undocumented, unmeasured: the runtime has no answer of the device's for them |
 //! | `supports_texture_2d_multisample_array` | yes | undocumented |
 //! | `supportsPrimitiveType:` of the raw values 5 to 9 | yes, yes, yes, yes, no | no public `MTLPrimitiveType` is one, and the runtime draws only the public types. **Pending support** (below): the render encoder draws a private type as Metal does where it is built to, and a draw it is not built for dies at the draw's selector (`encode_render`) |
-//! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536 | undocumented, and not the public `maxThreadgroupMemoryLength` (32768 on both platforms, the runtime's answer) |
-//! | `maxVertexAmplificationCount` (private, key 20) | 2, or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
+//! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536, Metal's answer at the device's Metal level, as the runtime records it (`MetalLevel::private_count`, its `PrivateAnswer::Metal`) | undocumented, and not the public `maxThreadgroupMemoryLength` (32768 on both platforms, the runtime's answer) |
+//! | `maxVertexAmplificationCount` (private, key 20) | 2, Metal's answer at the device's Metal level as the runtime records it (`MetalLevel::private_count`), or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
 //! | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (private, keys 23 and 24) | yes | the runtime makes tile pipelines and imageblocks, a `half4` member over `RGBA8Unorm` among them. **Pending support** (below): it answers no on every device (`Device::private_properties`), as its audit of Apple9 refuses part of each row (`TileShaders` and `NonsquareTileDispatch` tile shading it has not built, `Imageblocks` imageblock masters), which dies at its selector |
 //! | an indirect command buffer's `gpuResourceID` and `resourceIndex` ([`crate::gpu::icb`]'s `Space`) | an ID of Metal's pool of them (`Pool`), a placement's low 32 bits, and a placement at `ID_LIMIT` (16384) or past it dies, as Metal writes past its table there | the runtime's ID, which its records' address follows, follows Metal's pool, placement and hold too, but after a reservation holding an ID of 2^23 or more, which it is not given: it refuses one of 2^30 or more, which Metal takes to 2^31 - 1, and a buffer whose own ID is 2^23 or more |
 //! | an indirect command buffer's `uniqueIdentifier` ([`crate::gpu::icb`]) | `UNIQUE_IDENTIFIER_BASE` (`0x1000000000`) plus Metal's address of the buffer: the lowest free range from `FIRST_ADDRESS` (`0x18000`), aligned to `SLOT` (`0x8000`), that holds its `allocatedSize` (the runtime's, which is Metal's) and one more page | the runtime has no unique identifier of a buffer |
@@ -176,22 +176,12 @@ pub mod stand_in {
     pub const FAMILIES: [bool; 7] = [true, true, true, true, true, false, false];
     /// `supportsExtendedXR10Formats`.
     pub const EXTENDED_XR10_FORMATS: bool = true;
-    /// `maxComputeThreadgroupMemory` (private), which is not `maxThreadgroupMemoryLength`.
-    pub const MAX_COMPUTE_THREADGROUP_MEMORY: u64 = 65536;
-    /// `maxVertexAmplificationCount` (private), where the device takes that many.
-    pub const MAX_VERTEX_AMPLIFICATION_COUNT: u64 = 2;
     /// `supportsTileShaders` and `supportsNonSquareTileShaders` (private).
     pub const TILE_SHADERS: bool = true;
     /// `supportsImageBlocks` (private).
     pub const IMAGE_BLOCKS: bool = true;
-    /// `isLargeMRTSupported`.
-    pub const LARGE_MRT: bool = true;
     /// `isRGB10A2GammaSupported`.
     pub const RGB10A2_GAMMA: bool = true;
-    /// `supportsComputeCompressedTextureWrite`.
-    pub const COMPUTE_COMPRESSED_TEXTURE_WRITE: bool = false;
-    /// `supportsConditionalLoadStore`.
-    pub const CONDITIONAL_LOAD_STORE: bool = true;
     /// `supportsFloat16BCubicFiltering`.
     pub const FLOAT16_BCUBIC_FILTERING: bool = true;
     /// `supportsTexture2DMultisampleArray`.
@@ -238,8 +228,9 @@ fn simd_rows_exact(device: &rt::Device) -> [bool; 2] {
 }
 
 /// The runtime's answer of `property` on the device, read from what it acts on; where it has none
-/// of the device's, Metal's measured answer at the device's Metal level, a stand-in (none of the
-/// counts [`computed`] asks at the pinned runtime).
+/// of the device's, Metal's measured answer at the device's Metal level, as the runtime records
+/// it (its `PrivateAnswer::Metal`: `maxComputeThreadgroupMemory` and
+/// `maxVertexAmplificationCount` at the pinned runtime), a stand-in (the module's table).
 fn device_count(private: &rt::PrivateProperties, property: rt::PrivateCount) -> u64 {
     let answer = private.count(property);
     answer.value().unwrap_or(answer.metal())
@@ -266,10 +257,11 @@ fn memory_order_atomics(private: &rt::PrivateProperties) -> bool {
 /// runtime's answer on the device (`private`, `Device::private_properties`), computed from the
 /// documented facts it gives, or a stand-in (the module's docs).
 fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limits, Flags) {
-    use rt::PrivateCount as C;
+    use rt::{PrivateCount as C, PrivateFlag as F};
     let props = device.properties();
     let metal = device.compile_device().metal_properties();
     let count = |property| device_count(private, property);
+    let flag = |property| device_flag(private, property);
     let amplification = largest("supportsVertexAmplificationCount:", |count| {
         props.supports_vertex_amplification_count(count)
     });
@@ -295,7 +287,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         max_compute_local_memory_sizes: count(C::MaxComputeLocalMemorySizes),
         max_compute_samplers: count(C::MaxComputeSamplers),
         max_compute_textures: count(C::MaxComputeTextures),
-        max_compute_threadgroup_memory: stand_in::MAX_COMPUTE_THREADGROUP_MEMORY,
+        max_compute_threadgroup_memory: count(C::MaxComputeThreadgroupMemory),
         max_compute_threadgroup_memory_alignment_bytes: count(
             C::MaxComputeThreadgroupMemoryAlignmentBytes,
         ),
@@ -332,19 +324,16 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         // MoltenVK it refuses for want of `VK_EXT_rasterization_order_attachment_access`, where
         // the compile layer reads attachments through Metal's own fetch.
         is_framebuffer_read_supported: !refuses(Feature::FramebufferFetch),
-        is_large_mrt_supported: stand_in::LARGE_MRT,
+        is_large_mrt_supported: flag(F::IsLargeMrtSupported),
         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,
         supports_buffer_with_address_ranges: imports_host_memory,
         // This platform makes a buffer at an IOSurface's base (`new_buffer_on_surface`).
         supports_buffer_with_iosurface: true,
         // The adapter builds command predication (`predication`).
         supports_command_buffer_jump: true,
-        supports_compute_compressed_texture_write: stand_in::COMPUTE_COMPRESSED_TEXTURE_WRITE,
-        supports_conditional_load_store: stand_in::CONDITIONAL_LOAD_STORE,
-        supports_dynamic_attribute_stride: device_flag(
-            private,
-            rt::PrivateFlag::SupportsDynamicAttributeStride,
-        ),
+        supports_compute_compressed_texture_write: flag(F::SupportsComputeCompressedTextureWrite),
+        supports_conditional_load_store: flag(F::SupportsConditionalLoadStore),
+        supports_dynamic_attribute_stride: flag(F::SupportsDynamicAttributeStride),
         supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS,
         supports_float16_bcubic_filtering: stand_in::FLOAT16_BCUBIC_FILTERING,
         supports_heap_with_address_ranges: imports_host_memory,
@@ -364,7 +353,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         supports_texture_2d_multisample_array: stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY,
         supports_tile_shaders: stand_in::TILE_SHADERS,
     };
-    let amplification = amplification.min(stand_in::MAX_VERTEX_AMPLIFICATION_COUNT);
+    let amplification = amplification.min(count(C::MaxVertexAmplificationCount));
     (amplification, limits, flags)
 }
 
@@ -573,6 +562,43 @@ mod tests {
                 .flag(rt::PrivateFlag::SupportsDynamicAttributeStride)
                 .value()
         );
+    }
+
+    /// The private properties the runtime has no answer of the device's for answer Metal's, as
+    /// the runtime records it at the device's Metal level (`rt::PrivateAnswer::Metal`):
+    /// `maxComputeThreadgroupMemory`, `maxVertexAmplificationCount` (no more than the device
+    /// takes), `isLargeMRTSupported`, `supportsComputeCompressedTextureWrite` and
+    /// `supportsConditionalLoadStore`
+    #[test]
+    fn metal_only_properties_are_the_runtimes_record_of_metals() {
+        use rt::{PrivateAnswer, PrivateCount as C, PrivateFlag as F};
+        let d = dev();
+        let private = d.raw.private_properties();
+        let caps = d.caps();
+        assert_eq!(
+            private.count(C::MaxComputeThreadgroupMemory),
+            PrivateAnswer::Metal(caps.limits.max_compute_threadgroup_memory)
+        );
+        let PrivateAnswer::Metal(amplification) = private.count(C::MaxVertexAmplificationCount)
+        else {
+            panic!("maxVertexAmplificationCount: an answer of the device's");
+        };
+        assert!(caps.max_vertex_amplification_count <= amplification);
+        let f = &caps.flags;
+        for (flag, ours) in [
+            (F::IsLargeMrtSupported, f.is_large_mrt_supported),
+            (
+                F::SupportsComputeCompressedTextureWrite,
+                f.supports_compute_compressed_texture_write,
+            ),
+            (
+                F::SupportsConditionalLoadStore,
+                f.supports_conditional_load_store,
+            ),
+        ] {
+            let answer = private.flag(flag);
+            assert_eq!(answer, PrivateAnswer::Metal(ours), "{}", flag.selector());
+        }
     }
 
     #[cfg(target_os = "macos")]
