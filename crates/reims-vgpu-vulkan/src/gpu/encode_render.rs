@@ -365,6 +365,9 @@ pub struct RenderEncoderObject {
     dropped: Vec<Dropped>,
     /// The device of the command buffer, which makes the buffers of the encoder's own draws.
     device: rt::Device,
+    /// The buffers of indices of the platform's own its draws took, which its later draws of
+    /// the same kind take ([`OwnIndices`]).
+    own_indices: Mutex<OwnIndices>,
     /// The attachments whose store action the descriptor left `Unknown` and no late setter has
     /// decided yet, each with why a resolve into the resolve texture it names now, the
     /// descriptor's or a late resolve setter's, is never sent ([`Unsent`]): a late store action
@@ -2019,6 +2022,7 @@ fn opened(
         encoder: EncoderObject::new(raw, command_buffer),
         nil_pipeline: Mutex::new(false),
         device: command_buffer.device.raw.clone(),
+        own_indices: Mutex::new(OwnIndices::default()),
         undecided: Mutex::new(undecided(d)),
         late_stores: Mutex::new(Vec::new()),
         marks: Mutex::new(Marks::default()),
@@ -2231,13 +2235,9 @@ impl Private {
     /// `0xffffffff`, the restart index of the line strip a line loop draws as.
     fn indices(self, sel: &'static str, start: u32, count: u32) -> Vec<u32> {
         let n = self.index_count(u64::from(count));
-        let last = start.checked_add(count.saturating_sub(1));
-        if n > MAX_EMULATED_INDICES || (count > 0 && last.is_none()) {
-            unrepresentable(
-                sel,
-                &format!("{self:?} of {count} vertices from {start} as an indexed draw"),
-            );
-        }
+        listable(sel, (start, count), n, || {
+            format!("{self:?} of {count} vertices from {start} as an indexed draw")
+        });
         let at = |i: u32| i;
         let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         match self {
@@ -2278,19 +2278,11 @@ impl Private {
 /// draws them (the module docs). Vertex IDs past `u32`, and more indices than
 /// [`MAX_EMULATED_INDICES`], die at `sel`; another type has no such list.
 fn last_first(sel: &'static str, p: PrimitiveType, start: u32, count: u32) -> Vec<u32> {
-    let triangles = match p {
-        PrimitiveType::Triangle => count / 3,
-        PrimitiveType::TriangleStrip => count.saturating_sub(2),
-        _ => unrepresentable(sel, &format!("{p:?} with its last vertex first")),
-    };
+    let triangles = last_first_triangles(sel, p, count);
     let n = 3 * u64::from(triangles);
-    let last = start.checked_add(count.saturating_sub(1));
-    if n > MAX_EMULATED_INDICES || (count > 0 && last.is_none()) {
-        unrepresentable(
-            sel,
-            &format!("{p:?} of {count} vertices from {start}, last vertex first"),
-        );
-    }
+    listable(sel, (start, count), n, || {
+        format!("{p:?} of {count} vertices from {start}, last vertex first")
+    });
     let at = |i: u32| i;
     let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
     for t in 0..triangles {
@@ -2301,6 +2293,156 @@ fn last_first(sel: &'static str, p: PrimitiveType, start: u32, count: u32) -> Ve
         }
     }
     out
+}
+
+/// The triangles of `count` vertices of a list (`p` `Triangle`) or strip (`TriangleStrip`) of
+/// triangles ([`last_first`]); another type, which has no such list, dies at `sel`.
+fn last_first_triangles(sel: &'static str, p: PrimitiveType, count: u32) -> u32 {
+    match p {
+        PrimitiveType::Triangle => count / 3,
+        PrimitiveType::TriangleStrip => count.saturating_sub(2),
+        _ => unrepresentable(sel, &format!("{p:?} with its last vertex first")),
+    }
+}
+
+/// Dies at `sel`, `what` naming the draw, where a list of `n` indices of the platform's own of
+/// the vertices `start..start + count` is longer than [`MAX_EMULATED_INDICES`], or names a
+/// vertex past `u32`.
+fn listable(sel: &'static str, (start, count): (u32, u32), n: u64, what: impl FnOnce() -> String) {
+    let last = start.checked_add(count.saturating_sub(1));
+    if n > MAX_EMULATED_INDICES || (count > 0 && last.is_none()) {
+        unrepresentable(sel, &what());
+    }
+}
+
+/// A list of indices of the platform's own that a non-indexed draw draws over, relative to its
+/// first vertex ([`VulkanRenderEncoder::primitives`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listed {
+    /// One of Metal's private types' ([`Private::indices`]).
+    Private(Private),
+    /// A list or strip of triangles, each with its last vertex first ([`last_first`]).
+    LastFirst(PrimitiveType),
+}
+
+impl Listed {
+    /// The public type its indices draw.
+    fn public(self) -> PrimitiveType {
+        match self {
+            Listed::Private(t) => t.public(),
+            Listed::LastFirst(_) => PrimitiveType::Triangle,
+        }
+    }
+
+    /// How many indices it draws `count` vertices as.
+    fn index_count(self, sel: &'static str, count: u32) -> u64 {
+        match self {
+            Listed::Private(t) => t.index_count(u64::from(count)),
+            Listed::LastFirst(p) => 3 * u64::from(last_first_triangles(sel, p, count)),
+        }
+    }
+
+    /// How many indices it draws the vertices `start..start + count` as, dying at `sel` as
+    /// [`listable`] says.
+    fn checked(self, sel: &'static str, start: u32, count: u32) -> u64 {
+        let n = self.index_count(sel, count);
+        listable(sel, (start, count), n, || match self {
+            Listed::Private(t) => {
+                format!("{t:?} of {count} vertices from {start} as an indexed draw")
+            }
+            Listed::LastFirst(p) => {
+                format!("{p:?} of {count} vertices from {start}, last vertex first")
+            }
+        });
+        n
+    }
+
+    /// Its indices of the vertices `start..start + count`, relative to `start`, dying at `sel`
+    /// as [`listable`] says.
+    fn indices(self, sel: &'static str, start: u32, count: u32) -> Vec<u32> {
+        match self {
+            Listed::Private(t) => t.indices(sel, start, count),
+            Listed::LastFirst(p) => last_first(sel, p, start, count),
+        }
+    }
+
+    /// Whether its list of fewer vertices is the start of its list of more, as each primitive's
+    /// indices follow from its place alone: every list's but a line loop's, which ends at its
+    /// first vertex again.
+    fn grows(self) -> bool {
+        self != Listed::Private(Private::LineLoop)
+    }
+}
+
+/// The most indices a list the encoder keeps for its later draws holds ([`OwnIndices`]): 1 MiB
+/// of them. A draw of a longer one takes a buffer of its own.
+const KEPT_INDICES: u64 = 1 << 18;
+
+/// The fewest vertices a list the encoder keeps is made for, so a pass of small draws of
+/// growing counts makes few.
+const LEAST_KEPT: u32 = 256;
+
+/// The buffers of indices of the platform's own that an encoder's draws took ([`Listed`]), one
+/// a kind of list, each holding the kind's list of the most vertices a draw of it took (and at
+/// least [`LEAST_KEPT`]): a list of fewer vertices is its start ([`Listed::grows`]), so a draw of
+/// as many or fewer draws over its first indices, and a pass's draws make one buffer a kind
+/// where each would make its own. The runtime holds each buffer for every command that draws
+/// over it until its command buffer completes, as for a buffer made for the draw, and nothing
+/// writes it after it is made.
+#[derive(Debug, Default)]
+struct OwnIndices(Vec<(Listed, u32, rt::Buffer)>);
+
+/// A buffer of `indices`, of the platform's own ([`crate::gpu::own_buffer`]): it lies outside the
+/// Metal address space, so no guest buffer's `gpuAddress` depends on when the draws over it
+/// complete. A refusal dies at `sel`.
+fn index_buffer(sel: &'static str, device: &rt::Device, indices: &[u32]) -> rt::Buffer {
+    let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_ne_bytes()).collect();
+    let options = rt::ResourceOptions::new(
+        rt::StorageMode::Shared,
+        rt::CpuCacheMode::WriteCombined,
+        rt::HazardTrackingMode::Default,
+    );
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let contents = rt::BufferContents::Copy(&bytes);
+    plain(|| crate::gpu::own_buffer(device, length, options, contents))
+        .unwrap_or_else(|e| refused(sel, &e))
+}
+
+impl OwnIndices {
+    /// A buffer whose first `n` indices are `listed`'s of `count` vertices, which a draw `sel`
+    /// on `device` draws over: one kept, of as many vertices or more, or one made for `count`
+    /// vertices or more (twice the kept one's, at least [`LEAST_KEPT`]) and kept, where its list
+    /// holds no more than [`KEPT_INDICES`]; else one made for the draw alone, as is a line
+    /// loop's.
+    fn take(
+        &mut self,
+        sel: &'static str,
+        device: &rt::Device,
+        (listed, count, n): (Listed, u32, u64),
+    ) -> rt::Buffer {
+        let kept = self.0.iter().position(|&(l, _, _)| l == listed);
+        if let Some(at) = kept
+            && self.0[at].1 >= count
+        {
+            return self.0[at].2.clone();
+        }
+        if !listed.grows() || n > KEPT_INDICES {
+            return index_buffer(sel, device, &listed.indices(sel, 0, count));
+        }
+        let more = kept.map_or(0, |at| self.0[at].1).saturating_mul(2);
+        let wanted = count.max(more).max(LEAST_KEPT);
+        let vertices = if listed.index_count(sel, wanted) <= KEPT_INDICES {
+            wanted
+        } else {
+            count
+        };
+        let buffer = index_buffer(sel, device, &listed.indices(sel, 0, vertices));
+        match kept {
+            Some(at) => self.0[at] = (listed, vertices, buffer.clone()),
+            None => self.0.push((listed, vertices, buffer.clone())),
+        }
+        buffer
+    }
 }
 
 /// Whether a draw of `count` vertices or indices of `p` makes no primitive, which Metal draws
@@ -4037,14 +4179,14 @@ impl VulkanRenderEncoder {
     /// state (the module docs). A private type draws as its public one over the indices of its
     /// vertices ([`Private::indices`]), and a list or strip of triangles the provoking vertex
     /// rotates ([`Self::rotates`]) as a list over its triangles' vertices last first
-    /// ([`last_first`]), each in a buffer of its own that the command buffer keeps until it
-    /// completes; one of too few vertices draws nothing, as on Metal. The indices are relative to
-    /// `start`, the indexed draw's base vertex, so `[[base_vertex]]` reads `start` and
-    /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module
-    /// docs); a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal
-    /// draws from, dies. Such a draw restarts at the all-ones index alone after
-    /// `setPrimitiveRestartEnabled:index:` too, as a line loop's line strip has no index where
-    /// Metal's loop restarts.
+    /// ([`last_first`]), each in a buffer the encoder keeps for its later draws of the kind
+    /// ([`OwnIndices`]) and the command buffer until it completes; one of too few vertices draws
+    /// nothing, as on Metal. The indices are relative to `start`, the indexed draw's base vertex,
+    /// so `[[base_vertex]]` reads `start` and `[[vertex_id]]` each vertex's own, as Metal's
+    /// non-indexed draws give them (the module docs); a `start` past `i32::MAX`, which the
+    /// runtime's base vertex cannot hold and Metal draws from, dies. Such a draw restarts at the
+    /// all-ones index alone after `setPrimitiveRestartEnabled:index:` too, as a line loop's line
+    /// strip has no index where Metal's loop restarts.
     fn primitives(
         &self,
         sel: &'static str,
@@ -4065,7 +4207,7 @@ impl VulkanRenderEncoder {
             indexed: false,
             indirect: false,
         };
-        let (public, indices) = match topology {
+        let listed = match topology {
             Topology::Public(p) => {
                 self.pipelined(sel);
                 let empty = draws_none(p, count);
@@ -4074,27 +4216,21 @@ impl VulkanRenderEncoder {
                         e.draw_primitives(p, start, count, instances, base)
                     });
                 }
-                (PrimitiveType::Triangle, last_first(sel, p, start, count))
+                Listed::LastFirst(p)
             }
-            Topology::Private(t) => (t.public(), t.indices(sel, start, count)),
+            Topology::Private(t) => Listed::Private(t),
         };
-        if indices.is_empty() {
+        let public = listed.public();
+        let indices = listed.checked(sel, start, count);
+        if indices == 0 {
             return self.draw(sel, (None::<(Shape, ())>, true), |_, ()| Ok(()));
         }
         let base_vertex = i32::try_from(start).unwrap_or_else(|_| {
             unrepresentable(sel, &format!("vertex start {start} as a base vertex"))
         });
-        let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_ne_bytes()).collect();
-        let options = rt::ResourceOptions::new(
-            rt::StorageMode::Shared,
-            rt::CpuCacheMode::WriteCombined,
-            rt::HazardTrackingMode::Default,
-        );
-        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let contents = rt::BufferContents::Copy(&bytes);
-        let buffer = plain(|| crate::gpu::own_buffer(&self.device, length, options, contents))
-            .unwrap_or_else(|e| refused(sel, &e));
-        let n = small(sel, u64::try_from(indices.len()).unwrap_or(u64::MAX));
+        let taken = (listed, count, indices);
+        let buffer = plain(|| self.own_indices.lock().take(sel, &self.device, taken));
+        let n = small(sel, indices);
         self.pipelined(sel);
         self.issues(sel, None);
         self.rounds(sel, false);
@@ -4530,6 +4666,55 @@ pub(crate) mod tests {
         assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
         r.bind_one(FRAGMENT, false, 2, plain);
         assert!(r.textures[FRAGMENT].is_empty());
+    }
+
+    /// A pass's draws over indices of the platform's own take one buffer a kind of list while it
+    /// holds their vertices, its first indices each draw's own list: a draw of more vertices than
+    /// it holds makes one of twice as many, at least [`LEAST_KEPT`], which later draws take. A
+    /// line loop's list, whose list of fewer vertices is not the start of one of more, and a list
+    /// past [`KEPT_INDICES`], are made for the draw alone
+    #[test]
+    fn own_index_lists_are_kept_for_a_passs_later_draws() {
+        let d = dev();
+        let sel = "drawPrimitives:vertexStart:vertexCount:";
+        let mut kept = OwnIndices::default();
+        let mut take = |listed: Listed, count: u32| {
+            let n = listed.index_count(sel, count);
+            let b = kept.take(sel, &d.raw, (listed, count, n));
+            let n = usize::try_from(n).unwrap();
+            let length = usize::try_from(b.length()).unwrap();
+            assert!(length >= 4 * n, "{listed:?} of {count}");
+            // SAFETY: a Shared buffer of `length` bytes, which nothing writes after it is made.
+            let bytes = unsafe { std::slice::from_raw_parts(b.contents().unwrap().as_ptr(), length) };
+            let held: Vec<u32> = (bytes.as_chunks::<4>().0.iter().take(n))
+                .map(|w| u32::from_ne_bytes(*w))
+                .collect();
+            assert_eq!(held, listed.indices(sel, 0, count), "{listed:?} of {count}");
+            (b, length / 4)
+        };
+        let quads = Listed::Private(Private::Quads);
+        let (first, held) = take(quads, 8);
+        assert_eq!(held, 6 * 64, "{LEAST_KEPT} vertices of quads");
+        assert!(take(quads, LEAST_KEPT).0 == first);
+        let (grown, held) = take(quads, LEAST_KEPT + 4);
+        assert!(grown != first);
+        assert_eq!(held, 6 * 128, "twice the vertices");
+        assert!(take(quads, 12).0 == grown);
+        for listed in [
+            Listed::Private(Private::TriangleFan),
+            Listed::Private(Private::QuadStrip),
+            Listed::LastFirst(PrimitiveType::Triangle),
+            Listed::LastFirst(PrimitiveType::TriangleStrip),
+        ] {
+            let (b, _) = take(listed, 7);
+            assert!(b != grown, "{listed:?}");
+            assert!(take(listed, 9).0 == b, "{listed:?}");
+        }
+        let lines = Listed::Private(Private::LineLoop);
+        assert!(take(lines, 5).0 != take(lines, 5).0);
+        let long = u32::try_from(KEPT_INDICES / 6 * 4 + 4).unwrap();
+        assert!(take(quads, long).0 != take(quads, long).0);
+        assert!(take(quads, 12).0 == grown);
     }
 
     /// An open encoder on a target, on this platform.
