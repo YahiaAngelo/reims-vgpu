@@ -2491,7 +2491,6 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
         )
     }
 
-    /// The length set; past the descriptor's lengths, 0.
     /// The record's length where it holds the index, else the one core set there, or 0.
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
