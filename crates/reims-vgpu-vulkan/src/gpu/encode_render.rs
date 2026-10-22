@@ -1709,16 +1709,20 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
 /// What a pass's draws may write through what it binds and made resident: the host memory of
 /// the buffers and textures bound at each stage's slots, of the textures made resident with
 /// write usage, and the pipeline state's facts of which slots its functions write. A draw, a
-/// tile dispatch or an execution reads it ([`Reach::unsent`]).
+/// tile dispatch or an execution reads it ([`Reach::unsent`]). It holds only the binds that can
+/// decide what a draw asks ([`matters`]), each distinct one made resident once, so a draw asks
+/// nothing of the objects of plain memory every pass binds, and a pass that makes the same
+/// resources resident before each draw holds them once.
 #[derive(Debug, Default)]
 struct Reach {
     /// Each stage's buffers by slot, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order.
     buffers: [BTreeMap<u64, Bound>; 3],
     /// Each stage's textures by slot.
     textures: [BTreeMap<u64, Bound>; 3],
-    /// The textures made resident with write usage.
+    /// The textures made resident with write usage, each distinct one once, in the order first
+    /// made resident.
     used_textures: Vec<Bound>,
-    /// The buffers made resident with write usage.
+    /// The buffers made resident with write usage, likewise.
     used_buffers: Vec<Bound>,
     /// Whether the pass's visibility result buffer lies over memory the runtime imports through
     /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
@@ -1731,6 +1735,21 @@ struct Reach {
     pipeline: Option<(Arc<Reflection>, [bool; 3])>,
 }
 
+/// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
+/// it lies over memory the runtime imports through a writable twin of read-only pages, on a
+/// surface whose GPU writes never reach its memory, or is a texture whose writes the runtime
+/// refuses. A draw asks nothing of any other.
+fn matters(m: &Bound) -> bool {
+    !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
+}
+
+/// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
+/// never reach its memory, or into a texture whose writes the runtime refuses
+/// ([`VulkanRenderEncoder::issues`]).
+fn unsendable(m: &Bound) -> bool {
+    m.dropped || m.refused.is_some()
+}
+
 impl Reach {
     /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
     /// slots from `first`.
@@ -1741,17 +1760,33 @@ impl Reach {
     }
 
     /// `m`, of one object, bound to `stage`'s buffer slot (`buffers`) or texture slot `slot`. A
-    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew.
+    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew;
+    /// one of no memory, or that decides nothing ([`matters`]), empties the slot.
     fn bind_one(&mut self, stage: usize, buffers: bool, slot: u64, m: Bound) {
         let slots = if buffers {
             &mut self.buffers[stage]
         } else {
             &mut self.textures[stage]
         };
-        if !m.meets {
+        if !m.meets || !matters(&m) {
             slots.remove(&slot);
         } else if slots.get(&slot) != Some(&m) {
             slots.insert(slot, m);
+        }
+    }
+
+    /// `textures` and `buffers` made resident with write usage: those that decide something
+    /// ([`matters`]), each not held already.
+    fn used(&mut self, textures: Vec<Bound>, buffers: Vec<Bound>) {
+        for (list, held) in [
+            (textures, &mut self.used_textures),
+            (buffers, &mut self.used_buffers),
+        ] {
+            for m in list.into_iter().filter(matters) {
+                if !held.contains(&m) {
+                    held.push(m);
+                }
+            }
         }
     }
 
@@ -1770,26 +1805,26 @@ impl Reach {
 
     /// Whether a texture bound or made resident for writing, or a buffer bound to the tile
     /// stage, lies on a surface whose GPU writes never reach its memory
-    /// ([`crate::os::gpu_read_only`]). A vertex or fragment function's stores into a buffer on
-    /// one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
+    /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
+    /// or fragment function's stores into a buffer on one are dropped, as on Metal, and are sent
+    /// ([`crate::os::dropped_write`]).
     fn unsent_dropped(&self) -> bool {
         let bound = (self.textures.iter().chain([&self.buffers[TILE]])).flat_map(BTreeMap::values);
-        bound
-            .chain(&self.used_textures)
-            .any(|m| m.dropped || m.refused.is_some())
+        bound.chain(&self.used_textures).any(unsendable)
     }
 
     /// What a draw, a tile dispatch, or an execution whose commands take `inherits` of the
     /// encoder, may write that is never sent where it lies on a surface whose GPU writes never
-    /// reach its memory ([`VulkanRenderEncoder::issues`]): the textures bound at the
-    /// slots the pipeline state's functions write, the textures made resident with write usage,
-    /// and, but for an execution, whose commands run no tile function, the buffers bound at the
-    /// slots the tile function writes.
+    /// reach its memory, or into a texture whose writes the runtime refuses ([`unsendable`],
+    /// [`VulkanRenderEncoder::issues`]): the textures made resident with write usage, then the
+    /// textures bound at the slots the pipeline state's functions write, and, but for an
+    /// execution, whose commands run no tile function, the buffers bound at the slots the tile
+    /// function writes.
     fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
-        let mut written: Vec<_> = (self.used_textures.iter())
-            .map(|m| (Whether::Writes, m.clone()))
-            .collect();
-        written.extend(self.at_slots(inherits, [false, false, inherits.is_none()]));
+        let used = (self.used_textures.iter()).filter(|m| unsendable(m));
+        let mut written: Vec<_> = used.map(|m| (Whether::Writes, m.clone())).collect();
+        let buffers = [false, false, inherits.is_none()];
+        written.extend(self.at_slots(inherits, buffers, unsendable));
         written
     }
 
@@ -1801,37 +1836,43 @@ impl Reach {
     /// whose commands run no tile function and take the encoder's buffers only where they inherit
     /// them. `None` where it writes none.
     fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        let used = (self.used_textures.iter()).chain(&self.used_buffers);
-        let mut written: Vec<_> = (used.filter(|m| m.kept.holds()))
-            .map(|_| Whether::Writes)
-            .collect();
+        let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
+        if used.any(|m| m.kept.holds()) {
+            return Some(Whether::Writes);
+        }
         let buffers = inherits.is_none_or(|i| i.buffers);
-        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()]);
-        written.extend((slots.into_iter()).filter_map(|(w, m)| m.kept.holds().then_some(w)));
-        written.into_iter().find(Whether::holds)
+        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()], |m| {
+            m.kept.holds()
+        });
+        slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
 
     /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at
-    /// the stages' slots, one entry an object, with whether it does: the textures bound at the
-    /// slots the pipeline state's functions write, by its reflection, and the buffers too at the
-    /// stages `buffers` names, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order. Where the
-    /// reflection cannot tell, every function may write every buffer slot of its stage, as a
-    /// kernel may, a vertex function that writes memory every texture slot of its stage, and a
-    /// fragment or tile function that writes textures every texture slot of its stage. A vertex
-    /// function that writes no memory, by the runtime's translation of it (its
-    /// `vertex_writes_memory`), writes no slot of its stage, whatever its reflection answers of
-    /// an argument: a `device` pointer that is not `const` is read-write there, stored through
-    /// or not. An execution whose commands run pipeline states of their own, which no
-    /// reflection here tells, writes every bound buffer it takes, and no bound texture: Metal
-    /// makes no state that supports indirect command buffers of a function with a texture
-    /// argument, and such commands reach a texture only through an argument buffer, whose
+    /// the stages' slots of the objects `wanted` picks, one entry an object, with whether it
+    /// does: the textures bound at the slots the pipeline state's functions write, by its
+    /// reflection, and the buffers too at the stages `buffers` names, in [`VERTEX`], [`FRAGMENT`]
+    /// and [`TILE`] order. Where the reflection cannot tell, every function may write every
+    /// buffer slot of its stage, as a kernel may, a vertex function that writes memory every
+    /// texture slot of its stage, and a fragment or tile function that writes textures every
+    /// texture slot of its stage. A vertex function that writes no memory, by the runtime's
+    /// translation of it (its `vertex_writes_memory`), writes no slot of its stage, whatever its
+    /// reflection answers of an argument: a `device` pointer that is not `const` is read-write
+    /// there, stored through or not. An execution whose commands run pipeline states of their
+    /// own, which no reflection here tells, writes every bound buffer it takes, and no bound
+    /// texture: Metal makes no state that supports indirect command buffers of a function with a
+    /// texture argument, and such commands reach a texture only through an argument buffer, whose
     /// textures are made resident. Measured on the M3 Max (macOS 26.7):
     /// `supportIndirectCommandBuffers` with a vertex, fragment or kernel function taking a
     /// texture to read, sample or write answers no state ("Fragment shader cannot be used with
     /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
     /// state; an execution that inherits a state made without it, of such a function, faults
     /// its command buffer (`PageFault`), the texture bound unwritten.
-    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Bound)> {
+    fn at_slots(
+        &self,
+        inherits: Option<Inherits>,
+        buffers: [bool; 3],
+        wanted: fn(&Bound) -> bool,
+    ) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let state = match inherits {
             Some(i) if !i.pipeline => None,
@@ -1857,11 +1898,14 @@ impl Reach {
                 ),
                 None => Whether::Writes,
             };
-            for (&slot, m) in (self.buffers[stage].iter()).filter(|_| buffers[stage]) {
-                written.push((at(false, slot), m.clone()));
-            }
-            for (&slot, m) in (self.textures[stage].iter()).filter(|_| state.is_some()) {
-                written.push((at(true, slot), m.clone()));
+            let held = [
+                (false, &self.buffers[stage], buffers[stage]),
+                (true, &self.textures[stage], state.is_some()),
+            ];
+            for (texture, slots, _) in held.into_iter().filter(|&(.., on)| on) {
+                for (&slot, m) in slots.iter().filter(|(_, m)| wanted(m)) {
+                    written.push((at(texture, slot), m.clone()));
+                }
             }
         }
         written
@@ -2348,10 +2392,7 @@ impl VulkanRenderEncoder {
                 Bind::Texture(stage, slot, m) => reach.bind_one(stage, false, slot, m),
                 Bind::Buffers(stage, first, memory) => reach.bind(stage, true, first, memory),
                 Bind::Textures(stage, first, memory) => reach.bind(stage, false, first, memory),
-                Bind::Used(textures, buffers, true) => {
-                    reach.used_textures.extend(textures);
-                    reach.used_buffers.extend(buffers);
-                }
+                Bind::Used(textures, buffers, true) => reach.used(textures, buffers),
                 Bind::Used(_, _, false) => {}
             }
         });
@@ -2368,18 +2409,19 @@ impl VulkanRenderEncoder {
     /// whose pages the write would reach ([`Reach::kept`], [`crate::gpu::writes::kept_write`]).
     /// One that issues nothing, which Metal writes nothing of, is not asked.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
-        if crate::os::TWINS_READ_ONLY
-            && let Some(whether) = plain(|| self.reach.lock().kept(inherits))
-        {
+        let (kept, written) = plain(|| {
+            let reach = self.reach.lock();
+            let kept = (crate::os::TWINS_READ_ONLY)
+                .then(|| reach.kept(inherits))
+                .flatten();
+            let written = (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
+            (kept, written)
+        });
+        if let Some(whether) = kept {
             let what = format!("a draw's write through {}, into", whether.through());
             crate::gpu::writes::kept_write(sel, &what);
         }
-        let written = plain(|| {
-            let reach = self.reach.lock();
-            reach.unsent_dropped().then(|| reach.unsent(inherits))
-        });
-        let hit = (written.iter().flatten())
-            .find(|(w, m)| (m.dropped || m.refused.is_some()) && w.holds());
+        let hit = (written.iter().flatten()).find(|(w, m)| unsendable(m) && w.holds());
         if let Some((whether, m)) = hit {
             let what = format!("a draw's write through {}", whether.through());
             match m.refused.filter(|_| !m.dropped) {
@@ -4452,6 +4494,42 @@ pub(crate) mod tests {
             Private::Quads.indices(sel, u32::MAX - 3, 4),
             [0, 1, 3, 1, 2, 3]
         );
+    }
+
+    /// A pass holds only the binds that can decide what a draw asks of what it may write
+    /// (`matters`), and each distinct one made resident for writing once, however often it is
+    /// made resident: a draw asks the same of them as of all it bound
+    #[test]
+    fn a_pass_holds_only_the_binds_a_draw_asks_of() {
+        let plain = Bound {
+            meets: true,
+            ..Bound::default()
+        };
+        let dropped = Bound {
+            dropped: true,
+            ..plain.clone()
+        };
+        let kept = Bound {
+            kept: Kept::Always,
+            ..plain.clone()
+        };
+        let mut r = Reach::default();
+        r.bind(FRAGMENT, false, 0, vec![plain.clone(); 8]);
+        r.bind_one(VERTEX, true, 3, plain.clone());
+        assert!((r.textures.iter().chain(&r.buffers)).all(BTreeMap::is_empty));
+        assert!(!r.unsent_dropped() && r.kept(None).is_none());
+        for _ in 0..1000 {
+            let textures = vec![plain.clone(), dropped.clone()];
+            r.used(textures, vec![plain.clone(), kept.clone()]);
+        }
+        assert_eq!((r.used_textures.len(), r.used_buffers.len()), (1, 1));
+        assert!(r.unsent_dropped());
+        assert!(matches!(r.kept(None), Some(Whether::Writes)));
+        assert!(matches!(&r.unsent(None)[..], [(Whether::Writes, m)] if *m == dropped));
+        r.bind_one(FRAGMENT, false, 2, dropped.clone());
+        assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
+        r.bind_one(FRAGMENT, false, 2, plain);
+        assert!(r.textures[FRAGMENT].is_empty());
     }
 
     /// An open encoder on a target, on this platform.
