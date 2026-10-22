@@ -1193,8 +1193,8 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
 /// triangles' moved, over their vertices, over indices, restarting, from indirect arguments, and
 /// Metal's triangle fan. One that also reads a flat input draws as Metal does where the device
 /// has the last vertex; elsewhere the runtime draws its triangles from their last vertices, their
-/// weights in that order, which dies in strict mode (`provoking-vertex-unmatched`). At mode 0 all
-/// of them draw as Metal's
+/// first weights Metal's and the other two Metal's but for rounding, which dies in strict mode
+/// (`provoking-vertex-unmatched`). At mode 0 all of them draw as Metal's
 #[test]
 fn barycentric_weights_take_metals_order_at_the_last_vertex() {
     let (p, d) = (platform(), dev());

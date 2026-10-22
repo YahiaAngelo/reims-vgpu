@@ -126,12 +126,13 @@
 //!     (`modes_past_1_draw_metals_third_way`). The runtime takes the mode as the guest set it, and
 //!     draws it: mode 1 through `VK_EXT_provoking_vertex` where the device has its last vertex,
 //!     elsewhere (MoltenVK) from lists of the primitives led by their last vertices, which give a
-//!     triangle Metal's flat inputs, layer, viewport and weights. What it draws otherwise than
-//!     Metal it announces: a line drawn from its last vertex to its first
-//!     (`provoking-vertex-lines`); triangles that read flat inputs and weights, and patches,
-//!     without the last vertex, a layer or viewport selected in a synthesized geometry stage with
-//!     it, and a mode from 2 up, drawn as 1 (`provoking-vertex-unmatched`). Each is relayed, and
-//!     dies in strict mode ([`crate::answer::DIES`]).
+//!     triangle Metal's flat inputs, layer, viewport and weights (of one that also reads a flat
+//!     input, the second and third weights but for rounding). What it draws otherwise than Metal it
+//!     announces: a line drawn from its last vertex to its first (`provoking-vertex-lines`);
+//!     triangles that read flat inputs and weights, and patches, without the last vertex, a layer
+//!     or viewport selected in a synthesized geometry stage with it, and a mode from 2 up, drawn as
+//!     1 (`provoking-vertex-unmatched`). Each is relayed, and dies in strict mode
+//!     ([`crate::answer::DIES`]).
 //!   - `setPrimitiveRestartEnabled:index:` sets the index an indexed strip restarts at, `k`,
 //!     whatever `enabled` says (`{0, k}` draws as `{1, k}`, at `k` of 0, 3, 7, 15, `0xffff`
 //!     and `0xffffffff`). Without it a strip restarts at its index type's all-ones index, as

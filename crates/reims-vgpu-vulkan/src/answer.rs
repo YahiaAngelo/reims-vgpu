@@ -1074,16 +1074,17 @@ pub fn create<T>(
 ///   otherwise than Metal. On a device without its last vertex (`VK_EXT_provoking_vertex`'s
 ///   `provokingVertexLast` with `provokingVertexModePerPipeline`, which MoltenVK lacks), each line
 ///   is drawn from its last vertex to its first, its flat inputs Metal's but its pixels and its
-///   smooth inputs not always (`ProvokingVertexLines`); the weights of a triangle, or of an
-///   emulated mesh's, whose fragment function also reads a flat input are Metal's but for
-///   rounding, and a patch or a mesh draw through `VK_EXT_mesh_shader` takes its flat inputs from
-///   its first vertex (`ProvokingVertexUnmatched`). On a device with it, a
-///   strip whose vertex function computes `[[primitive_id]]` into its varying reads each
-///   primitive's last vertex's, and a layer or viewport selected in a synthesized geometry stage
-///   comes from each primitive's first vertex (`ProvokingVertexUnmatched`). On every device a
-///   mode from 2 up, its top bit set or not, which Metal draws a third way, is drawn as mode 1,
-///   announced at the setter (`ProvokingVertexUnmatched`). Announced at each such draw, or at the
-///   setter, inside its call, which dies at its selector;
+///   smooth inputs not always (`ProvokingVertexLines`); of the weights of a triangle, or of an
+///   emulated mesh's, whose fragment function also reads a flat input the first is Metal's and
+///   the other two Metal's but for rounding, and a patch or a mesh draw through
+///   `VK_EXT_mesh_shader` takes its flat inputs from its first vertex
+///   (`ProvokingVertexUnmatched`). On a device with it, a strip whose vertex function computes
+///   `[[primitive_id]]` into its varying reads each primitive's last vertex's, and a layer or
+///   viewport selected in a synthesized geometry stage comes from each primitive's first vertex
+///   (`ProvokingVertexUnmatched`). On every device a mode from 2 up, its top bit set or not,
+///   which Metal draws a third way, is drawn as mode 1, announced at the setter
+///   (`ProvokingVertexUnmatched`). Announced at each such draw, or at the setter, inside its
+///   call, which dies at its selector;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
