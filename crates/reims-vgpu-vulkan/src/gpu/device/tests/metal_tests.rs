@@ -1191,10 +1191,20 @@ fn surface_bytes(surface: &crate::os::OsSurface, length: u64) -> Vec<u8> {
 /// surfaces `a` and `b`, and a `Shared` texture of `format` as wide as the most columns of
 /// `size` a multiple of 4 holds, write on `p`'s device `d`, each in a command buffer of its
 /// own: the bytes of `b` (to `length`) after a copy of 8 by 5 texels from `a`'s (1, 2) to
-/// `b`'s (4, 4), then the bytes of `b` after a copy of `a`'s texels that fit into the
-/// `Shared` texture and of 8 by 4 of those from (2, 0) to `b`'s (12, 6). Metal's blit
-/// addresses a texture's alpha plane by its colour rows too, so it reads past the alpha plane
-/// from a row a quarter of the way down, whose bytes the runtime does not hold.
+/// `b`'s (4, 4), then the bytes of `b` after a copy of the top quarter of `a`'s texels that fit
+/// into the `Shared` texture and of 8 by 4 of those from (2, 0) to `b`'s (12, 6).
+///
+/// Metal's blit addresses a texture's alpha plane by its colour rows too, four of the plane's
+/// rows apart in the `Shared` texture, so a copy of more than its top quarter writes past its
+/// alpha plane, and at E26d's shape one of more than a third of `a`'s rows reads past the
+/// surface: bytes the runtime does not hold. Metal answers such a copy the same each time while
+/// its process alone is on the GPU, but beside another process's work there those accesses
+/// fault the GPU, and its recovery loses bytes inside the planes too, with no command buffer's
+/// error: the alpha bytes the copy into `b` reads come back 0 (measured on the M3 Max, macOS
+/// 27.0.1, Metal alone in each process: six processes copying all of `a`'s rows of 551 40
+/// times each at once, two copied zeros 1 and 2 times and four lost a command buffer to the
+/// recovery; copying the top quarter, none in 240 copies of each format; one process alone
+/// copying all of them, none in 200). The top quarter holds every byte the copy into `b` reads.
 fn surface_copies<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
     p: &P,
     d: &P::Device,
@@ -1221,12 +1231,16 @@ fn surface_copies<P: reims_vgpu_core::platform::Platform<Surface = crate::os::Os
     let other = (d.new_texture(OnFault::Die, &p.texture_descriptor(&shared)))
         .unwrap()
         .unwrap();
+    // At widths a multiple of 16 the `Shared` texture's alpha rows are `w` bytes apart and
+    // Metal's blit rows `4 w`, so a quarter of its rows is what the alpha plane holds.
+    assert_eq!(columns[0] % 16, 0, "{size:?}");
+    let quarter = [columns[0], columns[1] / 4];
     let q = d.new_command_queue().unwrap();
     blit_one::<P>(&q, copy_region::<P>((&ta, [1, 2]), (&tb, [4, 4]), [8, 5]));
     let first = surface_bytes(b, length);
     blit_one::<P>(
         &q,
-        copy_region::<P>((&ta, [0, 0]), (&other, [0, 0]), columns),
+        copy_region::<P>((&ta, [0, 0]), (&other, [0, 0]), quarter),
     );
     blit_one::<P>(
         &q,
@@ -1238,8 +1252,9 @@ fn surface_copies<P: reims_vgpu_core::platform::Platform<Surface = crate::os::Os
 /// Copies between a texture of a two-plane XR10 format (550, 551) over plane 0 of a 'b3a8'
 /// surface and another texture of the format write the surfaces' two planes as Metal's do,
 /// byte for byte, the bytes outside the copied texels kept: from one surface's texture into
-/// another's, out of one into a texture of its own, and from that into a surface's; at
-/// E26d's shape and at an odd size
+/// another's, out of one into a texture of its own (the rows Metal's blit keeps inside the
+/// planes, [`surface_copies`]), and from that into a surface's; at E26d's shape and at an odd
+/// size
 #[test]
 fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
     let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
