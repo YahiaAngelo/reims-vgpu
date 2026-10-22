@@ -1,17 +1,19 @@
-//! A render blob's SPI keys drawn on both platforms: the values that decode to nothing draw as
-//! Metal's own deserializer has Metal draw them, and as Metal draws without them; the values that
-//! die draw otherwise on Metal (the module docs, [`super::render_spi`]).
+//! A render blob's SPI keys drawn on both platforms: the values the runtime holds draw as Metal's
+//! own deserializer has Metal draw them, and so do the values that decode to nothing, which draw
+//! as Metal draws without them; the values that die draw otherwise on Metal (the module docs,
+//! [`super::render_spi`]). A compute blob's key the runtime holds runs as Metal's.
 
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue as _};
+use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
+use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::{
-    ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, PassSet, StencilAttachmentSet,
-    StencilDesc, TextureDesc,
+    ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, PassSet, SamplerDesc,
+    StencilAttachmentSet, StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_core::raise::OnFault;
@@ -25,6 +27,7 @@ use std::sync::Arc;
 use super::RENDER_SEL;
 use super::tests::rounded_render_of;
 use crate::gpu::device::tests::dev;
+use crate::platform::VulkanPlatform;
 use crate::platform::tests::platform;
 
 /// The library of `spi_keys.metal`.
@@ -169,6 +172,28 @@ fn bytes_of<P: Platform>(b: &P::Buffer, n: u64) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
+/// What a drawing draws beside its state and buffers: `count` vertices of primitive type
+/// `primitive`, and, at index 0, a texture and a sampler of the vertex stage and of the
+/// fragment stage, where given.
+struct Binds<'a, P: Platform> {
+    primitive: u64,
+    count: u64,
+    vertex: Option<(&'a P::Texture, &'a P::SamplerState)>,
+    fragment: Option<(&'a P::Texture, &'a P::SamplerState)>,
+}
+
+impl<P: Platform> Binds<'_, P> {
+    /// One triangle, and nothing more.
+    fn triangle() -> Self {
+        Binds {
+            primitive: 3,
+            count: 3,
+            vertex: None,
+            fragment: None,
+        }
+    }
+}
+
 /// A drawing of one case: the target's colour attachment 0 of `format`, of `samples` samples,
 /// cleared to opaque blue, under `state`, one triangle over it of colour `(1, 0.5, 0.25, 0.5)`,
 /// read back (resolved, where more than one sample).
@@ -177,6 +202,17 @@ fn drawn<P: Platform>(
     d: &P::Device,
     state: &P::RenderPipeline,
     (format, samples): (u32, u64),
+) -> Vec<u8> {
+    drawn_with(p, d, state, (format, samples), &Binds::triangle())
+}
+
+/// [`drawn`], drawing what `binds` says.
+fn drawn_with<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    state: &P::RenderPipeline,
+    (format, samples): (u32, u64),
+    binds: &Binds<'_, P>,
 ) -> Vec<u8> {
     let bytes = if format == RGBA16F { 8 } else { 4 };
     let resolved = target(p, d, format, 1);
@@ -209,7 +245,8 @@ fn drawn<P: Platform>(
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    for cmd in [
+    let one = NsRange::new(0, 1);
+    let mut cmds = vec![
         RenderCmd::SetRenderPipelineState {
             pipeline_state: Some(state),
         },
@@ -223,13 +260,38 @@ fn drawn<P: Platform>(
             offset: 0,
             index: 0,
         },
-        RenderCmd::DrawPrimitives {
-            primitive_type: 3,
-            vertex_start: 0,
-            vertex_count: 3,
-        },
-        RenderCmd::EndEncoding,
-    ] {
+    ];
+    let (vertex, fragment) = (
+        binds.vertex.map(|(t, s)| ([Some(t)], [Some(s)])),
+        binds.fragment.map(|(t, s)| ([Some(t)], [Some(s)])),
+    );
+    if let Some((textures, samplers)) = &vertex {
+        cmds.push(RenderCmd::SetVertexTextures {
+            textures,
+            range: one,
+        });
+        cmds.push(RenderCmd::SetVertexSamplerStates {
+            samplers,
+            range: one,
+        });
+    }
+    if let Some((textures, samplers)) = &fragment {
+        cmds.push(RenderCmd::SetFragmentTextures {
+            textures,
+            range: one,
+        });
+        cmds.push(RenderCmd::SetFragmentSamplerStates {
+            samplers,
+            range: one,
+        });
+    }
+    cmds.push(RenderCmd::DrawPrimitives {
+        primitive_type: binds.primitive,
+        vertex_start: 0,
+        vertex_count: binds.count,
+    });
+    cmds.push(RenderCmd::EndEncoding);
+    for cmd in cmds {
         e.encode(OnFault::Die, cmd).unwrap();
     }
     let out = read_back::<P>(d, &cb, &resolved, bytes);
@@ -268,9 +330,9 @@ const BLENDS: &[(u8, u32)] = &[(2, 1), (3, 4), (4, 5)];
 /// A write mask of red and alpha.
 const RED_ALPHA: &[(u8, u32)] = &[(9, 9)];
 
-/// Each SPI value that decodes to nothing draws as Metal draws it, byte for byte, and as Metal
-/// draws without it: `sampleMask` with a bit for each sample (OpenGL's `0xffffffff` among them),
-/// at 1 and 4 samples; `logicOperation` off (OpenGL's 2 among them), and 2 on where nothing
+/// Each SPI value that decodes to nothing, or that the runtime holds, draws as Metal draws it,
+/// byte for byte, and as Metal draws without it: `sampleMask` with a bit for each sample
+/// (OpenGL's `0xffffffff` among them), at 1 and 4 samples; `logicOperation` off (OpenGL's 2 among them), and 2 on where nothing
 /// blends, at a partial write mask, into unorm, sRGB and half-float attachments; the alpha
 /// test's function off, and Always on; `clipDistanceEnableMask` at every mask under no, one and
 /// two clip distances; `depthStencilWriteDisabled` without a depth attachment; and each
@@ -336,10 +398,7 @@ fn spi_values_that_decode_draw_as_metals() {
         let without = case_on(&mp, &md, (vertex, &[], format, samples, colour)).unwrap();
         assert!(theirs == without, "{case:?}");
     }
-    let dying: [Case<'_>; 7] = [
-        ("cover", &["1c 04 00000000"], RGBA8, 1, none),
-        ("cover", &["1c 04 02000000"], RGBA8, 1, none),
-        ("cover", &["1c 04 05000000"], RGBA8, 4, none),
+    let dying: [Case<'_>; 4] = [
         ("cover", &["1b 04 0000003f"], RGBA8, 4, none),
         ("cover", &["2d 04 01000000"], RGBA8, 1, none),
         (
@@ -369,6 +428,361 @@ fn spi_values_that_decode_draw_as_metals() {
         let without = case_on(&mp, &md, (vertex, &[], format, samples, colour)).unwrap();
         assert!(theirs != without, "{case:?}");
     }
+}
+
+/// A Private `SIDE` by `SIDE` texture of `format` holding `texels` (`bytes` a texel, row by row),
+/// written by a blit from a buffer.
+fn holding<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    (format, bytes): (u32, u64),
+    texels: &[u8],
+) -> P::Texture {
+    let t = d
+        .new_texture(
+            OnFault::Die,
+            &p.texture_descriptor(&TextureDesc {
+                texture_type: 2,
+                pixel_format: u64::from(format),
+                width: SIDE,
+                height: SIDE,
+                sample_count: 1,
+                usage: USAGE,
+                resource_options: Some(PRIVATE),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let source = buffer::<P>(d, SIDE * SIDE * bytes, texels);
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        BlitCmd::CopyBufferToTexture {
+            source_buffer: &source,
+            source_offset: 0,
+            source_bytes_per_row: SIDE * bytes,
+            source_bytes_per_image: SIDE * SIDE * bytes,
+            source_size: MtlSize::new(SIDE, SIDE, 1),
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+        },
+        BlitCmd::EndEncoding,
+    ] {
+        blit.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    t
+}
+
+/// A sampler of nearest filtering, normalized coordinates and `desc`'s address modes, border
+/// colour and compare function.
+fn sampler<P: Platform>(d: &P::Device, desc: SamplerDesc) -> P::SamplerState {
+    d.new_sampler_state(&SamplerDesc {
+        min_filter: Some(0),
+        mag_filter: Some(0),
+        mip_filter: Some(0),
+        normalized_coordinates: Some(true),
+        ..desc
+    })
+    .unwrap()
+    .unwrap()
+}
+
+/// `MTLSamplerAddressModeClampToBorderColor`, and the raw border colours the tests sample past
+/// the edge under: transparent black, opaque black, opaque white, and 3 and 7, which no
+/// enumerator is and Metal takes.
+const CLAMP_TO_BORDER: u64 = 5;
+const BORDERS: [u64; 5] = [0, 1, 2, 3, 7];
+
+/// A texture of 8-bit texels each a different colour, for the samples past its edge.
+fn patterned<P: Platform>(p: &P, d: &P::Device) -> P::Texture {
+    let texels: Vec<u8> = (0..SIDE * SIDE)
+        .flat_map(|i| {
+            let i = u8::try_from(i).unwrap();
+            [i.wrapping_mul(37), 255 - i, i.wrapping_mul(11), 200]
+        })
+        .collect();
+    holding(p, d, (RGBA8, 4), &texels)
+}
+
+/// What `border_kernel` writes under a compute blob of its function and the 4-byte `entries`,
+/// sampling `t` through a sampler of border colour `border`, on `p`'s device `d`: one `float4` a
+/// thread of an 8 by 8 grid, as bytes.
+fn border_dispatched<P: Platform>(
+    d: &P::Device,
+    t: &P::Texture,
+    border: u64,
+    entries: &[&str],
+) -> Vec<u8> {
+    let library = d.new_library(SPI_KEYS).unwrap().unwrap().unwrap();
+    let function = library
+        .new_function(OnFault::Die, "border_kernel")
+        .unwrap()
+        .unwrap();
+    let mut blob = format!("{:02x} 00 04 01000000", entries.len() + 1);
+    for entry in entries {
+        blob.push(' ');
+        blob.push_str(entry);
+    }
+    let blob = super::tests::hex(&blob);
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        assert_eq!(r, 1);
+        Ok(Some(function.clone_ref()))
+    };
+    let desc = d
+        .deserialize_compute_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    let state = d
+        .new_compute_pipeline_state(Some(&desc), 0)
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let s = sampler::<P>(
+        d,
+        SamplerDesc {
+            s_address_mode: Some(CLAMP_TO_BORDER),
+            t_address_mode: Some(CLAMP_TO_BORDER),
+            border_color: Some(border),
+            ..SamplerDesc::default()
+        },
+    );
+    let length = SIDE * SIDE * 16;
+    let out = buffer::<P>(d, length, &[]);
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        ComputeCmd::SetComputePipelineState {
+            state: Some(&state),
+        },
+        ComputeCmd::SetTexture {
+            texture: Some(t),
+            index: 0,
+        },
+        ComputeCmd::SetSamplerStates {
+            samplers: &[Some(&s)],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::SetBuffers {
+            buffers: &[Some(&out)],
+            offsets: &[0],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(SIDE, SIDE, 1),
+            threads_per_threadgroup: MtlSize::new(SIDE, SIDE, 1),
+        },
+        ComputeCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    bytes_of::<P>(&out, length)
+}
+
+/// Each SPI value the runtime holds draws as Metal draws it, byte for byte, on this host (an
+/// Apple M3 Max), where the runtime's measurement of it is an M4's (the module docs):
+/// - `sampleMask` without a bit for each sample: 0 and 2 at 1 sample, and 0, 5 and `0xa` at 4,
+///   each of which Metal draws otherwise than without it;
+/// - `pointCoordLowerLeft`, `pointSizeOutputVS`, `twoSideEnabled`, `vertexDepthCompareClampMask`
+///   and `needsCustomBorderColorSamplers` (render 57), each at 1 and at `0xffffffff`: over a
+///   triangle; over points of a size the vertex function writes, coloured by their
+///   `[[point_coord]]`; over triangles of both windings, coloured by `[[front_facing]]`; over a
+///   vertex function's comparisons of references outside 0 to 1 against a depth of 0 and of 1,
+///   under `Less` and `Greater`; and over samples past a texture's edge in a fragment function,
+///   under each of [`BORDERS`]. Metal draws each as without it;
+/// - a compute blob's `needsCustomBorderColorSamplers` (12) at 1, over a kernel's samples past the
+///   edge under each of [`BORDERS`], which Metal runs as without it
+#[test]
+fn spi_values_the_runtime_holds_draw_as_metals() {
+    // What `p` draws of `functions` under the 4-byte `entries`, with `binds`.
+    fn held<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        functions: (&str, &str),
+        entries: &[&str],
+        binds: &Binds<'_, P>,
+    ) -> Vec<u8> {
+        let element: &[(u8, u32)] = &[(0, 0), (1, RGBA8)];
+        let state = state::<P>(d, functions, entries, &[element]).unwrap();
+        drawn_with(p, d, &state, (RGBA8, 1), binds)
+    }
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let mut differ = Vec::new();
+    // Adds to `differ` where `ours`, of the case `of`, is not `theirs`, or, where `unchanged`,
+    // `theirs` is not `without`.
+    let mut compare = |of: String, ours: Result<Vec<u8>, String>, theirs, without, unchanged| {
+        match ours {
+            Err(line) => differ.push(format!("{of}: died: {line}")),
+            Ok(ours) if ours != theirs => differ.push(format!("{of}: ours differ from Metal's")),
+            Ok(_) => {}
+        }
+        if unchanged && theirs != without {
+            differ.push(format!("{of}: Metal's differ from its own without the key"));
+        }
+        if !unchanged && theirs == without {
+            differ.push(format!("{of}: Metal's are its own without the mask"));
+        }
+    };
+    let survived = |f: &dyn Fn() -> Vec<u8>| {
+        *crate::answer::LAST_LINE.lock() = None;
+        catch_death(f).map_err(|site| {
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            format!("{site:?} {line}")
+        })
+    };
+    let none: &[(u8, u32)] = &[];
+    let masks: [Case<'_>; 5] = [
+        ("cover", &["1c 04 00000000"], RGBA8, 1, none),
+        ("cover", &["1c 04 02000000"], RGBA8, 1, none),
+        ("cover", &["1c 04 00000000"], RGBA8, 4, none),
+        ("cover", &["1c 04 05000000"], RGBA8, 4, none),
+        ("cover", &["1c 04 0a000000"], RGBA8, 4, none),
+    ];
+    for case @ (vertex, _, format, samples, colour) in masks {
+        let ours = survived(&|| case_on(&p, &d, case).unwrap());
+        let theirs = case_on(&mp, &md, case).unwrap();
+        let without = case_on(&mp, &md, (vertex, &[], format, samples, colour)).unwrap();
+        compare(format!("{case:?}"), ours, theirs, without, false);
+    }
+    let (ot, ts) = (patterned(&p, &d), patterned(&mp, &md));
+    let mut cases = 0;
+    for key in [0x32u8, 0x33, 0x34, 0x35, 0x39] {
+        for value in ["01000000", "ffffffff"] {
+            let entry = format!("{key:02x} 04 {value}");
+            let entries = [entry.as_str()];
+            // The runtime notes `RestrictedDepthRange` at a vertex function's depth comparison
+            // on this host's MoltenVK, under the key or not, which strict mode dies of: that
+            // draw is compared as the process runs by default.
+            let mut both =
+                |what: &str,
+                 functions: (&str, &str),
+                 binds: (&Binds<'_, VulkanPlatform>, &Binds<'_, MetalPlatform>)| {
+                    let (ob, tb) = binds;
+                    let ours = survived(&|| {
+                        let draw = || held(&p, &d, functions, &entries, ob);
+                        match functions.0 {
+                            "compare_vertex" => crate::answer::relaxed(draw),
+                            _ => draw(),
+                        }
+                    });
+                    let theirs = held(&mp, &md, functions, &entries, tb);
+                    let without = held(&mp, &md, functions, &[], tb);
+                    compare(format!("{entry} {what}"), ours, theirs, without, true);
+                    cases += 1;
+                };
+            // A triangle; points coloured by their coordinate; and triangles of both windings,
+            // coloured by their facing.
+            for (functions, primitive, count) in [
+                (("cover", "paint"), 3, 3),
+                (("points", "paint_coord"), 0, 4),
+                (("facing", "paint_facing"), 3, 6),
+            ] {
+                let binds = (
+                    &Binds {
+                        primitive,
+                        count,
+                        ..Binds::triangle()
+                    },
+                    &Binds {
+                        primitive,
+                        count,
+                        ..Binds::triangle()
+                    },
+                );
+                both(functions.1, functions, binds);
+            }
+            // A vertex function's comparisons against a depth of 0 and of 1.
+            for depth in [0.0f32, 1.0] {
+                let texels: Vec<u8> = (0..SIDE * SIDE).flat_map(|_| depth.to_ne_bytes()).collect();
+                let (od, td) = (
+                    holding(&p, &d, (DEPTH32, 4), &texels),
+                    holding(&mp, &md, (DEPTH32, 4), &texels),
+                );
+                for compare_function in [1, 4] {
+                    let desc = SamplerDesc {
+                        compare_function: Some(compare_function),
+                        ..SamplerDesc::default()
+                    };
+                    let (os, tss) = (
+                        sampler::<VulkanPlatform>(&d, desc),
+                        sampler::<MetalPlatform>(&md, desc),
+                    );
+                    let binds = (
+                        &Binds {
+                            vertex: Some((&od, &os)),
+                            ..Binds::triangle()
+                        },
+                        &Binds {
+                            vertex: Some((&td, &tss)),
+                            ..Binds::triangle()
+                        },
+                    );
+                    both(
+                        &format!("comparisons against {depth} by {compare_function}"),
+                        ("compare_vertex", "paint_shaded"),
+                        binds,
+                    );
+                }
+            }
+            // Samples past a texture's edge.
+            for border in BORDERS {
+                let desc = SamplerDesc {
+                    s_address_mode: Some(CLAMP_TO_BORDER),
+                    t_address_mode: Some(CLAMP_TO_BORDER),
+                    border_color: Some(border),
+                    ..SamplerDesc::default()
+                };
+                let (os, tss) = (
+                    sampler::<VulkanPlatform>(&d, desc),
+                    sampler::<MetalPlatform>(&md, desc),
+                );
+                let binds = (
+                    &Binds {
+                        fragment: Some((&ot, &os)),
+                        ..Binds::triangle()
+                    },
+                    &Binds {
+                        fragment: Some((&ts, &tss)),
+                        ..Binds::triangle()
+                    },
+                );
+                both(
+                    &format!("samples past the edge, border colour {border}"),
+                    ("cover", "paint_border"),
+                    binds,
+                );
+            }
+        }
+    }
+    assert_eq!(cases, 5 * 2 * (3 + 4 + BORDERS.len()));
+    for border in BORDERS {
+        let set = ["0c 04 01000000"];
+        let ours = survived(&|| border_dispatched::<VulkanPlatform>(&d, &ot, border, &set));
+        let theirs = border_dispatched::<MetalPlatform>(&md, &ts, border, &set);
+        let without = border_dispatched::<MetalPlatform>(&md, &ts, border, &[]);
+        compare(
+            format!("kernel, border colour {border}"),
+            ours,
+            theirs,
+            without,
+            true,
+        );
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// What a pass of a depth-stencil attachment draws under a state of `entries`: its colour, then

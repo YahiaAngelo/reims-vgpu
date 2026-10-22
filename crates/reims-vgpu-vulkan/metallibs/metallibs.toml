@@ -10,7 +10,7 @@
 "ycbcr_probe.metallib" = "f0ff7d791baf6bc798658404b77e1df827020526d1cbcf9595ca1a12df9471ed"
 "refused.metallib" = "9fdfdf20dfe3f369d2327680d3deb895c42d1f200a6778c64ca60679ada375e1"
 "simd_stages.metallib" = "22e1de01ee1a6bcf4e177cea6fc2b4a1fdc428164e8933563a34de35076c51a7"
-"spi_keys.metallib" = "fb8eeebd3a27813f6d3d38a5a9e30c257f6d12f1764643280e73191281359757"
+"spi_keys.metallib" = "3d0556ba028c7dacfae33d7df241d0d1add4988371c78191c42fe7d63b83121a"
 "slice_write_repro.metallib" = "1c4872993597dfe010052ac5642aa8e31c56afe332686a732fed2d282f54719c"
 "unrasterized.metallib" = "b831601e9c812bd6cc313a5386004ad4701bc58ca1564ab03fa0cdaef4202175"
 "icb_color1.metallib" = "bbbeee21913b5c087448d1521ecebeaf6682eeb088276ffc8985f04b9382eedc"
