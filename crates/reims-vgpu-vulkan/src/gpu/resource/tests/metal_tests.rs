@@ -4763,12 +4763,12 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
 
 /// A depth or stencil texture without allowGPUOptimizedContents placed in a heap, which the
 /// runtime sizes as Metal does (`heap_depth_stencil_sizes_with_optimized_contents_off`). In a
-/// heap over no address ranges, core's legacy heap, one made dies where it is made, at every
-/// shape, as every depth or stencil texture made there does ([`HeapObject::legacy_made`]): a
-/// `Depth32Float` one and the suite's (a 2D `Depth32Float_Stencil8` render target, 8x8, as
-/// `render_state_depth` and four more cases place it there), one with the property on, and a
-/// 64x64 one at 0x4000 of the 0x8000 heap, where Metal's 16384 bytes fit, as core's copies would
-/// carry the runtime's layout to the guest's pages. The suite's beside the first, where Metal's
+/// heap over no address ranges, core's legacy heap, one is made, laid out in Metal's tiles on
+/// MoltenVK, in the driver's layout on any other driver, which the runtime announces
+/// (`legacy_heap_textures_announce_the_runtimes_layouts`): a `Depth32Float` one and the suite's (a
+/// 2D `Depth32Float_Stencil8` render target, 8x8, as `render_state_depth` and four more cases
+/// place it there), one with the property on, and a 64x64 one at 0x4000 of the 0x8000 heap,
+/// where Metal's 16384 bytes fit. The suite's beside the first, where Metal's
 /// size (16512 bytes, as the runtime's) runs past the heap's end, is nil, as Metal's; so are a
 /// 128x128 one at 0 (Metal's 65536 bytes), one off Metal's alignment (a 16x16 one at 0x40) and
 /// one past the heap's end, as the Metal platform answers in a heap of its own. A buffer over
@@ -4778,7 +4778,6 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
 /// byte of a buffer that lives. The Metal platform makes each made here or dying here
 #[test]
 fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
-    use reims_vgpu_core::raise::death::DeathSite;
     let texture_sel = "newTextureWithDescriptor:offset:";
     /// A `Depth32Float` render target, `side` by `side`, of `options`.
     fn depth_in<P: Platform>(
@@ -4894,9 +4893,6 @@ fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
             assert!(made(), "Metal: {case}");
         });
     }
-    let dies = |site: DeathSite, sel, case: &str| {
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{case}");
-    };
     let d = dev();
     let raw = suites.fields().descriptor(texture_sel, Maker::SizeQuery);
     let answer = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
@@ -4909,18 +4905,7 @@ fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
         ("with the property on", depth(16, Some(true)), beside),
         ("a 64x64 one at 0x4000", depth(64, Some(false)), 0x4000),
     ] {
-        *crate::answer::LAST_LINE.lock() = None;
-        dies(
-            catch_death(|| h.new_texture(&desc, at)).unwrap_err(),
-            texture_sel,
-            case,
-        );
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert!(
-            line.contains("a heap over no address ranges"),
-            "{case}: {line}"
-        );
-        assert!(line.contains("depth or stencil"), "{case}: {line}");
+        assert!(h.new_texture(&desc, at).unwrap().is_some(), "{case}");
     }
     let suites = suites_of(&platform(), 0x120);
     assert!(
@@ -6129,25 +6114,34 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
 /// What [`legacy_heap_bytes_on`] answers.
 type LegacyBytes = Option<(u64, Vec<u8>, Vec<u8>)>;
 
-/// What [`legacy_heap_bytes_on`] shows of `shape` at 0x10000 on the Vulkan platform's `d`: `None`
-/// where it dies of another kind than the heap's (the format, which the runtime lacks), the
-/// death's line where it dies of the heap's.
-fn legacy_heap_death(d: &VulkanDevice, shape: LegacyShape) -> Option<Result<LegacyBytes, String>> {
+/// What [`legacy_heap_bytes_on`] shows of `shape` at 0x10000 on the Vulkan platform's `d`, and
+/// the degradations the runtime announced as it ran that are not of [`crate::answer::DIES`]; the
+/// death's site and line where it dies (of the format, which the runtime lacks, among others).
+fn legacy_heap_on_vulkan(
+    d: &VulkanDevice,
+    shape: LegacyShape,
+) -> Result<(LegacyBytes, Vec<rt::Degradation>), String> {
     let desc = |t: &TextureDesc| platform().texture_descriptor(t);
     *crate::answer::LAST_LINE.lock() = None;
+    let before = crate::answer::RELAYED.lock().len();
     match catch_death(|| legacy_heap_bytes_on::<VulkanPlatform>(d, &desc, shape, 0x10000)) {
-        Ok(bytes) => Some(Ok(bytes)),
+        Ok(bytes) => Ok((bytes, crate::answer::RELAYED.lock()[before..].to_vec())),
         Err(site) => {
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            let heaps = "placed in a heap over no address ranges";
-            let at = (DeathKind::Abort, "newTextureWithDescriptor:offset:");
-            ((site.kind, site.file) == at && line.contains(heaps)).then_some(Err(line))
+            Err(format!("{:?} at {}: {line}", site.kind, site.file))
         }
     }
 }
 
-/// A texture of one sample and a colour format that Metal keeps uncompressed
-/// ([`metal_keeps_plain`]), placed in a heap over no address ranges with a buffer over all of
+/// Whether the device `d` is MoltenVK's, which places each image as a Metal texture in the
+/// Metal heap under its memory.
+fn on_moltenvk(d: &VulkanDevice) -> bool {
+    d.raw.properties().description.driver_id == Some(metal2vulkan::vk::DriverId::MOLTENVK)
+}
+
+/// A texture of one sample and a colour format that Metal keeps uncompressed (without
+/// `allowGPUOptimizedContents`, at a level 0 whose shorter side is under 16 texels, or of an
+/// unknown usage or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage), placed in a heap over no address ranges with a buffer over all of
 /// the heap first, as core makes its legacy heap, is made on MoltenVK, and the heap's bytes over
 /// it are Metal's both ways ([`legacy_heap_bytes_on`]): the bytes copied out after its texels
 /// are written, and the texels read after other bytes are copied in, byte for byte. Of every
@@ -6166,7 +6160,7 @@ fn legacy_heap_textures_are_metals_where_metal_keeps_them_plain() {
         return;
     };
     let d = dev();
-    if d.raw.properties().description.driver_id != Some(metal2vulkan::vk::DriverId::MOLTENVK) {
+    if !on_moltenvk(&d) {
         return;
     }
     let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
@@ -6226,10 +6220,9 @@ fn legacy_heap_textures_are_metals_where_metal_keeps_them_plain() {
     let mut compared = 0;
     for shape in shapes {
         let case = format!("{shape:?}");
-        let Some(made) = legacy_heap_death(&d, shape) else {
+        let Ok((ours, _)) = legacy_heap_on_vulkan(&d, shape) else {
             continue;
         };
-        let ours = made.unwrap_or_else(|line| panic!("{case}: {line}"));
         let theirs = legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000);
         assert_eq!(ours.is_some(), theirs.is_some(), "{case}");
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
@@ -6243,56 +6236,111 @@ fn legacy_heap_textures_are_metals_where_metal_keeps_them_plain() {
     assert!(compared >= 500, "{compared} compared");
 }
 
-/// A colour texture placed in a heap over no address ranges whose bytes the rule of
-/// [`HeapObject::legacy_made`] does not show are Metal's is made where Metal makes it, and its
-/// layout noticed ([`LegacyLayout`], announced once per device): one Metal may keep losslessly
-/// compressed, whether its bytes are Metal's (`RGBA8Unorm`, a 64x64 render target, 16x16 read
-/// textures) or not (an `R32Uint` or `RGBA8Uint` render target of 16x16 or more, a 3D
-/// `RGBA8Unorm` render target, an extended-range `BGRA10_XR` texture: measured, their bytes
-/// copied out or in differing from Metal's on MoltenVK); and a 4-sample render target without
-/// the property. A depth or stencil texture with `allowGPUOptimizedContents`, whose bytes are
-/// not Metal's at any shape measured (`Depth16Unorm`, `Depth32Float` and `Stencil8`, 8x8 and
-/// 64x64), dies at the placement, naming the heap and the reason
+/// A depth or stencil texture of one sample without `allowGPUOptimizedContents`, placed in a heap
+/// over no address ranges with a buffer over all of the heap first, as core makes its legacy
+/// heap, is made on MoltenVK, laid out in Metal's tiles, and the heap's bytes over it are Metal's
+/// both ways ([`legacy_heap_bytes_on`]), with nothing announced of its layout: `Depth16Unorm`
+/// and `Stencil8` render targets of 8x8, 37x5, 64x64 and 100x70, a 3-level 64x64 one and a
+/// 2-slice array of 32x32. `Depth32Float`, whose values a copy into it need not keep bit for bit
+/// outside `[0, 1]`, is left to the runtime's own probes
 #[test]
-fn legacy_heap_textures_metal_may_compress_are_announced() {
+fn legacy_heap_depth_textures_are_metals_where_metal_keeps_them_plain() {
+    let Some(metal) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    if !on_moltenvk(&d) {
+        return;
+    }
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let layouts = [
+        rt::Degradation::HeapTextureUntiledLayout,
+        rt::Degradation::HeapTextureLosslessLayout,
+    ];
+    let mut shapes = Vec::new();
+    for (format, block) in [(250, (2, (1, 1))), (253, (1, (1, 1)))] {
+        for side in [(8, 8), (37, 5), (64, 64), (100, 70)] {
+            shapes.push(LegacyShape::flat(format, block, side, 0x5, Some(false)));
+        }
+        let flat = LegacyShape::flat(format, block, (64, 64), 0x5, Some(false));
+        shapes.push(LegacyShape { levels: 3, ..flat });
+        shapes.push(LegacyShape {
+            texture_type: 3,
+            width: 32,
+            height: 32,
+            array: 2,
+            ..flat
+        });
+    }
+    for shape in shapes {
+        let case = format!("{shape:?}");
+        let (ours, relayed) =
+            legacy_heap_on_vulkan(&d, shape).unwrap_or_else(|line| panic!("{case}: {line}"));
+        let ours = ours.unwrap_or_else(|| panic!("made: {case}"));
+        assert!(
+            !layouts.iter().any(|kind| relayed.contains(kind)),
+            "{case}: {relayed:?}"
+        );
+        let theirs = legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000);
+        let theirs = theirs.unwrap_or_else(|| panic!("Metal makes it: {case}"));
+        assert_eq!(ours.0, theirs.0, "size: {case}");
+        assert!(ours.1 == theirs.1, "copied out: {case}");
+        assert!(ours.2 == theirs.2, "copied in: {case}");
+    }
+}
+
+/// A texture placed in a heap over no address ranges whose bytes the runtime does not lay out
+/// there as Metal's is made where Metal makes it, and the runtime announces its layout, which is
+/// relayed: one Metal may keep losslessly compressed (`heap-texture-lossless-layout`), whether
+/// its bytes are Metal's (`RGBA8Unorm`, a 64x64 render target, 16x16 read textures) or not (an
+/// `R32Uint` or `RGBA8Uint` render target of 16x16 or more, a 3D `RGBA8Unorm` render target, an
+/// extended-range `BGRA10_XR` texture: measured, their bytes copied out or in differing from
+/// Metal's on MoltenVK), depth and stencil textures with `allowGPUOptimizedContents` among them
+/// (`Depth32Float` and `Stencil8`, 64x64), and a 4-sample render target without the property
+/// (`heap-texture-untiled-layout`). An 8x8 `Depth16Unorm` texture with the property, which Metal
+/// keeps uncompressed, is laid out in Metal's tiles on MoltenVK, announcing nothing, and in the
+/// driver's layout on any other driver (`heap-texture-untiled-layout`)
+#[test]
+fn legacy_heap_textures_announce_the_runtimes_layouts() {
     let Some(metal) = MetalPlatform::system_default_device() else {
         return;
     };
     let d = dev();
     let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let plain = (4, (1, 1));
-    let moltenvk = crate::gpu::resource::on_moltenvk(&d);
-    let noticed = if moltenvk {
-        LegacyLayout::Compressible
-    } else {
-        LegacyLayout::Driver
-    };
-    let taken =
-        || crate::gpu::resource::LEGACY_LAYOUTS.with(|l| std::mem::take(&mut *l.borrow_mut()));
-    for (case, shape, differs) in [
+    let moltenvk = on_moltenvk(&d);
+    let lossless = Some(rt::Degradation::HeapTextureLosslessLayout);
+    let untiled = Some(rt::Degradation::HeapTextureUntiledLayout);
+    let layouts = [untiled, lossless];
+    for (case, shape, announced, differs) in [
         (
             "RGBA8Unorm render target",
             LegacyShape::flat(70, plain, (64, 64), 0x5, None),
+            lossless,
             false,
         ),
         (
             "RGBA8Unorm read",
             LegacyShape::flat(70, plain, (16, 16), 0x1, Some(true)),
+            lossless,
             false,
         ),
         (
             "R32Uint render target",
             LegacyShape::flat(53, plain, (16, 16), 0x5, None),
+            lossless,
             true,
         ),
         (
             "RGBA8Uint render target",
             LegacyShape::flat(73, plain, (64, 64), 0x4, None),
+            lossless,
             true,
         ),
         (
             "BGRA10_XR read",
             LegacyShape::flat(552, (8, (1, 1)), (64, 64), 0x1, None),
+            lossless,
             true,
         ),
         (
@@ -6302,45 +6350,43 @@ fn legacy_heap_textures_metal_may_compress_are_announced() {
                 depth: 8,
                 ..LegacyShape::flat(70, plain, (16, 16), 0x5, None)
             },
+            lossless,
             true,
-        ),
-    ] {
-        let theirs = legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000);
-        let theirs = theirs.unwrap_or_else(|| panic!("Metal makes it: {case}"));
-        taken();
-        let made = legacy_heap_death(&d, shape).unwrap();
-        let ours = made.unwrap_or_else(|line| panic!("{case}: {line}"));
-        let ours = ours.unwrap_or_else(|| panic!("made: {case}"));
-        assert_eq!(taken(), [noticed], "{case}");
-        if moltenvk && differs {
-            assert!(ours.1 != theirs.1 || ours.2 != theirs.2, "differs: {case}");
-        }
-    }
-    let depth = if moltenvk {
-        "depth or stencil"
-    } else {
-        "its own layout"
-    };
-    for (case, shape) in [
-        (
-            "Depth16Unorm",
-            LegacyShape::flat(250, (2, (1, 1)), (8, 8), 0x1, Some(true)),
         ),
         (
             "Depth32Float",
             LegacyShape::flat(252, plain, (64, 64), 0x5, None),
+            lossless,
+            false,
         ),
         (
             "Stencil8",
             LegacyShape::flat(253, (1, (1, 1)), (64, 64), 0x1, Some(true)),
+            lossless,
+            false,
+        ),
+        (
+            "Depth16Unorm",
+            LegacyShape::flat(250, (2, (1, 1)), (8, 8), 0x1, Some(true)),
+            if moltenvk { None } else { untiled },
+            false,
         ),
     ] {
-        assert!(
-            legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000).is_some(),
-            "Metal makes it: {case}"
-        );
-        let line = legacy_heap_death(&d, shape).unwrap().unwrap_err();
-        assert!(line.contains(depth), "{case}: {line}");
+        let theirs = legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000);
+        let theirs = theirs.unwrap_or_else(|| panic!("Metal makes it: {case}"));
+        let (ours, relayed) =
+            legacy_heap_on_vulkan(&d, shape).unwrap_or_else(|line| panic!("{case}: {line}"));
+        let ours = ours.unwrap_or_else(|| panic!("made: {case}"));
+        for kind in layouts {
+            let heard = kind.is_some_and(|kind| relayed.contains(&kind));
+            assert_eq!(heard, kind == announced, "{case}: {kind:?} in {relayed:?}");
+        }
+        if moltenvk && differs {
+            assert!(ours.1 != theirs.1 || ours.2 != theirs.2, "differs: {case}");
+        }
+        if announced.is_none() {
+            assert!(ours == theirs, "Metal's bytes: {case}");
+        }
     }
     let multisample = TextureDesc {
         texture_type: 4,
@@ -6369,13 +6415,13 @@ fn legacy_heap_textures_metal_may_compress_are_announced() {
         .unwrap()
         .unwrap();
     let desc = platform().texture_descriptor(&multisample);
-    taken();
+    let before = crate::answer::RELAYED.lock().len();
     let placed = heap.new_texture(&desc, 0).unwrap();
     assert!(placed.is_some(), "the multisample texture");
-    let noticed = if moltenvk {
-        LegacyLayout::Multisample
-    } else {
-        LegacyLayout::Driver
-    };
-    assert_eq!(taken(), [noticed], "the multisample texture");
+    let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
+    let untiled = rt::Degradation::HeapTextureUntiledLayout;
+    assert!(
+        relayed.contains(&untiled),
+        "the multisample texture: {relayed:?}"
+    );
 }

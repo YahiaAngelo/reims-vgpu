@@ -1244,10 +1244,11 @@ pub const DIES: [rt::Degradation; 131] = [
 /// The degradations a creator here learns of, announced at every occurrence too, which do not
 /// die ([`hearing`]):
 /// - `HeapTwoPlaneTexture`, a heap's two-plane XR10 texture whose texels lie in memory of their
-///   own, apart from the heap's bytes (one whose moves pass the device's limits; a mipmapped one
-///   and a 1D array announce `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the
-///   caller's thread
-///   inside the placement's call, which dies where a buffer or texture of the heap that lives
+///   own, apart from the heap's bytes: only one whose moves pass the device's limits (a one-level
+///   one keeps its planes in the heap's bytes, a 3D one its first depth slice's, over which Metal
+///   lays every other, and a mipmapped one and a 1D array its first level's, announcing
+///   `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the caller's thread inside the
+///   placement's call, which dies where a buffer or texture of the heap that lives
 ///   shares a byte with it: the heap's cover, the buffer over all of it core makes with each
 ///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]);
 /// - `MetalLevelBelowHost`, a device made on a macOS host whose release the runtime has not
@@ -1297,15 +1298,18 @@ pub const DIES: [rt::Degradation; 131] = [
 ///   (in strict mode die at their selector, [`crate::gpu::encode_render`]). Relayed the first
 ///   time alone ([`RELAYED_ONCE`]);
 /// - `HeapTextureUntiledLayout`, a texture in a heap over the guest's pages that the runtime does
-///   not lay out in Metal's tiles: a multisample texture, a two-aspect depth and stencil format, a
-///   PVRTC format, an image that holds other bytes than Metal's elements, or one past the device's
-///   limits; and in any heap a multisample texture Metal keeps uncompressed whose image the runtime
-///   makes in memory of its own, where the heap's memory cannot hold it (a `Shared` heap's depth or
-///   stencil texture without `allowGPUOptimizedContents` on MoltenVK). The runtime announces it
-///   too of a texture in a heap over the device's memory whose bytes there are not Metal's layout
-///   (a multisample one among them): in a heap over no address ranges, core's legacy heap, that
-///   is what the heap's `legacy_made` (`crate::gpu::resource::HeapObject`) notices of its bytes
-///   there, so it is relayed alone there. Its reads, writes and copies are Metal's, but its bytes
+///   not lay out in Metal's tiles: a layout not measured (a format whose layout in Metal's heaps
+///   is not probed), an image that holds other bytes than Metal's elements, moves past the
+///   device's limits, or a multisample texture whose samples the device does not move to and from
+///   a buffer (a 16-bit depth where its multisampled copies go by draws), in memory of its own; a
+///   multisample depth or stencil texture Metal keeps uncompressed lies in Metal's tiles, its
+///   samples side by side, on MoltenVK as elsewhere. The runtime announces it too of a texture in
+///   a heap over the device's memory whose bytes there are not Metal's layout: its image in the
+///   driver's layout (any colour image on a driver other than MoltenVK, a depth or stencil image
+///   the runtime does not tile), a shadow of the bytes in rows, a multisample texture, its colour
+///   ones on MoltenVK among them, or a layout not measured. In a heap over no address ranges,
+///   core's legacy heap, whose bytes core copies to and from the guest's pages, it is relayed
+///   alone ([`crate::gpu::resource::Placements`]). Its reads, writes and copies are Metal's, but its bytes
 ///   in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or texture
 ///   over them would meet other bytes than on Metal. Announced at each such texture, inside
 ///   `newTextureWithDescriptor:offset:`, which hears it. Over the guest's pages the heap keeps it
@@ -1318,18 +1322,22 @@ pub const DIES: [rt::Degradation; 131] = [
 ///   ([`RELAYED_ONCE`]), where nothing shares its bytes;
 /// - `HeapTextureLosslessLayout`, a texture in a heap over the guest's pages that Metal keeps
 ///   losslessly compressed, whose bytes on Metal are no layout of its texels: a single-sample one
-///   laid out as the runtime's own, which guests make by the tens of thousands a boot, and a 2- or
-///   4-sample one, its image in memory of its own, the heap's bytes keeping what they held. The
-///   runtime announces it too of such a texture in a heap over the device's memory, its image in
-///   the heap's bytes in the driver's layout (or, where the heap's memory cannot hold it, in memory
-///   of its own): in a heap over no address ranges, core's legacy heap, that is what `legacy_made`
-///   notices of its bytes there, so it is relayed alone there. Its reads, writes, resolves and
-///   copies are Metal's: only another resource over its bytes meets other bytes. Announced at each
-///   such texture, inside `newTextureWithDescriptor:offset:`, which hears it. A single-sample one
-///   is made and the notice relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A
-///   multisample one over the guest's pages is made too, and relayed as [`Inexact::HeapLayout`] (in
-///   strict mode it dies there, named): a buffer or texture over its bytes, which on Metal sees and
-///   changes them, would neither see nor change its image;
+///   laid out in its uncompressed tiles, which guests make by the tens of thousands a boot, and a
+///   2- or 4-sample one, its samples in its uncompressed tiles, or, where the device does not
+///   move them to and from a buffer, its image in memory of its own, the heap's bytes keeping what
+///   they held. The runtime announces it too of a depth or stencil texture it lays out in Metal's
+///   uncompressed tiles in any heap on MoltenVK, and of such a texture in a heap over the device's
+///   memory, its image there of the runtime's usage, which need not be compressed as Metal's: in
+///   a heap over no address ranges, core's legacy heap, it is relayed alone
+///   ([`crate::gpu::resource::Placements`]). Its reads, writes, resolves and copies are Metal's:
+///   only another resource over its bytes meets other bytes. Announced at each such texture,
+///   inside `newTextureWithDescriptor:offset:`, which hears it. A single-sample one is made and the
+///   notice relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A multisample
+///   one over the guest's pages is made too, and relayed as [`Inexact::HeapLayout`] (in strict
+///   mode it dies there, named): where its image lies in memory of its own, a buffer or texture
+///   over its bytes, which on Metal sees and changes them, would neither see nor change it. The
+///   notice does not tell that one from one whose samples lie in the heap's bytes, which a
+///   buffer over them meets uncompressed, as a single-sample one's texels: both relay so;
 /// - `UnmeasuredHeapTextureSize`, a texture whose layout in Metal's heaps the runtime does not
 ///   model, whose size and alignment it answers as its device's image's, larger or smaller than
 ///   Metal's: at the pinned runtime a PVRTC format on a device of Metal level 26.7 (the runtime

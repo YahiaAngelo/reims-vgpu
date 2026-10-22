@@ -435,10 +435,12 @@ pub struct HeapObject {
 /// apart; an untiled one's in the runtime's layout, where Metal's are its tiles; an optimized
 /// one's laid out and sized by the runtime, larger than Metal's.
 ///
-/// A depth or stencil texture made in a legacy heap dies, and a colour texture whose bytes there
-/// a stated rule does not show are Metal's is announced, once per device: core's copies through
-/// the heap's private buffer carry those bytes to and from the guest's pages
-/// ([`HeapObject::legacy_made`]).
+/// In a legacy heap, core's copies through the heap's private buffer carry the bytes of its
+/// textures to and from the guest's pages: the runtime lays a texture out there in Metal's tiles
+/// where it holds them (on MoltenVK, a texture of one sample that Metal keeps uncompressed, of a
+/// colour format, `Depth16Unorm`, `Depth32Float`, `Stencil8` or `Depth32Float_Stencil8`), and
+/// else announces its layout there (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`),
+/// which its creation relays, the first time alone ([`crate::answer::HEARD`]).
 #[derive(Debug, Default)]
 pub struct Placements {
     /// Its textures nothing may share a byte with, and why.
@@ -550,109 +552,6 @@ fn optimized_line(what: &str) -> String {
          sizes as Metal's texture with the property on, larger than Metal's with it off \
          (optimized-depth-stencil-texture)"
     )
-}
-
-/// Whether Metal keeps a colour texture of `desc` uncompressed, by the rule the runtime measured
-/// of Metal's lossless compression on an Apple M3 Max under macOS 26.7 and an Apple M4 under
-/// 27.0.1 (its `heap_tiled.rs`, `metal_compresses`): without `allowGPUOptimizedContents`, at a
-/// level 0 whose shorter side is under 16 texels (a 1D texture's is its one row), or of an
-/// unknown usage (every usage) or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage.
-pub(crate) fn metal_keeps_plain(desc: &rt::TextureDescriptor) -> bool {
-    let one_row = matches!(
-        desc.texture_type,
-        TextureType::Type1D | TextureType::Type1DArray
-    );
-    let shorter = if one_row {
-        1
-    } else {
-        desc.width.min(desc.height)
-    };
-    let plain = TextureUsage::SHADER_WRITE
-        .union(TextureUsage::PIXEL_FORMAT_VIEW)
-        .union(TextureUsage::SHADER_ATOMIC);
-    !desc.allow_gpu_optimized_contents
-        || shorter < 16
-        || desc.usage.is_empty()
-        || desc.usage.intersects(plain)
-}
-
-/// Whether `device`'s driver is MoltenVK, which places each image as a Metal texture in the
-/// Metal heap under its memory ([`HeapObject::legacy_made`]).
-pub(crate) fn on_moltenvk(device: &VulkanDevice) -> bool {
-    plain(|| device.raw.properties().description.driver_id)
-        == Some(metal2vulkan::vk::DriverId::MOLTENVK)
-}
-
-/// Why a colour texture's bytes in a heap over no address ranges may not be Metal's, which
-/// [`HeapObject::legacy_made`] announces once per device for each: an interim notice, pending a
-/// probe of Metal's bytes there and the runtime's laying such textures out in Metal's layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyLayout {
-    /// The device's driver is not MoltenVK, and lays the runtime's image out in its own layout.
-    Driver,
-    /// Metal may keep the texture losslessly compressed, which MoltenVK's texture, of the
-    /// runtime's usage, need not be ([`metal_keeps_plain`]).
-    Compressible,
-    /// The texture has more than one sample, whose bytes there nothing measured.
-    Multisample,
-}
-
-impl LegacyLayout {
-    /// The notice's line, naming the first texture of `desc` met for it.
-    fn notice(self, desc: &rt::TextureDescriptor) -> String {
-        let (name, why) = match self {
-            LegacyLayout::Driver => (
-                "legacy-heap-driver-layout",
-                "the device's driver lays the runtime's image out in its own layout",
-            ),
-            LegacyLayout::Compressible => (
-                "legacy-heap-compression-layout",
-                "Metal may keep the texture losslessly compressed (allowGPUOptimizedContents, a \
-                 level 0 whose shorter side is 16 texels or more, and none of ShaderWrite, \
-                 PixelFormatView and ShaderAtomic usage), which MoltenVK's texture of the \
-                 runtime's usage need not be",
-            ),
-            LegacyLayout::Multisample => (
-                "legacy-heap-multisample-layout",
-                "no measurement shows a multisample texture's bytes there as Metal's",
-            ),
-        };
-        format!(
-            "reims-vgpu-vulkan: {name}: a texture placed in a heap over no address ranges (first \
-             met: pixel format {}, {} sample(s), {}x{}x{}), whose bytes core copies to and from \
-             the guest's pages, carries the runtime's layout of the texture there, not Metal's: \
-             the guest's pages and the texture after a page-in hold bytes that differ from \
-             Metal's where the two layouts differ: {why}. Announced once per device; an interim \
-             notice, pending a probe of Metal's bytes there and their replication",
-            desc.pixel_format.as_raw(),
-            desc.sample_count,
-            desc.width,
-            desc.height,
-            desc.depth,
-        )
-    }
-}
-
-/// The devices, by registry ID, with each [`LegacyLayout`] they announced.
-static LEGACY_ANNOUNCED: Mutex<Vec<(u64, LegacyLayout)>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-std::thread_local! {
-    /// Each [`LegacyLayout`] [`HeapObject::legacy_made`] met on this thread, announced or not,
-    /// which a test reads.
-    pub(crate) static LEGACY_LAYOUTS: std::cell::RefCell<Vec<LegacyLayout>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Whether the device of registry ID `device` meets `layout` for the first time, which it then
-/// has.
-fn first_legacy_layout(device: u64, layout: LegacyLayout) -> bool {
-    let mut announced = LEGACY_ANNOUNCED.lock();
-    if announced.contains(&(device, layout)) {
-        return false;
-    }
-    announced.push((device, layout));
-    true
 }
 
 /// Whether the ranges share a byte.
@@ -777,8 +676,7 @@ impl HeapObject {
 
     /// The runtime's texture of `desc`, a depth or stencil texture without
     /// `allowGPUOptimizedContents` (`optimized-depth-stencil-texture`), made by `sel` at `offset`
-    /// in a heap over address ranges (in any other it has died, [`HeapObject::legacy_made`]), of
-    /// `size` bytes as the runtime answers them: it relays, or dies in strict mode
+    /// in a heap, of `size` bytes as the runtime answers them: it relays, or dies in strict mode
     /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its
     /// bytes past the heap's end), where the runtime answers fewer bytes than Metal's, or none
     /// (`HeapObject::new_texture`), and where the runtime's model of Metal's size and alignment
@@ -810,80 +708,6 @@ impl HeapObject {
                 "a placement where Metal answers nil, or that the runtime answers fewer bytes for \
                  than Metal's, of",
             );
-        }
-    }
-
-    /// The runtime's texture of `desc`, made by `sel` in a heap over no address ranges, core's
-    /// legacy heap, whose bytes core copies through its buffer over all of the heap to and from
-    /// the guest's pages ([`Placements`]): the guest's pages hold, and the texture reads after a
-    /// copy into the heap, the bytes of the runtime's image in the heap's memory, where Metal's
-    /// are Metal's own layout of the texture. Those bytes are Metal's by this rule, and nothing is
-    /// said of such a texture:
-    /// - the device's driver is MoltenVK, which places each image as a Metal texture in the
-    ///   Metal heap under its memory, at its offset (`MVKDeviceMemory::ensureMTLHeap`, the
-    ///   runtime's `driver_defects.rs`), and Metal lays a texture it keeps uncompressed out by its
-    ///   format, type, extent, levels and slices alone, whatever its usage: the heap's bytes over
-    ///   such a texture are Metal's, both ways, at every colour format the runtime makes on this
-    ///   host and every type, level count and slice count measured
-    ///   (`tests::metal_tests::legacy_heap_textures_are_metals_where_metal_keeps_them_plain`), and
-    ///   a one-level 2D two-plane XR10 texture's planes lie in the heap's bytes as Metal lays them
-    ///   (`a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals`);
-    /// - the texture has one sample and a colour format;
-    /// - Metal keeps it uncompressed ([`metal_keeps_plain`]).
-    ///
-    /// A depth or stencil texture is made, relayed, and dies in strict mode, naming the heap
-    /// ([`crate::answer::Inexact::HeapLayout`]): the runtime keeps its image apart from the heap's
-    /// memory on MoltenVK (`DepthStencilImagesLieApart`; no shape measured alike), and a native
-    /// driver lays it out in its own layout.
-    ///
-    /// Any other colour texture is made, and its layout announced on stderr once per device for
-    /// each reason ([`LegacyLayout`]): its bytes there are not Metal's where they differ, the
-    /// value Metal leaves undefined that a buffer over the texture's bytes reads, which is to be
-    /// probed and replicated, not accepted. Until then the notice says so, and nothing dies:
-    /// - on a driver other than MoltenVK, which lays the runtime's image out in its own layout;
-    /// - on MoltenVK, a texture Metal may keep losslessly compressed: MoltenVK's texture has the
-    ///   runtime's usage, which can keep it uncompressed where Metal's of the guest's usage is
-    ///   compressed (a 16x16 or larger render target of an integer format or of a 3D type, and an
-    ///   extended-range texture, measured:
-    ///   `tests::metal_tests::legacy_heap_textures_metal_may_compress_are_announced`), and nothing
-    ///   here tells which;
-    /// - a multisample texture, whose bytes no blit reaches to measure.
-    fn legacy_made(&self, sel: &'static str, desc: &rt::TextureDescriptor) {
-        let moltenvk = on_moltenvk(&self.device);
-        let colour = !metal2vulkan::metal::format::is_depth_stencil(desc.pixel_format);
-        if !colour {
-            let why = if moltenvk {
-                "the runtime keeps a depth or stencil image apart from the heap's memory, its \
-                 bytes there in the runtime's layout"
-            } else {
-                "the device's driver lays the runtime's image out in its own layout"
-            };
-            crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
-                format!(
-                    "a texture of pixel format {}, {} sample(s), placed in a heap over no address \
-                     ranges, whose bytes core copies to and from the guest's pages, which would \
-                     carry the runtime's layout of the texture where Metal's carry its own: {why}",
-                    desc.pixel_format.as_raw(),
-                    desc.sample_count,
-                )
-            });
-            return;
-        }
-        let layout = if !moltenvk {
-            LegacyLayout::Driver
-        } else if desc.sample_count > 1 {
-            LegacyLayout::Multisample
-        } else if !metal_keeps_plain(desc) {
-            LegacyLayout::Compressible
-        } else {
-            return;
-        };
-        #[cfg(test)]
-        LEGACY_LAYOUTS.with(|l| l.borrow_mut().push(layout));
-        if first_legacy_layout(self.device.registry_id, layout) {
-            let line = format!("{}\n", layout.notice(desc));
-            // One write, so the line never interleaves with another thread's.
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         }
     }
 
@@ -1974,11 +1798,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// range would end before Metal's texture does.
     ///
     /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
-    /// the guest's pages, a depth or stencil texture dies first, and a colour texture whose bytes
-    /// there are not Metal's by a stated rule is announced once per device
-    /// ([`HeapObject::legacy_made`]): what the runtime announces there of a texture's layout
+    /// the guest's pages, what the runtime announces of a texture's layout there
     /// (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`), its bytes in the heap's
-    /// memory in its image's layout, is what that notices, and the creation relays it alone.
+    /// memory not Metal's, is relayed alone ([`Placements`]).
     fn new_texture(
         &self,
         descriptor: &VulkanTextureDescriptor,
@@ -2014,9 +1836,6 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         }
         made.map(|t| {
             t.map(|raw| {
-                if !self.backing.detaches() {
-                    self.legacy_made(sel, &desc);
-                }
                 // Over the guest's pages alone, as an untiled one is (below).
                 let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
                     && self.backing.detaches();
@@ -2044,7 +1863,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let texture = self.device.texture_in(raw, under, 0);
                 // Over the guest's pages alone: in a legacy heap, over the device's memory, what
                 // the runtime announces of the texture's layout there (untiled, or lossless where
-                // Metal compresses it) is what `legacy_made` notices of its bytes.
+                // Metal compresses it) is relayed alone.
                 let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout)
                     && self.backing.detaches();
                 let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
@@ -3171,52 +2990,6 @@ pub(crate) mod tests {
         )
     }
 
-    /// A legacy heap's layout is announced once per device for each reason
-    /// ([`HeapObject::legacy_made`]): a second texture of a reason on a device says nothing, and
-    /// another reason or another device is announced. The line names the reason, the texture
-    /// met first, and that it is an interim notice
-    #[test]
-    fn legacy_layouts_are_announced_once_per_device_and_reason() {
-        let device = u64::MAX - 0x1e6a;
-        assert!(first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(!first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(!first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(first_legacy_layout(device - 1, LegacyLayout::Compressible));
-        let desc = platform().texture_descriptor(&TextureDesc {
-            pixel_format: 53,
-            width: 64,
-            height: 32,
-            usage: 0x5,
-            ..TextureDesc::default()
-        });
-        let desc = desc
-            .fields()
-            .descriptor("newTextureWithDescriptor:offset:", Maker::Other);
-        let line = LegacyLayout::Compressible.notice(&desc);
-        for part in [
-            "legacy-heap-compression-layout",
-            "a heap over no address ranges",
-            "pixel format 53, 1 sample(s), 64x32x1",
-            "not Metal's",
-            "losslessly compressed",
-            "Announced once per device",
-            "interim notice",
-        ] {
-            assert!(line.contains(part), "{part}: {line}");
-        }
-        assert!(
-            LegacyLayout::Driver
-                .notice(&desc)
-                .contains("its own layout")
-        );
-        assert!(
-            LegacyLayout::Multisample
-                .notice(&desc)
-                .contains("multisample")
-        );
-    }
-
     /// The size query of a mipmapped texture Metal keeps losslessly compressed, whose layout in
     /// Metal's heaps the runtime models, answers Metal's as the runtime models it
     /// (`Device::metal_heap_texture_size_and_align`) on Metal, and at least that on a native
@@ -3226,8 +2999,8 @@ pub(crate) mod tests {
     /// and the three-level `RGBA16Float` render targets the macOS 26 boots asked the size of,
     /// with `BlockWritesOnly` and without ([`LOSSLESS_MIPMAPPED_SHAPES`]). A texture
     /// of its own memory of each is made, and so is its placement in a heap of the query's size,
-    /// over no address ranges, whose layout there is noticed (Metal may compress it, or the
-    /// driver lays it out its own way: [`HeapObject::legacy_made`]). On every OS: what is checked
+    /// over no address ranges, whose layout there the runtime announces, Metal keeping it
+    /// compressed (`heap-texture-lossless-layout`). On every OS: what is checked
     /// is the runtime's answer and what is made of it, on whatever device; how it compares with
     /// Metal's is `metal_tests`' (`lossless_mipmapped_heap_texture_sizes_are_metals`)
     #[test]
@@ -3268,15 +3041,12 @@ pub(crate) mod tests {
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
-            LEGACY_LAYOUTS.with(|l| l.borrow_mut().clear());
+            let before = crate::answer::RELAYED.lock().len();
             let placed = heap.new_texture(&desc, 0).unwrap().unwrap();
             assert_eq!(placed.mipmap_level_count(), mipmap_level_count, "{name}");
-            let noticed = LEGACY_LAYOUTS.with(|l| std::mem::take(&mut *l.borrow_mut()));
-            let layout = match on_moltenvk(&d) {
-                true => LegacyLayout::Compressible,
-                false => LegacyLayout::Driver,
-            };
-            assert_eq!(noticed, [layout], "{name}");
+            let lossless = rt::Degradation::HeapTextureLosslessLayout;
+            let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
+            assert!(relayed.contains(&lossless), "{name}: {relayed:?}");
         }
         let unmeasured = rt::Degradation::UnmeasuredHeapTextureSize;
         assert!(!crate::answer::RELAYED.lock().contains(&unmeasured));

@@ -147,13 +147,11 @@
 //! there dies instead, `gpu_writes`).
 //!
 //! **Differences this platform announces itself**, each a line on stderr once per device, until
-//! the runtime announces a typed kind for it, which then places it by its reach: the three
-//! layouts of a colour texture placed in a heap over no address ranges, whose bytes core copies
-//! to and from the guest's pages, that may not be Metal's there (`legacy-heap-driver-layout`,
-//! `legacy-heap-compression-layout` and `legacy-heap-multisample-layout`,
-//! `crate::gpu::resource::LegacyLayout`). Nothing dies at them, in strict mode either: an interim
-//! notice, pending a probe of Metal's bytes there. On Linux,
-//! read-only memory (a range core maps read-only, as the EFI framebuffer; the alias of a
+//! the runtime announces a typed kind for it, which then places it by its reach: none at the
+//! pinned runtime, which announces the layouts of a texture placed in a heap over no address
+//! ranges, whose bytes core copies to and from the guest's pages, that are not Metal's there
+//! (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`, relayed). On Linux, read-only
+//! memory (a range core maps read-only, as the EFI framebuffer; the alias of a
 //! read-only replace or heap; a surface the GPU only reads) the runtime imports through a
 //! writable twin of its pages, as Linux drivers pin imported pages for writing: the GPU reads
 //! what Metal's reads, and its writes would reach the pages, where Metal drops them. Every
