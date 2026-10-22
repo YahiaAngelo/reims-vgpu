@@ -20,8 +20,8 @@
 //!     the getter answers. The numbers, not the handle: the guest's release of the state lets it
 //!     go, as Metal's indirect command keeps no state alive ([`SetPipeline`]).
 //!     A record the GPU wrote (a kernel's, or a blit's copy) names a state no setter gave the
-//!     command, by its resource ID: the getter answers the identifier of the state this platform
-//!     made with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
+//!     command, by its resource ID: the getter answers the runtime's identifier of the state made
+//!     with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
 //!     (measured: a kernel's set of a compute and of a render state read from an argument
 //!     buffer). A record names its state by the state's resource ID, which the runtime reads
 //!     whether or not the state still lives (`pipeline_id`), and one naming none answers 0, as
@@ -39,9 +39,8 @@
 //!     ([`crate::gpu::unique_id::HISTORY`]), it dies. Core's set keeps the state's numbers
 //!     ([`CommandSide`]), not the state, and the runtime's command names its state without
 //!     holding it, as Metal's does: the guest's release gives the ID back, and a state made later
-//!     takes it, on Metal with the released one's identifier too, which the command then answers
-//!     (measured). Where a later state may hold that identifier, the getter dies
-//!     ([`IcbObject::pipeline_identifier`]).
+//!     takes it, with the released one's identifier too, as on Metal (measured), which the
+//!     command then answers ([`IcbObject::pipeline_identifier`]).
 //! - **A blit's copy and reset of commands** move and reset what is kept beside them once the
 //!   blit's command buffer completed, as Metal's GPU has run the blit by then. Until it commits,
 //!   the GPU ran none of it: a getter answers what stands, and a setter comes before the blit.
@@ -595,7 +594,8 @@ enum Kept {
 }
 
 /// A pipeline state core set on a command, by its numbers: its runtime state's resource ID and
-/// its `uniqueIdentifier`, one per creation, so two are equal only for one state. Keeping no
+/// its `uniqueIdentifier`, no other live state's, which a state made after its release may take,
+/// as on Metal, where the getters answer the two alike. Keeping no
 /// handle lets the guest's release of the state drop this platform's object of it, as Metal's
 /// indirect command keeps no state alive, so the release is noted
 /// ([`crate::gpu::unique_id::released`]), which decides which state a record names once a
@@ -855,30 +855,6 @@ fn joinable(
     b_start <= a_end || !plain(|| crate::gpu::unique_id::held_within(device, a_end, b_start))
 }
 
-/// Whether the state of `identifier` among `history`'s was released before a state of
-/// indirect command buffer support was made on the device of registry ID `device`, so that Metal
-/// may answer its identifier for that state ([`crate::gpu::unique_id`]); one `history` no longer
-/// keeps counts as released whenever a state was made since the first kept.
-fn superseded(
-    device: u64,
-    identifier: u64,
-    history: Option<&crate::gpu::unique_id::History>,
-) -> bool {
-    use crate::gpu::unique_id::{LIVE, made_since};
-    let Some(history) = history else {
-        return false;
-    };
-    let gone = (history.holders.iter())
-        .find(|holder| holder.identifier == identifier)
-        .map_or(
-            history
-                .lost_until
-                .min(history.holders.front().map_or(0, |h| h.made)),
-            |h| h.gone,
-        );
-    gone != LIVE && made_since(device, gone)
-}
-
 /// The death of a getter, an execution or a copy of a command whose record Metal's copy past the
 /// buffer's end may have written over ([`IcbObject::overrun`]).
 const OVERRUN: &str = "a command whose record Metal's copy of commands past the indirect command \
@@ -1135,30 +1111,17 @@ impl IcbObject {
     /// The `uniqueIdentifier` of the pipeline state a record names by `id`, made on the device
     /// of registry ID `device`, by core's set on command `index`, the spans in which the GPU may
     /// have written the buffer's records and the states made with `id` ([`named_state`]); where
-    /// those do not tell which state, it dies.
-    ///
-    /// It dies too for a state released before a state of indirect command buffer support was
-    /// made on its device ([`superseded`]): Metal may have given that one the released state's
-    /// identifier, by which core's map of identifiers to the guest's references, the newest
-    /// registration winning, answers the newer state, where this platform's identifier, never
-    /// handed out twice, would answer the released one's reference.
+    /// those do not tell which state, it dies. A released state's identifier may be a later
+    /// state's, the runtime reusing it as Metal does, so core's map of identifiers to the guest's
+    /// references, the newest registration winning, answers the newer state, as on Metal.
     fn pipeline_identifier(&self, sel: &'static str, index: u32, (device, id): (u64, u64)) -> u64 {
         let own = self.side(sel, Access::Read(Kept::Pipeline), index, |s| {
             s.pipeline.map(|p| (p.numbers(), s.pipeline_at))
         });
         let writes: Vec<_> = plain(|| self.sides.lock().writes.iter().map(Window::span).collect());
         let history = plain(|| crate::gpu::unique_id::holders(device, id));
-        let identifier = named_state(own, &writes, id, history.as_ref())
-            .unwrap_or_else(|why| unrepresentable(sel, why));
-        if plain(|| superseded(device, identifier, history.as_ref())) {
-            unrepresentable(
-                sel,
-                "the pipeline state a record names, released before a state that supports \
-                 indirect command buffers was made, which Metal may have given its identifier, so \
-                 that the guest's reference by it is the newer state's",
-            );
-        }
-        identifier
+        named_state(own, &writes, id, history.as_ref())
+            .unwrap_or_else(|why| unrepresentable(sel, why))
     }
 
     /// The `uniqueIdentifier` getter `sel`'s answer for command `index`, whose record names no
@@ -2839,7 +2802,7 @@ mod tests {
     /// across core's set of a command between their ends
     #[test]
     fn spans_are_joined_only_where_that_names_the_same_states() {
-        use crate::gpu::unique_id::{next_of, now, released};
+        use crate::gpu::unique_id::{made, now, released};
         // A registry ID no device answers, so no other test's states meet these.
         let device = u64::MAX - 9;
         assert!(joinable(device, (10, 20), (15, 30), &[]));
@@ -2847,8 +2810,8 @@ mod tests {
         assert!(joinable(device, (10, 20), (30, 40), &[19, 40]));
         assert!(!joinable(device, (10, 20), (30, 40), &[20]));
         let before = now();
-        let made = next_of(device, 5);
-        released(device, 5, made);
+        made(device, 5, 0x100);
+        released(device, 5, 0x100);
         let after = now();
         assert!(!joinable(device, (0, before), (after, after + 1), &[]));
         assert!(joinable(
@@ -2962,10 +2925,12 @@ mod tests {
     }
 
     /// A command a kernel may have encoded after a state made later took the resource ID of the
-    /// one its argument buffer held, released while the dispatch waited to be committed, dies:
-    /// its record names the ID, which either state held while the GPU may have written it
+    /// one its argument buffer held, released while the dispatch waited to be committed, answers
+    /// the identifier both held: the later state took the released one's identifier too, as
+    /// Metal's does, so the states that held the ID while the GPU may have written the record
+    /// answer one identifier
     #[test]
-    fn a_command_written_while_two_states_held_its_id_dies() {
+    fn a_command_written_while_two_states_held_its_id_answers_their_identifier() {
         use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
@@ -3015,20 +2980,18 @@ mod tests {
         ] {
             e.encode(OnFault::Return, cmd).unwrap();
         }
+        let released = computes[1].unique_identifier();
         computes.truncate(1);
         let (later, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
-        assert!(later.iter().any(|state| state.gpu_resource_id() == id));
+        let holder = later.iter().find(|state| state.gpu_resource_id() == id);
+        assert_eq!(
+            holder.map(|state| state.unique_identifier()),
+            Some(released)
+        );
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
-        let site = catch_death(|| {
-            icb.compute_command(0)
-                .unwrap()
-                .unwrap()
-                .pipeline_state_unique_identifier()
-        })
-        .unwrap_err();
-        let at = (site.kind, site.file);
-        assert_eq!(at, (DeathKind::Abort, "getPipelineStateUniqueIdentifier"));
+        let answer = icb.compute_command(0).unwrap().unwrap();
+        assert_eq!(answer.pipeline_state_unique_identifier(), released);
         drop((renders, later_renders));
     }
 
@@ -3121,10 +3084,9 @@ mod tests {
     }
 
     /// A state the guest released while a command core set it on still names it goes, as Metal's
-    /// does: a state made after it, whose identifier Metal answers as the released one's
-    /// (measured), dies where the guest reads it (info 460), as every state made with indirect
-    /// command buffer support does, and so does the command's getter, by whose answer core's map
-    /// would reach the released state where Metal's reaches the later
+    /// does: a state made after it takes its identifier, as Metal's does (measured), which the
+    /// guest reads (info 460), and so does the command's getter, by whose answer core's map
+    /// reaches the later state, as Metal's does
     #[test]
     fn a_state_a_command_names_goes_at_the_guests_release() {
         use reims_vgpu_core::platform::resource::ComputePipeline as _;
@@ -3138,17 +3100,12 @@ mod tests {
                 pipeline_state: Some(&computes[1]),
             })
             .unwrap();
+        let released = computes[1].unique_identifier();
         computes.truncate(1);
         let (later, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
         drop((renders, later_renders));
-        let died = |site: reims_vgpu_core::raise::death::DeathSite| (site.kind, site.file);
-        let read = catch_death(|| later[0].guest_unique_identifier()).unwrap_err();
-        assert_eq!(died(read), (DeathKind::Abort, "uniqueIdentifier"));
-        let answer = catch_death(|| command.pipeline_state_unique_identifier()).unwrap_err();
-        assert_eq!(
-            died(answer),
-            (DeathKind::Abort, "getPipelineStateUniqueIdentifier")
-        );
+        assert_eq!(later[0].guest_unique_identifier(), released);
+        assert_eq!(command.pipeline_state_unique_identifier(), released);
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at

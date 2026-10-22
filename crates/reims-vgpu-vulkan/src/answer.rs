@@ -2249,9 +2249,8 @@ mod tests {
         //   which dies at the copy.
         // - `PlainStateUniqueIdentifier`: the `uniqueIdentifier` of a pipeline state made without
         //   indirect command buffer support, which Metal answers as an address that differs from
-        //   run to run. No value the guest or the host sees: this platform
-        //   answers its own numbering ([`crate::gpu::unique_id`]), and never calls the runtime's
-        //   identifier getters, whose answers announce it.
+        //   run to run, and the runtime as one of a process-wide count. The guest reads it (info
+        //   command 460, [`crate::gpu::unique_id`]): Metal's own answer is not one value.
         // - `AbsentArgumentRead`: a pipeline state whose function may read an argument its
         //   function constants removed, announced as it is made. The runtime takes zero for such a
         //   read and the command buffer completes, where Metal's compiler drops or folds the read
@@ -2282,16 +2281,18 @@ mod tests {
         //   (`crate::platform`'s `device_options`) leaves the first two unreachable. VM boots
         //   relay `GpuTimesFromHost`, which the runtime also takes on MoltenVK 1.4.1 whatever the
         //   option (its `TimestampsWaitForEveryQueue`).
-        // - `UnmeasuredUniqueIdentifier`: no value the guest or the host sees. The runtime announces
-        //   it where a call answers an identifier it has not measured to be Metal's number: a
-        //   state's with indirect command buffer support, a buffer's made after an
-        //   encoder, and an indirect command's state identifier, which its read-back of the
-        //   commands answers (`IndirectCommandBuffer::commands`). This platform reads that
-        //   read-back for every getter of a command ([`crate::gpu::icb`]), so the runtime announces
-        //   the kind there, but answers its own numbers: a state's from [`crate::gpu::unique_id`],
-        //   a command's state identifier by the state core set or the states that held the ID, and
-        //   a buffer's from Metal's range, dying after an encoder. It never answers the
-        //   runtime's identifiers.
+        // - `UnmeasuredUniqueIdentifier`: the runtime announces it where a call answers an
+        //   identifier it has not measured to be Metal's number: a state's with indirect command
+        //   buffer support, a buffer's made after an encoder, and an indirect command's state
+        //   identifier, which its read-back of the commands answers
+        //   (`IndirectCommandBuffer::commands`). The guest reads a state's (info command 460) and
+        //   a command's ([`crate::gpu::unique_id`], [`crate::gpu::icb`]): Metal's own answer is
+        //   not one value, an address of Metal's allocation of such states that follows what the
+        //   process made before and how it was started (`0x100` apart between a test binary and
+        //   the same binary started from a shell), where the runtime keeps the relations a guest
+        //   can rely on: one value for a state's life, no other live state's, the last released
+        //   taken again first by kind, as Metal's. A buffer's made after an encoder dies before the
+        //   runtime answers it ([`crate::answer::Unfollowed::IcbIdentifierAfterEncoder`]).
         // - `IndirectValuePastRecord`: no value the guest or the host sees. The runtime announces
         //   it at a command's threadgroup length at an index past 30, which no function binds and
         //   its records do not hold, so its read-back answers a fresh command's value there. This

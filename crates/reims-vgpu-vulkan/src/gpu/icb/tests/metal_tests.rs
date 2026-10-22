@@ -1071,11 +1071,10 @@ fn made_by<P: Platform>(
 
 /// A command a kernel encoded with a state since released, whose resource ID a state made
 /// later took: Metal answers the released state's identifier, which the later state took too
-/// (measured), so core's map gives the guest the later state's reference. This platform's
-/// identifier of it, never handed out twice, would reach the released state, so the getter
-/// dies
+/// (measured), so core's map gives the guest the later state's reference. The runtime reuses
+/// the released state's identifier as Metal does, so the guest reaches the later state here too
 #[test]
-fn a_command_naming_a_released_state_dies_where_core_would_reach_a_later_one() {
+fn a_command_naming_a_released_state_reaches_a_later_one_as_metals() {
     /// What the guest reaches by the command's answer, in making order, the index of the
     /// released state and whether a later state took its ID; `None` where the getter died
     fn reaches<P: Platform>(d: &P::Device) -> (Option<Option<usize>>, usize, bool) {
@@ -1098,8 +1097,8 @@ fn a_command_naming_a_released_state_dies_where_core_would_reach_a_later_one() {
         });
         (answer.ok().map(|answer| reached(&made, answer)), 1, reused)
     }
-    let (reached_here, _, reused) = reaches::<VulkanPlatform>(&dev());
-    assert_eq!((reached_here, reused), (None, true));
+    let (reached_here, released, reused) = reaches::<VulkanPlatform>(&dev());
+    assert!(reused && reached_here.flatten().unwrap() > released);
     if let Some(md) = MetalPlatform::system_default_device() {
         let (reached_there, released, _) = reaches::<MetalPlatform>(&md);
         let reached_there = reached_there.flatten().unwrap();
@@ -1155,11 +1154,11 @@ fn a_released_state_the_cpu_set_runs_as_metals() {
 /// A command core set a state on, which the guest then released before states were made:
 /// Metal's state made later takes the released one's resource ID and its identifier too,
 /// which the command answers (measured, M3 Max), so core's map gives the guest the later
-/// state's reference, and the getter here dies. The runtime's command names the state
-/// without holding it, so the later state takes its ID here too. A state a kernel encodes on
-/// the command after is answered
+/// state's reference, as the runtime's reuse of the identifier gives it here. The runtime's
+/// command names the state without holding it, so the later state takes its ID here too. A
+/// state a kernel encodes on the command after is answered
 #[test]
-fn a_command_core_set_dies_once_a_later_state_may_hold_its_identifier() {
+fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
     use reims_vgpu_core::platform::resource::ComputePipeline as _;
     /// The command, what the guest reaches by its answer once the first was released and
     /// states were made after it (in making order; `None` where the getter died), and
@@ -1185,7 +1184,7 @@ fn a_command_core_set_dies_once_a_later_state_may_hold_its_identifier() {
     }
     let d = dev();
     let (icb, reached_here, taken) = set_then_released::<VulkanPlatform>(&d);
-    assert_eq!((reached_here, taken), (None, true));
+    assert!(taken && reached_here.flatten().unwrap() > 1);
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
     let (states, renders) = twin_states::<VulkanPlatform>(&d, &library);
     encode_by_kernel::<VulkanPlatform>(
@@ -1328,19 +1327,20 @@ fn a_command_an_executed_kernel_wrote_answers_the_state_holding_its_id_then() {
     }
 }
 
-/// The guest's read of a state's identifier (info command 460) dies for every state made with
-/// indirect command buffer support, compute and render, before a state of its device was
-/// released as after, and answers it for one made without that support. Metal's identifier
-/// of such a state is an address of its own allocation of them, `0x1000000000` and up, the
-/// same in every process that makes the same states in the same order in one environment
-/// (here two child processes, each making [`twin_states`]), which this platform's counter
-/// does not reproduce (the docs of `unique_id`)
+/// The guest's read of a state's identifier (info command 460) answers the runtime's for every
+/// state, made with indirect command buffer support or not. Metal's identifier of a state made
+/// with it is an address of its own allocation of them, `0x1000000000` and up, the same in
+/// every process that makes the same states in the same order in one environment (here two
+/// child processes, each making [`twin_states`]); the runtime's is in that range, at offsets
+/// that are not Metal's (`unmeasured-unique-identifier`), and a render state made after one was
+/// released takes the released one's, the last released first, as Metal's does
 #[test]
-fn an_icb_capable_states_identifier_dies_where_the_guest_reads_it() {
+fn an_icb_capable_states_identifier_is_the_runtimes() {
     use reims_vgpu_core::platform::resource::{
         ComputePipeline as _, Library as _, RenderPipeline as _,
     };
-    const TEST: &str = "gpu::icb::tests::metal_tests::an_icb_capable_states_identifier_dies_where_the_guest_reads_it";
+    const TEST: &str =
+        "gpu::icb::tests::metal_tests::an_icb_capable_states_identifier_is_the_runtimes";
     if std::env::var("RVG_CHILD").as_deref() == Ok(TEST) {
         let md = MetalPlatform::system_default_device().unwrap();
         let library = md.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
@@ -1353,24 +1353,21 @@ fn an_icb_capable_states_identifier_dies_where_the_guest_reads_it() {
     }
     let d = dev();
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
-    let dies = |read: &dyn Fn() -> u64| {
-        let site = catch_death(read).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "uniqueIdentifier")
-        );
-    };
     let (computes, mut renders) = twin_states::<VulkanPlatform>(&d, &library);
-    for c in &computes {
-        dies(&|| c.guest_unique_identifier());
+    let computes_read = computes
+        .iter()
+        .map(|c| (c.guest_unique_identifier(), c.unique_identifier()));
+    let renders_read = renders
+        .iter()
+        .map(|r| (r.guest_unique_identifier(), r.unique_identifier()));
+    for (read, identifier) in computes_read.chain(renders_read) {
+        assert_eq!(read, identifier);
+        assert!(identifier >= 1 << 36, "{identifier:#x}");
     }
-    for r in &renders {
-        dies(&|| r.guest_unique_identifier());
-    }
+    let released = renders[1].unique_identifier();
     renders.truncate(1);
-    let (later_computes, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
-    dies(&|| later_computes[0].guest_unique_identifier());
-    dies(&|| later_renders[0].guest_unique_identifier());
+    let (_later_computes, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
+    assert_eq!(later_renders[0].guest_unique_identifier(), released);
     let f = library
         .new_function(OnFault::Return, "nothing")
         .unwrap()

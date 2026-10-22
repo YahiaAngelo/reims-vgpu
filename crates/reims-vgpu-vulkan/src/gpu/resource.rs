@@ -940,8 +940,8 @@ pub type VulkanLibrary = Obj<LibraryObject>;
 /// `id<MTLFunction>`.
 pub type VulkanFunction = Obj<rt::Function>;
 
-/// A runtime compute pipeline state, with the `uniqueIdentifier` this platform gave it when it was
-/// made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
+/// A runtime compute pipeline state, with the runtime's `uniqueIdentifier` of it, read when it
+/// was made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
 #[derive(Debug)]
 pub struct ComputePipelineObject {
     /// The runtime's state.
@@ -954,13 +954,14 @@ pub struct ComputePipelineObject {
 }
 
 impl ComputePipelineObject {
-    /// `raw`, just made, with a fresh identifier: one per creation, even where the runtime
-    /// answers a state it made before for an equal request, as Metal gives a pipeline made from
-    /// an identical record a new one. It is kept by the state's resource ID, which an indirect
-    /// command's record names it by ([`crate::gpu::unique_id::next_of`]).
+    /// `raw`, just made, with the runtime's identifier of it: one per creation, as Metal gives a
+    /// pipeline made from an identical record a new one, and as the runtime makes a new state of
+    /// each request. It is kept by the state's resource ID, which an indirect command's record
+    /// names it by ([`crate::gpu::unique_id::made`]).
     pub fn new(raw: rt::ComputePipelineState) -> ComputePipelineObject {
-        let unique_identifier =
-            crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+        let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
+            raw.unique_identifier()
+        });
         ComputePipelineObject {
             raw,
             unique_identifier,
@@ -991,7 +992,7 @@ pub type VulkanComputePipeline = Obj<ComputePipelineObject>;
 pub struct RenderPipelineObject {
     /// The runtime's state.
     pub raw: rt::RenderPipelineState,
-    /// The identifier this creation took ([`crate::gpu::unique_id`]).
+    /// The runtime's identifier of it, read when it was made ([`crate::gpu::unique_id`]).
     unique_identifier: u64,
     /// Its descriptor's `inputPrimitiveTopology`, which decides whether Metal sizes the points
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
@@ -1028,38 +1029,14 @@ impl Drop for RenderPipelineObject {
     }
 }
 
-/// The guest's read of a pipeline state's `uniqueIdentifier` (info command 460), of `kind`: a
-/// debug line, which tells how often guests read it, and for which states; then its identifier,
-/// or, for a state made with indirect command buffer support (`supports_icbs`), the death
-/// ([`identifier_of_an_icb_state`]).
-fn guest_identifier(kind: &str, supports_icbs: bool, identifier: u64) -> u64 {
-    log::debug!(
-        "info 460: uniqueIdentifier of a {kind} pipeline state {} indirect command buffer \
-         support: {}",
-        if supports_icbs { "with" } else { "without" },
-        if supports_icbs {
-            "dies".to_owned()
-        } else {
-            format!("answers {identifier}")
-        },
-    );
-    if supports_icbs {
-        identifier_of_an_icb_state();
-    }
+/// The runtime's `uniqueIdentifier` of a state it just made on `device` with resource ID `id`,
+/// `identifier`'s answer, which relays the runtime's notice of it once a device
+/// (`plain-state-unique-identifier`, `unmeasured-unique-identifier`, [`crate::answer`]): kept by
+/// the ID ([`crate::gpu::unique_id::made`]).
+fn made_with(device: &rt::Device, id: rt::ResourceId, identifier: impl FnOnce() -> u64) -> u64 {
+    let identifier = plain(identifier);
+    crate::gpu::unique_id::made(device.registry_id(), id.0, identifier);
     identifier
-}
-
-/// The death of the guest's read of the `uniqueIdentifier` of a state made with indirect command
-/// buffer support: Metal's is an address of its own allocation of such states, the same in every
-/// run that makes and releases the same states in the same order, which this platform's counter
-/// does not reproduce ([`crate::gpu::unique_id`]).
-fn identifier_of_an_icb_state() -> ! {
-    unrepresentable(
-        "uniqueIdentifier",
-        "Metal's identifier of a pipeline state made with indirect command buffer support, an \
-         address of its allocation of such states that is the same from run to run, which this \
-         platform's counter does not reproduce",
-    )
 }
 
 /// The descriptor a render pipeline state was made of.
@@ -1074,8 +1051,7 @@ pub enum RenderDescriptor {
 /// `id<MTLRenderPipelineState>`.
 pub type VulkanRenderPipeline = Obj<RenderPipelineObject>;
 
-/// The handle of a state a creator made, with a fresh identifier: every creation takes one, even
-/// where the runtime answers a state it made before for an equal request. Its input primitive
+/// The handle of a state a creator made, with the runtime's identifier of it. Its input primitive
 /// topology is Metal's default.
 #[cfg(test)]
 pub(crate) fn render_pipeline(raw: rt::RenderPipelineState) -> VulkanRenderPipeline {
@@ -1089,8 +1065,9 @@ pub(crate) fn render_pipeline_of(
     input_primitive_topology: PrimitiveTopologyClass,
     descriptor: Option<RenderDescriptor>,
 ) -> VulkanRenderPipeline {
-    let unique_identifier =
-        crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+    let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
+        raw.unique_identifier()
+    });
     Obj::new(RenderPipelineObject {
         raw,
         unique_identifier,
@@ -2165,19 +2142,9 @@ impl ComputePipeline for VulkanComputePipeline {
         }))
     }
 
-    /// The identifier the state was given when it was made.
+    /// The runtime's identifier of the state, read when it was made.
     fn unique_identifier(&self) -> u64 {
         plain(|| self.unique_identifier)
-    }
-
-    /// Its identifier, but for a state made with indirect command buffer support, which dies
-    /// ([`guest_identifier`]).
-    fn guest_unique_identifier(&self) -> u64 {
-        guest_identifier(
-            "compute",
-            ComputePipeline::support_indirect_command_buffers(self),
-            ComputePipeline::unique_identifier(self),
-        )
     }
 }
 
@@ -2225,15 +2192,6 @@ impl RenderPipeline for VulkanRenderPipeline {
 
     fn unique_identifier(&self) -> u64 {
         self.unique_identifier
-    }
-
-    /// As a compute state's ([`guest_identifier`]).
-    fn guest_unique_identifier(&self) -> u64 {
-        guest_identifier(
-            "render",
-            RenderPipeline::support_indirect_command_buffers(self),
-            self.unique_identifier,
-        )
     }
 }
 

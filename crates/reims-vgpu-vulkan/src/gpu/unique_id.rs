@@ -1,13 +1,16 @@
-//! `uniqueIdentifier` (SPI) of pipeline states: the runtime has none, and the guest reads it
-//! (the info command 460), so this platform hands one out itself.
+//! The pipeline states made with each resource ID, which decide which state an indirect
+//! command's record names ([`crate::gpu::icb`]).
 //!
-//! Metal's identifiers of states made without `supportIndirectCommandBuffers` differ from run to
-//! run, so what the guest can rely on, and what the suite locks as relations (`info_replies`' 460
-//! records, of such states), is how they relate: one pipeline answers one nonzero value every time;
-//! a render and a compute pipeline answer different ones; and a second pipeline made from an
-//! identical record answers a new one. So every creation takes the next value of one process-wide
-//! counter, shared by every pipeline kind, even where the runtime answers a state it made before
-//! for an equal request; the handle keeps it, so every reference to that handle answers it.
+//! A state's `uniqueIdentifier` (SPI, the guest's info command 460) is the runtime's
+//! (`ComputePipelineState::unique_identifier`, `RenderPipelineState::unique_identifier`), read
+//! as the state is made: one nonzero value for the state's life, no other live state's, and a
+//! second state made from an identical record a new one. A state made without
+//! `supportIndirectCommandBuffers` answers one of a process-wide count, where Metal's is an
+//! address that differs from run to run (`plain-state-unique-identifier`); one made with it
+//! answers 2^36 plus an offset in the runtime's allocation of such states, which reuses a
+//! released state's identifier, the last released first, by kind, as Metal's does, at offsets
+//! that are not Metal's (`unmeasured-unique-identifier`: Metal's follow its allocator and the
+//! process's history, as how the process was started).
 //!
 //! **By resource ID.** An indirect command's record names its pipeline state by the state's
 //! resource ID, and a record the GPU wrote (a kernel's `set_compute_pipeline_state` or
@@ -16,46 +19,20 @@
 //! state's own identifier (measured on the M3 Max, macOS 26.7: of a compute and of a render
 //! command a kernel encoded, and of the second of two states made from one descriptor), and still
 //! answers it once the state was released, though a state made later took its ID (measured). So
-//! each identifier handed out for a state of a nonzero resource ID, one made with
-//! `supportIndirectCommandBuffers`, is kept by that ID and its device with the points of [`now`]'s
-//! order it was made and released at ([`next_of`], [`released`], [`holders`]): a state holds its
-//! ID from its creation to its release. The runtime gives a state's ID back only once the state
-//! goes, so states its plain allocation numbered hold one ID one after another; a state placed at
-//! the ID of one still live holds it beside that one. The [`HISTORY`] states made last with each
-//! ID are kept. Which of them a record names is decided by when it can have been written
-//! ([`crate::gpu::icb`]).
-//!
-//! **Of a state with indirect command buffer support.** Metal's identifier of a state made with
-//! `supportIndirectCommandBuffers` is an address of its own allocation of such states,
-//! `0x1000000000` and up, the same in every run that makes and releases the same states in the same
-//! order (measured on the M3 Max, macOS 26.7: five runs of a sequence of twelve creations and
-//! releases answered equal values), which it reuses once a state goes: a compute state made after
-//! one was released answers the released one's identifier, the last released first, whatever
-//! resource ID it takes (of two released, it took the first one's ID and the second one's
-//! identifier), and a render state takes another kind of allocation. Its steps depend on the
-//! functions (one kernel's states 0xc0 apart, the first of another 0x300 on, render states 0x200
-//! apart), and its base on what the process made before and on how it was started (four states made
-//! by a test binary its test started answered each 0x100 below the same four made by the binary
-//! started from a shell). This platform answers a new identifier for every creation, and reproduces
-//! none of that, so the identifier of every state made with `supportIndirectCommandBuffers` dies
-//! where the guest reads it (info command 460, [`crate::gpu::resource`]). A state made without that
-//! support has an identifier Metal allocates elsewhere, as any memory, which differs from run to
-//! run, and the guest's read answers this platform's.
+//! each state of a nonzero resource ID, one made with `supportIndirectCommandBuffers`, is kept by
+//! that ID and its device with its identifier and the points of [`now`]'s order it was made and
+//! released at ([`made`], [`released`], [`holders`]): a state holds its ID from its creation to
+//! its release. The runtime gives a state's ID back only once the state goes, so states its plain
+//! allocation numbered hold one ID one after another; a state placed at the ID of one still live
+//! holds it beside that one. The [`HISTORY`] states made last with each ID are kept. Which of
+//! them a record names is decided by when it can have been written ([`crate::gpu::icb`]); the
+//! runtime's own answer there (`pipeline_unique_identifier`) names a live holder, and none where
+//! a released state's ID was taken while the GPU could write the record.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_core::sync::Mutex;
-
-/// The next identifier to hand out; 0 is never one.
-static NEXT: AtomicU64 = AtomicU64::new(1);
-
-/// A fresh identifier for a pipeline state being made: nonzero, and never handed out before in
-/// this process.
-pub fn next() -> u64 {
-    // Relaxed: only the values' uniqueness matters, not their order against other memory.
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
 
 /// The last point handed out of the order of what decides which state a record names: each
 /// state's creation and each span in which the GPU may write records ([`now`]).
@@ -100,17 +77,12 @@ pub struct History {
 /// they were made on and that ID.
 static OF_ID: Mutex<BTreeMap<(u64, u64), History>> = Mutex::new(BTreeMap::new());
 
-/// The point of [`now`]'s order at which the last state of a nonzero resource ID was made, by
-/// the registry ID of the runtime's device it was made on.
-static LAST_MADE: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
-
-/// A fresh identifier ([`next`]) for a state the runtime just made on the device of registry ID
-/// `device` with resource ID `id`, kept by that ID with the point it was made at ([`holders`]).
-/// A state of ID 0, which no indirect command can name, is kept by none.
-pub fn next_of(device: u64, id: u64) -> u64 {
-    let identifier = next();
+/// Keeps the state of identifier `identifier` the runtime just made on the device of registry ID
+/// `device` with resource ID `id` by that ID, with the point it was made at ([`holders`]). A
+/// state of ID 0, which no indirect command can name, is kept by none.
+pub fn made(device: u64, id: u64, identifier: u64) {
     if id == 0 {
-        return identifier;
+        return;
     }
     let mut of_id = OF_ID.lock();
     let history = of_id.entry((device, id)).or_default();
@@ -121,7 +93,6 @@ pub fn next_of(device: u64, id: u64) -> u64 {
         made,
         gone: LIVE,
     });
-    LAST_MADE.lock().insert(device, made);
     if history.holders.len() > HISTORY {
         // The oldest released one, else the oldest.
         let at = (history.holders.iter())
@@ -131,7 +102,6 @@ pub fn next_of(device: u64, id: u64) -> u64 {
             history.lost_until = history.lost_until.max(dropped.gone);
         }
     }
-    identifier
 }
 
 /// The states made on the device of registry ID `device` with resource ID `id`; `None` where
@@ -140,9 +110,10 @@ pub fn holders(device: u64, id: u64) -> Option<History> {
     OF_ID.lock().get(&(device, id)).cloned()
 }
 
-/// Notes that the state of identifier `identifier` made on the device of registry ID `device`
-/// with resource ID `id` was released, now: it no longer holds the ID. One of ID 0 changes
-/// nothing.
+/// Notes that the live state of identifier `identifier` made on the device of registry ID
+/// `device` with resource ID `id` was released, now: it no longer holds the ID. One of ID 0
+/// changes nothing. A released state's identifier may be a later state's too, so the live one
+/// goes.
 pub fn released(device: u64, id: u64, identifier: u64) {
     if id == 0 {
         return;
@@ -153,7 +124,7 @@ pub fn released(device: u64, id: u64, identifier: u64) {
         history
             .holders
             .iter_mut()
-            .find(|h| h.identifier == identifier)
+            .find(|h| h.identifier == identifier && h.gone == LIVE)
     });
     if let Some(holder) = holder {
         holder.gone = gone;
@@ -170,50 +141,25 @@ pub fn held_within(device: u64, from: u64, to: u64) -> bool {
         .any(|holder| holder.made >= from && holder.gone != LIVE && holder.gone <= to)
 }
 
-/// Whether a state of a nonzero resource ID was made on the device of registry ID `device` after
-/// point `point` of [`now`]'s order.
-pub fn made_since(device: u64, point: u64) -> bool {
-    LAST_MADE
-        .lock()
-        .get(&device)
-        .is_some_and(|&made| made > point)
-}
-
 /// What these keep is process-wide, so tests over a real device's states need a process each, as
 /// `cargo nextest` gives them; these use registry IDs no device answers.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use reims_vgpu_core::num::ToU64;
 
-    /// Every identifier is nonzero and new, across threads
-    #[test]
-    fn identifiers_are_nonzero_and_never_reused() {
-        let mut seen: Vec<u64> = std::thread::scope(|s| {
-            let workers: Vec<_> = (0..4)
-                .map(|_| s.spawn(|| (0..256).map(|_| next()).collect::<Vec<_>>()))
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().unwrap())
-                .collect()
-        });
-        let count = seen.len();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), count);
-        assert!(seen.iter().all(|&id| id != 0));
-    }
+    use super::*;
 
     /// The states made with a nonzero resource ID are kept by it, in the order they were made,
     /// with when each was released, on their own device only, the [`HISTORY`] made last, a
     /// released one giving way first; one of ID 0 is kept by none, and its release changes
-    /// nothing
+    /// nothing; a release takes the live state of an identifier a released one had too
     #[test]
     fn states_are_kept_by_resource_id_in_the_order_they_were_made() {
         // A registry ID no device answers, so no other test's states meet these.
         let device = u64::MAX - 7;
         let before = now();
-        let first = next_of(device, 3);
+        let first = 101;
+        made(device, 3, first);
         let kept = holders(device, 3).unwrap();
         assert_eq!((kept.holders.len(), kept.lost_until), (1, 0));
         let holder = kept.holders[0];
@@ -222,24 +168,30 @@ mod tests {
         released(device, 0, first);
         assert_eq!(holders(device, 3).unwrap().holders[0].gone, LIVE);
         released(device, 3, first);
-        let later = next_of(device, 3);
-        assert_ne!(later, first);
+        // A later state takes the released one's identifier, as the runtime and Metal reuse it.
+        let later = first;
+        made(device, 3, later);
+        released(device, 3, later);
+        made(device, 3, later);
         let kept = holders(device, 3).unwrap();
-        let (a, b) = (kept.holders[0], kept.holders[1]);
-        assert_eq!((a.identifier, b.identifier, b.gone), (first, later, LIVE));
-        assert!(a.made < a.gone && a.gone < b.made);
+        let (a, b, c) = (kept.holders[0], kept.holders[1], kept.holders[2]);
+        assert_eq!([a.identifier, b.identifier, c.identifier], [first; 3]);
+        assert!(a.made < a.gone && a.gone < b.made && b.made < b.gone && b.gone < c.made);
+        assert_eq!(c.gone, LIVE);
         assert_eq!(holders(device - 1, 3), None);
-        let unnamed = next_of(device, 0);
-        assert_ne!(unnamed, 0);
+        made(device, 0, 7);
         assert_eq!(holders(device, 0), None);
-        // Past HISTORY, the released first state gives way, then the oldest live one.
-        let made: Vec<_> = (1..HISTORY).map(|_| next_of(device, 3)).collect();
+        // Past HISTORY, the released first states give way, then the oldest live one.
+        let identifiers: Vec<u64> = (0..HISTORY.to_u64() - 1).map(|i| 200 + i).collect();
+        for &identifier in &identifiers {
+            made(device, 3, identifier);
+        }
         let kept = holders(device, 3).unwrap();
-        assert_eq!(kept.lost_until, a.gone);
-        let identifiers: Vec<_> = kept.holders.iter().map(|h| h.identifier).collect();
-        assert_eq!(identifiers[0], later);
-        assert_eq!(identifiers[1..], made[..]);
-        next_of(device, 3);
+        assert_eq!(kept.lost_until, b.gone);
+        let kept_identifiers: Vec<_> = kept.holders.iter().map(|h| h.identifier).collect();
+        assert_eq!(kept_identifiers[0], first);
+        assert_eq!(kept_identifiers[1..], identifiers[..]);
+        made(device, 3, 999);
         assert_eq!(holders(device, 3).unwrap().lost_until, LIVE);
     }
 }
