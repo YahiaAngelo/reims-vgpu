@@ -1322,10 +1322,13 @@ fn modes_past_1_draw_metals_third_way() {
         2,
         7,
         0xff,
+        0x8000_0000,
+        0xffff_ffff,
         1 << 32,
         1 << 62,
         (1 << 63) - 1,
         1 << 63,
+        u64::MAX - 1,
         u64::MAX,
     ];
     let kind = rt::Degradation::ProvokingVertexUnmatched;

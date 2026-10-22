@@ -113,24 +113,25 @@
 //!     drawn here is wider than 1, so those draws, and executions, die after another width.
 //!   - `setProvokingVertexMode:` of 0 takes a primitive's flat inputs, and the layer and the
 //!     viewport its vertex function writes (`[[render_target_array_index]]`,
-//!     `[[viewport_array_index]]`), from its first vertex, Metal's default and Vulkan's; 1 from
-//!     its last (a line's second vertex, a list triangle's third, strip triangle i's vertex
-//!     i + 2, a private type's list primitive's last), in direct, indexed (each piece of a
-//!     restarted strip its own parity), indirect and instanced draws and patches, where an
-//!     execution of an indirect command buffer's commands takes the first vertex at every mode.
-//!     `[[barycentric_coord]]` is in mode 0's order at mode 1 but for a strip's odd triangles,
-//!     `(b2, b0, b1)` of mode 0's. Every other mode, its top bit set or not (2, 7, 255, `2^32`,
-//!     `2^62`, `2^63`, `u64::MAX`), draws a third way: a list triangle from its last vertex, a
-//!     patch from its first, and strips, lines and points otherwise than at 0 and at 1
-//!     (`modes_past_1_draw_metals_third_way`). The runtime takes the mode and draws it: mode 1
-//!     through `VK_EXT_provoking_vertex` where the device has its last vertex, elsewhere
-//!     (MoltenVK) from lists of the primitives led by their last vertices, which give a triangle
-//!     Metal's flat inputs, layer, viewport and weights. What it draws otherwise than Metal it
-//!     announces: a line drawn from its last vertex to its first (`provoking-vertex-lines`);
-//!     triangles that read flat inputs and weights, and patches, without the last vertex, a
-//!     layer or viewport selected in a synthesized geometry stage with it, and a mode from 2 up,
-//!     drawn as 1 (`provoking-vertex-unmatched`). Each is relayed, and dies in strict mode
-//!     ([`crate::answer::DIES`]).
+//!     `[[viewport_array_index]]`), from its first vertex, Metal's default and Vulkan's; 1 from its
+//!     last (a line's second vertex, a list triangle's third, strip triangle i's vertex i + 2, a
+//!     private type's list primitive's last), in direct, indexed (each piece of a restarted strip
+//!     its own parity), indirect and instanced draws and patches, where an execution of an indirect
+//!     command buffer's commands takes the first vertex at every mode. `[[barycentric_coord]]` is
+//!     in mode 0's order at mode 1 but for a strip's odd triangles, `(b2, b0, b1)` of mode 0's.
+//!     Every other mode, its top bit set or not (2, 7, 255, `2^31`, `2^32 - 1`, `2^32`, `2^62`,
+//!     `2^63 - 1`, `2^63`, `u64::MAX - 1`, `u64::MAX`), draws a third way: a list triangle's flat
+//!     inputs from its last vertex, a patch from its first, and strips, lines, points and the layer
+//!     a list triangle's vertex function writes otherwise than at 0 and at 1
+//!     (`modes_past_1_draw_metals_third_way`). The runtime takes the mode as the guest set it, and
+//!     draws it: mode 1 through `VK_EXT_provoking_vertex` where the device has its last vertex,
+//!     elsewhere (MoltenVK) from lists of the primitives led by their last vertices, which give a
+//!     triangle Metal's flat inputs, layer, viewport and weights. What it draws otherwise than
+//!     Metal it announces: a line drawn from its last vertex to its first
+//!     (`provoking-vertex-lines`); triangles that read flat inputs and weights, and patches,
+//!     without the last vertex, a layer or viewport selected in a synthesized geometry stage with
+//!     it, and a mode from 2 up, drawn as 1 (`provoking-vertex-unmatched`). Each is relayed, and
+//!     dies in strict mode ([`crate::answer::DIES`]).
 //!   - `setPrimitiveRestartEnabled:index:` sets the index an indexed strip restarts at, `k`,
 //!     whatever `enabled` says (`{0, k}` draws as `{1, k}`, at `k` of 0, 3, 7, 15, `0xffff`
 //!     and `0xffffffff`). Without it a strip restarts at its index type's all-ones index, as
@@ -1856,12 +1857,6 @@ fn draws_none(t: rt::DrawPrimitiveType, count: u32) -> bool {
     count < least
 }
 
-/// The `setProvokingVertexMode:` mode a mode whose top bit is set goes to the runtime as: one
-/// Metal draws the third way, as it draws those (`modes_past_1_draw_metals_third_way`, measured
-/// on this host), which the runtime draws as mode 1 and announces
-/// (`provoking-vertex-unmatched`), where it would draw a mode whose top bit is set as mode 0.
-const THIRD_WAY: u64 = 2;
-
 /// A draw's raw primitive type: a public one, one of the private ones Metal draws (5 to 8), or
 /// 9, which Metal's GPU fails the command buffer at ([`VulkanRenderEncoder::nine`],
 /// [`unmeasured_type_9`]), each of which the runtime draws as Metal does
@@ -2902,11 +2897,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 })
             }
             // The runtime draws the encoder's draws after it as Metal does at the mode, or
-            // announces what it draws otherwise (the module docs). Metal draws a mode whose top
-            // bit is set the third way, as every mode from 2 up, where the runtime takes such a
-            // mode as 0, so it goes to the runtime as one of the third way ([`THIRD_WAY`]).
+            // announces what it draws otherwise (the module docs).
             RenderCmd::SetProvokingVertexMode { mode } => {
-                let mode = if mode >> 63 == 1 { THIRD_WAY } else { mode };
                 encoded(&mut |e| e.set_provoking_vertex_mode(mode))
             }
             RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
