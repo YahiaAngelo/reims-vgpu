@@ -2293,12 +2293,12 @@ mod tests {
         //   a buffer's from Metal's range, dying after an encoder. It never answers the
         //   runtime's identifiers.
         // - `IndirectValuePastRecord`: no value the guest or the host sees. The runtime announces
-        //   it at a command's buffer set at a slot past 31, or threadgroup length at an index past
-        //   30, which no function binds and its records do not hold, so its read-back answers a
-        //   fresh command's value there. This platform keeps such a value beside the
-        //   command and answers Metal's getters from it, as Metal keeps it for its getters alone
-        //   (`icb`'s `slots_past_the_record_read_back_as_on_metal` and
-        //   `lengths_past_the_record_read_back_as_on_metal`, measured on this host).
+        //   it at a command's threadgroup length at an index past 30, which no function binds and
+        //   its records do not hold, so its read-back answers a fresh command's value there. This
+        //   platform keeps such a value beside the command and answers Metal's getter from it, as
+        //   Metal keeps it for its getter alone (`icb`'s
+        //   `lengths_past_the_record_read_back_as_on_metal`, measured on this host). A buffer set
+        //   past slot 31 the runtime keeps itself (`slots_past_the_record_read_back_as_on_metal`).
         // - `UnlistedArgumentSampler`: the difference dies where it shows. It is announced before
         //   any command shows it (a sampler state no set-1 array can hold, as it is made or
         //   listed), where most such work never shows it; the command buffer the runtime fails for
