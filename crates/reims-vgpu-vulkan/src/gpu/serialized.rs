@@ -124,12 +124,13 @@
 //!   state is made where the function's slot declares the format, else at a draw or an execution
 //!   that binds such a texture at a slot the function writes, or reaches one through a heap or an
 //!   argument buffer. So a mode 2 state is decided once the runtime made it, as Metal's compile
-//!   answers a refusal with the `NSError` first, and dies there where a half-float colour
-//!   attachment it writes ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an
-//!   index the function has an output for: `fragment_color_outputs`) is of a sample count whose
-//!   resolve nothing measured at this mode, or is `RGBA16Float` at colour 0 under alpha to
-//!   coverage with alpha in its write mask ([`rounded_writes`]). Every other state of a mode the
-//!   device supports is made as at the default.
+//!   answers a refusal with the `NSError` first, and relays there, or dies in strict mode
+//!   ([`rounded_writes_inexact`]), where a half-float colour attachment it writes
+//!   ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an index the function has
+//!   an output for: `fragment_color_outputs`) is of a sample count whose resolve nothing
+//!   measured at this mode, or is `RGBA16Float` at colour 0 under alpha to coverage with alpha
+//!   in its write mask ([`rounded_writes`]). Every other state of a mode the device supports is
+//!   made as at the default.
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
@@ -520,7 +521,8 @@ pub fn rounded_writes(desc: &RenderPipelineDescriptor, color_outputs: &[u32]) ->
 
 /// The sample counts above one at which a [`NEAREST_EVEN`] state's half-float colour attachment
 /// that stores the fragment function's output as written was measured to resolve as Metal's (the
-/// module docs): a state of another count above one dies as it is made ([`rounded_writes`]).
+/// module docs): a state of another count above one relays as it is made, or dies there in
+/// strict mode ([`rounded_writes`]).
 const RESOLVE_MEASURED: [u32; 2] = [2, 4];
 
 /// Whether a state of `samples` samples resolves its half-float attachments as Metal's at
