@@ -2054,11 +2054,17 @@ pub(crate) mod tests {
     /// last reference. The runtime may free the buffer's import then, the command buffer still
     /// running, as no command of it names the buffer or the texture. Whenever it frees it, the
     /// surface's memory stays mapped until it did ([`crate::os::surface_memory_hold`]): read
-    /// unmapped, the device imports no more than before the texture was made. Its own memory, and
-    /// a single range of pages the platform's VM mapped, which the test unmaps through it as core's
-    /// mapping's release would. Core makes no surface over such a range (a single range is a page
-    /// of the host's own RAM, which no hold defers), so the second case pins only the unmap hold
-    /// the surface's hold carries. An i915 execbuffer that lists an import whose pages are unmapped
+    /// unmapped, the device imports no more by their pointer than before the texture was made.
+    /// Where the device refuses the pointer and imports dma-bufs of the pages instead (RADV, for
+    /// any page with a file behind it), the import reads the file's pages the dma-buf pinned,
+    /// whatever is mapped at the address, and may outlive the mapping: the runtime drops the
+    /// keep-alive as it destroys the buffer's `VkBuffer`, then frees the dma-bufs' imports with the
+    /// pages (its `Imported`'s drop; 3 runs of 20 on the Radeon 780M, RADV, Mesa 26.2.4, read the
+    /// memory unmapped with the import live). The import is counted either way, and goes. Its own
+    /// memory, and a single range of pages the platform's VM mapped, which the test unmaps through
+    /// it as core's mapping's release would. Core makes no surface over such a range (a single
+    /// range is a page of the host's own RAM, which no hold defers), so the second case pins only
+    /// the unmap hold the surface's hold carries. An i915 execbuffer that lists an import whose pages are unmapped
     /// fails, which ANV answers as the device lost (`crate::remap`'s docs): the command buffer
     /// completes, and the memory is unmapped once the import was freed. The command buffer reads
     /// another texture through its ID, so no command of it names the surface's. Linux's: on macOS
@@ -2145,8 +2151,14 @@ pub(crate) mod tests {
                 true,
             ),
         ];
-        // The device's imports of host memory now.
-        let imports = || d.raw.work_counts().host_imports_live;
+        // The device's imports of host memory now: by their pointer, and of dma-bufs of the pages
+        // where the device refuses their pointer (RADV refuses any page with a file behind it, the
+        // surface's own memory among them: one chunk on the 7900 XTX and the 780M).
+        let imports = || {
+            let counts = d.raw.work_counts();
+            let dma_bufs = counts.dma_buf_memories_live + counts.dma_buf_image_memories_live;
+            (counts.host_imports_live, dma_bufs)
+        };
         for (surface, cores) in surfaces {
             let base = surface.base_address();
             let before = imports();
@@ -2154,10 +2166,16 @@ pub(crate) mod tests {
                 .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
                 .unwrap()
                 .unwrap();
-            assert_eq!(imports(), before + 1, "imported (core's mapping: {cores})");
-            // Whether the surface's memory is mapped, or the device no longer imports it: read in
-            // that order, as the runtime frees the import before it lets the memory go.
-            let mapped_while_imported = || crate::os::mapped(base) || imports() == before;
+            let (pointers, dma_bufs) = imports();
+            assert_eq!(
+                pointers + dma_bufs,
+                before.0 + before.1 + 1,
+                "imported (core's mapping: {cores})"
+            );
+            // Whether the surface's memory is mapped, or the device no longer imports it by its
+            // pointer: read in that order, as the runtime frees such an import before it lets the
+            // memory go. A dma-buf's import may outlive the mapping (the test's docs).
+            let mapped_while_imported = || crate::os::mapped(base) || imports().0 == before.0;
             let (words, read, held) = (buffer(16), buffer(16), buffer(8));
             let word = |i: usize| {
                 // SAFETY: one of the buffer's four words, which the kernel reads and writes.
@@ -2257,7 +2275,10 @@ pub(crate) mod tests {
                 }),
                 "unmapped once the import was freed (core's mapping: {cores})"
             );
-            assert_eq!(imports(), before, "freed (core's mapping: {cores})");
+            assert!(
+                within(&|| imports() == before),
+                "freed (core's mapping: {cores})"
+            );
         }
     }
 
