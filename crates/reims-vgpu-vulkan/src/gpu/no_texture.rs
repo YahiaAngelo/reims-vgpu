@@ -22,8 +22,9 @@
 //!   `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`, and
 //!   `newTextureWithDescriptor:iosurface:plane:`. `heapTextureSizeAndAlignWithDescriptor:`
 //!   answers 0 bytes there, at an alignment of the type alone: 128 for a 1D, 2D or 2D multisample
-//!   texture, 16 for a texture buffer, and 16 KiB for every other type. The nil comes
-//!   before each creator's own checks, which a texture of another format aborts or is nil at:
+//!   texture, 16 for a texture buffer, and 16 KiB for every other type (128 at macOS 27.0.1, the
+//!   runtime's answer at that level). The nil comes before each creator's own checks, which a
+//!   texture of another format aborts or is nil at:
 //!   `framebufferOnly` where the creator asserts it is not set, a rotation of a texture not over an
 //!   IOSurface, a storage mode other than the heap's, an offset or rows off their alignment or
 //!   short of a row, an offset past the heap's end, a plane the surface lacks, and a type other

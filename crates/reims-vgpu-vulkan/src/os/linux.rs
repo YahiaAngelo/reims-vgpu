@@ -118,12 +118,16 @@ pub fn install_process_services() {
 }
 
 /// The macOS release whose Metal the runtime's devices answer as where releases differ
-/// (`DeviceOptions::metal_level`): macOS 26.7, the release of the M3 Max whose Metal the suite's
-/// expected files, the pins and the measurements here were taken on, so a Linux host answers the
-/// guest as that Mac does. The runtime's default off macOS is its newest measured release,
-/// which takes and describes other pixel formats ([`rt::MetalLevel::knows`],
-/// [`rt::MetalLevel::describes`]).
-pub const METAL_LEVEL: Option<rt::MetalLevel> = Some(rt::MetalLevel::MacOS26_7);
+/// (`DeviceOptions::metal_level`, the rows of [`rt::MetalLevel`]): macOS 27.0.1 (26A434), the
+/// release the M3 Max runs, on which the suite's host-dependent expected files were recorded
+/// (`AppleM3Max-40c-26A434`) and this crate's comparisons with Metal run, where the Vulkan
+/// platform answers as the host's release. So a Linux host answers the guest as that Mac does.
+/// Named, as the runtime's default off macOS is its newest measured release, which moves when the
+/// runtime measures another, and is announced for every device (`MetalLevelNotMacOS`). It is
+/// Metal's behaviour alone: what the paravirtual device reports to the guest's driver (the guest
+/// ABI's binary versions and features, the device's feature level) is the host's to configure,
+/// and does not follow it.
+pub const METAL_LEVEL: Option<rt::MetalLevel> = Some(rt::MetalLevel::MacOS27_0_1);
 
 /// The registry ID the platform answers for the runtime's default device in place of its own:
 /// none, as there is no Metal here to ask, so the runtime's own stands.

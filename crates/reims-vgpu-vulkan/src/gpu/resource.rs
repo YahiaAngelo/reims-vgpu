@@ -4120,8 +4120,8 @@ pub(crate) mod tests {
     /// whose blocks the runtime lays out as its own at every level where Metal tiles them, dies
     /// at the placement, its line naming `heap-texture-block-compressed-layout`
     /// ([`crate::answer::DIES`]); a texture of a plain format of `ShaderWrite` usage there, and
-    /// one of `BC1_RGBA`, whose blocks lie in Metal's tiles at this host's macOS 26.7, are made
-    /// (the compressed ones of `ShaderRead` usage)
+    /// one of `BC1_RGBA`, whose blocks lie in Metal's tiles at every level the runtime measured,
+    /// are made (the compressed ones of `ShaderRead` usage)
     #[test]
     fn a_heap_texture_over_guest_pages_in_the_runtimes_layout_dies() {
         use reims_vgpu_core::platform::types::ResourceAddressRange;

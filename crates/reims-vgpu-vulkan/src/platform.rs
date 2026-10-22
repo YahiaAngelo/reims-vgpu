@@ -261,11 +261,11 @@ pub(crate) fn answering_level(sel: &'static str, what: impl FnOnce() -> String) 
 }
 
 /// The Metal level every device of this process answers at (`rt::DeviceProperties::metal_level`):
-/// the macOS release whose Metal the runtime answers as where releases differ, which pixel format
-/// values a texture descriptor takes ([`rt::MetalLevel::knows`]) and which formats Metal describes
-/// ([`rt::MetalLevel::describes`]). [`device_options`] names the OS's
+/// the macOS release whose Metal the runtime answers as where releases differ, among them which
+/// pixel format values a texture descriptor takes ([`rt::MetalLevel::knows`]) and which formats
+/// Metal describes ([`rt::MetalLevel::describes`]). [`device_options`] names the OS's
 /// ([`crate::os::METAL_LEVEL`]): on macOS none, so it is the host's release, or the newest
-/// measured release below it; on Linux macOS 26.7, the contract machine's. The same for every
+/// measured release below it; on Linux macOS 27.0.1, the contract machine's. The same for every
 /// device. The first device the platform adopts sets it ([`answered_at`]); read before any is,
 /// it is the runtime's system default device's, made for it, which dies as [`made_devices`]
 /// does where the runtime makes none, at `sel`, the call that asks.
@@ -312,8 +312,8 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
-/// OS's Metal level ([`crate::os::METAL_LEVEL`]: on Linux macOS 26.7, the contract machine's, where
-/// the runtime's default off macOS is its newest measured release), the shader cache in
+/// OS's Metal level ([`crate::os::METAL_LEVEL`]: on Linux macOS 27.0.1, the contract machine's,
+/// where the runtime's default off macOS is its newest measured release), the shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,

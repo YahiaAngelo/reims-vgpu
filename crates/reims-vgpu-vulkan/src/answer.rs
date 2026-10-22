@@ -357,10 +357,10 @@ pub fn create<T>(
 ///   map of no layers reaches the runtime here ([`crate::gpu::rate_map`]);
 /// - `HeapTextureBlockCompressedLayout`: a texture made in a heap over the guest's pages of a
 ///   block-compressed format whose placement the device's Metal level does not measure (PVRTC
-///   at every level; BC, ETC2, EAC and ASTC are measured at this host's macOS 26.7 and at
-///   27.0.1), whose blocks the runtime lays out as its own where Metal tiles them. Its reads,
-///   writes and copies are Metal's, but a buffer or texture over its bytes meets other bytes than
-///   Metal's would. Announced once per texture, inside the call that made it (the heap's
+///   at every level; BC, ETC2, EAC and ASTC are measured at macOS 26.7 and at 27.0.1), whose
+///   blocks the runtime lays out as its own where Metal tiles them. Its reads, writes and copies
+///   are Metal's, but a buffer or texture over its bytes meets other bytes than Metal's would.
+///   Announced once per texture, inside the call that made it (the heap's
 ///   `newTextureWithDescriptor:offset:`), which dies at its selector;
 /// - `BiasedDepthPastUnitRange`: a draw of triangles in depth clip mode under a depth bias, on a
 ///   device that enabled `VK_EXT_depth_range_unrestricted` but cannot clamp to `[0, 1]` while it
@@ -916,9 +916,9 @@ pub fn create<T>(
 ///     binds the pipeline's variant, inside its call;
 ///   - `MetalLevelNotMacOS`: a device made off macOS with no Metal level named, which answers as
 ///     the runtime's newest measured release, where Metal's answers differ by release. This
-///     platform names one on every OS but macOS ([`crate::os::METAL_LEVEL`]: on Linux macOS 26.7),
-///     so the runtime announces it for no device here. Announced as the device is made, inside
-///     the creator's call;
+///     platform names one on every OS but macOS ([`crate::os::METAL_LEVEL`]: on Linux macOS
+///     27.0.1), so the runtime announces it for no device here. Announced as the device is made,
+///     inside the creator's call;
 /// - the note `DeviceNanEncoding`: a NaN whose bits the device decides, where Metal answers its
 ///   own: the canonical `0x7fc00000` for its float arithmetic and functions, a 16-bit float
 ///   texel's own NaN for its read, sample, gather or pixel fetch and the canonical one for a
