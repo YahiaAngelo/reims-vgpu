@@ -667,8 +667,12 @@ impl VulkanDevice {
         };
         // SAFETY: an alias of the surface's allocation stays mapped until the runtime freed its
         // import, which the keep-alive holds, and so does the surface's own memory on Linux
-        // (`surface_memory_hold`); on macOS that memory stays while the surface lives, which the
-        // deallocator holds until the runtime lets go of the buffer, Metal's moment.
+        // (`surface_memory_hold`). On macOS the keep-alive holds nothing of that memory: it stays
+        // while the surface lives, which the deallocator holds until the runtime lets go of the
+        // buffer, Metal's moment, which may come before the import is freed. That falls short of
+        // `HostMemory::new`'s keep-alive clause, a deviation whose ground is MoltenVK's no-copy
+        // buffer keeping the pages Metal wired as it was made (`crate::remap`, "What is not ours
+        // to unmap").
         let memory = unsafe { crate::os::host_memory(base) };
         let contents = rt::BufferContents::NoCopy {
             memory,
