@@ -1766,13 +1766,16 @@ pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
 pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::HostBytes<'a> {
     let length =
         usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
-    let first = range.ptr().addr();
-    let Some(start) = NonNull::new(range.ptr().as_ptr::<u8>()).filter(|_| length != 0) else {
+    if length == 0 {
         return rt::HostBytes::from_slice(&[]);
-    };
-    if first < reims_vgpu_core::guest::ZERO_REGION_END || first.checked_add(length).is_none() {
-        crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
     }
+    let first = range.ptr().addr();
+    let start = NonNull::new(range.ptr().as_ptr::<u8>())
+        .filter(|_| first >= reims_vgpu_core::guest::ZERO_REGION_END)
+        .filter(|_| first.checked_add(length).is_some());
+    let Some(start) = start else {
+        crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
+    };
     // SAFETY: `HostRange::new`'s contract keeps `start..start + length` mapped and readable for
     // the call the bytes are given to, which reads them only while it runs and keeps nothing of
     // the pointer. They are guest memory, which the guest's vCPUs and GPU work write outside the
