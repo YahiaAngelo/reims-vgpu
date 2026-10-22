@@ -42,10 +42,12 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 pub(crate) use macos::MATRIX_KEY;
 pub use wsi::{add_window_extensions, present_fences};
 
+#[cfg(test)]
+pub(crate) use surface::in_runs;
 pub(crate) use surface::{
-    MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, in_runs,
-    memory_kind, over_guest_pages, page_runs, plane, plane_facts, runs_meet, surface_alias,
-    surface_bytes_memory, surface_memory, surface_offset, write_surface_bytes, ycbcr_facts,
+    MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, memory_kind,
+    over_guest_pages, page_runs, plane, plane_facts, surface_alias, surface_bytes_memory,
+    surface_memory, surface_offset, write_surface_bytes, ycbcr_facts,
 };
 
 /// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at

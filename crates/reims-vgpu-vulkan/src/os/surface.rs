@@ -127,23 +127,6 @@ pub(crate) fn in_runs(
     held
 }
 
-/// Whether [`in_runs`] finds any of `offsets` in `runs`, walking them as it does, to the first
-/// it finds, with nothing collected.
-pub(crate) fn runs_meet(runs: &[std::ops::Range<u64>], offsets: &std::ops::Range<u64>) -> bool {
-    let mut at = 0u64;
-    for run in runs {
-        let length = run.end - run.start;
-        if offsets.start.max(at) < offsets.end.min(at + length) {
-            return true;
-        }
-        at += length;
-        if at >= offsets.end {
-            break;
-        }
-    }
-    false
-}
-
 /// The offset of `surface`'s bytes into its allocation (`kIOSurfaceOffset`), as
 /// `OsSurfaces::create` made it: its base address lies that far into the allocation, a
 /// page-aligned mapping of `IOSurfaceGetAllocSize` bytes (measured on the M3 Max at 0x40, 0x1000
@@ -363,33 +346,6 @@ pub(crate) mod tests {
         );
         assert_eq!(in_runs(&runs, &(0x10_000..0x11_000)), []);
         assert_eq!(in_runs(&[], &(0..0x100)), []);
-    }
-
-    /// Bytes meet runs where `in_runs` finds any of them: at each run's edges, past their end,
-    /// over runs of no length, and for no bytes
-    #[test]
-    fn runs_meet_where_in_runs_finds_bytes() {
-        let runs = [
-            0x10_000..0x14_000,
-            0x50_000..0x50_000,
-            0x40_000..0x48_000,
-            0x20_000..0x24_000,
-        ];
-        let edges = [
-            0, 1, 0x3fff, 0x4000, 0x4001, 0xbfff, 0xc000, 0xffff, 0x10_000, 0x10_001,
-        ];
-        for list in [&runs[..], &runs[..1], &runs[1..2], &[]] {
-            for &start in &edges {
-                for &end in &edges {
-                    let offsets = start..end;
-                    assert_eq!(
-                        runs_meet(list, &offsets),
-                        !in_runs(list, &offsets).is_empty(),
-                        "{list:x?} {offsets:x?}"
-                    );
-                }
-            }
-        }
     }
 
     /// A 'BGRA' surface of `width` × `height`, 4 bytes an element, rows of `width × 4`, made over

@@ -112,19 +112,66 @@ struct Paged {
     /// The guest's pages, as the host maps them (each a first byte and an end): those of the
     /// object's last replace, or of the address ranges a heap was made over.
     pages: Vec<Range<u64>>,
+    /// Where each of `pages` ends in the object's bytes, laid out over them in their order: the
+    /// lengths up to it added up, so the run holding an object's byte is found by a search, not
+    /// a walk from the first (a heap over scattered pages holds a run a page).
+    ends: Vec<u64>,
     /// Whether a detach left the object in no memory since, where the GPU reads zeros through
     /// it.
     zeroed: bool,
+}
+
+impl Paged {
+    /// `pages`, laid out in their order, a detach leaving none of them zeroed.
+    fn of(pages: Vec<Range<u64>>) -> Paged {
+        let ends = (pages.iter())
+            .scan(0u64, |at, run| {
+                *at = at.saturating_add(run.end - run.start);
+                Some(*at)
+            })
+            .collect();
+        Paged {
+            pages,
+            ends,
+            zeroed: false,
+        }
+    }
+
+    /// The host ranges that hold the object's bytes `bytes`, as a walk of `pages` from the first
+    /// finds them (`os::surface::in_runs`), from the first run whose end lies past `bytes`' start.
+    fn in_runs(&self, bytes: &Range<u64>) -> Vec<Range<u64>> {
+        let first = self.ends.partition_point(|&end| end <= bytes.start);
+        let mut held = Vec::new();
+        let mut at = first
+            .checked_sub(1)
+            .and_then(|before| self.ends.get(before).copied())
+            .unwrap_or(0);
+        for (run, &end) in self.pages.iter().zip(&self.ends).skip(first) {
+            if at >= bytes.end {
+                break;
+            }
+            let (from, to) = (bytes.start.max(at), bytes.end.min(end));
+            if from < to {
+                held.push(run.start + (from - at)..run.start + (to - at));
+            }
+            at = end;
+        }
+        held
+    }
+
+    /// Whether [`Paged::in_runs`] finds any of `bytes`: the runs, laid out one after another,
+    /// hold the object's bytes from 0 to the last run's end, so whether `bytes` meet those.
+    fn meets(&self, bytes: &Range<u64>) -> bool {
+        let total = self.ends.last().copied().unwrap_or(0);
+        bytes.start < bytes.end && bytes.start < total
+    }
 }
 
 impl Seen {
     /// The object is over `pages` from now on, its uses forgotten.
     pub(crate) fn set_pages(&self, pages: Vec<Range<u64>>) {
         let guests = !pages.is_empty();
-        *self.paged.lock() = Paged {
-            pages,
-            zeroed: false,
-        };
+        *self.paged.lock() = Paged::of(pages);
         self.guests.store(guests, Ordering::Release);
         self.forget_uses();
     }
@@ -155,15 +202,14 @@ impl Seen {
     /// detached.
     pub(crate) fn in_pages(&self, bytes: &Range<u64>) -> Option<Vec<Range<u64>>> {
         let paged = self.paged.lock();
-        (!paged.zeroed && !paged.pages.is_empty()).then(|| crate::os::in_runs(&paged.pages, bytes))
+        (!paged.zeroed && !paged.pages.is_empty()).then(|| paged.in_runs(bytes))
     }
 
     /// Whether [`Seen::in_pages`] finds any memory of `bytes`, read as it reads it, with nothing
     /// collected; `None` where it answers `None`.
     pub(crate) fn meets_pages(&self, bytes: &Range<u64>) -> Option<bool> {
         let paged = self.paged.lock();
-        (!paged.zeroed && !paged.pages.is_empty())
-            .then(|| crate::os::runs_meet(&paged.pages, bytes))
+        (!paged.zeroed && !paged.pages.is_empty()).then(|| paged.meets(bytes))
     }
 
     /// Whether a detach left the object in no memory since its last replace.
@@ -183,7 +229,7 @@ impl Seen {
         if paged.zeroed {
             return Some(Vec::new());
         }
-        (!paged.pages.is_empty()).then(|| crate::os::in_runs(&paged.pages, bytes))
+        (!paged.pages.is_empty()).then(|| paged.in_runs(bytes))
     }
 
     /// Keeps a command's use of `memory`, unless a use kept holds all of it already: that one
@@ -736,6 +782,51 @@ mod tests {
         seen.set_pages(vec![0x50_0000..0x50_0000 + PAGE]);
         agree(&seen);
         assert_eq!(seen.meets_pages(&(0..1)), Some(true));
+    }
+
+    /// An object's bytes are found in its pages by a search from the run that holds their first
+    /// byte, as a walk of the runs from the first finds them: in each run they reach, in order, at
+    /// each run's edges, past their end, over runs of no length, and for no bytes; and they meet
+    /// the pages where that finds any
+    #[test]
+    fn bytes_in_pages_are_found_by_a_search_as_by_a_walk() {
+        let scattered: Vec<Range<u64>> = (0..64u64)
+            .map(|i| {
+                let at = 0x100_0000 + ((i * 37) % 64) * 2 * PAGE;
+                at..at + PAGE * (1 + i % 3)
+            })
+            .collect();
+        let lists = [
+            vec![
+                0x10_000..0x14_000,
+                0x50_000..0x50_000,
+                0x40_000..0x48_000,
+                0x20_000..0x24_000,
+            ],
+            vec![0x10_000..0x14_000],
+            vec![0x50_000..0x50_000],
+            vec![],
+            scattered,
+        ];
+        for runs in lists {
+            let paged = Paged::of(runs.clone());
+            let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
+            let mut edges = vec![0, 1, 0x3fff, 0x4000, 0x4001, 0xbfff, 0xc000, 0xffff];
+            edges.extend([total.saturating_sub(1), total, total + 1]);
+            edges.extend((1..12).map(|i| i * total / 11 + i % 3));
+            for &start in &edges {
+                for &end in &edges {
+                    let bytes = start..end;
+                    let walked = crate::os::in_runs(&runs, &bytes);
+                    assert_eq!(
+                        paged.meets(&bytes),
+                        !walked.is_empty(),
+                        "{runs:x?} {bytes:x?}"
+                    );
+                    assert_eq!(paged.in_runs(&bytes), walked, "{runs:x?} {bytes:x?}");
+                }
+            }
+        }
     }
 
     /// A texture kept apart in a heap over memory of its own, as core makes its detached heaps,
