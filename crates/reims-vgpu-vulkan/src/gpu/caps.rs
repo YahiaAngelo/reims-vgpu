@@ -562,7 +562,11 @@ mod tests {
             };
             let answer = private.count(property);
             assert_eq!(Some(ours), answer.value(), "{}", property.selector());
-            assert!(ours <= answer.metal(), "{}: past Metal's", property.selector());
+            assert!(
+                ours <= answer.metal(),
+                "{}: past Metal's",
+                property.selector()
+            );
         }
         assert_eq!(
             Some(caps.flags.supports_dynamic_attribute_stride),

@@ -70,7 +70,10 @@ fn a_compute_states_resource_index_is_metals() {
 /// constants Metal asserts at unspecialized, and this crate's own test and product libraries,
 /// each with its name.
 fn every_metallib() -> Vec<(String, Vec<u8>)> {
-    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/suite/fixtures/shaders");
+    let fixtures = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/suite/fixtures/shaders"
+    );
     let mut libs: Vec<(String, Vec<u8>)> = std::fs::read_dir(fixtures)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -171,7 +174,12 @@ fn compute_state_answers_are_metals_for_every_kernel_here() {
             }
         }
     }
-    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
     assert_eq!(died, ["sample_held_sampler_float"]);
     assert!(compared > 100, "{compared} kernels");
 }

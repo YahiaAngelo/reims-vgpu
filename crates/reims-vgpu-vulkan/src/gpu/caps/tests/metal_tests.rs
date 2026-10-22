@@ -260,7 +260,10 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
     let mut out = vec![
         ("name".to_owned(), format!("{:?}", caps.name)),
         ("registryID".to_owned(), format!("{:#x}", caps.registry_id)),
-        ("gpuCoreCount".to_owned(), format!("{:?}", caps.gpu_core_count)),
+        (
+            "gpuCoreCount".to_owned(),
+            format!("{:?}", caps.gpu_core_count),
+        ),
         (
             "maxThreadsPerThreadgroup".to_owned(),
             format!("{:?}", caps.max_threads_per_threadgroup),
@@ -285,7 +288,10 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
     out.extend(fields(format!("{:?}", caps.limits)));
     out.extend(fields(format!("{:?}", caps.flags)));
     for (count, answer) in SAMPLE_COUNTS.iter().zip(&caps.sample_counts) {
-        out.push((format!("supportsTextureSampleCount:{count}"), format!("{answer:?}")));
+        out.push((
+            format!("supportsTextureSampleCount:{count}"),
+            format!("{answer:?}"),
+        ));
     }
     for (t, answer) in caps.primitive_types.iter().enumerate() {
         out.push((format!("supportsPrimitiveType:{t}"), format!("{answer:?}")));
@@ -326,5 +332,10 @@ fn every_cap_is_the_metal_platforms_here() {
         .filter(|(o, t)| o != t)
         .map(|((name, o), (_, t))| format!("{name}: ours {o}, Metal's {t}"))
         .collect();
-    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
 }
