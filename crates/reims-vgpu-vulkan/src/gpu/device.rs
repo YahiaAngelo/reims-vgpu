@@ -2064,11 +2064,11 @@ pub(crate) mod tests {
     /// memory, and a single range of pages the platform's VM mapped, which the test unmaps through
     /// it as core's mapping's release would. Core makes no surface over such a range (a single
     /// range is a page of the host's own RAM, which no hold defers), so the second case pins only
-    /// the unmap hold the surface's hold carries. An i915 execbuffer that lists an import whose pages are unmapped
-    /// fails, which ANV answers as the device lost (`crate::remap`'s docs): the command buffer
-    /// completes, and the memory is unmapped once the import was freed. The command buffer reads
-    /// another texture through its ID, so no command of it names the surface's. Linux's: on macOS
-    /// IOSurface's memory is the surface's own
+    /// the unmap hold the surface's hold carries. An i915 execbuffer that lists an import whose
+    /// pages are unmapped fails, which ANV answers as the device lost (`crate::remap`'s docs): the
+    /// command buffer completes, and the memory is unmapped once the import was freed. The command
+    /// buffer reads another texture through its ID, so no command of it names the surface's.
+    /// Linux's: on macOS IOSurface's memory is the surface's own
     #[cfg(target_os = "linux")]
     #[test]
     fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
