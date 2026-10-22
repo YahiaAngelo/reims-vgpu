@@ -944,6 +944,162 @@ fn blits_move_lengths_past_the_record_as_metals() {
     }
 }
 
+/// A threadgroup memory length at an index of 38 or more is a later command's, 38 a command
+/// whatever the descriptor's count (2 here), one past the last command's is kept apart from
+/// every command's, and an index past 32 bits is its low 32 bits', at the setter and the getter,
+/// as on Metal
+#[test]
+fn lengths_cross_into_later_commands_as_on_metal() {
+    fn reads<P: Platform>(d: &P::Device) -> Vec<u64> {
+        let icb = make::<P>(d, &compute_desc(), 3);
+        let command = |i| icb.compute_command(i).unwrap().unwrap();
+        for (i, length, index) in [
+            (0, 16, 40),
+            (1, 32, 1),
+            (1, 48, 50),
+            (2, 64, 45),
+            (0, 80, (1 << 32) + 5),
+        ] {
+            command(i)
+                .encode(IcbComputeCmd::SetThreadgroupMemoryLength { length, index })
+                .unwrap();
+        }
+        let at = [
+            (1, 2),
+            (0, 40),
+            (0, 39),
+            (2, 12),
+            (1, 50),
+            (2, 45),
+            (0, 121),
+            (1, 83),
+            (0, 5),
+            (0, (1 << 32) + 5),
+            (2, 7),
+        ];
+        (at.iter())
+            .map(|&(i, index)| command(i).threadgroup_memory_length(index).unwrap())
+            .collect()
+    }
+    let vulkan = reads::<VulkanPlatform>(&dev());
+    assert_eq!(vulkan, [16, 16, 32, 48, 48, 64, 64, 64, 80, 80, 0]);
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
+    }
+}
+
+/// A blit's copy carries the threadgroup memory lengths a command holds, the record's and the 7
+/// past them, a length of an index of 38 or more among them as the later command's, and a
+/// blit's reset clears them, while a length past the last command's that a copy or a reset of
+/// another command does not reach stays, as on Metal. A copy into the last command, and a reset
+/// of it on the CPU, change some of those lengths on Metal and none here (`Tail`): a getter of
+/// one is relayed here, a death in strict mode, until core sets it again
+#[test]
+fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
+    fn length<P: Platform>(icb: &P::Icb, i: u64, index: u64) -> u64 {
+        let command = icb.compute_command(i).unwrap().unwrap();
+        command.threadgroup_memory_length(index).unwrap()
+    }
+    fn set<P: Platform>(icb: &P::Icb, i: u64, length: u64, index: u64) {
+        let command = icb.compute_command(i).unwrap().unwrap();
+        command
+            .encode(IcbComputeCmd::SetThreadgroupMemoryLength { length, index })
+            .unwrap();
+    }
+    /// What each step answers, and the two buffers, for the steps after it.
+    fn reads<P: Platform>(d: &P::Device) -> (Vec<u64>, [P::Icb; 2]) {
+        let (a, b) = (
+            make::<P>(d, &compute_desc(), 2),
+            make::<P>(d, &compute_desc(), 2),
+        );
+        for (i, length, index) in [
+            (0, 16, 3),
+            (0, 32, 33),
+            (0, 48, 40),
+            (1, 64, 35),
+            (1, 80, 40),
+        ] {
+            set::<P>(&a, i, length, index);
+        }
+        set::<P>(&b, 1, 90, 41);
+        let reset = |icb, at| BlitCmd::ResetCommandsInBuffer {
+            buffer: icb,
+            range: NsRange::new(at, 1),
+        };
+        for cmds in [vec![copy_to(&a, 1, &b, 0)], vec![reset(&a, 0)]] {
+            assert_eq!(blits::<P>(d, cmds).status().0, COMPLETED);
+        }
+        let mut read = vec![
+            length::<P>(&a, 0, 3),
+            length::<P>(&a, 0, 33),
+            length::<P>(&a, 0, 40),
+            length::<P>(&a, 1, 35),
+            length::<P>(&a, 1, 40),
+            length::<P>(&b, 0, 3),
+            length::<P>(&b, 0, 33),
+            length::<P>(&b, 0, 40),
+            length::<P>(&b, 1, 41),
+        ];
+        let last = BlitCmd::CopyIndirectCommandBuffer {
+            source: &a,
+            source_range: NsRange::new(1, 1),
+            destination: &b,
+            destination_index: 1,
+        };
+        assert_eq!(blits::<P>(d, vec![last]).status().0, COMPLETED);
+        read.extend([length::<P>(&b, 1, 2), length::<P>(&b, 1, 35)]);
+        (read, [a, b])
+    }
+    let d = dev();
+    let (vulkan, [a, b]) = reads::<VulkanPlatform>(&d);
+    assert_eq!(vulkan, [0, 0, 48, 64, 80, 16, 32, 0, 90, 48, 64]);
+    let kind = crate::answer::Inexact::IcbLengthPastTheLastCommand;
+    let unfollowed = |icb: &VulkanIcb, i, index| {
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| length::<VulkanPlatform>(icb, i, index)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, "getThreadgroupMemoryLengthAtIndex:")
+        );
+        assert!(line.contains(kind.code()), "{line}");
+        crate::answer::relaxed(|| length::<VulkanPlatform>(icb, i, index))
+    };
+    assert_eq!([unfollowed(&b, 1, 40), unfollowed(&b, 1, 41)], [0, 90]);
+    assert_eq!(length::<VulkanPlatform>(&a, 1, 40), 80);
+    a.compute_command(1)
+        .unwrap()
+        .unwrap()
+        .encode(IcbComputeCmd::Reset)
+        .unwrap();
+    assert_eq!(unfollowed(&a, 1, 40), 80);
+    set::<VulkanPlatform>(&b, 1, 7, 41);
+    set::<VulkanPlatform>(&a, 1, 5, 40);
+    let again = [
+        length::<VulkanPlatform>(&b, 1, 41),
+        length::<VulkanPlatform>(&a, 1, 40),
+    ];
+    assert_eq!(again, [7, 5]);
+    assert_eq!(unfollowed(&b, 1, 40), 0);
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let (metal, [a, b]) = reads::<MetalPlatform>(&md);
+    assert_eq!(metal, vulkan);
+    a.compute_command(1)
+        .unwrap()
+        .unwrap()
+        .encode(IcbComputeCmd::Reset)
+        .unwrap();
+    set::<MetalPlatform>(&b, 1, 7, 41);
+    set::<MetalPlatform>(&a, 1, 5, 40);
+    let again_on_metal = [
+        length::<MetalPlatform>(&b, 1, 41),
+        length::<MetalPlatform>(&a, 1, 40),
+    ];
+    assert_eq!(again_on_metal, again);
+}
+
 /// A buffer set at an offset past 32 bits answers the buffer's address plus the offset's low
 /// 32 bits, of each stage and form, as on Metal
 #[test]

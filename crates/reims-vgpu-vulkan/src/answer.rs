@@ -2094,11 +2094,16 @@ pub enum Inexact {
     /// announces once a device, as such a buffer is read). Relayed at every such buffer, wider
     /// than the runtime's notice ([`crate::gpu::icb`]).
     IcbIdentifierAfterEncoder,
+    /// A threadgroup memory length of a compute indirect command buffer past its last command's,
+    /// from the encoding of a copy into the last command or of a reset of it on, until core sets
+    /// it again: Metal's copy and reset change some such lengths, and the runtime's none, so the
+    /// getter answers the runtime's, as set before ([`crate::gpu::icb`]'s `Tail`).
+    IcbLengthPastTheLastCommand,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::HalfOutputBlend,
         Self::Clear,
         Self::BfloatLoaded,
@@ -2113,6 +2118,7 @@ impl Inexact {
         Self::ProtectedContent,
         Self::UniqueIdentifier,
         Self::IcbIdentifierAfterEncoder,
+        Self::IcbLengthPastTheLastCommand,
     ];
 
     /// The kind's code, which its line names.
@@ -2132,6 +2138,7 @@ impl Inexact {
             Self::ProtectedContent => "inexact-protected-content",
             Self::UniqueIdentifier => "inexact-unique-identifier",
             Self::IcbIdentifierAfterEncoder => "inexact-icb-identifier-after-encoder",
+            Self::IcbLengthPastTheLastCommand => "inexact-icb-length-past-last-command",
         }
     }
 }
@@ -2764,7 +2771,8 @@ mod tests {
                 | Inexact::LateResolve
                 | Inexact::ProtectedContent
                 | Inexact::UniqueIdentifier
-                | Inexact::IcbIdentifierAfterEncoder => {}
+                | Inexact::IcbIdentifierAfterEncoder
+                | Inexact::IcbLengthPastTheLastCommand => {}
             }
         }
     }

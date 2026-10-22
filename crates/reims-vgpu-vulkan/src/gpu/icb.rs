@@ -11,11 +11,15 @@
 //!   reset. An execution the GPU replays binds a nil buffer's bits as the address Metal's function
 //!   sees, and one replayed on the host binds none and announces `indirect-nil-buffer-offset`,
 //!   which dies ([`crate::answer::DIES`]).
-//!   A threadgroup memory length's getter is the runtime's too
+//!   A threadgroup memory length's setter and getter are the runtime's too
 //!   (`IndirectComputeCommand::threadgroup_memory_length`), past the 31 a record holds as well,
 //!   which Metal keeps for its getter alone, as the runtime does: 38 a command, an index of 38 or
 //!   more reaching a later command's, as Metal's, which the runtime's blits move with the
-//!   records.
+//!   records, and one past the last command's kept beside the buffer, which a copy or a reset of
+//!   another command does not reach; the index's low 32 bits, as Metal's take them. A copy into
+//!   the last command and a reset of it change some of the lengths past it on Metal and none in
+//!   the runtime, so once one may have run, a getter of such a length is relayed, a death in
+//!   strict mode, until core sets it again ([`Tail`]).
 //! - **The pipeline state's `uniqueIdentifier`** a command's getter answers is the runtime's
 //!   (`pipeline_unique_identifier`): that of the state its record names by the state's resource
 //!   ID, which a record the GPU wrote (a kernel's, or a blit's copy) names with no setter's, as
@@ -349,6 +353,35 @@ struct Sides {
     /// The progress of each command buffer that executes the buffer or makes it resident, once
     /// each, while the GPU may run it ([`IcbObject::executed`], [`IcbObject::resident`]).
     executions: Vec<std::sync::Weak<Progress>>,
+    /// What Metal answers of the threadgroup memory lengths past the last command's that the
+    /// runtime's may not.
+    tail: Tail,
+}
+
+/// The threadgroup memory lengths past the last command's ([`LENGTHS_A_COMMAND`]), which Metal
+/// and the runtime keep beside the buffer and read back as set, a copy or a reset of another
+/// command reaching none of them. A copy into the last command and a reset of it reach some on
+/// Metal, and none in the runtime (measured on the M3 Max, macOS 27.0.1, buffers of 2 compute
+/// commands: a blit's copy of the last command into another buffer's last carries the length 2
+/// past it over a 0 there, but a 0 copied leaves a length set there, and a blit's or the CPU's
+/// reset of the last command zeroes it; neither reaches the length 102 past it). From the
+/// encoding of one on, the runtime's answer of such a length may not be Metal's, and its getter
+/// is relayed, a death in strict mode ([`Inexact::IcbLengthPastTheLastCommand`]), until core
+/// sets it again.
+#[derive(Debug, Default)]
+struct Tail {
+    /// A copy into the last command or a reset of it was encoded, ran or may have.
+    reached: bool,
+    /// The places past the last command's lengths core set since, which answer as set.
+    set: BTreeSet<u64>,
+}
+
+impl Tail {
+    /// A copy into the last command or a reset of it was encoded, ran or may have.
+    fn reach(&mut self) {
+        self.reached = true;
+        self.set.clear();
+    }
 }
 
 /// The death of a getter, an execution or a copy of a command whose record Metal's copy past the
@@ -464,13 +497,18 @@ impl IcbObject {
         let Some(progress) = &progress else {
             return;
         };
+        let tail = destination.reaches_the_last(to..to + (from.end - from.start));
         type Land = fn(&mut Sides, u64, u64, Vec<(u64, bool)>);
         let copy = |land: Land| {
             let (source, destination) = (Arc::clone(&self.sides), Arc::clone(&destination.sides));
             let from = from.clone();
             move || {
                 let moved = source.lock().copies(from.clone());
-                land(&mut destination.lock(), from.start, to, moved);
+                let mut destination = destination.lock();
+                land(&mut destination, from.start, to, moved);
+                if tail {
+                    destination.tail.reach();
+                }
             }
         };
         progress.at_completion(copy(Sides::take));
@@ -483,7 +521,8 @@ impl IcbObject {
         let Some(progress) = &progress else {
             return;
         };
-        let sides = Arc::clone(&self.sides);
+        let tail = self.reaches_the_last(range.clone());
+        let (sides, failed) = (Arc::clone(&self.sides), Arc::clone(&self.sides));
         progress.at_completion(move || {
             let mut sides = sides.lock();
             for i in range {
@@ -491,12 +530,66 @@ impl IcbObject {
                     sides.corrupted.remove(&i);
                 }
             }
+            if tail {
+                sides.tail.reach();
+            }
+        });
+        if tail {
+            progress.at_failure(move || failed.lock().tail.reach());
+        }
+    }
+
+    /// Command `index` was reset on the CPU: its whole record is written again, and, of the last
+    /// command, some lengths past it on Metal ([`Tail`]).
+    fn rewritten(&self, index: u32) {
+        let last = plain(|| self.raw.size()).checked_sub(1);
+        plain(|| {
+            let mut sides = self.sides.lock();
+            sides.corrupted.remove(&index);
+            if last == Some(u64::from(index)) {
+                sides.tail.reach();
+            }
         });
     }
 
-    /// Command `index` was reset on the CPU: its whole record is written again.
-    fn rewritten(&self, index: u32) {
-        plain(|| self.sides.lock().corrupted.remove(&index));
+    /// Whether a blit that writes commands `range` reaches the last command, which changes some
+    /// lengths past it on Metal ([`Tail`]): where it does, they are taken as changed from now on.
+    fn reaches_the_last(&self, range: Range<u64>) -> bool {
+        let last = plain(|| self.raw.size()).checked_sub(1);
+        let reaches = last.is_some_and(|last| range.contains(&last));
+        if reaches {
+            plain(|| self.sides.lock().tail.reach());
+        }
+        reaches
+    }
+
+    /// Core set the threadgroup memory length `flat` places into the buffer's array of them,
+    /// past the last command's ([`Tail`]): it answers as set again.
+    fn tail_set(&self, flat: u64) {
+        plain(|| {
+            let mut sides = self.sides.lock();
+            if sides.tail.reached {
+                sides.tail.set.insert(flat);
+            }
+        });
+    }
+
+    /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
+    /// past the last command's ([`Tail`]): relayed, a death in strict mode, where a copy into the
+    /// last command or a reset of it may have changed it on Metal since core set it.
+    fn tail_read(&self, sel: &'static str, flat: u64) {
+        let unknown = plain(|| {
+            let sides = self.sides.lock();
+            sides.tail.reached && !sides.tail.set.contains(&flat)
+        });
+        if unknown {
+            inexact(sel, Inexact::IcbLengthPastTheLastCommand, || {
+                "a threadgroup memory length past the last command's, which Metal's copy into \
+                 the last command or reset of it may have changed, and the runtime's do not: it \
+                 answers the runtime's"
+                    .to_owned()
+            });
+        }
     }
 
     /// A blit `sel` of the command buffer of `progress` (none once it went) copies commands into
@@ -914,6 +1007,18 @@ impl CommandObject<rt::IndirectRenderCommand> {
 }
 
 impl CommandObject<rt::IndirectComputeCommand> {
+    /// Where Metal keeps the command's threadgroup memory length at `index`'s low 32 bits
+    /// ([`LENGTHS_A_COMMAND`]): the command whose record holds it, or its place in the buffer's
+    /// array of them, past the last command's ([`Tail`]).
+    fn length_place(&self, index: u64) -> Result<u32, u64> {
+        let flat = u64::from(self.index) * LENGTHS_A_COMMAND + u64::from(index.low_u32());
+        let command = flat / LENGTHS_A_COMMAND;
+        match command < plain(|| self.icb.raw.size()) {
+            true => Ok(command.low_u32()),
+            false => Err(flat),
+        }
+    }
+
     /// The command's record, read back, for `sel`.
     fn record(&self, sel: &'static str) -> rt::EncodedComputeCommand {
         self.icb.intact(sel, self.index);
@@ -1341,8 +1446,13 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             IcbComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 let length = u32::try_from(length)
                     .unwrap_or_else(|_| unrepresentable(sel, &format!("a length of {length}")));
-                let at = slot(sel, index);
-                set(sel, || c.set_threadgroup_memory_length(length, at))
+                set(sel, || {
+                    c.set_threadgroup_memory_length(length, index.low_u32())
+                })?;
+                if let Err(flat) = self.length_place(index) {
+                    self.icb.tail_set(flat);
+                }
+                Ok(())
             }
         }
     }
@@ -1394,14 +1504,13 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     /// The runtime's length where Metal keeps it, at the index's low 32 bits, as Metal's getter
     /// takes them: the command's below 38, a later command's at 38 or more
     /// ([`LENGTHS_A_COMMAND`]), past the last command's too. A command whose record Metal's copy
-    /// past the buffer's end may have written over dies ([`IcbObject::overrun`]).
+    /// past the buffer's end may have written over dies ([`IcbObject::overrun`]); one past the
+    /// last command's that a copy into it or a reset of it may have changed is relayed ([`Tail`]).
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
-        let flat = u64::from(self.index) * LENGTHS_A_COMMAND + u64::from(index.low_u32());
-        if let Ok(reached) = u32::try_from(flat / LENGTHS_A_COMMAND)
-            && u64::from(reached) < self.icb.raw.size()
-        {
-            self.icb.intact(sel, reached);
+        match self.length_place(index) {
+            Ok(command) => self.icb.intact(sel, command),
+            Err(flat) => self.icb.tail_read(sel, flat),
         }
         let length = get(sel, || self.raw.threadgroup_memory_length(index));
         let length = length.unwrap_or_else(|| {
