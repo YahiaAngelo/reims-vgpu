@@ -76,4 +76,91 @@ pub(crate) mod tests {
     fn the_tests_page_is_the_hosts() {
         assert_eq!(OsVm::new().page_size(), PAGE);
     }
+
+    /// Each call takes whole pages as Mach's does, which this checks on macOS (measured on the M3
+    /// Max, macOS 27.0.1): a fixed overwrite and a remap take their length rounded up to whole
+    /// pages from the page of their address, a remap's source from the page of its first byte,
+    /// though the bytes run into the next page, and the remap answers the target's page; a
+    /// protect and a deallocate take every page the bytes touch; a call of no bytes off a page's
+    /// start changes nothing, a remap's refused as an invalid argument
+    #[test]
+    fn the_vm_spans_its_calls_as_mach_does() {
+        use reims_vgpu_core::num::ToUsize as _;
+        use reims_vgpu_core::platform::os::vm::{HostAddr, KernReturn, VmProt};
+
+        let vm = OsVm::new();
+        let page = vm.page_size();
+        let at = |base: HostAddr, i: u64| base.wrapping_add(i * page);
+        // Four pages that a view can be made of, page `i` filled with `first + i`.
+        let pages = |first: u8| {
+            let base = allocate_aliasable(4 * page).unwrap();
+            for (i, byte) in (0..4).zip(first..) {
+                // SAFETY: the page just allocated, readable and writable.
+                unsafe {
+                    at(base, i)
+                        .as_ptr::<u8>()
+                        .write_bytes(byte, page.to_usize())
+                };
+            }
+            base
+        };
+        // The first byte of each page.
+        let bytes = |base: HostAddr| -> Vec<u8> {
+            // SAFETY: the test's pages, mapped readable.
+            (0..4)
+                .map(|i| unsafe { at(base, i).as_ptr::<u8>().read_volatile() })
+                .collect()
+        };
+        let near_the_end = page - 0x80;
+
+        let zeroed = pages(0xa0);
+        vm.allocate_fixed_overwrite(zeroed.wrapping_add(near_the_end), 0x100)
+            .unwrap();
+        assert_eq!(bytes(zeroed), [0, 0xa1, 0xa2, 0xa3], "a fixed overwrite");
+
+        let (source, target) = (pages(0x10), pages(0xb0));
+        let into_page_1 = at(target, 1).wrapping_add(near_the_end);
+        let remapped =
+            vm.remap_shared_overwrite(into_page_1, source.wrapping_add(near_the_end), page);
+        assert_eq!(remapped, Ok(at(target, 1)));
+        assert_eq!(
+            bytes(target),
+            [0xb0, 0x10, 0xb2, 0xb3],
+            "a remap of a page's length"
+        );
+        let remapped =
+            vm.remap_shared_overwrite(target, source.wrapping_add(near_the_end), page + 1);
+        assert_eq!(remapped, Ok(target));
+        assert_eq!(
+            bytes(target),
+            [0x10, 0x11, 0xb2, 0xb3],
+            "and of a byte more"
+        );
+
+        vm.protect_max(target.wrapping_add(near_the_end), 0x100, VmProt::READ)
+            .unwrap();
+        let writable_pages: Vec<bool> = (0..4).map(|i| writable(at(target, i), page)).collect();
+        assert_eq!(writable_pages, [false, false, true, true], "a protect");
+        assert!(
+            vm.deallocate(zeroed.wrapping_add(near_the_end), 0x100)
+                .is_success()
+        );
+        let mapped_pages: Vec<bool> = (0..4).map(|i| mapped(at(zeroed, i))).collect();
+        assert_eq!(mapped_pages, [false, false, true, true], "a deallocate");
+
+        let off = at(target, 2).wrapping_add(0x80);
+        assert_eq!(
+            vm.remap_shared_overwrite(off, source, 0),
+            Err(KernReturn(4))
+        );
+        vm.allocate_fixed_overwrite(off, 0).unwrap();
+        vm.protect_max(off, 0, VmProt::NONE).unwrap();
+        assert!(vm.deallocate(off, 0).is_success());
+        assert_eq!(bytes(target)[2], 0xb2, "no bytes: the page as it was");
+        assert!(mapped(at(target, 2)) && writable(at(target, 2), page));
+
+        for base in [zeroed, source, target] {
+            assert!(vm.deallocate(base, 4 * page).is_success());
+        }
+    }
 }

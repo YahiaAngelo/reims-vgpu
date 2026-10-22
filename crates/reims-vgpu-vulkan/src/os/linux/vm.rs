@@ -22,8 +22,16 @@
 //! - **`protect_max`** is `mprotect`: Linux has no maximum protection, and the current one
 //!   stands in for it, so a lowered protection can be raised again, which Mach refuses. A
 //!   forbidden write is a `SIGSEGV`, where Mach's is a `SIGBUS`: a death either way.
-//! - Each call takes whole host pages (`sysconf(_SC_PAGESIZE)`), from the page of its first byte
-//!   to the page past its last, as Mach's do.
+//! - **Whole pages**, of the host's size (`sysconf(_SC_PAGESIZE)`), as Mach takes them (measured
+//!   on the M3 Max, macOS 27.0.1, 16 KiB pages; `crate::os`'s
+//!   `the_vm_spans_its_calls_as_mach_does` checks it there): `protect_max` and `deallocate` take
+//!   every page the range's bytes touch, from the page of its first byte to the page past its
+//!   last; `allocate_fixed_overwrite` and `remap_shared_overwrite` take the length rounded up to
+//!   whole pages from the page of the address, the remap's source from the page of its first
+//!   byte too ([`length_pages`]), so a range that starts into a page and runs into the next takes
+//!   one page fewer than its bytes touch, and the remap answers the target's page. A call of no
+//!   bytes changes nothing, wherever it starts: the remap's is `KERN_INVALID_ARGUMENT`, the
+//!   others' success.
 //!
 //! **Mappings.** Each run of a view is a VMA, so a view of scattered pages costs one per run: a
 //! 1080p surface over 16 KiB granules about 507. The views share a budget short of
@@ -65,13 +73,26 @@ pub(super) fn page_size() -> u64 {
 }
 
 /// The whole pages `len` bytes at `addr` lie in: the first byte of the first, and their length;
-/// `None` where they pass the end of the address space.
+/// `None` where they pass the end of the address space. Those `protect_max` and `deallocate`
+/// take (module docs).
 fn pages(addr: HostAddr, len: u64) -> Option<(u64, u64)> {
     let mask = page_size() - 1;
     let start = addr.addr().to_u64();
     let first = start & !mask;
     let end = start.checked_add(len)?.checked_add(mask)? & !mask;
     Some((first, end - first))
+}
+
+/// The pages a call of `len` bytes at `addr` takes where Mach takes the length rounded up to
+/// whole pages from the page of the address (`allocate_fixed_overwrite`,
+/// `remap_shared_overwrite`; module docs): the first byte of that page, and the length; `None`
+/// where they pass the end of the address space.
+fn length_pages(addr: HostAddr, len: u64) -> Option<(u64, u64)> {
+    let mask = page_size() - 1;
+    let first = addr.addr().to_u64() & !mask;
+    let length = len.checked_add(mask)? & !mask;
+    first.checked_add(length)?;
+    Some((first, length))
 }
 
 /// A Mach answer for the `errno` of a refused call, which `what` names: `ENOMEM` is
@@ -465,9 +486,10 @@ impl HostVm for LinuxVm {
         Ok(HostAddr::from_addr(at.to_usize()))
     }
 
-    /// Fresh anonymous memory over the pages of the range, which then shows no file.
+    /// Fresh anonymous memory over the pages of the range's length from the page of its address
+    /// (module docs), which then show no file.
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
-        let (first, length) = pages(addr, len).ok_or(NO_SPACE)?;
+        let (first, length) = length_pages(addr, len).ok_or(NO_SPACE)?;
         if length == 0 {
             return Ok(());
         }
@@ -476,21 +498,20 @@ impl HostVm for LinuxVm {
         Ok(())
     }
 
-    /// The source's pages, from the page of its first byte, mapped from their files over `dst`'s
-    /// pages, each with the protection the source has there (module docs).
+    /// The source's pages of the length, from the page of its first byte, mapped from their files
+    /// over as many from `dst`'s page, each with the protection the source has there: that
+    /// page's first byte, which Mach writes back (module docs).
     fn remap_shared_overwrite(
         &self,
         dst: HostAddr,
         src: HostAddr,
         len: u64,
     ) -> Result<HostAddr, KernReturn> {
-        let mask = page_size() - 1;
-        let into = src.addr().to_u64() & mask;
-        let (target, length) = pages(dst, len.saturating_add(into)).ok_or(INVALID_ARGUMENT)?;
-        let (source, _) = pages(src, len).ok_or(INVALID_ADDRESS)?;
-        if length == 0 {
-            return Ok(dst);
+        if len == 0 {
+            return Err(INVALID_ARGUMENT);
         }
+        let (target, length) = length_pages(dst, len).ok_or(INVALID_ARGUMENT)?;
+        let (source, _) = length_pages(src, len).ok_or(INVALID_ADDRESS)?;
         let Some(pieces) = files::pieces(source, length) else {
             log::debug!(
                 target: "reims_vgpu_vulkan::os",
@@ -515,15 +536,15 @@ impl HostVm for LinuxVm {
         for piece in pieces {
             files::record(target + piece.at, piece.length, piece.backing, piece.prot);
         }
-        Ok(dst)
+        Ok(HostAddr::from_addr(target.to_usize()))
     }
 
-    /// `mprotect` of the range's pages (module docs).
+    /// `mprotect` of the range's pages; none for no bytes (module docs).
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn> {
-        let (first, length) = pages(addr, len).ok_or(INVALID_ARGUMENT)?;
-        if length == 0 {
+        if len == 0 {
             return Ok(());
         }
+        let (first, length) = pages(addr, len).ok_or(INVALID_ARGUMENT)?;
         let bits = prot_bits(prot);
         // SAFETY: lowering or raising a range's protection is the caller's decision; a later
         // access it forbids faults (a process death).
@@ -534,15 +555,16 @@ impl HostVm for LinuxVm {
         Ok(())
     }
 
-    /// `munmap` of the range's pages, which show no file from then on. A range of memory the
-    /// library registered and does not own (the guest's RAM) is refused, unmapped by nothing.
+    /// `munmap` of the range's pages, which show no file from then on; none for no bytes (module
+    /// docs). A range of memory the library registered and does not own (the guest's RAM) is
+    /// refused, unmapped by nothing.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
+        if len == 0 {
+            return KernReturn::SUCCESS;
+        }
         let Some((first, length)) = pages(addr, len) else {
             return INVALID_ARGUMENT;
         };
-        if length == 0 {
-            return KernReturn::SUCCESS;
-        }
         if files::meets_registration(first, length) {
             log::error!(
                 target: "reims_vgpu_vulkan::os",
