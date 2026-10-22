@@ -1853,14 +1853,21 @@ pub(crate) mod tests {
             return kept.clone_ref();
         }
         options.policy = policy;
-        let raw = rt::Device::system_default_with(&options).unwrap();
-        let device = Obj::new(DeviceObject {
+        let device = device_of_options(&options);
+        made.push((policy, device.clone_ref()));
+        device
+    }
+
+    /// A device of the system default's physical device made with `options`, after the shared
+    /// device ([`dev`]) and not kept for [`adopt`], as [`device_with_policy`]'s are.
+    pub(crate) fn device_of_options(options: &rt::DeviceOptions) -> VulkanDevice {
+        drop(dev());
+        let raw = rt::Device::system_default_with(options).unwrap();
+        Obj::new(DeviceObject {
             registry_id: registry_id(&raw),
             raw,
             caps: OnceLock::new(),
-        });
-        made.push((policy, device.clone_ref()));
-        device
+        })
     }
 
     /// A sparse heap takes its range where the model of Metal's space places it: unpinned or at a

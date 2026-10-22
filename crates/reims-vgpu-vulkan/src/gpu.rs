@@ -30,6 +30,8 @@ pub mod encode_render;
 pub mod event;
 pub mod fill;
 pub mod format_info;
+#[cfg(test)]
+mod frame_cost;
 pub mod icb;
 pub mod metal_space;
 pub mod no_texture;
