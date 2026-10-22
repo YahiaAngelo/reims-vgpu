@@ -11,10 +11,13 @@
 //!   `Depth16Unorm` texture where the device's maintenance8 copies are missing or wrong
 //!   (MoltenVK 1.4.1 among them). Such a refusal is one, its line naming the copy's shape
 //!   (`buffer_copy_shape`).
-//! - **The private fills** (`fillBuffer:range:pattern4:` and the two `fillTexture:...`) are
-//!   copies from a staging buffer of the bytes Metal writes ([`crate::gpu::fill`]), at most
-//!   [`STAGING_BYTES`] of them, copied again for the rest; a fill that writes nothing encodes
-//!   nothing. A texture fill of a format whose fill [`crate::gpu::fill`] does not measure
+//! - **`fillBuffer:range:pattern4:`** is the runtime's `fill_buffer_pattern4`, which writes the
+//!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_the_metal_platforms`,
+//!   over more than the runtime stages at once).
+//! - **The private texture fills** (the two `fillTexture:...`) are copies from a staging buffer
+//!   of the bytes Metal writes ([`crate::gpu::fill`]), at most [`STAGING_BYTES`] of them, copied
+//!   again for the rest; a fill that writes nothing encodes nothing. A texture fill of a format
+//!   whose fill [`crate::gpu::fill`] does not measure
 //!   ([`crate::gpu::fill::texel_bytes`]) is the runtime's `fill_texture` of the pattern, or of the
 //!   colour packed as [`crate::gpu::fill`] packs it, at the level and slice and in the region
 //!   [`crate::gpu::fill::place`] gives, as Metal's fill writes it on this host:
@@ -1020,30 +1023,8 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 range,
                 pattern,
             } => {
-                if range.length == 0 {
-                    return self.nothing(sel);
-                }
                 let range = indices(sel, range);
-                let head = fill::pattern4_head(range.start, range.end - range.start);
-                let body = range.end - range.start - head;
-                let chunk = body.min(STAGING_BYTES);
-                let mut bytes = fill::pattern4(pattern, to_usize(sel, head));
-                bytes.extend(fill::pattern4(pattern, to_usize(sel, chunk)));
-                let staging = staging(sel, plain(|| buffer.raw.device()), &bytes)?;
-                if head > 0 {
-                    caught(&mut |e| {
-                        e.copy_from_buffer_to_buffer(&staging, 0, &buffer.raw, range.start, head)
-                    })?;
-                }
-                let mut at = range.start + head;
-                while at < range.end {
-                    let n = chunk.min(range.end - at);
-                    caught(&mut |e| {
-                        e.copy_from_buffer_to_buffer(&staging, head, &buffer.raw, at, n)
-                    })?;
-                    at += n;
-                }
-                Ok(())
+                caught(&mut |e| e.fill_buffer_pattern4(&buffer.raw, range.clone(), pattern))
             }
             BlitCmd::FillTexture {
                 texture,

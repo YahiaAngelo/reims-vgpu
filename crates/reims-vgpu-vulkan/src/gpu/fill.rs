@@ -1,16 +1,17 @@
 //! What the private fills write, and where: `fillBuffer:range:pattern4:`,
 //! `fillTexture:level:slice:region:bytes:length:` and
-//! `fillTexture:level:slice:region:color:pixelFormat:`. The blit encoder writes these bytes with
-//! the runtime's copies, and into a texture of a format whose fill nothing here measured
-//! ([`texel_bytes`]) with the runtime's fill ([`crate::gpu::encode_blit`]). A colour in a bfloat
-//! format, an extended-range `_sRGB` twin or an RGBX format ([`RUNTIME_PACKED`]) is the
-//! runtime's colour fill, which packs it.
+//! `fillTexture:level:slice:region:color:pixelFormat:`. The blit encoder writes the texture
+//! fills' bytes with the runtime's copies, and into a texture of a format whose fill nothing here
+//! measured ([`texel_bytes`]) with the runtime's fill ([`crate::gpu::encode_blit`]). A colour in a
+//! bfloat format, an extended-range `_sRGB` twin or an RGBX format ([`RUNTIME_PACKED`]) is the
+//! runtime's colour fill, which packs it. The pattern fill is the runtime's
+//! (`fill_buffer_pattern4`), which writes it as Metal does (below).
 //!
 //! Metal's answers, measured on `AppleM3Max-40c-25G229` with no validation:
 //! - **The pattern** of `pattern4:` is its four bytes, low first, repeated from the range's start
-//!   up to the first offset that is a multiple of 16 (the head, [`pattern4_head`]), and from
-//!   that offset afresh to the range's end ([`pattern4`]): a fill of 7 bytes at 41 writes
-//!   `01 02 03 04 01 02 03`, then `01 02 ..` from 48. An empty range writes nothing.
+//!   up to the first offset that is a multiple of 16 (the head), and from that offset afresh to
+//!   the range's end: a fill of 7 bytes at 41 writes `01 02 03 04 01 02 03`, then `01 02 ..` from
+//!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_the_metal_platforms`).
 //! - **A texel** of either texture fill is its pattern (the bytes, or the colour's bytes) repeated
 //!   from its start and cut at the texture format's block bytes ([`texel`]): bytes past a block
 //!   go unread, and a colour of fewer bytes repeats (an R8Unorm colour fills each byte of an
@@ -102,23 +103,6 @@ use crate::answer::unrepresentable;
 
 /// The most texels a fill region may span before the cut: Metal took 23 ms for this many.
 const MEASURED_TEXELS: u64 = 1 << 32;
-
-/// `length` bytes of `fillBuffer:range:pattern4:`'s head or body: `pattern`, low byte first,
-/// repeated from its start.
-pub fn pattern4(pattern: u32, length: usize) -> Vec<u8> {
-    pattern
-        .to_le_bytes()
-        .into_iter()
-        .cycle()
-        .take(length)
-        .collect()
-}
-
-/// The bytes of the head of a pattern fill of `length` bytes at `start`: those before the first
-/// offset at or after `start` that is a multiple of 16, where the pattern starts afresh.
-pub fn pattern4_head(start: u64, length: u64) -> u64 {
-    start.next_multiple_of(16).saturating_sub(start).min(length)
-}
 
 /// A texel of `bytes` bytes: `pattern` repeated from its start and cut at `bytes`. An empty
 /// pattern (none reaches here) is a texel of zeroes.
@@ -827,19 +811,10 @@ mod tests {
 
     use super::*;
 
-    /// The pattern and the texels repeat from their start; a colour in a format Metal packs no
+    /// The texels repeat their pattern from its start; a colour in a format Metal packs no
     /// colour in, or one not reproduced or measured (BGRA10_XR_sRGB), dies
     #[test]
     fn patterns_and_texels() {
-        assert_eq!(pattern4(0x0403_0201, 6), [1, 2, 3, 4, 1, 2]);
-        assert_eq!(
-            (
-                pattern4_head(41, 100),
-                pattern4_head(9, 3),
-                pattern4_head(32, 9)
-            ),
-            (7, 3, 0)
-        );
         assert_eq!(texel(&[1, 2, 3, 4, 5], 4), [1, 2, 3, 4]);
         assert_eq!(texel(&[0x80], 4), [0x80; 4]);
         assert_eq!(texel(&[1, 2], 8), [1, 2, 1, 2, 1, 2, 1, 2]);
