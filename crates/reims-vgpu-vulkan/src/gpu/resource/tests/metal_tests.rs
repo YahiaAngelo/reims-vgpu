@@ -954,12 +954,10 @@ fn depth_stencil_textures_without_optimized_contents_take_metals_space() {
 /// A depth or stencil texture's heap size with allowGPUOptimizedContents off is larger at
 /// the runtime than the Metal platform's on this host, as the runtime keeps its GPU-optimized
 /// layout (`OptimizedDepthStencilTexture`), so the query answers Metal's, the runtime's model
-/// of it or made of the runtime's answers for colour formats
-/// (`metal_space::metal_size_and_align`): the Metal
-/// platform's size and alignment for each format, 4x4 to 128x128, of 1 and 4 samples, at
-/// each of [`DEPTH_USAGES`], where the runtime's own answer is at least as many bytes, at an
-/// alignment Metal's divides. An X32_Stencil8 texture, whose answer is neither rule's, answers
-/// the runtime's model of Metal's, the Metal platform's. With it on or unset the size is
+/// of it: the Metal platform's size and alignment for each format, 4x4 to 128x128, of 1 and 4
+/// samples, at each of [`DEPTH_USAGES`], where the runtime's own answer is at least as many
+/// bytes, at an alignment Metal's divides, an X32_Stencil8 texture's among them, a `Stencil8`
+/// one's of its shape. With it on or unset the size is
 /// Metal's: a `Depth32Float_Stencil8` one's is the runtime's, which models its layout and
 /// announces nothing, Metal's at this shape
 #[test]
@@ -1192,11 +1190,11 @@ const DEPTH_MORE_USAGES: [u64; 11] = [
 /// [`DEPTH_MORE_SHAPES`] at those and [`DEPTH_MORE_USAGES`]; and of a 64x64 2D one at
 /// `ShaderRead | RenderTarget` with the write-combined CPU cache mode, untracked hazard
 /// tracking, `framebufferOnly` and protection options 0x1. The query answers each, the Metal
-/// platform's answer ([`crate::gpu::metal_space::metal_size_and_align`]), a multisample one
-/// at `Shared` storage among them, whose image the runtime makes in memory of its own; and the
-/// runtime's own answer
-/// is at least as many bytes, at an alignment the model's divides, which a heap's placement
-/// of such a texture relies on (`HeapObject::new_texture`)
+/// platform's answer (the runtime's model of it, `VulkanDevice::metal_answer_at`), a
+/// multisample one at `Shared` storage among them, whose image the runtime makes in memory of
+/// its own; and the runtime's own answer is at least as many bytes, at an alignment the
+/// model's divides, which a heap's placement of such a texture relies on
+/// (`HeapObject::new_texture`)
 #[test]
 fn heap_depth_stencil_shapes_with_optimized_contents_off_are_metals() {
     let sel = "heapTextureSizeAndAlignWithDescriptor:";
@@ -1266,8 +1264,7 @@ fn heap_depth_stencil_shapes_with_optimized_contents_off_are_metals() {
                 let answered = catch_death(|| d.heap_texture_size_and_align(&ours));
                 let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                 let raw = ours.fields().descriptor(sel, Maker::SizeQuery);
-                let answer = |desc: &rt::TextureDescriptor| d.size_and_align_at(sel, desc);
-                let modelled = crate::gpu::metal_space::metal_size_and_align(&raw, answer);
+                let modelled = d.metal_answer_at(sel, &raw);
                 let runtimes = crate::answer::plain(|| d.raw.heap_texture_size_and_align(&raw));
                 if let (Some(model), Ok(runtimes)) = (modelled, &runtimes)
                     && (runtimes.size < model.size || !runtimes.align.is_multiple_of(model.align))
@@ -1297,13 +1294,12 @@ fn heap_depth_stencil_shapes_with_optimized_contents_off_are_metals() {
 /// texture with allowGPUOptimizedContents off, of `Depth16Unorm`, `Depth32Float`, `Stencil8`,
 /// `Depth32Float_Stencil8` and `X32_Stencil8`, at `Private` and `Shared` storage, of one
 /// image (2D and multisample) and of each shape of [`DEPTH_SHAPES`], 4x4 to 128x128, at each
-/// of [`DEPTH_USAGES`], against the rules [`crate::gpu::metal_space::metal_size_and_align`]
-/// makes Metal's answer by: a format of one aspect as its colour format, the runtime's answer
-/// for it, and a two-aspect one as its depth's answer rounded up to a page, then its
-/// stencil's ([`crate::gpu::metal_space::paired`]). It prints each format, storage and shape,
-/// whether every row of it is the rule's, and each row Metal answers otherwise, Metal's answer
-/// beside the rule's. Every row of the formats the rules are taken for is the rule's
-/// (`twins`); `X32_Stencil8`'s, which no rule is taken for, are printed alone
+/// of [`DEPTH_USAGES`], against the rules the runtime's model of Metal's answer
+/// ([`depth_rule`]) takes: a format of one aspect as its colour format, and a two-aspect one
+/// as its depth's answer rounded up to a page, then its stencil's, an `X32_Stencil8` one as a
+/// `Stencil8` one of its shape. It prints each format, storage and shape, whether every row of
+/// it is the rule's, and each row Metal answers otherwise, Metal's answer beside the rule's.
+/// Every row is the rule's
 #[test]
 #[ignore = "a measurement: Metal's depth and stencil sizes against the rules"]
 fn depth_stencil_sizes_against_the_rules() {
@@ -1332,21 +1328,7 @@ fn depth_stencil_sizes_against_the_rules() {
                             .texture_descriptor(&t)
                             .fields()
                             .descriptor(sel, Maker::SizeQuery);
-                        let answer = |desc: &rt::TextureDescriptor| d.size_and_align_at(sel, desc);
-                        let colour = match pixel_format {
-                            250 => Some(PixelFormat::R16Unorm),
-                            252 => Some(PixelFormat::R32Float),
-                            253 => Some(PixelFormat::R8Unorm),
-                            _ => None,
-                        };
-                        let rule = match colour {
-                            Some(colour) => {
-                                let mut twin = raw;
-                                twin.pixel_format = colour;
-                                answer(&twin)
-                            }
-                            None => crate::gpu::metal_space::paired(&raw, answer),
-                        };
+                        let rule = depth_rule(&d, &raw);
                         let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&t);
                         let theirs = metal.heap_texture_size_and_align(&desc).unwrap();
                         if rule != Some(theirs) {
@@ -1366,7 +1348,7 @@ fn depth_stencil_sizes_against_the_rules() {
                 for row in &rows {
                     eprintln!("{row}");
                 }
-                if !rows.is_empty() && pixel_format != 261 {
+                if !rows.is_empty() {
                     differ.push(format!("{pixel_format} {storage} {name}"));
                 }
             }
@@ -1375,23 +1357,12 @@ fn depth_stencil_sizes_against_the_rules() {
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
-/// The rules' answer for a depth or stencil texture of `raw`, of `d`'s answers for colour
-/// formats ([`crate::gpu::metal_space::metal_size_and_align`]'s, where it takes them): a
-/// format of one aspect as its colour format, and any other as its depth's answer rounded up
-/// to a page, then its stencil's ([`crate::gpu::metal_space::paired`]). `None` where the
-/// runtime answers none.
+/// The rules' answer for a depth or stencil texture of `raw`: the runtime's model of Metal's
+/// answer (`VulkanDevice::metal_answer_at`), a format of one aspect as its colour format, and a
+/// two-aspect one as its depth's answer rounded up to a page, then its stencil's. `None` where
+/// the model answers none.
 fn depth_rule(d: &VulkanDevice, raw: &rt::TextureDescriptor) -> Option<SizeAndAlign> {
-    let sel = "heapTextureSizeAndAlignWithDescriptor:";
-    let answer = |desc: &rt::TextureDescriptor| d.size_and_align_at(sel, desc);
-    let colour = match raw.pixel_format {
-        PixelFormat::Depth16Unorm => PixelFormat::R16Unorm,
-        PixelFormat::Depth32Float => PixelFormat::R32Float,
-        PixelFormat::Stencil8 => PixelFormat::R8Unorm,
-        _ => return crate::gpu::metal_space::paired(raw, answer),
-    };
-    let mut twin = *raw;
-    twin.pixel_format = colour;
-    answer(&twin)
+    d.metal_answer_at("heapTextureSizeAndAlignWithDescriptor:", raw)
 }
 
 /// The square sides the wider depth and stencil measurement asks ([`measure_depth_classes`]):
@@ -1654,8 +1625,7 @@ fn read_or_rendered(usage: u64) -> bool {
 /// The wider measurement's classes of usages, options and private properties, each of the
 /// representative shapes ([`wide_representatives`]): every set of [`WIDE_USAGE_BITS`] but
 /// [`DEPTH_USAGES`], those holding `ShaderRead` or `RenderTarget` or no bit but 0x8, and the
-/// others, each of which Metal answers the rules' for (the others:
-/// [`crate::gpu::metal_space`]'s `twins`); and at
+/// others, each of which Metal answers the rules' for; and at
 /// each of [`DEPTH_USAGES`], the write-combined CPU cache mode, untracked and tracked hazard
 /// tracking, `framebufferOnly`, `isDrawable`, protection options 0x1, 0x2 and bit 63, and
 /// `writeSwizzleEnabled` (of the identity swizzle), and a swizzle at `ShaderRead`, which it
@@ -1982,8 +1952,7 @@ fn optimized_depth_textures_take_metals_modelled_size() {
 /// (`optimized-depth-stencil-texture`), answers the runtime's model of Metal's answer, a
 /// `Stencil8` texture of its shape, the size `newTextureWithDescriptor:` gives its range of
 /// Metal's space: the Metal platform's size and alignment for each shape here, at `Private` and
-/// `Shared` storage, a 2D one of two levels among them. It died at its selector before, as the
-/// colour rule answers none for it (`metal_space::metal_size_and_align`)
+/// `Shared` storage, a 2D one of two levels among them
 #[test]
 fn x32_stencil8_size_queries_are_metals() {
     let sel = "heapTextureSizeAndAlignWithDescriptor:";
@@ -5057,12 +5026,11 @@ fn placements_of_optimized_depth_textures_die_where_the_size_decides() {
 }
 
 /// An optimized `X32_Stencil8` render target (`optimized-depth-stencil-texture`) placed in a
-/// heap over the guest's pages, whose size and alignment Metal's are not measured for
-/// ([`crate::gpu::metal_space::metal_size_and_align`] names none), dies where the runtime makes
-/// it, as the runtime's nil dies there: Metal may answer nil at an offset the runtime takes. A
-/// `Depth32Float` one, measured, is made. Metal makes each
+/// heap over the guest's pages is made, as a `Depth32Float` one is: its size and alignment are
+/// the runtime's model of Metal's, a `Stencil8` one's of its shape, which the runtime's own
+/// answer covers. Metal makes each
 #[test]
-fn unmeasured_optimized_placements_die_where_made() {
+fn optimized_x32_stencil8_placements_are_made_as_metals() {
     let sel = "newTextureWithDescriptor:offset:";
     /// A render target of `pixel_format`, 16x16, of `heap`'s options, with
     /// allowGPUOptimizedContents off.
@@ -5086,17 +5054,15 @@ fn unmeasured_optimized_placements_die_where_made() {
         }
     }
     let (p, d) = (platform(), dev());
-    let (heap, ..) = heap_over_pages(&p, &d);
-    let made = heap.new_texture(&target(&p, &heap, 252), 0).unwrap();
-    assert!(made.is_some(), "Depth32Float");
-    let (heap, ..) = heap_over_pages(&p, &d);
-    let desc = target(&p, &heap, 261);
-    *crate::answer::LAST_LINE.lock() = None;
-    let site = catch_death(|| heap.new_texture(&desc, 0)).unwrap_err();
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-    assert!(line.contains("not measured"), "{line}");
-    assert!(line.contains("optimized-depth-stencil-texture"), "{line}");
+    for pixel_format in [252, 261] {
+        let (heap, ..) = heap_over_pages(&p, &d);
+        let desc = target(&p, &heap, pixel_format);
+        *crate::answer::LAST_LINE.lock() = None;
+        let made = catch_death(|| heap.new_texture(&desc, 0));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let made = made.unwrap_or_else(|site| panic!("{pixel_format}: died at {site:?}: {line}"));
+        assert!(made.unwrap().is_some(), "{pixel_format} ({sel})");
+    }
 }
 
 /// A placement heap's buffer of length 0 is made at an offset of 256 bytes' alignment up to

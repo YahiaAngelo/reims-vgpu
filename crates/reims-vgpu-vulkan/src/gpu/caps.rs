@@ -80,13 +80,11 @@
 //!   heap fails as Metal's does; [`crate::gpu::command`]'s docs list where it differs;
 //! - `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with
 //!   `allowGPUOptimizedContents` off answers Metal's size, the runtime's model of Metal's answer,
-//!   which answers an X32_Stencil8 texture as a Stencil8 one of its shape, else made of the
-//!   runtime's answers for colour formats
-//!   ([`crate::gpu::metal_space::metal_size_and_align`]), as the runtime's own is larger:
-//!   MoltenVK keeps the texture's GPU-optimized layout, which the runtime announces
+//!   which answers an X32_Stencil8 texture as a Stencil8 one of its shape, as the runtime's own
+//!   is larger: MoltenVK keeps the texture's GPU-optimized layout, which the runtime announces
 //!   (`OptimizedDepthStencilTexture`, [`crate::gpu::device`]'s query). It dies for a descriptor
-//!   neither answers (one of `ShaderAtomic` usage the runtime refuses first, as Metal asserts),
-//!   and so does a
+//!   the model does not answer (one of `ShaderAtomic` usage the runtime refuses first, as Metal
+//!   asserts), and so does a
 //!   placement of such a texture in a heap where the runtime's size decides it
 //!   (`crate::gpu::resource::Placements`), and
 //!   `newTextureWithDescriptor:` of such a texture the runtime's model of Metal's answer has

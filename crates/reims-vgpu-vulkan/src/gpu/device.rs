@@ -432,8 +432,8 @@ fn descriptor_options(initial: u64, options: &[OptionSet]) -> u64 {
 
 impl VulkanDevice {
     /// The runtime's answer to `heapTextureSizeAndAlignWithDescriptor:` for `desc`, asked inside
-    /// `sel`; `None` where it refuses it. What [`metal_space::own_heap_size`] and
-    /// [`metal_space::metal_size_and_align`] make Metal's answer of.
+    /// `sel`; `None` where it refuses it. What [`metal_space::own_heap_size`] makes Metal's
+    /// answer of where the runtime models none.
     pub(crate) fn size_and_align_at(
         &self,
         sel: &'static str,

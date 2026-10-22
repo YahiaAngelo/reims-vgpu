@@ -78,7 +78,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
 
-use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::types::SizeAndAlign;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
@@ -234,168 +233,6 @@ pub fn own_memory(
         heap_size: heap_size.unwrap_or_else(|| allocation_of(sel, desc)),
         class: PoolClass::of(desc.resource_options.storage_mode().ok()),
     }
-}
-
-/// The colour formats whose answers to `heapTextureSizeAndAlignWithDescriptor:` make Metal's
-/// for a depth or stencil texture of `desc` without GPU-optimized contents
-/// ([`metal_size_and_align`]), of a descriptor Metal's answer is measured to follow them for:
-/// for a format of one aspect, the colour format of its element bytes (`Depth16Unorm`'s
-/// `R16Unorm`, `Depth32Float`'s `R32Float`, `Stencil8`'s `R8Unorm`), and for
-/// `Depth32Float_Stencil8` its depth's and its stencil's (`R32Float`, then `R8Unorm`,
-/// [`paired`]). `None` for any other format, `X32_Stencil8` among them, whose answers are neither
-/// rule's, and for a descriptor of these formats Metal asserts at or the measurements did not
-/// make:
-/// - `ShaderAtomic`, at which Metal asserts ("is not a valid format to be used with texture
-///   atomics"), as the runtime refuses the descriptor first (`Invalid`, `UsageForFormat`), so no
-///   size query here asks;
-/// - a texture type but 2D, 2D array, 2D multisample, 2D multisample array, cube and cube
-///   array, a sample count but 1, 2 and 4, and a storage but `Private` and `Shared`, at which
-///   Metal asserts or no measurement asked (Metal asserts at a 1D, 1D array, 3D or texture
-///   buffer depth texture and at 8 samples, where the runtime refuses the descriptor first).
-///
-/// Every other usage takes the rules, measured exact: a usage that holds neither `ShaderRead`
-/// nor `RenderTarget` but some other bit (`ShaderWrite`, `PixelFormatView`, or Apple's private
-/// 0x4000, 0x8000 or 0x10000, alone or together) among them. The runtime answers a colour
-/// texture's size by its usage as Metal does, plain where Metal keeps it uncompressed
-/// (`ShaderWrite` and `PixelFormatView` among them), and plans that image so MoltenVK keeps it
-/// uncompressed. `depth_stencil_sizes_of_more_usages_and_properties_against_the_rules`, on the
-/// M3 Max under
-/// macOS 26.7, found every row of those usages the rule's: 930 rows (62 usage sets at 15
-/// representative shapes) of each of the four formats, at `Private` and at `Shared` storage.
-///
-/// Metal lays out a format of one aspect as the colour format of its bytes: `vaprobe
-/// depthsizes` (the M3 Max, macOS 26.7: private textures read by shaders and rendered to, 4x4 to
-/// 128x128, of 1 and 4 samples) answered each depth and stencil one as its colour format, size,
-/// alignment and `allocatedSize`, with `allowGPUOptimizedContents` unset, on and off, and the
-/// runtime's measure of Metal's layout counts depth and stencil formats among every type
-/// (its `heap_tiled.rs`). A `Depth32Float_Stencil8` texture's answer was its depth's rounded up
-/// to a page, then its stencil's, at every row (the 4x4 one's 0x80 then 0x80 bytes 0x4080, the
-/// 128x128 one's 0x10000 then 0x4000 bytes 0x14000). The measurements, against the Metal
-/// platform on the M3 Max under macOS 26.7, found both rules at every row they asked of
-/// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8`, at `Private` and
-/// `Shared` storage:
-/// - `depth_stencil_sizes_against_the_rules`: one image (2D, and 2D multisample at 4 samples),
-///   two levels and every level, 2D arrays of 2 and of 3 of every level, cubes of one and of
-///   every level, cube arrays of 2 of one and of every level and of 3 of two levels, and
-///   multisample arrays of 2 at 4 samples, 4x4 to 128x128, of usages `ShaderRead`,
-///   `ShaderRead | ShaderWrite`, `RenderTarget`, `ShaderRead | RenderTarget` and
-///   `ShaderRead | ShaderWrite | PixelFormatView`;
-/// - `depth_stencil_sizes_of_more_sides_and_levels_against_the_rules`, at those five usages: 2D
-///   of one level and of every level count at 48 extents (square sides from 1 to 16384, odd
-///   ones and ones a texel past a power of two among them, and 1440x1080, 3840x2160, 1920x1080,
-///   2560x1600, 5120x2880, 1024x768, 3x5, 7x3, 100x37, 129x64, 64x129, 333x777, 1x1000,
-///   1000x1, 16384x1 and 1x16384), and cubes and cube arrays of 1 to 4 of every level count at
-///   each square side;
-/// - `depth_stencil_sizes_of_more_arrays_and_samples_against_the_rules`, at those five usages:
-///   2D arrays of 2 to 8 of one, two and every level at the 48 extents, of 16, 64 and 2048 at
-///   six, and of every length to 2048 at 129x129 (at `ShaderRead | RenderTarget`); cube arrays
-///   of 8 and 341 at four sides and of every length to 341 at 129; 2D multisample at 2 and 4
-///   samples at the 48 extents; multisample arrays of 1 to 8 at 2 and 4 samples at the 48
-///   extents, of 16, 64 and 2048 at six, and of every length to 2048 at 129x64;
-/// - `depth_stencil_sizes_of_more_usages_and_properties_against_the_rules`, at 15 shapes of
-///   those classes: every set of `ShaderRead`, `ShaderWrite`, `RenderTarget`, 0x8,
-///   `PixelFormatView`, 0x4000, 0x8000 and 0x10000, the rule's at every row (the 62 that hold
-///   neither `ShaderRead` nor `RenderTarget` but another bit, above);
-///   and at the five usages, the write-combined CPU cache mode, untracked and tracked hazard
-///   tracking, `framebufferOnly`, `isDrawable`, protection options 0x1, 0x2 and bit 63,
-///   `writeSwizzleEnabled`, and a swizzle at `ShaderRead`.
-///
-/// `X32_Stencil8` answered the pair rule at no row of the first measurement's shapes and
-/// storages: Metal's answer was smaller by a page or more (0x80 for the 4x4 one, where the pair
-/// rule gives 0x4080), and no other rule was measured for it: the query answers it by the
-/// runtime's model of Metal's answer, a `Stencil8` texture of its shape
-/// (`crate::gpu::device`). The device test
-/// `heap_depth_stencil_shapes_with_optimized_contents_off_are_metals` compares the query's
-/// answers with Metal's at `Private` and `Shared` storage, over a row of each class above, a
-/// multisample texture at `Shared` among them, which the runtime makes in memory of its own
-/// apart from a heap's bytes. `unmeasured_depth_sizes_die_at_the_size_query` checks
-/// that the query dies for the descriptors left out that the runtime refuses.
-fn twins(desc: &rt::TextureDescriptor) -> Option<(PixelFormat, Option<PixelFormat>)> {
-    use metal2vulkan::metal::{TextureType as T, TextureUsage as U};
-    let storage = matches!(
-        desc.resource_options.storage_mode(),
-        Ok(rt::StorageMode::Private | rt::StorageMode::Shared)
-    );
-    let texture_type = matches!(
-        desc.texture_type,
-        T::Type2D
-            | T::Type2DArray
-            | T::Type2DMultisample
-            | T::Type2DMultisampleArray
-            | T::Cube
-            | T::CubeArray
-    );
-    let samples = matches!(desc.sample_count, 1 | 2 | 4);
-    let usage = !desc.usage.contains(U::SHADER_ATOMIC);
-    if !(storage && texture_type && samples && usage) {
-        return None;
-    }
-    match desc.pixel_format {
-        PixelFormat::Depth16Unorm => Some((PixelFormat::R16Unorm, None)),
-        PixelFormat::Depth32Float => Some((PixelFormat::R32Float, None)),
-        PixelFormat::Stencil8 => Some((PixelFormat::R8Unorm, None)),
-        PixelFormat::Depth32FloatStencil8 => {
-            Some((PixelFormat::R32Float, Some(PixelFormat::R8Unorm)))
-        }
-        _ => None,
-    }
-}
-
-/// Metal's answer to `heapTextureSizeAndAlignWithDescriptor:` for a depth or stencil texture of
-/// `desc` without GPU-optimized contents, whose image the runtime keeps GPU-optimized and whose
-/// size it answers larger (`OptimizedDepthStencilTexture`, [`crate::gpu::caps`]' list: 66048
-/// bytes for a 128x128 `Depth32Float` texture, where Metal answers 65536), made of `answer`, the
-/// runtime's answers for colour formats, which are Metal's ([`twins`]): its colour format's
-/// answer, or for `Depth32Float_Stencil8` its depth's size rounded up to a page, then its
-/// stencil's, at the larger of their alignments (0x80 at every row of `vaprobe depthsizes`).
-/// `None` for any other descriptor, one [`twins`] names none for, and where the runtime answers
-/// none for a colour format.
-pub fn metal_size_and_align(
-    desc: &rt::TextureDescriptor,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    if desc.allow_gpu_optimized_contents {
-        return None;
-    }
-    let (first, stencil) = twins(desc)?;
-    let Some(stencil) = stencil else {
-        return twin(desc, first, &answer);
-    };
-    pair(twin(desc, first, &answer)?, twin(desc, stencil, &answer)?)
-}
-
-/// `answer` for `desc` of `pixel_format`.
-fn twin(
-    desc: &rt::TextureDescriptor,
-    pixel_format: PixelFormat,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    let mut twin = *desc;
-    twin.pixel_format = pixel_format;
-    answer(&twin)
-}
-
-/// A two-aspect texture's size and alignment of its depth's and its stencil's: the depth's size
-/// rounded up to a page, then the stencil's, at the larger of their alignments.
-fn pair(depth: SizeAndAlign, stencil: SizeAndAlign) -> Option<SizeAndAlign> {
-    Some(SizeAndAlign {
-        size: (depth.size.checked_next_multiple_of(PAGE))?.checked_add(stencil.size)?,
-        align: depth.align.max(stencil.align),
-    })
-}
-
-/// The size and alignment [`metal_size_and_align`]'s rule for `Depth32Float_Stencil8` ([`pair`])
-/// gives a texture of `desc` of any shape and format, of `answer`'s answers for it as `R32Float`
-/// and as `R8Unorm`: what the measurement `depth_stencil_sizes_against_the_rules` compares
-/// Metal's answers for `Depth32Float_Stencil8` and `X32_Stencil8` textures with ([`twins`]).
-pub fn paired(
-    desc: &rt::TextureDescriptor,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    pair(
-        twin(desc, PixelFormat::R32Float, &answer)?,
-        twin(desc, PixelFormat::R8Unorm, &answer)?,
-    )
 }
 
 /// The heap size Metal's space takes for a texture of its own memory of `desc`
@@ -3343,178 +3180,60 @@ mod tests {
         }
     }
 
-    /// Where the runtime's model of Metal's answer has none, a depth or stencil texture without
-    /// GPU-optimized contents takes Metal's heap size, made of the runtime's answers for colour
-    /// formats (`vaprobe depthsizes`: the colour formats' answers with
-    /// `allowGPUOptimizedContents` off, 4x4 to 128x128, of 1 and 4 samples, make every depth and
-    /// stencil one's), a `Depth32Float_Stencil8` texture of more slices by the same pair rule, at
-    /// `Private` or `Shared` storage; with it on, at `Managed` storage, or of `X32_Stencil8`, the
-    /// runtime's own answer. Metal's is made of any usage but `ShaderAtomic`, none and one that
-    /// holds neither `ShaderRead` nor `RenderTarget` but another bit among them, and of a cube;
-    /// none is of `ShaderAtomic`, of a 3D texture, or of 8 samples ([`twins`]). Where the model
-    /// has one, it is the size, whatever the runtime's answers
+    /// A depth or stencil texture without GPU-optimized contents takes the runtime's model of
+    /// Metal's heap size where the model has one, whatever the runtime's own answer, of every
+    /// format, sample count, storage and slice count; where the model has none, the runtime's
+    /// answer; where neither answers, none
     #[test]
     fn depth_and_stencil_textures_take_metals_heap_size() {
-        use metal2vulkan::metal::{TextureType, TextureUsage};
-        const SIDES: [u64; 6] = [4, 8, 16, 64, 100, 128];
-        // Each colour format's answer, by side, of 1 sample and then of 4.
-        const R32F: [[u64; 6]; 2] = [
-            [0x80, 0x100, 0x400, 0x4000, 0x1_0000, 0x1_0000],
-            [0x100, 0x400, 0x1000, 0x1_0000, 0x4_0000, 0x4_0000],
-        ];
-        const R16: [[u64; 6]; 2] = [
-            [0x80, 0x80, 0x200, 0x2000, 0x8000, 0x8000],
-            [0x80, 0x200, 0x800, 0x8000, 0x2_0000, 0x2_0000],
-        ];
-        const R8: [[u64; 6]; 2] = [
-            [0x80, 0x80, 0x100, 0x1000, 0x4000, 0x4000],
-            [0x80, 0x100, 0x400, 0x4000, 0x1_0000, 0x1_0000],
-        ];
-        const D32S8: [[u64; 6]; 2] = [
-            [0x4080, 0x4080, 0x4100, 0x5000, 0x1_4000, 0x1_4000],
-            [0x4080, 0x4100, 0x4400, 0x1_4000, 0x5_0000, 0x5_0000],
-        ];
-        /// What the runtime answers here for a depth or stencil descriptor: not Metal's.
+        use metal2vulkan::metal::{PixelFormat, TextureType};
+        /// What the runtime answers here for a descriptor: not Metal's.
         const RUNTIMES: u64 = 0x7_0000;
-        let answer = |desc: &rt::TextureDescriptor| {
-            let i = SIDES.iter().position(|&side| side == desc.width).unwrap();
-            let n = usize::from(desc.sample_count > 1);
-            let size = match desc.pixel_format {
-                PixelFormat::R32Float => R32F[n][i],
-                PixelFormat::R16Unorm => R16[n][i],
-                PixelFormat::R8Unorm => R8[n][i],
-                _ => RUNTIMES,
-            };
-            Some(SizeAndAlign { size, align: 0x80 })
+        let answer = |_: &rt::TextureDescriptor| {
+            Some(SizeAndAlign {
+                size: RUNTIMES,
+                align: 0x80,
+            })
         };
-        let desc = |pf, side, samples: u64, allow| {
-            let mut desc = rt::TextureDescriptor::texture_2d(pf, side, side, false);
+        let none = |_: &rt::TextureDescriptor| None;
+        let modelled = SizeAndAlign {
+            size: 0x4080,
+            align: 0x80,
+        };
+        let desc = |pf, samples: u64| {
+            let mut desc = rt::TextureDescriptor::texture_2d(pf, 64, 64, false);
             if samples > 1 {
                 desc.texture_type = TextureType::Type2DMultisample;
                 desc.sample_count = samples;
             }
             desc.resource_options = rt::ResourceOptions::private();
-            desc.allow_gpu_optimized_contents = allow;
+            desc.allow_gpu_optimized_contents = false;
             desc
         };
-        let formats = [
-            (PixelFormat::Depth32Float, R32F),
-            (PixelFormat::Depth16Unorm, R16),
-            (PixelFormat::Stencil8, R8),
-            (PixelFormat::Depth32FloatStencil8, D32S8),
-        ];
-        for (pf, metal) in formats {
-            for (n, samples) in [1, 4].into_iter().enumerate() {
-                for (i, side) in SIDES.into_iter().enumerate() {
-                    let off = own_heap_size(&desc(pf, side, samples, false), None, answer);
-                    assert_eq!(off, Some(metal[n][i]), "{pf:?} {side} {samples}");
-                    let on = own_heap_size(&desc(pf, side, samples, true), None, answer);
-                    assert_eq!(on, Some(RUNTIMES), "{pf:?} {side} {samples} on");
-                }
-            }
-        }
-        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 4, 1, false);
+        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 1);
         slices.texture_type = TextureType::Type2DArray;
         slices.array_length = 2;
-        let pair = SizeAndAlign {
-            size: 0x4080,
-            align: 0x80,
-        };
-        assert_eq!(
-            metal_size_and_align(&slices, answer),
-            Some(pair),
-            "two slices"
-        );
-        assert_eq!(
-            own_heap_size(&slices, None, answer),
-            Some(0x4080),
-            "two slices"
-        );
-        let x32s8 = desc(PixelFormat::X32Stencil8, 4, 1, false);
-        assert_eq!(metal_size_and_align(&x32s8, answer), None, "X32_Stencil8");
-        assert_eq!(
-            own_heap_size(&x32s8, None, answer),
-            Some(RUNTIMES),
-            "X32_Stencil8"
-        );
-        let modelled = SizeAndAlign {
-            size: 0x80,
-            align: 0x80,
-        };
-        for desc in [
-            &x32s8,
-            &slices,
-            &desc(PixelFormat::Depth32Float, 4, 1, true),
-        ] {
-            let size = own_heap_size(desc, Some(modelled), answer);
-            assert_eq!(size, Some(0x80), "the model's: {desc:?}");
-        }
-        let d32s8 = desc(PixelFormat::Depth32FloatStencil8, 128, 1, false);
-        let metal = SizeAndAlign {
-            size: 0x1_4000,
-            align: 0x80,
-        };
-        assert_eq!(metal_size_and_align(&d32s8, answer), Some(metal));
-        let on = desc(PixelFormat::Depth32Float, 4, 1, true);
-        assert_eq!(metal_size_and_align(&on, answer), None, "on");
-        let mut shared = desc(PixelFormat::Depth32Float, 4, 1, false);
+        let mut shared = desc(PixelFormat::Depth32Float, 1);
         shared.resource_options = rt::ResourceOptions::shared();
-        let r32f = SizeAndAlign {
-            size: 0x80,
-            align: 0x80,
-        };
-        assert_eq!(metal_size_and_align(&shared, answer), Some(r32f), "Shared");
-        let mut managed = shared;
-        managed.resource_options = rt::ResourceOptions::new(
-            rt::StorageMode::Managed,
-            rt::CpuCacheMode::DefaultCache,
-            rt::HazardTrackingMode::Default,
-        );
-        assert_eq!(metal_size_and_align(&managed, answer), None, "Managed");
-        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 128, 1, false);
-        slices.texture_type = TextureType::Type2DArray;
-        slices.array_length = 2;
-        assert_eq!(paired(&slices, answer), Some(metal), "the pair rule");
-        assert_eq!(metal_size_and_align(&slices, answer), Some(metal), "slices");
-        let none = |_: &rt::TextureDescriptor| None;
-        let off = desc(PixelFormat::Depth32Float, 4, 1, false);
-        assert_eq!(own_heap_size(&off, None, none), None, "no answer");
-        let size = own_heap_size(&off, Some(modelled), none);
-        assert_eq!(size, Some(0x80), "the model's, no answer");
-        let used = |usage| {
-            let mut d = desc(PixelFormat::Depth32Float, 4, 1, false);
-            d.usage = usage;
-            metal_size_and_align(&d, answer)
-        };
-        for usage in [
-            TextureUsage::UNKNOWN,
-            TextureUsage::RENDER_TARGET,
-            TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW,
-            TextureUsage::RENDER_TARGET | TextureUsage::BLOCK_WRITES_ONLY,
-            TextureUsage::SHADER_WRITE,
-            TextureUsage::PIXEL_FORMAT_VIEW,
-            TextureUsage::NO_CONCURRENT_ACCESS,
-            TextureUsage::VIDEO,
-            TextureUsage::BLOCK_WRITES_ONLY,
-            TextureUsage::SHADER_WRITE | TextureUsage::PIXEL_FORMAT_VIEW,
+        let mut descs = vec![slices, shared];
+        for pf in [
+            PixelFormat::Depth16Unorm,
+            PixelFormat::Depth32Float,
+            PixelFormat::Stencil8,
+            PixelFormat::Depth32FloatStencil8,
+            PixelFormat::X32Stencil8,
         ] {
-            assert_eq!(used(usage), Some(r32f), "{usage:?}");
+            descs.extend([desc(pf, 1), desc(pf, 4)]);
         }
-        for usage in [
-            TextureUsage::SHADER_ATOMIC,
-            TextureUsage::SHADER_READ | TextureUsage::SHADER_ATOMIC,
-        ] {
-            assert_eq!(used(usage), None, "{usage:?}");
+        for desc in &descs {
+            let size = own_heap_size(desc, Some(modelled), answer);
+            assert_eq!(size, Some(0x4080), "the model's: {desc:?}");
+            let size = own_heap_size(desc, Some(modelled), none);
+            assert_eq!(size, Some(0x4080), "the model's, no answer: {desc:?}");
+            let size = own_heap_size(desc, None, answer);
+            assert_eq!(size, Some(RUNTIMES), "the runtime's: {desc:?}");
+            assert_eq!(own_heap_size(desc, None, none), None, "none: {desc:?}");
         }
-        let mut cube = desc(PixelFormat::Depth32Float, 4, 1, false);
-        cube.texture_type = TextureType::Cube;
-        assert_eq!(metal_size_and_align(&cube, answer), Some(r32f), "a cube");
-        let mut volume = desc(PixelFormat::Depth32Float, 4, 1, false);
-        volume.texture_type = TextureType::Type3D;
-        assert_eq!(metal_size_and_align(&volume, answer), None, "3D");
-        let mut eight = desc(PixelFormat::Depth32Float, 4, 4, false);
-        eight.sample_count = 8;
-        assert_eq!(metal_size_and_align(&eight, answer), None, "8 samples");
     }
 
     #[test]

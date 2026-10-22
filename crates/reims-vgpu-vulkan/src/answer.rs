@@ -1200,19 +1200,16 @@ pub const DIES: [rt::Degradation; 124] = [
 ///   by 64 `Depth32Float` texture, where Metal answers 16384). Announced where such a texture is
 ///   sized or placed. Its reads and writes are Metal's, so its creation relays it, a device's
 ///   texture's, whose range or slot of Metal's space is of Metal's size, the runtime's model of
-///   Metal's answer, which asks no image and hears nothing, else made of the runtime's answers for
-///   colour formats ([`crate::gpu::metal_space::own_heap_size`]), and a heap's placement's that
-///   fits it. Where the model has none, a device's texture of a descriptor Metal's size is not
-///   measured for (another storage than `Private` or `Shared`; one of `ShaderAtomic` usage the
-///   runtime refuses first, as Metal asserts) dies at `newTextureWithDescriptor:`, at every shape;
-///   an `X32_Stencil8` texture takes the model's size, a `Stencil8` one's of its shape, and dies
-///   where the model has none. `heapTextureSizeAndAlignWithDescriptor:` hears it and answers
-///   Metal's, the runtime's model of it first, as the device's texture takes it, an `X32_Stencil8`
-///   one's among them, else made of the runtime's answers for colour formats
-///   ([`crate::gpu::metal_space::metal_size_and_align`]), and dies at its selector where neither
-///   answers ([`crate::gpu::device`]). A placement that depends on the runtime's size dies: a
-///   heap's placement that hears it dies where it answers nil inside the heap and Metal's smaller
-///   size fits there or is not measured (where Metal's does not fit either, the nil is Metal's),
+///   Metal's answer, which asks no image and hears nothing
+///   ([`crate::gpu::metal_space::own_heap_size`]), and a heap's placement's that fits it. Where
+///   the model has none (one of `ShaderAtomic` usage the runtime refuses first, as Metal
+///   asserts), a device's texture dies at `newTextureWithDescriptor:`, at every shape; an
+///   `X32_Stencil8` texture takes the model's size, a `Stencil8` one's of its shape.
+///   `heapTextureSizeAndAlignWithDescriptor:` hears it and answers Metal's, the runtime's model of
+///   it, as the device's texture takes it, and dies at its selector where the model has none
+///   ([`crate::gpu::device`]). A placement that depends on the runtime's size dies: a heap's
+///   placement that hears it dies where it answers nil inside the heap and Metal's smaller size
+///   fits there or is not modelled (where Metal's does not fit either, the nil is Metal's),
 ///   where it is made but Metal answers nil or a size the runtime's falls short of, and in a heap
 ///   over no address ranges at every shape (`crate::gpu::resource::HeapObject`'s placement).
 ///   Elsewhere the heap keeps the texture apart: a placement over a byte of it dies while it lives,
