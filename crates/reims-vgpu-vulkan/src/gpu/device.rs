@@ -227,6 +227,14 @@ static DEVICES: Mutex<Vec<(u64, VulkanDevice)>> = Mutex::new(Vec::new());
 /// surface while a buffer under it lives.
 static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::new(BTreeMap::new());
 
+/// Held while a buffer over a surface is made (`newBufferWithIOSurface:`), from Metal's space's
+/// count of the buffers at the surface's address ([`metal_space::surface_buffer`]) to the made
+/// buffer's place among [`SURFACE_BUFFERS`]: so a second buffer over the surface, made at once
+/// on another thread (two isolated tasks' mappings of one surface prepared together), is made
+/// after the first is kept, and shares its range, where it would otherwise find the address
+/// counted and no live buffer to share, and die.
+static SURFACE_BUFFER_MAKES: Mutex<()> = Mutex::new(());
+
 /// The handle of `raw`, which `sel` made: the object of the same device made before, or a new
 /// one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
@@ -857,7 +865,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// buffer over the surface while another holds that address shares the range of a live one,
     /// as Metal answers the address for both; one made while none lives, after the last's
     /// release and before the runtime frees its range, dies: Metal makes it there, and the
-    /// runtime shares a range only with a live buffer.
+    /// runtime shares a range only with a live buffer. Buffers over surfaces are made one at a
+    /// time ([`SURFACE_BUFFER_MAKES`]).
     fn new_buffer_on_surface(
         &self,
         iosurface: Option<&OsSurface>,
@@ -865,6 +874,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         use reims_vgpu_core::platform::os::surface::Surface as _;
         let sel = "newBufferWithIOSurface:";
         let surface = iosurface.unwrap_or_else(|| unrepresentable(sel, "a nil IOSurface"));
+        let _making = SURFACE_BUFFER_MAKES.lock();
         let surface = Arc::new(surface.clone_ref());
         let (key, alloc_size) = (surface.id().0, surface.alloc_size());
         let (place, space) = metal_space::surface_buffer(key, alloc_size);
@@ -2266,6 +2276,31 @@ pub(crate) mod tests {
     }
 
     /// Every handle to one runtime device is one object
+    /// Buffers made over one surface on two threads at once, as two isolated tasks' mappings of
+    /// it are prepared, are both made, at the surface's address, whichever is made first: the
+    /// second shares the first's range once the first is made, and none sees the address held
+    /// with no live buffer to share
+    #[test]
+    fn buffers_made_over_a_surface_at_once_are_both_made() {
+        let d = dev();
+        for round in 0..64 {
+            let surface = crate::os::tests::bgra_surface(64, 64);
+            let started = std::sync::Barrier::new(2);
+            let made = || {
+                started.wait();
+                catch_death(|| d.new_buffer_on_surface(Some(&surface)).unwrap().unwrap())
+                    .map_err(|site| (site.kind, site.file))
+            };
+            let (one, two) = std::thread::scope(|s| {
+                let other = s.spawn(made);
+                (made(), other.join().unwrap())
+            });
+            let (one, two) = (one.unwrap(), two.unwrap());
+            use reims_vgpu_core::platform::resource::Buffer as _;
+            assert_eq!(one.gpu_address(), two.gpu_address(), "round {round}");
+        }
+    }
+
     #[test]
     fn a_device_is_one_object() {
         let d = dev();
