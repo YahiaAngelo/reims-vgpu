@@ -1954,7 +1954,9 @@ fn make(
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let d = without_unused_resolves(d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d).map(Box::new)) {
+    match plain_at(sel, || {
+        command_buffer.raw.render_command_encoder(&d).map(Box::new)
+    }) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), rasterizes, varying_rates).map(Some)
