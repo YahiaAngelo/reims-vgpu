@@ -2429,13 +2429,33 @@ fn surface_counts(s: &OsSurface) -> (i64, i32) {
     (s.retain_count(), unsafe { IOSurfaceGetUseCount(at) })
 }
 
+/// Waits until `q`'s command buffers that completed have let go of what they retained, as
+/// Metal lets go of it: on the queue's completion queue, after the command buffer's waiters
+/// returned (`-[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]` releases its
+/// resource list once `waitUntilCompleted` is woken), so a read right after the wait may find it
+/// still held. A queue's completions run in order there, each letting go before the next one's
+/// waiters return, so the wait is an empty command buffer of `q`, committed and waited for.
+/// Measured on the M3 Max (macOS 27.0.1; 8 processes at once beside 16 busy CPU threads, 300
+/// render passes each storing a texture on a surface): the surface still held right after the
+/// wait in 30 of 2400, the texture let go of after the wait in 217; after the empty command
+/// buffer's wait, held in none and let go of after it in none (after one of another queue's, 6).
+/// This platform lets go before the wait returns, as the runtime opens its waiters' gate only
+/// then.
+fn let_go<P: Platform>(q: &P::CommandQueue) {
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+}
+
 /// [`surface_counts`] of a 16 by 16 surface (`BGRA8Unorm`, or two planes for the YCbCr
 /// reaches) as a command buffer of `d`'s reaches it as `reach` says: with the texture or
 /// buffer on it made; once the command buffer committed waiting for an event, every other
-/// handle to the texture or buffer released; after it completed, the command buffer still
-/// held; and once the command buffer is released. Each step runs in an autorelease pool of
-/// its own, popped before the counts are read. With them, how many pipelines `made` counts
-/// were made from the command buffer's encoding until it completed.
+/// handle to the texture or buffer released; after it completed and its queue let go of what
+/// it retained ([`let_go`]), the command buffer still held; and once the command buffer is
+/// released. Each step runs in an autorelease pool of its own, popped before the counts are
+/// read. With them, how many pipelines `made` counts were made from the command buffer's
+/// encoding until it completed.
 fn surface_references<P: Platform<Surface = OsSurface>>(
     p: &P,
     d: &P::Device,
@@ -2718,6 +2738,7 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
         event.set_signaled_value(1).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{reach:?}: {:?}", cb.error());
+        let_go::<P>(&q);
     }
     seen[2] = surface_counts(&s);
     let made = made(d) - made_before;
@@ -2748,9 +2769,11 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
 /// kind for a `half` read of an argument buffer's texture, whose format the function does not
 /// know and whose texel it converts by a rounding Metal's may not be. That case runs last here.
 ///
-/// Metal's side runs every case first, before this platform makes anything in the process:
-/// once MoltenVK has worked on Metal's device, Metal lets go of what a completed command
-/// buffer held late (`texture_identifiers_are_reused_as_metals`)
+/// Metal lets go of what a completed command buffer retained after its waiters returned, the
+/// more often once MoltenVK has worked on Metal's device
+/// (`texture_identifiers_are_reused_as_metals`): the counts after the completion are read once
+/// its queue let go of it ([`let_go`]). Metal's side runs every case first, before this
+/// platform makes anything in the process
 #[test]
 fn a_command_buffer_holds_a_surface_as_metals_does() {
     let ycbcr = [(505, *b"x420"), (543, *b"x420"), (540, *b"420v")];
@@ -2857,7 +2880,8 @@ enum Beside {
 }
 
 /// [`surface_counts`] of a 16 by 16 `BGRA8Unorm` surface at the steps `beside` names, each
-/// step in an autorelease pool of its own.
+/// step in an autorelease pool of its own. A wait for a command buffer's completion waits until
+/// its queue let go of what it retained too ([`let_go`]).
 fn surface_holds<P: Platform<Surface = OsSurface>>(
     p: &P,
     d: &P::Device,
@@ -3005,9 +3029,10 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
         }
         (cb, reached)
     };
-    let done = |cb: &P::CommandBuffer| {
+    let done = |q: &P::CommandQueue, cb: &P::CommandBuffer| {
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{beside:?}: {:?}", cb.error());
+        let_go::<P>(q);
     };
     let on_s = || {
         d.new_texture_on_surface(&desc, Some(&s), 0)
@@ -3025,7 +3050,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
                 let _pool = Pool::here();
                 let cb = reading(&q, &t, false);
                 cb.commit(OnFault::Die).unwrap();
-                done(&cb);
+                done(&q, &cb);
             }
             let (cb, reached) = {
                 let _pool = Pool::here();
@@ -3048,7 +3073,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
             {
                 let _pool = Pool::here();
                 event.set_signaled_value(1).unwrap();
-                done(&cb);
+                done(&q2, &cb);
             }
             seen.push(surface_counts(&s));
             {
@@ -3078,7 +3103,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
             };
             {
                 let _pool = Pool::here();
-                done(&cb);
+                done(&q, &cb);
             }
             let after = surface_counts(&s);
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3100,7 +3125,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
                 let _pool = Pool::here();
                 let cb = reading(&q, &t, false);
                 cb.commit(OnFault::Die).unwrap();
-                done(&cb);
+                done(&q, &cb);
             }
             seen.push(surface_counts(&s));
             {
@@ -3119,9 +3144,11 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
 }
 
 /// [`surface_holds`] of each case on this platform and on Metal's, which agree, and are its
-/// `want`. Metal's side runs every case first, before this platform makes anything in the
-/// process: once MoltenVK has worked on Metal's device, Metal lets go of what a completed
-/// command buffer held late (`texture_identifiers_are_reused_as_metals`).
+/// `want`. Metal lets go of what a completed command buffer retained after its waiters
+/// returned, the more often once MoltenVK has worked on Metal's device
+/// (`texture_identifiers_are_reused_as_metals`), so [`surface_holds`] reads the counts after a
+/// completion once its queue let go of it ([`let_go`]). Metal's side runs every case first,
+/// before this platform makes anything in the process.
 fn holds_as_metals(cases: &[(Beside, &[(i64, i32)])]) {
     let theirs: Option<Vec<_>> = MetalPlatform::system_default_device().map(|md| {
         let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
@@ -5853,6 +5880,7 @@ fn texture_reuse_on<P: Platform>(
     let h = texture();
     note("after releasing it in flight", &h);
     cb.wait_until_completed(OnFault::Return).unwrap();
+    let_go::<P>(&q);
     let i = texture();
     note("after the command buffer completed", &i);
     drop(cb);
@@ -5919,7 +5947,9 @@ fn texture_identifiers_are_metals() {
 /// autorelease pool over the encoding). Once this platform's run of the sequence has put
 /// MoltenVK's work on Metal's device, Metal frees it later, a race of its own: still held
 /// after the wait in 3 runs of 3 (after the command buffer's release too in two of them), and
-/// free 300 ms after the wait in 2 runs of 2
+/// free 300 ms after the wait in 2 runs of 2. Metal lets go of what a completed command buffer
+/// retained after its waiters returned, so under load it frees it late alone too: the IDs after
+/// the completion are taken once the queue let go of it ([`let_go`])
 #[test]
 fn texture_identifiers_are_reused_as_metals() {
     let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
