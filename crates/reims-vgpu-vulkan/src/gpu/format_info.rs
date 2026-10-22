@@ -35,9 +35,9 @@
 //! 2^32 + 5 and 2^62 + 3). Core asks none of these: its extents are the guest's 32-bit width and
 //! height, at depth 1 and array length 1.
 //!
-//! **What this platform's own rules read of a description** ([`block`]: a fill's texel, a
-//! texture's bytes by Apple's layout, a CPU write's unit) is macOS 26.7's, where those rules were
-//! measured; the levels describe it alike.
+//! **What this platform's own rules read of a description** ([`block`]: a texture's bytes by
+//! Apple's layout, a CPU write's unit) is macOS 26.7's, where those rules were measured; the
+//! levels describe it alike.
 //!
 //! **Which values Metal's setter takes and which formats Metal describes** differ by macOS
 //! release, so both are the runtime's row of the release the devices answer as
@@ -271,15 +271,14 @@ impl Block {
     }
 }
 
-/// What this platform's own rules read of Metal's description of `raw` (a fill's texel,
-/// [`crate::gpu::fill`]; a texture's bytes by Apple's layout, [`crate::gpu::metal_space`]; a CPU
-/// write's unit, [`crate::gpu::resource`]): macOS 26.7's, where the rules were measured. The
-/// levels the runtime measured describe it alike but where one describes `raw` and another does
-/// not (no value at the runtime's levels): there `sel` asks the level
-/// ([`crate::platform::answering_level`]) and, at any but macOS 26.7, which describes none, reads
-/// that level's description, relayed naming
-/// `what` (`a fill of`, ...), as nothing measured the rule at a release that describes the
-/// format, and dies in strict mode ([`crate::answer::Inexact::MetalLevel`]).
+/// What this platform's own rules read of Metal's description of `raw` (a texture's bytes by
+/// Apple's layout, [`crate::gpu::metal_space`]; a CPU write's unit, [`crate::gpu::resource`]):
+/// macOS 26.7's, where the rules were measured. The levels the runtime measured describe it
+/// alike but where one describes `raw` and another does not (no value at the runtime's levels):
+/// there `sel` asks the level ([`crate::platform::answering_level`]) and, at any but macOS 26.7,
+/// which describes none, reads that level's description, relayed naming `what` (`Apple's layout
+/// of a texture of`, ...), as nothing measured the rule at a release that describes the format,
+/// and dies in strict mode ([`crate::answer::Inexact::MetalLevel`]).
 pub(crate) fn block(sel: &'static str, raw: u64, what: &str) -> Block {
     let level = || crate::platform::answering_level(sel, || format!("{what} pixel format {raw}"));
     block_at(level, sel, raw, what)

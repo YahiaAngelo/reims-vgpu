@@ -14,14 +14,14 @@
 //! - **`fillBuffer:range:pattern4:`** is the runtime's `fill_buffer_pattern4`, which writes the
 //!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_the_metal_platforms`,
 //!   over more than the runtime stages at once).
-//! - **The private bytes fill** (`fillTexture:level:slice:region:bytes:length:`) is copies from a
-//!   staging buffer of the bytes Metal writes ([`crate::gpu::fill`]), at most [`STAGING_BYTES`]
-//!   of them, copied again for the rest; a fill that writes nothing encodes nothing. A fill of a
-//!   texture of a format whose fill [`crate::gpu::fill`] does not measure
-//!   ([`crate::gpu::fill::texel_bytes`]) is the runtime's `fill_texture` of the pattern, and a
-//!   colour fill of a texture of any format the runtime's colour fill, which fills the texel it
-//!   packs as its `fill_texture` fills a pattern, at the level and slice and in the region
-//!   [`crate::gpu::fill::place`] gives, as Metal's fill writes it on this host:
+//! - **The private texture fills** (the two `fillTexture:...`) are the runtime's: a bytes fill
+//!   its `fill_texture` of the pattern, a colour fill its colour fill, which fills the texel it
+//!   packs as `fill_texture` fills a pattern ([`crate::gpu::fill`]), each copies from a staging
+//!   buffer outside the Metal address space, at the level and slice and in the region
+//!   [`crate::gpu::fill::place`] gives; a fill that writes nothing encodes nothing. They write
+//!   what Metal's fill writes on this host (`texture_fills_are_the_metal_platforms`, of colour
+//!   and depth formats, levels, slices, cube faces, 3D depths, cut regions and a fill larger than
+//!   the runtime stages at once) and:
 //!   - a compressed format's blocks, each the pattern cut at its bytes or repeated to them, the
 //!     region counting blocks, which the runtime cuts at the level's blocks (the cut `place`
 //!     makes, at the level's texels, is no tighter): BC, 4 by 4 ASTC, ETC2 and EAC
@@ -49,8 +49,9 @@
 //!   cube array too (`compressed_cube_fills_are_the_metal_platforms`). The runtime fills the
 //!   rest of the formats Metal fills too: a two-plane XR10 texture of its own memory at any width
 //!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
-//!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart. It refuses a multisample texture's fill
-//!   alone, which `place` dies at first.
+//!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart; the YCbCr and padded formats of a
+//!   texture over a surface or memory (`fills_of_ycbcr_and_padded_textures_are_metals`). It
+//!   refuses a multisample texture's fill alone, which `place` dies at first.
 //! - **A colour fill** is the runtime's colour fill, which packs the colour in the call's pixel
 //!   format as Metal does ([`crate::gpu::fill`]) and fills that texel as its `fill_texture` fills
 //!   a pattern (above), at the level and slice and in the region `place` gives. A colour in a
@@ -291,31 +292,11 @@ fn indices(
     range(r).unwrap_or_else(|| unrepresentable(sel, &format!("the range {r:?}")))
 }
 
-/// The most bytes a fill stages at once: a larger fill copies them again.
-pub const STAGING_BYTES: u64 = 4 << 20;
-
-/// `n`, a length in this address space, for `sel`.
-fn to_usize(sel: &'static str, n: u64) -> usize {
-    usize::try_from(n).unwrap_or_else(|_| unrepresentable(sel, "a length past the address space"))
-}
-
-/// A Shared buffer of `device` holding `bytes`, which a fill sent with `sel` copies from; the
-/// encoder retains it until its command buffer completes. It lies outside the Metal address space
-/// ([`crate::gpu::own_buffer`]).
-fn staging(sel: &'static str, device: &rt::Device, bytes: &[u8]) -> RaiseResult<rt::Buffer> {
-    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    send(sel, Policy::Dies, || {
-        let contents = rt::BufferContents::Copy(bytes);
-        crate::gpu::own_buffer(device, length, rt::ResourceOptions::shared(), contents)
-    })
-}
-
 impl VulkanBlitEncoder {
-    /// A fill of `region` of `texture` at `level` and `slice` with `pattern`, for `sel`: where
-    /// [`fill::place`] says, each texel `pattern` repeated or cut at the format's block bytes; of
-    /// a texture of a format whose fill nothing here measured ([`fill::texel_bytes`]), the
-    /// runtime's fill there, which cuts the pattern at its unit and refuses what it did not
-    /// measure (the module's docs).
+    /// A fill of `region` of `texture` at `level` and `slice` with `pattern`, for `sel`: the
+    /// runtime's fill, where [`fill::place`] says, which cuts the pattern at its unit or repeats
+    /// it to it and refuses what it did not measure (the module's docs). An empty pattern (a
+    /// length of 0 at a readable address, which nothing measured on Metal) fills zeroes.
     fn fill_texture(
         &self,
         sel: &'static str,
@@ -326,65 +307,23 @@ impl VulkanBlitEncoder {
         pattern: &[u8],
     ) -> RaiseResult<()> {
         let raw = texture.copied(sel);
-        let (format, shape) = plain(|| {
-            let shape = fill::Shape {
-                texture_type: raw.texture_type(),
-                extent: [raw.width(), raw.height(), raw.depth()],
-                levels: raw.mipmap_level_count(),
-                array_length: raw.array_length(),
-            };
-            (raw.pixel_format(), shape)
+        let shape = plain(|| fill::Shape {
+            texture_type: raw.texture_type(),
+            extent: [raw.width(), raw.height(), raw.depth()],
+            levels: raw.mipmap_level_count(),
+            array_length: raw.array_length(),
         });
-        let Some(texel_bytes) = fill::texel_bytes(sel, format) else {
-            let Some(place) = fill::place(sel, &shape, level, slice, region) else {
-                return self.nothing(sel);
-            };
-            let ([x, y, z], [w, h, d]) = (place.origin, place.size);
-            let region = rt::Region::new_3d(x, y, z, w, h, d);
-            return send(sel, Policy::Dies, || {
-                self.with(sel, |e| {
-                    e.fill_texture(raw, place.level, place.slice, region, pattern)
-                })
-            });
-        };
-        let texel = fill::texel(pattern, texel_bytes);
         let Some(place) = fill::place(sel, &shape, level, slice, region) else {
             return self.nothing(sel);
         };
-        let [width, height, depth] = place.size;
-        let row = texel.repeat(to_usize(sel, width));
-        let row_bytes = u64::try_from(row.len()).unwrap_or(u64::MAX);
-        let rows = (STAGING_BYTES / row_bytes).clamp(1, height);
-        let staging = staging(
-            sel,
-            plain(|| raw.device()),
-            &row.repeat(to_usize(sel, rows)),
-        )?;
-        let [x, y, z] = place.origin;
-        for image in 0..depth {
-            let mut done = 0;
-            while done < height {
-                let n = rows.min(height - done);
-                send(sel, Policy::Dies, || {
-                    self.with(sel, |e| {
-                        e.copy_from_buffer_to_texture(
-                            &staging,
-                            0,
-                            row_bytes,
-                            row_bytes * n,
-                            rt::Size::new(width, n, 1),
-                            raw,
-                            place.slice,
-                            place.level,
-                            rt::Origin::new(x, y + done, z + image),
-                            rt::BlitOption::None,
-                        )
-                    })
-                })?;
-                done += n;
-            }
-        }
-        Ok(())
+        let ([x, y, z], [w, h, d]) = (place.origin, place.size);
+        let region = rt::Region::new_3d(x, y, z, w, h, d);
+        let pattern = if pattern.is_empty() { &[0][..] } else { pattern };
+        send(sel, Policy::Dies, || {
+            self.with(sel, |e| {
+                e.fill_texture(raw, place.level, place.slice, region, pattern)
+            })
+        })
     }
 }
 

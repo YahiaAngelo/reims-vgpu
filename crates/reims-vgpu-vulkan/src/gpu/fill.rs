@@ -1,11 +1,10 @@
 //! What the private fills write, and where: `fillBuffer:range:pattern4:`,
 //! `fillTexture:level:slice:region:bytes:length:` and
-//! `fillTexture:level:slice:region:color:pixelFormat:`. The blit encoder writes a bytes fill's
-//! texels with the runtime's copies, and into a texture of a format whose fill nothing here
-//! measured ([`texel_bytes`]) with the runtime's fill ([`crate::gpu::encode_blit`]). A colour fill
-//! is the runtime's colour fill (`fill_texture_color`), which packs the colour as Metal does
-//! (below) and fills the texel it packs. The pattern fill is the runtime's
-//! (`fill_buffer_pattern4`), which writes it as Metal does (below).
+//! `fillTexture:level:slice:region:color:pixelFormat:`. The blit encoder's texture fills are the
+//! runtime's ([`crate::gpu::encode_blit`]), where [`place`] says: a bytes fill its `fill_texture`,
+//! a colour fill its `fill_texture_color`, which packs the colour as Metal does (below) and fills
+//! the texel it packs. The pattern fill is the runtime's (`fill_buffer_pattern4`), which writes it
+//! as Metal does (below).
 //!
 //! Metal's answers, measured on `AppleM3Max-40c-25G229` with no validation:
 //! - **The pattern** of `pattern4:` is its four bytes, low first, repeated from the range's start
@@ -13,9 +12,9 @@
 //!   the range's end: a fill of 7 bytes at 41 writes `01 02 03 04 01 02 03`, then `01 02 ..` from
 //!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_the_metal_platforms`).
 //! - **A texel** of either texture fill is its pattern (the bytes, or the colour's bytes) repeated
-//!   from its start and cut at the texture format's block bytes ([`texel`]): bytes past a block
-//!   go unread, and a colour of fewer bytes repeats (an R8Unorm colour fills each byte of an
-//!   RGBA32Uint texel).
+//!   from its start and cut at the texture format's block bytes: bytes past a block go unread,
+//!   and a colour of fewer bytes repeats (an R8Unorm colour fills each byte of an RGBA32Uint
+//!   texel).
 //! - **A colour** is packed in the call's pixel format, whatever the texture's, by the runtime's
 //!   rules (its `fill_value.rs`), which are Metal's. Measured: colours filled by this platform's
 //!   blit encoder and by Metal's into an `RGBA32Uint` texel each, every byte compared, in each
@@ -62,46 +61,9 @@ const MEASURED_TEXELS: u64 = 1 << 32;
 
 /// The most bytes of its pattern a fill of a texture with bytes reads: a block of the largest
 /// format Metal describes at any level the runtime measured (`RGBA32Float` and the 16-byte
-/// compressed blocks), as a texel is the pattern cut at its format's block ([`texel`], and the
-/// runtime's fill likewise), the bytes past it unread.
+/// compressed blocks), as the runtime's fill cuts a texel from the pattern at its format's
+/// block, the bytes past it unread.
 pub const MOST_PATTERN_BYTES: usize = 16;
-
-/// A texel of `bytes` bytes: `pattern` repeated from its start and cut at `bytes`. An empty
-/// pattern (none reaches here) is a texel of zeroes.
-pub fn texel(pattern: &[u8], bytes: usize) -> Vec<u8> {
-    if pattern.is_empty() {
-        return vec![0; bytes];
-    }
-    pattern.iter().copied().cycle().take(bytes).collect()
-}
-
-/// The bytes of a texel of `format`, a texture's, that a fill writes as this module measured it;
-/// `None` for a format whose fill nothing here measured, which the runtime's fill writes
-/// ([`crate::gpu::encode_blit`]): a compressed one (the 4:2:2 `GBGR422` and `BGRG422` among
-/// them), a stencil or combined depth/stencil one, the two-plane XR10 ones (550, 551), whose
-/// colour word is not the block Metal describes, and one Metal describes no block of. `sel` is
-/// the fill's, which dies at a format another release describes and macOS 26.7, where the fills
-/// were measured, does not ([`crate::gpu::format_info::block`]).
-pub fn texel_bytes(sel: &'static str, format: PixelFormat) -> Option<usize> {
-    let raw = u64::from(format.as_raw());
-    let block = crate::gpu::format_info::block(sel, raw, "a fill of a texture of");
-    let unmeasured = block.compressed()
-        || block.bytes() == 0
-        || matches!(
-            format,
-            PixelFormat::Stencil8
-                | PixelFormat::X32Stencil8
-                | PixelFormat::X24Stencil8
-                | PixelFormat::Depth24UnormStencil8
-                | PixelFormat::Depth32FloatStencil8
-                | PixelFormat::RGB10A82PXR10
-                | PixelFormat::RGB10A82PXR10SRGB
-        );
-    match unmeasured {
-        true => None,
-        false => usize::try_from(block.bytes()).ok(),
-    }
-}
 
 /// The formats Metal packs no colour in, for which a colour fill writes bytes Metal holds from
 /// earlier work (the module's docs).
@@ -332,15 +294,11 @@ mod tests {
 
     use super::*;
 
-    /// The texels repeat their pattern from its start; a colour fill packs its colour in a
-    /// format Metal packs it in, and dies at another: a format Metal packs no colour in, one
-    /// whose colour the runtime fills as zeroes (compressed, 4:2:2, YCbCr, padded), a value no
-    /// format is
+    /// A colour fill packs its colour in a format Metal packs it in, and dies at another: a
+    /// format Metal packs no colour in, one whose colour the runtime fills as zeroes (compressed,
+    /// 4:2:2, YCbCr, padded), a value no format is
     #[test]
-    fn patterns_texels_and_colour_formats() {
-        assert_eq!(texel(&[1, 2, 3, 4, 5], 4), [1, 2, 3, 4]);
-        assert_eq!(texel(&[0x80], 4), [0x80; 4]);
-        assert_eq!(texel(&[1, 2], 8), [1, 2, 1, 2, 1, 2, 1, 2]);
+    fn colour_formats() {
         assert_eq!(colour_format("s", 70), PixelFormat::RGBA8Unorm);
         assert_eq!(colour_format("s", 93), PixelFormat::RGB9E5Float);
         assert_eq!(colour_format("s", 553), PixelFormat::BGRA10XRSRGB);
@@ -436,28 +394,6 @@ mod tests {
             place_of(&flat, 0, 0, r([0, 0, 0], [1 << 16, 1 << 16, 1])),
             at(0, 0, [0, 0, 0], [4, 4, 1])
         );
-    }
-
-    /// A colour or depth texture's texel is its description's block; a compressed (4:2:2
-    /// included), stencil, combined depth/stencil or two-plane XR10 texture's fill is the
-    /// runtime's
-    #[test]
-    fn texels_of_formats() {
-        const FILL: &str = "fillTexture:level:slice:region:color:pixelFormat:";
-        assert_eq!(texel_bytes(FILL, PixelFormat::RGBA8Unorm), Some(4));
-        assert_eq!(texel_bytes(FILL, PixelFormat::Depth32Float), Some(4));
-        assert_eq!(texel_bytes(FILL, PixelFormat::RGBA32Float), Some(16));
-        for format in [
-            PixelFormat::BC1RGBA,
-            PixelFormat::GBGR422,
-            PixelFormat::Stencil8,
-            PixelFormat::X32Stencil8,
-            PixelFormat::Depth32FloatStencil8,
-            PixelFormat::RGB10A82PXR10,
-            PixelFormat::RGB10A82PXR10SRGB,
-        ] {
-            assert_eq!(texel_bytes(FILL, format), None, "{format:?}");
-        }
     }
 
     #[cfg(target_os = "macos")]
