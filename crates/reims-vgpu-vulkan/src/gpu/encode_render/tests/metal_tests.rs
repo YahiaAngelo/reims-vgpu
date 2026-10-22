@@ -7920,6 +7920,46 @@ fn after_a_failure<P: Platform>(
     lines
 }
 
+/// [`after_a_failure`]'s lines without what depends on time: when each command buffer was
+/// committed, the hang's status then, and how long the hang took.
+fn untimed(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let line = match line.split_once(" after ") {
+                Some((head, _)) if !line.starts_with(' ') => head.to_owned(),
+                _ => line,
+            };
+            match (line.find(" (committed at "), line.find("): ")) {
+                (Some(from), Some(to)) => format!("{}{}", &line[..from], &line[to + 1..]),
+                _ => line,
+            }
+        })
+        .collect()
+}
+
+/// Command buffers committed on the queue of one whose draw of primitive type 9 hangs the GPU, at
+/// once after its commit, run nothing and complete without an error, their event signals
+/// firing, and one of another queue runs, here as on Metal ([`after_a_failure`]): each one's
+/// status, error, bytes and signal, and what the completed handlers saw, in their order. Under
+/// macOS 27.0.1 Metal runs one committed once the hang's command buffer reads scheduled, about
+/// 1 ms on, in most runs and nothing of it in others (`metal_runs_after_a_type_9_hang_here`),
+/// so only the commit at once is compared
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs Metal's GPU"]
+fn later_command_buffers_of_a_hang_run_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for _ in 0..3 {
+        let theirs = untimed(after_a_failure(&mp, &md, Failure::Hang, Later::AtOnce));
+        let ours = untimed(after_a_failure(&p, &d, Failure::Hang, Later::AtOnce));
+        assert_eq!(ours, theirs);
+    }
+}
+
 /// Measures what Metal's GPU does to command buffers committed on the queue of one whose draw of
 /// primitive type 9 hangs it, and on another, at once, once it is scheduled and after 1 to 8 ms
 /// ([`after_a_failure`]). One line a command buffer.

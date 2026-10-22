@@ -134,13 +134,21 @@
 //!   same queue submitted meanwhile, committed at once or up to 10 ms on, completing it without
 //!   an error (status `Completed`), its event signals firing and its completed handlers seeing
 //!   that. One of another queue runs, and so does one of the same queue whose event wait held it
-//!   until the hang completed, and one committed after it. The runtime completes no command
-//!   buffer so: one committed on a queue while a hang of that queue is in flight here dies at
-//!   its commit. The hang stays in flight here as long as Metal's: its command buffer holds what
-//!   comes after its hanging encoder (its later signals, its completion) until [`HANG_TIME`]
-//!   after the GPU reached it ([`CommandBufferObject::hold_after_hang`]). A protection failure
-//!   reaches no later command buffer: one committed on its queue while it is in flight runs,
-//!   on Metal (measured alike) as here.
+//!   until the hang completed, and one committed after it. Under macOS 27.0.1 (26A434, the same
+//!   host, `later_command_buffers_of_a_hang_run_as_metals`) Metal still runs nothing of one
+//!   committed at once, while the hang's command buffer reads committed, and completes it so;
+//!   one committed once it reads scheduled (about 1 ms on) it mostly runs, and in 1 of 10 runs
+//!   nothing of it: Metal races there. A command buffer committed on a queue while a hang of
+//!   that queue is in flight here is committed failed with the runtime's code 0, which
+//!   completes it as Metal completes one committed at once, and as one of Metal's answers
+//!   later ([`CommandBufferObject::behind_hang`]); one that encoded an event wait dies at its
+//!   commit, as whether its wait holds it past the hang is decided as it is submitted, where the
+//!   runtime's check answers no code 0. The hang stays in flight here as long as Metal's: its
+//!   command buffer holds what comes after its hanging encoder (its later signals, its
+//!   completion) until [`HANG_TIME`] after the GPU reached it
+//!   ([`CommandBufferObject::hold_after_hang`]). A protection failure reaches no later command
+//!   buffer: one committed on its queue while it is in flight runs, on Metal (measured alike)
+//!   as here.
 //! - **A submission that uses a detached buffer or heap** fails with
 //!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
 //!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides
@@ -247,24 +255,15 @@ impl QueueObject {
 /// How many of a queue's command buffers that Metal's GPU hangs at (a draw of primitive type 9,
 /// [`HANG`]) are in flight: from the commit until [`HANG_TIME`] after the GPU reached the hang
 /// ([`CommandBufferObject::hold_after_hang`]). Metal runs nothing of a command buffer of the
-/// queue submitted meanwhile, and completes it without an error (the module docs), which the
-/// runtime has no form for: one committed meanwhile dies at its commit ([`Hangs::committing`]).
+/// queue submitted meanwhile, and completes it without an error (the module docs), as the
+/// runtime's code-0 commit failure does ([`CommandBufferObject::behind_hang`]).
 #[derive(Debug, Default)]
 struct Hangs(AtomicUsize);
 
 impl Hangs {
-    /// Dies at `commit` of a command buffer of the queue while one of its hangs is in flight.
-    fn committing(&self) {
-        let hangs = self.0.load(Ordering::SeqCst);
-        if hangs != 0 {
-            unrepresentable(
-                "commit",
-                "a command buffer committed on a queue while a command buffer of that queue \
-                 that Metal's GPU hangs at (a draw of primitive type 9) is in flight: Metal runs \
-                 none of it and completes it without an error, its event signals firing, and \
-                 the runtime completes no command buffer so",
-            );
-        }
+    /// Whether one of the queue's hangs is in flight.
+    fn in_flight(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -293,6 +292,9 @@ pub struct CommandBufferObject {
     /// Its place among the releases of detached objects until it commits, which its submission
     /// check then holds ([`backing::submission_check`]).
     opened: Mutex<Option<Opened>>,
+    /// Whether `encodeWaitForEvent:value:` encoded a wait in it, which may hold it past a hang
+    /// of its queue in flight at its commit ([`CommandBufferObject::behind_hang`]).
+    waited: AtomicBool,
     /// How many runtime encoders it has made: each encoder of Metal's, or a part of one where
     /// [`predication`] ends a compute encoder's runtime encoder and makes another. As no two are
     /// open at once, each one's count before it is its place among the encoders the runtime
@@ -522,6 +524,43 @@ impl CommandBufferObject {
         get(sel, || self.raw.encode_signal_event(at(), 1));
         get(sel, || self.raw.encode_wait_for_event(at(), 2));
         *hold = Some(event);
+    }
+
+    /// How it fails, committed by `sel` on a queue while a hang of that queue is in flight
+    /// ([`Hangs`]): as Metal runs nothing of it and completes it without an error, its event
+    /// signals firing (the module docs), by the runtime's commit failure of code 0. It dies
+    /// where Metal's answer is not decided at the commit or not measured: an event wait it
+    /// encoded may hold it until the hang ended, after which Metal runs it, and the runtime's
+    /// submission check, which decides it as Metal does when its waits are met, answers no code
+    /// 0; Metal's GPU would fail it for what its encoders did too ([`Failing`]); or it uses a
+    /// detached object (`detached`), which fails a submission Metal runs.
+    fn behind_hang(&self, sel: &'static str, detached: impl FnOnce() -> bool) -> rt::CommitFailure {
+        let unmeasured = if self.waited.load(Ordering::SeqCst) {
+            Some(
+                "an event wait, which Metal runs past where it held it until the hang ended, \
+                 and decides as it submits it, where the runtime's submission check answers no \
+                 failure of code 0",
+            )
+        } else if !plain(|| self.failing.lock().is_empty())
+            || protection_code(plain(|| self.protection.lock().options)) == INVALID_INPUT
+        {
+            Some("a failure of Metal's GPU of its own, which nothing measured beside a hang")
+        } else if detached() {
+            Some("a use of a detached object, which nothing measured beside a hang")
+        } else {
+            None
+        };
+        if let Some(what) = unmeasured {
+            unrepresentable(
+                sel,
+                &format!(
+                    "a command buffer committed on a queue while a command buffer of that queue \
+                     that Metal's GPU hangs at (a draw of primitive type 9) is in flight, with \
+                     {what}"
+                ),
+            );
+        }
+        rt::CommitFailure::new(0)
     }
 
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
@@ -939,6 +978,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             progress: Mutex::new(None),
             predication,
             opened: Mutex::new(Some(Opened::new())),
+            waited: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
@@ -1377,21 +1417,25 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// which fails a submission that uses a detached buffer or heap (module docs). A slow commit
     /// and a late completion are debug lines ([`timing::commit`]). One that holds work for
     /// Metal's tiler takes Metal's allocation for it as the runtime submits it
-    /// ([`tiler_handler`]). One committed while a hang of its queue is in flight dies
-    /// ([`Hangs`]); one that hangs Metal's GPU is in flight until [`HANG_TIME`] after the GPU
-    /// reached its hang ([`hang_ends`]).
+    /// ([`tiler_handler`]). One committed while a hang of its queue is in flight runs nothing
+    /// and completes without an error, as on Metal ([`CommandBufferObject::behind_hang`]); one
+    /// that hangs Metal's GPU is in flight until [`HANG_TIME`] after the GPU reached its hang
+    /// ([`hang_ends`]).
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
         let progress = self.progress.lock().clone();
         let hold = plain(|| self.hold.lock().take());
         let committed = encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
-            self.hangs.committing();
             let opened = self.opened.lock().take();
-            let failure = self.failure("commit", || {
+            let detached = || {
                 opened.as_ref().is_some_and(|opened| {
                     backing::uses_detached(|| self.raw.used_resources(), opened)
                 })
-            });
+            };
+            let failure = match self.hangs.in_flight() {
+                true => Some(self.behind_hang("commit", detached)),
+                false => self.failure("commit", detached),
+            };
             self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
             let check = match (&failure, opened) {
                 (None, Some(opened)) => Some(backing::submission_check(opened.commit())),
@@ -1489,7 +1533,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         encoding(sel, Policy::Dies, || {
             let event = self::event(sel, event);
             predication::boundary(&self.predication, sel);
-            self.raw.encode_wait_for_event(event, value)
+            self.raw.encode_wait_for_event(event, value)?;
+            self.waited.store(true, Ordering::SeqCst);
+            Ok(())
         })
     }
 

@@ -73,8 +73,8 @@
 //! - **Primitive type 9**, which Metal's GPU hangs at, fails the command buffer as Metal's GPU
 //!   does ([`VulkanRenderEncoder::hangs`]), in flight as long as Metal's; over indices or
 //!   indirect arguments, or of no vertices or instances, which nothing measured, it dies. A
-//!   command buffer committed on its queue while it is in flight, which Metal runs nothing of
-//!   and completes without an error, dies at its commit ([`crate::gpu::command`]).
+//!   command buffer committed on its queue while it is in flight runs nothing and completes
+//!   without an error, as Metal's does ([`crate::gpu::command`]).
 //! - **Apple's private commands** compose public ones where their meaning is measured:
 //!   `setDepthClipModeSPI:` is `setDepthClipMode:`; the late resolve setters set the runtime's
 //!   resolve targets, `yInvert` dropped, which Metal ignores, and one the attachment cannot use
@@ -2645,9 +2645,8 @@ impl VulkanRenderEncoder {
     /// map.
     /// The encoder's end holds what comes after it until the time Metal's GPU fails the command
     /// buffer ([`crate::gpu::command::CommandBufferObject::hold_after_hang`]), so the hang is in
-    /// flight as long as Metal's, and a command buffer committed on its queue meanwhile, which
-    /// Metal runs nothing of and completes without an error, dies at its commit
-    /// ([`crate::gpu::command`]).
+    /// flight as long as Metal's, and a command buffer committed on its queue meanwhile runs
+    /// nothing and completes without an error, as Metal's does ([`crate::gpu::command`]).
     fn hangs(&self, sel: &'static str, count: u32, instances: u32) -> RaiseResult<()> {
         self.pipelined(sel);
         if !plain(|| self.marks.lock().pipeline) {
@@ -4958,11 +4957,13 @@ pub(crate) mod tests {
 
     /// A command buffer of a draw of primitive type 9 is in flight as long as Metal's: its signal
     /// after the hang fires, and it completes, no sooner than `HANG_TIME` after its commit. A
-    /// command buffer committed on its queue meanwhile, which Metal runs nothing of and completes
-    /// without an error, dies at its commit; one of another queue runs then, and one of its
-    /// queue once it completed (`metal_runs_after_a_type_9_hang_here` measures Metal's). The
-    /// command buffer of its queue is made before the hang's commit and committed right after it,
-    /// within `HANG_TIME` however long the other queue's takes to run under load
+    /// command buffer committed on its queue meanwhile runs nothing and completes without an
+    /// error, its event signal firing, as Metal's; one that encoded an event wait dies at its
+    /// commit; one of another queue runs then, and one of its queue once it completed
+    /// (`metal_runs_after_a_type_9_hang_here` measures Metal's,
+    /// `later_command_buffers_of_a_hang_run_as_metals` compares). The command buffers of its
+    /// queue are made before the hang's commit and committed right after it, within `HANG_TIME`
+    /// however long the other queue's takes to run under load
     #[test]
     fn a_type_9_hang_is_in_flight_as_long_as_metals() {
         use reims_vgpu_core::platform::event::EventRef;
@@ -5017,10 +5018,19 @@ pub(crate) mod tests {
         };
         let clock = crate::os::OsClock::new();
         let since = |start| clock.now_mono().saturating_duration_since(start);
-        let (cb, _b) = filling(&q);
+        let (behind, b) = filling(&q);
+        let signalled = d.new_shared_event().unwrap();
+        behind
+            .encode_signal(Some(EventRef::Shared(&signalled)), 3)
+            .unwrap();
+        let (waits, _) = filling(&q);
+        waits
+            .encode_wait(Some(EventRef::Shared(&signalled)), 1)
+            .unwrap();
         let started = clock.now_mono();
         hang.commit(OnFault::Die).unwrap();
-        let site = catch_death(|| cb.commit(OnFault::Die)).unwrap_err();
+        behind.commit(OnFault::Die).unwrap();
+        let site = catch_death(|| waits.commit(OnFault::Die)).unwrap_err();
         assert_eq!(site.file, "commit");
         runs(&other);
         assert!(event.wait_until_signaled_value(1, std::time::Duration::from_secs(5)));
@@ -5031,6 +5041,13 @@ pub(crate) mod tests {
             (hang.status().0, hang.error().map(|e| e.code)),
             (5, Some(2))
         );
+        behind.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(behind.status().0, 4);
+        assert!(behind.error().is_none(), "{:?}", behind.error());
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        assert_eq!(first, 0, "it ran");
+        assert_eq!(signalled.signaled_value(), 3);
         runs(&q);
     }
 
