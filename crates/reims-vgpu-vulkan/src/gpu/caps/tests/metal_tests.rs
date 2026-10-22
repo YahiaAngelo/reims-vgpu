@@ -135,9 +135,9 @@ fn device_info_key_33_is_metals_but_the_simd_bits() {
     }
 }
 
-/// Every stand-in is the Metal platform's answer on this host, but `supportsMemoryOrderAtomics`
-/// at macOS 27.0.1: the runtime has no memory-order atomics, so ours stays false, Metal's answer
-/// at 26.7, where Metal 27.0.1 on the M3 Max answers true ([`stand_in::MEMORY_ORDER_ATOMICS`])
+/// Every stand-in is the Metal platform's answer on this host, and `supportsMemoryOrderAtomics`
+/// is Metal's at the level the devices answer at, false at macOS 26.7 and true at 27.0.1, where
+/// the runtime takes the atomics on this device ([`memory_order_atomics`])
 #[test]
 fn stand_ins_are_the_metal_platforms_here() {
     let Some(metal) = MetalPlatform::system_default_device() else {
@@ -171,13 +171,18 @@ fn stand_ins_are_the_metal_platforms_here() {
         f.supports_float16_bcubic_filtering,
         stand_in::FLOAT16_BCUBIC_FILTERING
     );
-    assert!(!ours.flags.supports_memory_order_atomics);
     let metals = match crate::platform::metal_level("supportsMemoryOrderAtomics") {
         metal2vulkan_runtime::MetalLevel::MacOS26_7 => false,
         metal2vulkan_runtime::MetalLevel::MacOS27_0_1 => true,
         level => panic!("no answer measured at {level}"),
     };
-    assert_eq!(f.supports_memory_order_atomics, metals);
+    assert_eq!(
+        (
+            f.supports_memory_order_atomics,
+            ours.flags.supports_memory_order_atomics
+        ),
+        (metals, metals)
+    );
     assert_eq!(
         f.supports_texture_2d_multisample_array,
         stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY
@@ -248,4 +253,78 @@ fn stand_ins_are_the_metal_platforms_here() {
         ours.limits.max_threadgroup_memory_length,
         m.limits.max_threadgroup_memory_length
     );
+}
+
+/// Every answer of `caps`, by its selector, in the order core's `DeviceCaps` holds them.
+fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("name".to_owned(), format!("{:?}", caps.name)),
+        ("registryID".to_owned(), format!("{:#x}", caps.registry_id)),
+        ("gpuCoreCount".to_owned(), format!("{:?}", caps.gpu_core_count)),
+        (
+            "maxThreadsPerThreadgroup".to_owned(),
+            format!("{:?}", caps.max_threads_per_threadgroup),
+        ),
+        (
+            "maxVertexAmplificationCount".to_owned(),
+            caps.max_vertex_amplification_count.to_string(),
+        ),
+    ];
+    // `Debug` of the structs names every field: one answer a field.
+    let fields = |debug: String| {
+        let body = debug
+            .split_once('{')
+            .and_then(|(_, rest)| rest.rsplit_once('}'))
+            .map(|(body, _)| body.to_owned())
+            .unwrap_or_default();
+        body.split(',')
+            .filter_map(|f| f.split_once(':'))
+            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    out.extend(fields(format!("{:?}", caps.limits)));
+    out.extend(fields(format!("{:?}", caps.flags)));
+    for (count, answer) in SAMPLE_COUNTS.iter().zip(&caps.sample_counts) {
+        out.push((format!("supportsTextureSampleCount:{count}"), format!("{answer:?}")));
+    }
+    for (t, answer) in caps.primitive_types.iter().enumerate() {
+        out.push((format!("supportsPrimitiveType:{t}"), format!("{answer:?}")));
+    }
+    for (family, answer) in FAMILIES.iter().zip(&caps.families) {
+        out.push((format!("supportsFamily:{family}"), format!("{answer:?}")));
+    }
+    for (mode, answer) in WRITE_ROUNDING_MODES.iter().zip(&caps.write_rounding_modes) {
+        out.push((
+            format!("supportsTextureWriteRoundingMode:{mode}"),
+            format!("{answer:?}"),
+        ));
+    }
+    out.push((
+        "heapBufferSizeAndAlignWithLength:options:".to_owned(),
+        format!("{:?}", caps.heap_buffer_page_private),
+    ));
+    out.push((
+        "minimumLinearTextureAlignmentForPixelFormat:".to_owned(),
+        format!("{:?}", caps.min_linear_alignment_bgra8),
+    ));
+    out
+}
+
+/// Every answer of the device's caps is the Metal platform's on this host, field for field:
+/// every limit, flag, sample count, primitive type, family and rounding mode core asks, and the
+/// heap-buffer and linear-alignment queries
+#[test]
+fn every_cap_is_the_metal_platforms_here() {
+    let Some(metal) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let (ours, theirs) = (answers(&dev().caps()), answers(&metal.caps()));
+    assert_eq!(ours.len(), theirs.len());
+    let differ: Vec<String> = ours
+        .iter()
+        .zip(&theirs)
+        .filter(|(o, t)| o != t)
+        .map(|((name, o), (_, t))| format!("{name}: ours {o}, Metal's {t}"))
+        .collect();
+    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
 }
