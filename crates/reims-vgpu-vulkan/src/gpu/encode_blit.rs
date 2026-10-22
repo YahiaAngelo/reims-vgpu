@@ -59,8 +59,8 @@
 //!   `_sRGB` twin, an RGBX format) into a texture of another format is filled, relayed, and dies
 //!   in strict mode (`colours_the_runtime_packs_are_the_metal_platforms`): a twin's bytes there
 //!   follow no rule measured on Metal, and a bfloat or RGBX colour's were not compared, where the
-//!   runtime repeats the packed texel. A colour in a format Metal packs none in dies
-//!   ([`crate::gpu::fill::colour_format`]).
+//!   runtime repeats the packed texel. A colour in a format Metal packs none in fills the bytes
+//!   of the command buffer's last packed texel, as Metal's do ([`crate::gpu::fill`]).
 //! - **The indirect command buffer blits** copy and reset the commands' records as the command
 //!   buffer runs, and what Metal answers of the commands beside their records
 //!   ([`crate::gpu::icb`]) once it completed; a range past a buffer's size, which Metal runs as

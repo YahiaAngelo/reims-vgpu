@@ -412,18 +412,10 @@ fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
 
 /// What Metal writes for a colour in a format it packs none in, on this host: never the
 /// colour's bytes, but those the fill before it packed, into another texture, whatever the
-/// colour; this platform dies there
+/// colour; this platform's colour fill writes the same
+/// (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`)
 #[test]
 fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
-    for format in LEFTOVER_FORMATS {
-        let raw = u64::from(format.as_raw());
-        let site = catch_death(|| colour_format("s", raw)).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "s"),
-            "{format:?}"
-        );
-    }
     let Some(d) = MetalPlatform::system_default_device() else {
         return;
     };

@@ -30,23 +30,22 @@
 //!   extended-range `_sRGB` twins, the RGBX formats) is compared into a texture of its own format
 //!   (`encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`); into a texture of
 //!   another format nothing compared it ([`crate::gpu::encode_blit`]).
-//! - **A colour in a format Metal packs none in** (Invalid, every depth and stencil format:
-//!   Depth16Unorm, Depth32Float, Stencil8, Depth24Unorm_Stencil8, Depth32Float_Stencil8,
-//!   X32_Stencil8, X24_Stencil8, and the two-plane XR10 formats RGB10A8_2P_XR10 and its sRGB
-//!   twin, 550 and 551: [`LEFTOVER_FORMATS`]) writes no byte of the colour, but bytes Metal holds
-//!   from earlier work (measured): after an RGBA32Uint fill of (7, 9, 3, 1) into one texture, a
-//!   fill of any colour in one of these formats later in the encoder writes `07 00 00 00 09 00
-//!   00 00 03 00 00 00 01 00 00 00` into another texture's RGBA32Uint texel; with no colour
-//!   packed before it in the encoder, bytes no colour gave (not a colour an earlier command
-//!   buffer packed), which differ between these formats, between texture formats and between
-//!   runs (a 550 colour into a 550 texture, paged out by core's XR10 kernel: plane 0 `77 d7 44
-//!   c7` in one process and `00 00 00 c0` in another, whatever the colour, NaN included). They
-//!   are Metal's state, which nothing here holds, so these die too
-//!   (`metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`). A colour in a
-//!   compressed, 4:2:2, YCbCr or padded format writes the same earlier fill's bytes, whatever the
-//!   colour (measured for BC1, BC4, BC6H, BC7, PVRTC, EAC, ETC2, ASTC LDR, sRGB and HDR, both
-//!   4:2:2 formats, 500, 505, 508 and 576 to 579), where the runtime's fill writes zero bytes:
-//!   these die too (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`).
+//! - **A colour in a format Metal packs none in** (every format outside [`PACKED`] and
+//!   [`OWN_FORMAT_PACKED`]: Invalid, the depth and stencil formats and the two-plane XR10
+//!   formats, 550 and 551, [`LEFTOVER_FORMATS`]; the compressed, 4:2:2, YCbCr and padded ones)
+//!   writes no byte of the colour, but bytes Metal holds from earlier work (measured): after an
+//!   RGBA32Uint fill of (7, 9, 3, 1) into one texture, a fill of any colour in one of these
+//!   formats later in the encoder, or in a later encoder of the command buffer, writes `07 00 00
+//!   00 09 00 00 00 03 00 00 00 01 00 00 00` into another texture's RGBA32Uint texel, cut at a
+//!   narrower one; with no colour packed before it in the command buffer, bytes no colour gave
+//!   (not a colour an earlier command buffer packed), which differ between texture formats and
+//!   between runs (a 550 colour into a 550 texture, paged out by core's XR10 kernel: plane 0 `77
+//!   d7 44 c7` in one process and `00 00 00 c0` in another, whatever the colour, NaN included;
+//!   `metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`). The runtime's colour
+//!   fill holds the command buffer's last packed texel over zeros and fills those bytes, Metal's
+//!   in every case measured (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`, each of
+//!   these formats); where Metal's are other bytes of its own, it announces `UnpackedFillColor`,
+//!   one of Metal's answers, relayed.
 //! - **Where** ([`place`]): a level past the texture's writes nothing; the region is cut at the
 //!   level's extent. A 3D texture takes the region's depth and ignores the slice; every other
 //!   type ignores the region's `z` and depth. A 1D or 2D texture ignores the slice; an array
@@ -181,26 +180,19 @@ pub const RGBX: [PixelFormat; 11] = [
     PixelFormat::RGBX32Float,
 ];
 
-/// The pixel format `raw` a colour fill for `sel` packs its colour in: one of [`PACKED`] or
-/// [`OWN_FORMAT_PACKED`]. Another dies: one of [`LEFTOVER_FORMATS`], for which Metal writes bytes
-/// of its own state, and any other (a compressed, 4:2:2, YCbCr or padded format, for which Metal
-/// writes the same bytes of its own state and the runtime's fill writes zeroes; a value no
-/// format is).
+/// The pixel format `raw` a colour fill for `sel` packs its colour in: any format, one of
+/// [`PACKED`] or [`OWN_FORMAT_PACKED`] packing it and any other taking the bytes an earlier
+/// colour fill left (the module's docs). A value no format is dies.
 pub fn colour_format(sel: &'static str, raw: u64) -> PixelFormat {
     let format = u32::try_from(raw)
         .ok()
         .and_then(|raw| PixelFormat::try_from(raw).ok());
-    match format {
-        Some(f) if PACKED.contains(&f) || OWN_FORMAT_PACKED.contains(&f) => f,
-        _ => {
-            let why = if format.is_some_and(|f| LEFTOVER_FORMATS.contains(&f)) {
-                "for which Metal writes bytes left by earlier work, not the colour's"
-            } else {
-                "which this platform does not pack as Metal does"
-            };
-            unrepresentable(sel, &format!("a colour in pixel format {raw}, {why}"))
-        }
-    }
+    format.unwrap_or_else(|| {
+        unrepresentable(
+            sel,
+            &format!("a colour in pixel format {raw}, which no format is"),
+        )
+    })
 }
 
 /// What a fill can write in a texture: its type, its first level's extent, its levels and its
@@ -298,16 +290,20 @@ mod tests {
 
     use super::*;
 
-    /// A colour fill packs its colour in a format Metal packs it in, and dies at another: a
-    /// format Metal packs no colour in, one whose colour the runtime fills as zeroes (compressed,
-    /// 4:2:2, YCbCr, padded), a value no format is
+    /// A colour fill takes a format Metal packs its colour in, and one it packs none in (Invalid,
+    /// depth, stencil, two-plane, compressed, 4:2:2, YCbCr, padded), and dies at a value no
+    /// format is
     #[test]
     fn colour_formats() {
         assert_eq!(colour_format("s", 70), PixelFormat::RGBA8Unorm);
         assert_eq!(colour_format("s", 93), PixelFormat::RGB9E5Float);
         assert_eq!(colour_format("s", 553), PixelFormat::BGRA10XRSRGB);
         assert_eq!(colour_format("s", 300), PixelFormat::RGBX8Unorm);
-        for format in [0, 252, 260, 550, 130, 186, 240, 505, 576, 9999, 1 << 32] {
+        for format in [0, 252, 260, 550, 130, 186, 240, 505, 576] {
+            let raw = u32::try_from(format).unwrap();
+            assert_eq!(colour_format("s", format).as_raw(), raw);
+        }
+        for format in [9999, 1 << 32] {
             let site = catch_death(|| colour_format("s", format)).unwrap_err();
             assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"), "{format}");
         }
