@@ -85,7 +85,9 @@
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
 //!   gives no range over them meanwhile. Core deallocates only whole ranges it made and never
 //!   reaches again, so nothing maps over a waiting unmap but a fixed overwrite, which takes those
-//!   pages out of it (`Holds::replaced`).
+//!   pages out of it (`Holds::replaced`). A released hold's unmaps run from the decision to the
+//!   unmap in one order with the fixed overwrites ([`OVERWRITES`]), so an overwrite never lands
+//!   between them, to be unmapped with the pages that waited there.
 //! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the host's or
 //!   the system's, which no hold defers: the host's own mapping in a device without a memory map
 //!   (`unmapMemory`, the blocks setup; QEMU passes a memory map, so a guest under QEMU never
@@ -231,6 +233,27 @@ impl GuestMappings {
 /// ([`UnmapHold`]). A leaf lock: nothing is called under it.
 static HOLDS: Mutex<Holds> = Mutex::new(Holds::new());
 
+/// The order of [`VulkanVm`]'s fixed overwrites, each with the waiting unmaps it takes its pages
+/// out of, and a released hold's unmaps, each from the decision to the unmap (module docs, "What
+/// it keeps"): an overwrite between those would be unmapped with the pages that waited. Taken
+/// before [`HOLDS`], around the OS's calls alone; a hold's release with no unmap waiting skips it.
+static OVERWRITES: Mutex<()> = Mutex::new(());
+
+/// `call`, a fixed overwrite of the `length` pages at `at`, then what waited to be unmapped there
+/// taken out of the waiting unmaps, in [`OVERWRITES`]' order.
+fn overwrite<T>(
+    (at, length): (HostPtr, u64),
+    call: impl FnOnce() -> Result<T, KernReturn>,
+) -> Result<T, KernReturn> {
+    let _order = OVERWRITES.lock();
+    let made = call()?;
+    let first = at.addr().to_u64();
+    HOLDS
+        .lock()
+        .replaced(&(first..first.saturating_add(length)));
+    Ok(made)
+}
+
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
 /// buffer's keep-alive: while it lives, [`VulkanVm`]'s `deallocate` of pages it meets leaves them
 /// mapped, and its drop, which the runtime makes once it freed the import, unmaps them (module
@@ -255,12 +278,18 @@ impl UnmapHold {
 }
 
 impl Drop for UnmapHold {
-    /// Unmaps what waited for this hold and no other: under no lock, calling nothing else.
+    /// Unmaps what waited for this hold and no other, in [`OVERWRITES`]' order where an unmap
+    /// waits, calling nothing else.
     fn drop(&mut self) {
-        let free = HOLDS.lock().release(self.first, self.id);
-        if free.is_empty() {
-            return;
+        {
+            let mut holds = HOLDS.lock();
+            if !holds.unmaps_wait() {
+                holds.release(self.first, self.id);
+                return;
+            }
         }
+        let _order = OVERWRITES.lock();
+        let free = HOLDS.lock().release(self.first, self.id);
         let vm = OsVm::new();
         for pages in free {
             let at = HostPtr::from_addr(pages.start.to_usize());
@@ -352,9 +381,9 @@ impl HostVm for VulkanVm {
     }
 
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
-        self.vm.allocate_fixed_overwrite(addr, len)?;
-        let pages = self.changed(length_pages(addr, len, self.page_size()));
-        HOLDS.lock().replaced(&pages);
+        let pages = length_pages(addr, len, self.page_size());
+        overwrite(pages, || self.vm.allocate_fixed_overwrite(addr, len))?;
+        self.changed(pages);
         Ok(())
     }
 
@@ -364,14 +393,15 @@ impl HostVm for VulkanVm {
         src: HostAddr,
         len: u64,
     ) -> Result<HostAddr, KernReturn> {
-        let at = self.vm.remap_shared_overwrite(dst, src, len)?;
-        // The kernel maps as many of the source's pages, from the page of its first byte.
-        let replaced = self.changed(length_pages(dst, len, self.page_size()));
-        HOLDS.lock().replaced(&replaced);
+        let pages = length_pages(dst, len, self.page_size());
+        let at = overwrite(pages, || self.vm.remap_shared_overwrite(dst, src, len))?;
+        self.changed(pages);
         #[cfg(test)]
         {
+            // The kernel maps as many of the source's pages, from the page of its first byte.
             let (source, _) = length_pages(src, len, self.page_size());
-            (GUEST_MAPPINGS.lock()).mapped(replaced.start, replaced.end, source.addr().to_u64());
+            let first = pages.0.addr().to_u64();
+            (GUEST_MAPPINGS.lock()).mapped(first, first + pages.1, source.addr().to_u64());
         }
         Ok(at)
     }

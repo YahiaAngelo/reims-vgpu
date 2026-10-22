@@ -90,6 +90,11 @@ impl Holds {
         true
     }
 
+    /// Whether any unmap waits.
+    pub(super) fn unmaps_wait(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     /// Whether an unmap of a page of `pages` waits.
     #[cfg(test)]
     pub(super) fn waits(&self, pages: &Range<u64>) -> bool {
