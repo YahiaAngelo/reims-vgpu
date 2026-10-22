@@ -1261,9 +1261,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             predication::boundary(&self.predication, "commit");
             let opened = self.opened.lock().take();
             let detached = || {
-                opened.as_ref().is_some_and(|opened| {
-                    backing::uses_detached(|| self.raw.used_resources(), opened)
-                })
+                opened
+                    .as_ref()
+                    .is_some_and(|opened| backing::uses_detached(&self.raw, opened))
             };
             let failure = self.failure("commit", detached);
             self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());

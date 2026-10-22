@@ -792,10 +792,13 @@ impl Detached {
         number
     }
 
-    /// Whether a command buffer made at `made` fails where it uses object `id`: the object is
-    /// detached, or was released detached after the command buffer was made.
-    fn fails(&self, id: rt::ObjectId, made: u64) -> bool {
-        self.detached.contains(&id) || self.released.get(&id).is_some_and(|&at| at > made)
+    /// The objects a command buffer made at `made` fails by where it uses one: those detached
+    /// now, and those released detached after it was made.
+    fn failing(&self, made: u64) -> Vec<rt::ObjectId> {
+        let released = (self.released.iter())
+            .filter(|&(_, &at)| at > made)
+            .map(|(&id, _)| id);
+        self.detached.iter().copied().chain(released).collect()
     }
 
     /// The open command buffers that hold nothing let go of ([`Detached::open`]).
@@ -906,11 +909,18 @@ impl Registry {
             || self.latest.load(Ordering::SeqCst) > made.saturating_add(1)
     }
 
-    /// Whether a command buffer made at `made` fails where it uses any of `ids`
-    /// ([`Detached::fails`]).
+    /// The objects a command buffer made at `made` fails by where it uses one
+    /// ([`Detached::failing`]).
+    fn failing(&self, made: u64) -> Vec<rt::ObjectId> {
+        self.state.lock().failing(made)
+    }
+
+    /// Whether a command buffer made at `made` fails where it uses any of `ids`, as the runtime
+    /// answers of what it uses and [`Registry::failing`] ([`Opened::submit`]).
+    #[cfg(test)]
     fn fails(&self, ids: &[rt::ObjectId], made: u64) -> bool {
-        let state = self.state.lock();
-        ids.iter().any(|&id| state.fails(id, made))
+        let failing = self.failing(made);
+        ids.iter().any(|id| failing.contains(id))
     }
 
     /// Command buffer `number` closed, and those that hold nothing let go of: the releases no
@@ -974,40 +984,28 @@ impl Opened {
 
     /// The submission check of `submission` of the command buffer ([`submission_check`]): it
     /// fails with [`DETACHED_USE`] where it uses a buffer or heap detached now, or one released
-    /// detached since the command buffer was made ([`Detached::fails`]); else it is noted
+    /// detached since the command buffer was made ([`Detached::failing`]); else it is noted
     /// submitted, with its encoders, until the command buffer closes. It is decided and noted at
     /// once, under the command buffer's lock, which a detach reads the notes under
-    /// ([`in_flight`]), so a detach either fails it or sees it. What it uses is asked only where
-    /// an object could fail it, and let go of under no lock: it may hold a resource's last handle.
+    /// ([`in_flight`]), so a detach either fails it or sees it. Whether it uses one is asked only
+    /// where an object could fail it, of the runtime (`rt::Submission::uses`), which lists
+    /// nothing and holds no handle.
     fn submit(&self, submission: &rt::Submission<'_>) -> Option<NonZeroU64> {
         let objects = MADE.load(Ordering::SeqCst);
         let number = self.0.number;
-        let mut used = None;
-        loop {
-            if used.is_none() && DETACHED.any(number) {
-                used = Some(ids(submission.used_resources()));
-            }
-            let mut submitted = self.0.submitted.lock();
-            if DETACHED.any(number) {
-                // An object detached or released since it was first asked: what it uses, asked
-                // anew with the lock let go of.
-                let Some(used) = &used else {
-                    continue;
-                };
-                if DETACHED.fails(used, number) {
-                    return NonZeroU64::new(DETACHED_USE);
-                }
-            }
-            DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
-            let noted = submitted.get_or_insert_with(|| Submitted {
-                cb: submission.command_buffer().clone(),
-                encoders: Vec::new(),
-                made: objects,
-            });
-            noted.encoders.push(submission.encoders());
-            noted.made = noted.made.max(objects);
-            return None;
+        let mut submitted = self.0.submitted.lock();
+        if DETACHED.any(number) && submission.uses(&DETACHED.failing(number)) {
+            return NonZeroU64::new(DETACHED_USE);
         }
+        DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
+        let noted = submitted.get_or_insert_with(|| Submitted {
+            cb: submission.command_buffer().clone(),
+            encoders: Vec::new(),
+            made: objects,
+        });
+        noted.encoders.push(submission.encoders());
+        noted.made = noted.made.max(objects);
+        None
     }
 }
 
@@ -1021,23 +1019,12 @@ impl Drop for Opened {
     }
 }
 
-/// Whether command buffer `cb`, where it uses what `used` lists, fails: it uses a buffer or heap
-/// detached now, or one released detached since it was made ([`Detached::fails`]). `used` is
-/// asked only where an object could fail it.
-pub(crate) fn uses_detached(used: impl FnOnce() -> rt::UsedResources, cb: &Opened) -> bool {
-    let number = cb.0.number;
-    DETACHED.any(number) && DETACHED.fails(&ids(used()), number)
-}
-
-/// The identities of what `used` lists, a buffer not placed in a heap or a heap, as
-/// [`Detached`] names them. `used` is released here, without a lock: what it holds may be a
-/// resource's last handle.
-fn ids(used: rt::UsedResources) -> Vec<rt::ObjectId> {
-    used.buffers
-        .iter()
-        .map(rt::Buffer::object_id)
-        .chain(used.heaps.iter().map(rt::Heap::object_id))
-        .collect()
+/// Whether command buffer `cb`, made at `opened`, fails: it uses a buffer or heap detached now,
+/// or one released detached since it was made ([`Detached::failing`]). Asked of the runtime
+/// (`rt::CommandBuffer::uses`) only where an object could fail it.
+pub(crate) fn uses_detached(cb: &rt::CommandBuffer, opened: &Opened) -> bool {
+    let number = opened.0.number;
+    DETACHED.any(number) && cb.uses(&DETACHED.failing(number))
 }
 
 /// The check of each submission of the command buffer committed as `cb`
@@ -1073,18 +1060,10 @@ fn in_flight(id: rt::ObjectId, made: u64) -> Vec<rt::CommandBuffer> {
 }
 
 /// Whether `cb`'s ended encoders at `encoders`, those of its submissions the runtime submitted,
-/// use object `id` ([`in_flight`]).
+/// use object `id` ([`in_flight`]), as the runtime answers it (`rt::CommandBuffer::encoders_use`,
+/// which lists nothing).
 fn took(cb: &rt::CommandBuffer, encoders: &[std::ops::Range<usize>], id: rt::ObjectId) -> bool {
-    let ended = cb.ended_encoders();
-    encoders
-        .iter()
-        .flat_map(Clone::clone)
-        .filter_map(|at| ended.get(at))
-        .any(|encoder| {
-            let used = &encoder.used_resources;
-            used.buffers.iter().any(|b| b.object_id() == id)
-                || used.heaps.iter().any(|h| h.object_id() == id)
-        })
+    (encoders.iter()).any(|at| cb.encoders_use(at.clone(), &[id]))
 }
 
 /// Returns once `cb` completed, its status `Completed` or `Error`, which the runtime sets before
