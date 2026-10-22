@@ -658,6 +658,117 @@ mod tests {
         assert!(summary.add("b", &times(102.5, 4.0)).is_empty());
     }
 
+    /// Prints, in microseconds, how long a command buffer of one 16-byte blit fill and a signal
+    /// of a shared event takes from its commit to its completed handler, with the legs of
+    /// [`LEGS`] between, and how long the commit holds the committing thread: through the
+    /// platform as core drives it (a blit encoder, a completed handler, the signal, the commit),
+    /// and through the runtime alone on the same device, 200 of each, alternating, after 20 to
+    /// warm up. The difference is what the platform adds between the commit and core's handler.
+    /// Measured on the M3 Max (MoltenVK, a dev build, runtime a62e8a365f), at the median: 271 us
+    /// from the commit to the handler through the platform and 265 us through the runtime, of
+    /// which the commit to the submission 29 us and 22 us (the platform's submission check and
+    /// submission handler, on the runtime's scheduler thread) and the GPU until seen complete
+    /// 212 us and 213 us; the commit held its thread 11 us and 9 us.
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the latencies"]
+    fn commit_to_handler_latency() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::types::NsRange;
+
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let raw_q = d.raw.new_command_queue().unwrap();
+        let event = d.new_shared_event().unwrap();
+        let buffer = crate::gpu::resource::tests::shared(16);
+        let times = |commit: f64, cb: &rt::CommandBuffer| Times {
+            commit,
+            kernel_start: cb.kernel_start_time(),
+            kernel_end: cb.kernel_end_time(),
+            gpu_start: cb.gpu_start_time().unwrap_or(0.0),
+            gpu_end: cb.gpu_end_time().unwrap_or(0.0),
+            handler: rt::host_time(),
+        };
+        let mut runs: [(&str, Vec<(Times, Duration)>); 2] =
+            [("platform", Vec::new()), ("runtime", Vec::new())];
+        let mut value = 0;
+        for round in 0..220 {
+            for (platform, (_, seen)) in runs.iter_mut().enumerate() {
+                value += 1;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let held = if platform == 0 {
+                    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+                    let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+                    let fill = BlitCmd::FillBuffer {
+                        buffer: &buffer,
+                        range: NsRange::new(0, 16),
+                        value: 7,
+                    };
+                    blit.encode(OnFault::Return, fill).unwrap();
+                    blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+                    let raw = cb.raw.clone();
+                    let start = rt::host_time();
+                    cb.add_completed_handler(
+                        OnFault::Return,
+                        Box::new(move |_| tx.send(times(start, &raw)).unwrap()),
+                    )
+                    .unwrap();
+                    cb.encode_signal(Some(EventRef::Shared(&event)), value)
+                        .unwrap();
+                    let at = now();
+                    cb.commit(OnFault::Return).unwrap();
+                    let held = elapsed_since(at);
+                    cb.wait_until_completed(OnFault::Return).unwrap();
+                    held
+                } else {
+                    let cb = raw_q.command_buffer().unwrap();
+                    let mut e = cb.blit_command_encoder().unwrap();
+                    e.fill_buffer(&buffer.raw, 0..16, 7).unwrap();
+                    e.end_encoding().unwrap();
+                    let start = rt::host_time();
+                    cb.add_completed_handler(Box::new(move |cb: &rt::CommandBuffer| {
+                        tx.send(times(start, cb)).unwrap();
+                    }))
+                    .unwrap();
+                    cb.encode_signal_event(rt::EventRef::Shared(&event), value)
+                        .unwrap();
+                    let at = now();
+                    cb.commit().unwrap();
+                    let held = elapsed_since(at);
+                    cb.wait_until_completed().unwrap();
+                    held
+                };
+                let t = rx.recv().unwrap();
+                if round >= 20 {
+                    seen.push((t, held));
+                }
+            }
+        }
+        for (name, seen) in runs {
+            let us = |s: f64| format!("{:.0}", s * 1e6);
+            let at = |v: &[f64], percent: usize| v[(v.len() - 1) * percent / 100];
+            let mut held: Vec<f64> = seen.iter().map(|(_, d)| d.as_secs_f64()).collect();
+            held.sort_unstable_by(f64::total_cmp);
+            println!(
+                "{name}: {} command buffers, the commit held its thread {} us at the median, \
+                 {} us p90",
+                seen.len(),
+                us(at(&held, 50)),
+                us(at(&held, 90))
+            );
+            let legs: Vec<[f64; 6]> = seen.iter().filter_map(|(t, _)| t.legs()).collect();
+            for (i, leg) in LEGS.iter().enumerate() {
+                let mut v: Vec<f64> = legs.iter().map(|l| l[i]).collect();
+                v.sort_unstable_by(f64::total_cmp);
+                println!(
+                    "  {leg}: p10 {} us, median {} us, p90 {} us",
+                    us(at(&v, 10)),
+                    us(at(&v, 50)),
+                    us(at(&v, 90))
+                );
+            }
+        }
+    }
+
     /// Prints the time from a command buffer's commit to its completion, in microseconds, on the
     /// runtime's default device made with and without `gpu_times_from_host`, over command
     /// buffers of one 256-byte blit fill each, 25 on one device then 25 on the other, for 40
