@@ -128,11 +128,10 @@ fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it_as_met
     assert_eq!((released_state_marks::<MetalPlatform>(&md), ours), (1, 1));
 }
 
-/// A reservation holding an ID of 2^23 or more reaches the runtime, whose IDs stay Metal's: 2
-/// and 2^23 + 1 reserved, Metal's pool hands out 1 then 3, and so do the runtime's, each buffer
-/// reaching its records
+/// A reservation holding an ID of 2^23 or more is the runtime's too, whose IDs stay Metal's: 2
+/// and 2^23 + 1 reserved, both hand out 1 then 3
 #[test]
-fn a_reservation_past_2_23_keeps_the_runtimes_ids_metals() {
+fn a_reservation_past_2_23_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<P::Icb> {
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
         (0..2).map(|_| make::<P>(d, &compute_desc(), 1)).collect()
@@ -145,14 +144,22 @@ fn a_reservation_past_2_23_keeps_the_runtimes_ids_metals() {
         assert_eq!(metal, [1, 3]);
     }
     let live = ids::<VulkanPlatform>(&dev());
-    let seen: Vec<(u64, u64, bool)> = live
-        .iter()
-        .map(|b| {
-            let runtime = b.raw.gpu_resource_id().0;
-            (b.gpu_resource_id(), runtime, b.reaches_its_records())
-        })
-        .collect();
-    assert_eq!(seen, [(1, 1, true), (3, 3, true)]);
+    let seen: Vec<u64> = live.iter().map(|b| b.gpu_resource_id()).collect();
+    assert_eq!(seen, [1, 3]);
+}
+
+/// A buffer whose own ID is 2^23 or more, which plain allocation hands out past a reservation of
+/// 16,000,000 (the smaller free range, 16,000,001 on), is made at that ID, as Metal makes it
+#[test]
+fn a_buffer_numbered_past_2_23_is_metals() {
+    fn id<P: Platform>(d: &P::Device) -> u64 {
+        d.reserve_resource_indices(5, &[16_000_000]).unwrap();
+        make::<P>(d, &compute_desc(), 1).gpu_resource_id()
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(id::<MetalPlatform>(&md), 16_000_001);
+    }
+    assert_eq!(id::<VulkanPlatform>(&dev()), 16_000_001);
 }
 
 /// Plain IDs given back come back from the smallest free range, as Metal's do: with 2, 3 and
@@ -331,10 +338,10 @@ fn a_reservation_after_one_of_0_alone_dies() {
     assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
 }
 
-/// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, and
-/// plain IDs start at 1, as on Metal
+/// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, plain IDs
+/// then starting at 1, as Metal's
 #[test]
-fn a_reservation_of_2_31_minus_1_hands_out_1_next() {
+fn a_reservation_of_2_31_minus_1_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<u64> {
         d.reserve_resource_indices(5, &[(1 << 31) - 1]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();

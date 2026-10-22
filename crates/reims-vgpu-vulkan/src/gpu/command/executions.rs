@@ -8,10 +8,7 @@
 //!   command where a buffer holds the range) and dies, at `commit`, naming the execution and the
 //!   command, where a direct command of its kind dies:
 //!   - a draw of points, of some vertices and instances, under a state whose points Metal sizes
-//!     none of ([`Points`], `crate::gpu::encode_render`'s `sized`);
-//!   - a dispatch or draw under a state that can encode indirect commands, in an encoder that
-//!     made resident for writing an indirect command buffer whose ID is not the runtime's
-//!     ([`Execution::guest_id`], `crate::gpu::encode_compute`'s `dispatchable`).
+//!     none of ([`Points`], `crate::gpu::encode_render`'s `sized`).
 //!
 //!   Commands that inherit the encoder's state are decided at the execution's call where the
 //!   state alone decides (`crate::gpu::encode_compute`, `crate::gpu::encode_render`). A command
@@ -93,10 +90,6 @@ pub(crate) struct Execution {
     /// Its range; `None` for one a buffer holds, which the GPU reads as it runs, so every command
     /// of the buffer is asked.
     pub(crate) range: Option<Range<u64>>,
-    /// Metal's ID of an indirect command buffer its encoder made resident for writing that is
-    /// not the runtime's ID of it, where its commands name their own states: a command whose
-    /// state can encode indirect commands dies.
-    pub(crate) guest_id: Option<u64>,
     /// Which states size its draws of points.
     pub(crate) points: Points,
     /// The indirect command buffers its encoder made resident for writing, where its commands
@@ -113,7 +106,7 @@ impl Execution {
 
     /// Whether its commands decide a death.
     fn decides(&self) -> bool {
-        self.guest_id.is_some() || self.points != Points::Unasked
+        self.points != Points::Unasked
     }
 
     /// Checks its commands at the commit (the module docs): dies where one would die as a direct
@@ -125,7 +118,6 @@ impl Execution {
             sel: execution,
             icb,
             range,
-            guest_id,
             points,
             writable,
         } = self;
@@ -135,14 +127,14 @@ impl Execution {
             writable.iter().for_each(|w| gpu_writes("commit", w));
             return None;
         }
-        if !may_find(&icb, points, guest_id.is_some() || !writable.is_empty()) {
+        if !may_find(&icb, points, !writable.is_empty()) {
             return decides.then_some(icb);
         }
         let range = range.unwrap_or(0..icb.size());
         let commands = get("commit", || icb.raw.commands(range.clone()));
         let mut writes = false;
         for (index, command) in (range.start..).zip(&commands) {
-            writes |= ask(execution, index, command, (points, guest_id), true) == Some(true);
+            writes |= ask(execution, index, command, points, true) == Some(true);
         }
         if writes && !writable.is_empty() {
             if decides && writable.iter().any(|w| same(w, &icb)) {
@@ -166,8 +158,8 @@ impl Execution {
     /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
     /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
     /// nothing into the runtime. A death test's child runs without that capture, as production.
-    /// With it, what the check looks for: draws of points where a state sizes them, and commands
-    /// under states that may encode where `guest_id` names their writes. An execution of a range
+    /// With it, what the check looks for: draws of points where a state sizes them. An execution
+    /// of a range
     /// whose buffer's records rule out every kind it names may run on the GPU alone, unchecked;
     /// one of a range the GPU reads looks for every kind.
     pub(crate) fn host_step_check(
@@ -176,11 +168,10 @@ impl Execution {
         if !self.decides() {
             return None;
         }
-        let (execution, points, guest_id) = (self.sel, self.points, self.guest_id);
-        let needs =
-            rt::IndirectCommandCheckNeeds::new(points != Points::Unasked, guest_id.is_some());
+        let (execution, points) = (self.sel, self.points);
+        let needs = rt::IndirectCommandCheckNeeds::new(points != Points::Unasked, false);
         let check: rt::IndirectCommandCheck = Box::new(move |index, command| {
-            ask(execution, index, command, (points, guest_id), false);
+            ask(execution, index, command, points, false);
         });
         Some((check, needs))
     }
@@ -189,7 +180,7 @@ impl Execution {
 /// Whether the commit's reading of `icb`'s records may find a death or a write ([`ask`]): whether
 /// what every route wrote into them so far (`command_writes`), the CPU's setters alone where the
 /// GPU may have written none, holds a draw or a dispatch, and, where the execution asks of
-/// neither a guest's ID nor a buffer made resident for writing (`by_state`), a draw of points
+/// no buffer made resident for writing (`by_state`), a draw of points
 /// where `points` asks of them. Records no route wrote a draw or a dispatch into run nothing and
 /// ask nothing: a buffer of no command types among them, whose execution in a pass Metal runs
 /// nothing of, and whose records the runtime refuses to read.
@@ -202,8 +193,7 @@ fn may_find(icb: &VulkanIcb, points: Points, by_state: bool) -> bool {
 
 /// Asks command `index` of `execution`'s indirect command buffer, `command`, of the death a direct
 /// command of its kind dies of (the module docs), `points` saying which states size its draws
-/// of points and `guest_id` the ID through which a state that can encode indirect commands would
-/// write: dies where one would, at `commit`. Where `encodes` is asked (the commit's), answers
+/// of points: dies where one would, at `commit`. Where `encodes` is asked (the commit's), answers
 /// whether its state may encode indirect commands (one released since may); `None` for a
 /// command of no draw or dispatch, or of no state, which runs nothing, and wherever `encodes` is
 /// not asked and the answer decides no death. A command's state is looked at only where a death
@@ -212,24 +202,20 @@ fn ask(
     execution: &str,
     index: u64,
     command: &rt::IndirectCommand,
-    (points, guest_id): (Points, Option<u64>),
+    points: Points,
     encodes: bool,
 ) -> Option<bool> {
     let at = || format!("command {index} of {execution}'s indirect command buffer");
-    let answered = encodes || guest_id.is_some();
-    let (named, draw) =
+    let named =
         match command {
             rt::IndirectCommand::Compute(c) if c.dispatch.is_some() => {
-                if c.pipeline_id.is_none() || !answered {
+                if c.pipeline_id.is_none() || !encodes {
                     return None;
                 }
                 let state = c.pipeline.as_ref().filter(|s| {
                     Some(plain(|| s.unique_identifier())) == c.pipeline_unique_identifier
                 });
-                (
-                    state.map(|s| plain(|| s.can_encode_indirect_commands())),
-                    None,
-                )
+                state.map(|s| plain(|| s.can_encode_indirect_commands()))
             }
             rt::IndirectCommand::Render(r) if r.draw.is_some() => {
                 let of_points = points != Points::Unasked && points_drawn(r.draw);
@@ -237,7 +223,7 @@ fn ask(
                     dies_unsized(&at());
                 }
                 let sized_asked = points == Points::Own && of_points;
-                if r.pipeline_id.is_none() || !(answered || sized_asked) {
+                if r.pipeline_id.is_none() || !(encodes || sized_asked) {
                     return None;
                 }
                 let state = r.pipeline.as_ref().filter(|s| {
@@ -258,30 +244,15 @@ fn ask(
                         ),
                     }
                 }
-                if !answered {
+                if !encodes {
                     return None;
                 }
-                (
-                    state.map(|s| plain(|| s.can_encode_indirect_commands())),
-                    r.draw,
-                )
+                state.map(|s| plain(|| s.can_encode_indirect_commands()))
             }
             _ => return None,
         };
     // `None`: a state released since, whose functions nothing here holds.
-    let may_encode = named != Some(false);
-    if let Some(id) = guest_id
-        && may_encode
-    {
-        let what = format!(
-            "{}, a {} under a pipeline state that can encode indirect commands, or one released \
-             since, which the runtime runs in its place",
-            at(),
-            if draw.is_some() { "draw" } else { "dispatch" },
-        );
-        crate::gpu::encode_compute::encodes_through_guest_id("commit", &what, id);
-    }
-    Some(may_encode)
+    Some(named != Some(false))
 }
 
 /// Whether `draw` is of points, of some vertices or indices and instances.
@@ -445,7 +416,6 @@ mod tests {
             sel: "executeCommandsInBuffer:withRange:",
             icb: icb.clone_ref(),
             range: Some(range),
-            guest_id: None,
             points: Points::Own,
             writable: Vec::new(),
         }

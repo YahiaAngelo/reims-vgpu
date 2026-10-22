@@ -1834,23 +1834,21 @@ reims_vgpu_core::death_test!(
 );
 
 /// A draw of points, and an execution of commands that inherit the encoder's state, under a
-/// state of the point class whose vertex function can encode indirect commands die in an encoder that made resident for writing
-/// an indirect command buffer whose ID is not the runtime's (one made after a reservation kept
-/// from the runtime, `icb::reserve_apart`), as a compute dispatch does
-/// (`crate::gpu::encode_compute`); an execution
-/// whose command's own state can dies at the commit, which reads its record. A draw under a
-/// state that cannot runs, and so does one under the state that can where the buffer made
-/// resident for writing has the runtime's ID
+/// state of the point class whose vertex function can encode indirect commands run in an encoder
+/// that made resident for writing an indirect command buffer numbered past a reservation of 2
+/// and 2^23 + 1, which the runtime takes as Metal does, so the buffer's ID, 3, is the runtime's
+/// and Metal's alike, as a compute dispatch does (`crate::gpu::encode_compute`); so does an
+/// execution whose command's own state can, which its commit reads, a draw under a state that
+/// cannot, and one where the buffer made resident for writing is numbered 1
 #[test]
-fn work_that_can_encode_after_an_icb_made_writable_dies() {
+fn work_that_can_encode_after_an_icb_made_writable_runs() {
     use reims_vgpu_core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
     use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::raise::death::DeathKind;
 
     let (p, d) = (platform(), dev());
-    crate::gpu::icb::reserve_apart(&[2, (1 << 23) + 1]);
+    d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
     let make = |inherit_pipeline_state| {
         d.new_indirect_command_buffer(
             &IcbDesc {
@@ -1865,7 +1863,10 @@ fn work_that_can_encode_after_an_icb_made_writable_dies() {
         .unwrap()
     };
     let (reaching, written) = (make(false), make(false));
-    assert!(reaching.reaches_its_records() && !written.reaches_its_records());
+    assert_eq!(
+        (reaching.gpu_resource_id(), written.gpu_resource_id()),
+        (1, 3)
+    );
     let encoding = classed_state(&d, ("encoding_vertex", true), PrimitiveTopologyClass::Point);
     let other = classed_state(&d, ("point_vertex", true), PrimitiveTopologyClass::Point);
     let drawn = || RenderCmd::DrawPrimitives {
@@ -1922,20 +1923,19 @@ fn work_that_can_encode_after_an_icb_made_writable_dies() {
         indirect_command_buffer: icb,
         execution_range: NsRange::new(0, 1),
     };
-    for (last, sel) in [
-        (drawn(), "drawPrimitives:vertexStart:vertexCount:"),
-        (execution(&inheriting), "executeCommandsInBuffer:withRange:"),
-    ] {
-        let (e, _dst) = open_encoder();
-        send_all(&e, opening(&encoding, "written"));
-        let site = catch_death(|| e.encode(OnFault::Return, last)).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-    }
+    let mut inherited = opening(&encoding, "written");
+    inherited.push(execution(&inheriting));
     let mut executed = opening(&other, "written");
     executed.push(execution(&own));
-    commit_dies(executed);
+    for cmds in [inherited, executed] {
+        pass_pixels(&p, &d, cmds);
+    }
     let unlit = pass_pixels(&p, &d, Vec::new());
-    for (state, resident) in [(&other, "written"), (&encoding, "reaching")] {
+    for (state, resident) in [
+        (&other, "written"),
+        (&encoding, "written"),
+        (&encoding, "reaching"),
+    ] {
         let mut cmds = opening(state, resident);
         cmds.push(drawn());
         assert_ne!(pass_pixels(&p, &d, cmds), unlit);

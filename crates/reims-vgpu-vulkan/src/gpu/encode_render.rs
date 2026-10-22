@@ -67,13 +67,12 @@
 //!   (`private_types_from_far_vertex_starts_draw_as_metals`). On a device without device
 //!   addresses the runtime refuses such a draw (`PrivatePrimitives`), which dies.
 //! - **Work of a pipeline state that can encode indirect commands** (the runtime's
-//!   `can_encode_indirect_commands`) dies in an encoder that made resident for writing an indirect
-//!   command buffer whose ID is not the runtime's, as a compute encoder's does
-//!   ([`crate::gpu::encode_compute`]): a draw of something, a tile dispatch, and an execution of
-//!   commands that inherit the state at its call ([`VulkanRenderEncoder::encodes`]); an
-//!   execution whose commands name their own at the commit, which reads them. Elsewhere such
-//!   work may write the records of each buffer the encoder made resident for writing, for good
-//!   (`executions::gpu_writes`).
+//!   `can_encode_indirect_commands`) may write the records of each buffer the encoder made
+//!   resident for writing, for good (`executions::gpu_writes`), through the buffer's ID, the
+//!   runtime's, as a compute encoder's does ([`crate::gpu::encode_compute`]): a draw of
+//!   something, a tile dispatch, and an execution of commands that inherit the state at its call
+//!   ([`VulkanRenderEncoder::encodes`]); an execution whose commands name their own at the
+//!   commit, which reads them.
 //! - **Primitive type 9**, which Metal's GPU draws nothing of, goes to the runtime, which fails
 //!   the command buffer as Metal's GPU does ([`VulkanRenderEncoder::nine`]): directly, of 3
 //!   vertices or more and an instance, it hangs Metal's GPU, the hang in flight as long as
@@ -230,7 +229,6 @@ use metal2vulkan::pipeline::RenderPipelineDescriptor;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
@@ -2071,7 +2069,7 @@ impl VulkanRenderEncoder {
             self.layered(sel);
             self.sized(sel, shape);
             self.issues(sel, None);
-            self.encodes(sel, "a draw");
+            self.encodes(sel);
         }
     }
 
@@ -2220,13 +2218,12 @@ impl VulkanRenderEncoder {
         self.marked(sel, Shape::Execution);
         let inherits_pipeline = icb.inherits.pipeline;
         let execution = if inherits_pipeline {
-            self.encodes(sel, "an execution of commands that inherit");
+            self.encodes(sel);
             let m = *plain(|| self.marks.lock());
             Execution {
                 sel,
                 icb: icb.clone_ref(),
                 range,
-                guest_id: None,
                 points: if m.pipeline && !m.points_sized {
                     Points::Unsized
                 } else {
@@ -2239,7 +2236,6 @@ impl VulkanRenderEncoder {
                 sel,
                 icb: icb.clone_ref(),
                 range,
-                guest_id: plain(|| *self.encoder.icb_written.lock()),
                 points: Points::Own,
                 writable: plain(|| {
                     let writable = self.encoder.writable_icbs.lock();
@@ -2260,19 +2256,12 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Work `sel`, `what`, of the pipeline state the encoder set last: where that state can encode
-    /// indirect commands, it dies in an encoder that made resident for writing an indirect command
-    /// buffer whose ID is not the runtime's
-    /// ([`crate::gpu::encode_compute::encodes_through_guest_id`]), and its functions may write the
-    /// records of each buffer the encoder made resident for writing
-    /// ([`crate::gpu::command::executions::gpu_writes`]).
-    fn encodes(&self, sel: &'static str, what: &str) {
+    /// Work `sel` of the pipeline state the encoder set last: where that state can encode indirect
+    /// commands, its functions may write the records of each buffer the encoder made resident for
+    /// writing ([`crate::gpu::command::executions::gpu_writes`]).
+    fn encodes(&self, sel: &'static str) {
         if !plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
             return;
-        }
-        if let Some(id) = plain(|| *self.encoder.icb_written.lock()) {
-            let what = format!("{what} of a pipeline state that can encode indirect commands");
-            crate::gpu::encode_compute::encodes_through_guest_id(sel, &what, id);
         }
         let writable: Vec<VulkanIcb> = plain(|| {
             let writable = self.encoder.writable_icbs.lock();
@@ -2284,20 +2273,12 @@ impl VulkanRenderEncoder {
     }
 
     /// `useResource` forms made `icbs` resident for writing: the encoder's functions whose state
-    /// can encode indirect commands may write their records ([`Self::encodes`]), and the first
-    /// whose ID is not the runtime's is the one such a function would reach another buffer's
-    /// records through.
+    /// can encode indirect commands may write their records ([`Self::encodes`]).
     fn writable(&self, icbs: &[VulkanIcb]) {
         plain(|| {
             let mut writable = self.encoder.writable_icbs.lock();
             writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
         });
-        if let Some(icb) = icbs.iter().find(|icb| !icb.reaches_its_records()) {
-            let id = icb.gpu_resource_id();
-            plain(|| {
-                self.encoder.icb_written.lock().get_or_insert(id);
-            });
-        }
     }
 
     /// A tile dispatch `sel`: one after a nil pipeline state dies ([`Self::pipelined`]). One in a
@@ -2310,7 +2291,7 @@ impl VulkanRenderEncoder {
     fn tiled(&self, sel: &'static str) {
         self.pipelined(sel);
         self.bfloat_drawn(sel);
-        self.encodes(sel, "a tile dispatch");
+        self.encodes(sel);
         if self.no_layers {
             crate::answer::inexact(sel, crate::answer::Inexact::RateMap, || {
                 "a tile dispatch in a pass of a rasterization rate map of no layers, which Metal \

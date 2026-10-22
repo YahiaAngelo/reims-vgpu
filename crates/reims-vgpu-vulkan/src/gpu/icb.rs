@@ -71,34 +71,25 @@
 //!   it (measured: `getCommandType` answers `DrawPatches` and `drawPatchesArguments` its
 //!   arguments, whatever the descriptor's types); a nil index or tessellation factor buffer,
 //!   which Metal crashes at, dies.
-//! - **Numbers the guest sees** are Metal's ([`Numbers`]): the `gpuResourceID`, which is also
-//!   the `resourceIndex`, from a space of IDs of Metal's indirect command buffers, and the
-//!   `uniqueIdentifier`, the runtime's, Metal's address of the buffer in its range of the GPU's
-//!   address space (`rt::IndirectCommandBuffer::unique_identifier`), of a buffer made before the
-//!   process's first encoder. Of one made after an encoder of any kind, Metal's address depends
+//! - **Numbers the guest sees** are Metal's, the runtime's: the `gpuResourceID`, which is also
+//!   the `resourceIndex`, from Metal's pool of IDs of indirect command buffers, and the
+//!   `uniqueIdentifier`, Metal's address of the buffer in its range of the GPU's address space
+//!   (`rt::IndirectCommandBuffer::unique_identifier`), of a buffer made before the process's
+//!   first encoder. Of one made after an encoder of any kind, Metal's address depends
 //!   on what the encoders took of the range, which the runtime does not follow, and the read dies
 //!   ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
-//!   buffer reaches a buffer's records by. It follows Metal's pool, placement, reservations and
-//!   hold, as these numbers do ([`Space`]): a placed buffer takes the same ID in the runtime, and
-//!   each reservation Metal takes reaches the runtime, whose IDs run to 2^31 - 1, as Metal's do
-//!   (`metal2vulkan`'s `RECORDS_ID_LIMIT`, [`reserve`]). So it is the guest's. A buffer is made,
-//!   its ID given back and the runtime's buffer dropped, under the lock of [`Space`], and a
-//!   reservation reaches the runtime under it too, so the runtime takes and gives back its IDs in
-//!   the order these are. One window parts them ([`IcbObject::reaches_its_records`]): a buffer
-//!   released while a command buffer that executes it or makes it resident is pending gives its
-//!   ID back here in the command buffer's completed handler ([`crate::gpu::command`]), and in the
-//!   runtime just after, as the runtime lets go of what the commands used once its completed
-//!   handlers ran; a buffer made between the two, on another thread, may take that ID here and
-//!   another in the runtime. A kernel encoding through the guest's ID of such a buffer would not
-//!   reach its records, so a direct dispatch in a compute encoder that made one resident for
-//!   writing dies ([`crate::gpu::encode_compute`]).
+//!   buffer reaches a buffer's records by, so the kernel reaches the records of the buffer the
+//!   guest names. What Metal does with a reservation that the runtime does not follow is kept here
+//!   ([`Ids`]): the calls Metal spins at or hands out IDs twice after. The runtime takes a
+//!   reservation of IDs to 2^31 - 1 and makes a buffer at every ID below 2^31
+//!   (`RECORDS_ID_LIMIT`), each ID's records at an address of their own, as Metal takes and makes
+//!   them ([`reserve`], [`new_indirect_command_buffer`]).
 //! - **Refusals** die at the selector, naming the runtime's error: Metal without its validation
 //!   layer raises at none of them, and goes on at those measured (an index at or past the size,
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -142,32 +133,14 @@ pub const NIL_BUFFER_ADDRESS: u64 = 0x1_eeee_1111;
 /// crashed from run to run, 100000 crashed).
 const ID_LIMIT: u64 = 16384;
 
-/// What Metal numbers one indirect command buffer by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Numbers {
-    /// `gpuResourceID`, which `resourceIndex` answers too.
-    id: u64,
-    /// Whether plain allocation handed the ID out (a placed one does not count against it).
-    plain: bool,
-}
-
-/// The size of Metal's first pool of indirect command buffer IDs ([`Pool`]): plain allocation
-/// hands out every ID below it before the pool doubles (measured, in the tests on both
-/// platforms: with 1 to 25 handed out and 2 to 9 given back, the next ID is 26, from the free
-/// range of 26 to 31, the smaller, where a pool of 64 would hand out 2; and 10 reserved alone
-/// leaves the order from 1, so the pool holds at least 20).
-const FIRST_POOL: u64 = 32;
-
-/// Metal's numbers of the live indirect command buffers of the process (one device's, as the
-/// host has one). Isolated tasks share them, as every task's device is the one object of the
-/// process's device ([`crate::gpu::device::adopt`]), and as every task's work is Metal's one
-/// device's in a process (the suite's `interplay_decodewalk_44` records, on the M3, an isolated
-/// task's two buffers at `0x68000` and `0x70000` of the range, after another task's two at
-/// `0x18000` and `0x20000` and that task's encoders).
+/// What Metal does with a reservation of indirect command buffer IDs that the runtime does not
+/// follow, of the process (one device's, as the host has one). Isolated tasks share it, as every
+/// task's device is the one object of the process's device ([`crate::gpu::device::adopt`]).
 ///
-/// Measured on this host: plain allocation hands out IDs from Metal's pool ([`Pool`]); a
-/// placement (`setResourceIndex:` of a nonzero index) takes the index's low 32 bits whoever
-/// holds them, reserved or not, and takes no ID from the pool.
+/// Measured on this host: plain allocation hands out IDs from Metal's pool, which the runtime
+/// follows (the tests compare it with Metal: its first 32 IDs, the smallest free range first, a
+/// reservation's split); a placement (`setResourceIndex:` of a nonzero index) takes the index's
+/// low 32 bits whoever holds them, reserved or not, and takes no ID from the pool.
 ///
 /// A reservation (`reserveResourceIndicesForResourceType:indices:indexCount:` of type 5) keeps
 /// its IDs from plain allocation for good. Only the process's first call with an ID counts, and
@@ -175,8 +148,8 @@ const FIRST_POOL: u64 = 32;
 /// saying "reserve() must be called before any allocation takes place". A call holding an ID of
 /// 2^32 or more is dropped whole, and a later call is the reservation. 0 is no ID: beside others
 /// the call is theirs (0 and 20 hand out what 20 alone does: 21 to 31, 1 to 19, then 32 on), and
-/// alone it reserves nothing (plain IDs from 1). Of the calls Metal takes, two kinds go
-/// otherwise ([`Reservation`]):
+/// alone it reserves nothing (plain IDs from 1). The runtime does each of these. Of the calls
+/// Metal takes, two kinds go otherwise, which the runtime does not follow ([`Reservation`]):
 /// - one holding an ID of 2^31 to 2^32 - 1 never returns: Metal spins in
 ///   `AGX::Mempool<32u,0u,true,0u,0u,unsigned long long>::reserve` at full CPU (measured at 2^31,
 ///   2^31 + 5 and 2^32 - 1, the longest run 5 minutes, and at 2^31 + 5 after a call of 0 alone),
@@ -189,7 +162,7 @@ const FIRST_POOL: u64 = 32;
 ///   core's command queues, made with the device, run before any reservation; buffers, textures
 ///   over a buffer, heaps and their textures, sampler states, command buffers' creation, commit and
 ///   wait, and texture reservations go on. No buffer lives while it spins: one made first makes
-///   Metal ignore the reservation. The thread parks for good holding the lock of [`Space`]
+///   Metal ignore the reservation. The thread parks for good holding the lock of [`IDS`]
 ///   ([`reserve_in`], [`crate::answer::hang`]), as a hang stays a hang, so every later creation and
 ///   reservation of type 5, on any thread, an isolated task's among them, waits on it for good,
 ///   before any death of its own ([`new_indirect_command_buffer`]). After a buffer was made Metal
@@ -197,19 +170,27 @@ const FIRST_POOL: u64 = 32;
 /// - one after a call of 0 alone is taken, and Metal then hands out IDs twice (measured, in order
 ///   of making: 0 then 20, 21 to 31, 1 to 19, then 1 to 10; 0 then 10, 1 to 9, 11 to 31, then 1
 ///   to 15; 0 then 100, 101 to 127, 1 to 31, then 1 to 82; 0 then 2^31 - 1, 1 to 31, then 1 to
-///   31 and 32 on). [`Pool`] does not follow Metal's past such a call, so it dies at the
-///   selector.
+///   31 and 32 on), which the runtime does not copy, so it dies at the selector.
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
 /// command buffer blocked on an event, then completed): a compute or render encoder's execution
 /// or `useResource` of it keeps the buffer and its ID until the command buffer completes, or goes
 /// uncommitted; a blit's copy (from it or into it) or reset keeps neither, its ID free at once.
-struct Space {
-    /// The plain IDs, once a buffer was made or a reservation taken.
-    pool: Option<Pool>,
+/// The runtime holds its IDs so too.
+#[derive(Debug, Default)]
+struct Ids {
+    /// Whether a buffer was made, placed or not, or a reservation taken: Metal ignores a
+    /// reservation then.
+    started: bool,
+    /// Whether a call of 0 alone came before that: Metal takes a later reservation, then hands
+    /// out IDs twice.
+    lone_zero: bool,
 }
 
-static SPACE: Mutex<Space> = Mutex::new(Space { pool: None });
+static IDS: Mutex<Ids> = Mutex::new(Ids {
+    started: false,
+    lone_zero: false,
+});
 
 /// Whether an encoder of any kind was made in the process ([`encoder_made`]).
 static ENCODED: AtomicBool = AtomicBool::new(false);
@@ -238,42 +219,31 @@ pub(crate) fn encoder_made() {
     }
 }
 
-impl Space {
-    /// The pool of plain IDs, made at its first use.
-    fn pool(&mut self) -> &mut Pool {
-        self.pool.get_or_insert_with(|| Pool::new(FIRST_POOL))
-    }
-
-    /// The numbers of a new buffer, placed at `placed` when given.
-    fn take(&mut self, placed: Option<u64>) -> Numbers {
-        let (id, plain) = match placed {
-            Some(id) => {
-                self.pool().started = true;
-                (id, false)
-            }
-            None => (self.pool().take(), true),
-        };
-        Numbers { id, plain }
-    }
-
-    /// Frees the ID of a buffer released.
-    fn give_back(&mut self, numbers: &Numbers) {
-        if numbers.plain {
-            self.pool().give(numbers.id);
-        }
-    }
-
-    /// Keeps `ids` from plain allocation, where Metal takes the reservation ([`Pool::reserve`]):
-    /// what Metal does with it. A call holding an ID of 2^32 or more is dropped whole.
+impl Ids {
+    /// What Metal does with `ids` reserved: a call holding an ID of 2^32 or more is dropped
+    /// whole; any other is ignored once a buffer was made or a reservation taken. 0 is no ID: a
+    /// call of no other ID changes nothing, and one of 0 alone marks it. One Metal hangs at or
+    /// hands out IDs twice after changes nothing either.
     fn reserve(&mut self, ids: &[u64]) -> Reservation {
-        if ids.iter().any(|&id| id > u64::from(u32::MAX)) {
+        if self.started || ids.iter().any(|&id| id > u64::from(u32::MAX)) {
             return Reservation::Ignored;
         }
-        self.pool().reserve(ids)
+        if ids.iter().all(|&id| id == 0) {
+            self.lone_zero |= !ids.is_empty();
+            return Reservation::Ignored;
+        }
+        if ids.iter().any(|&id| id >= 1 << 31) {
+            return Reservation::Hangs;
+        }
+        if self.lone_zero {
+            return Reservation::HandsOutTwice;
+        }
+        self.started = true;
+        Reservation::Taken
     }
 }
 
-/// What Metal does with a reservation of indirect command buffer IDs ([`Space`]).
+/// What Metal does with a reservation of indirect command buffer IDs ([`Ids`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reservation {
     /// Its IDs are kept from plain allocation for good.
@@ -286,153 +256,16 @@ enum Reservation {
     HandsOutTwice,
 }
 
-/// Metal's plain allocation of indirect command buffer IDs (measured on this host, each case in
-/// the tests on both platforms): free ranges inside a pool of [`FIRST_POOL`] IDs whose size
-/// doubles. Each ID handed out is the lowest of the smallest free range, the lower of two alike,
-/// and where none is free the pool doubles, its new IDs one free range. An ID given back joins
-/// the free ranges either side of it, so with 2, 3 and 5 of 1 to 8 given back, the next are 5,
-/// 2, 3, then 9. A reservation doubles the pool until it holds each reserved ID, the new IDs
-/// joining the free range that ends at the old size, and splits the free range holding the ID:
-/// 100 alone starts the IDs at 101, where the range above it is the smaller, and 2 and 16382
-/// hand out 1, 16383, then 3.
-#[derive(Debug)]
-struct Pool {
-    /// Every ID below it is free, handed out or reserved.
-    size: u64,
-    /// The free ranges, start to end (exclusive), none touching another.
-    free: BTreeMap<u64, u64>,
-    /// The same ranges as length and start: the first is the one an ID is handed out from.
-    smallest: BTreeSet<(u64, u64)>,
-    /// Whether a buffer was made, placed or not, or a reservation taken: Metal ignores a
-    /// reservation then.
-    started: bool,
-    /// Whether a call of 0 alone came before that: Metal takes a later reservation, then hands
-    /// out IDs twice.
-    lone_zero: bool,
-}
-
-impl Pool {
-    /// A pool of `size` IDs, every one above 0 free.
-    fn new(size: u64) -> Pool {
-        let mut pool = Pool {
-            size,
-            free: BTreeMap::new(),
-            smallest: BTreeSet::new(),
-            started: false,
-            lone_zero: false,
-        };
-        pool.add(1, size);
-        pool
-    }
-
-    /// `[start, end)` free, unless empty.
-    fn add(&mut self, start: u64, end: u64) {
-        if start < end {
-            self.free.insert(start, end);
-            self.smallest.insert((end - start, start));
-        }
-    }
-
-    /// The free range at `start` taken out: its end.
-    fn cut(&mut self, start: u64) -> Option<u64> {
-        let end = self.free.remove(&start)?;
-        self.smallest.remove(&(end - start, start));
-        Some(end)
-    }
-
-    /// The pool doubled, its new IDs joining the free range that ends where it ended.
-    fn grow(&mut self) {
-        let old = self.size;
-        self.size = old.saturating_mul(2);
-        let start = match self.free.range(..old).next_back() {
-            Some((&start, &end)) if end == old => {
-                self.cut(start);
-                start
-            }
-            _ => old,
-        };
-        self.add(start, self.size);
-    }
-
-    /// The next ID, now handed out.
-    fn take(&mut self) -> u64 {
-        self.started = true;
-        if self.smallest.is_empty() {
-            self.grow();
-        }
-        let start = self.smallest.first().map_or(self.size, |&(_, start)| start);
-        if let Some(end) = self.cut(start) {
-            self.add(start + 1, end);
-        }
-        start
-    }
-
-    /// `id`, handed out, free again.
-    fn give(&mut self, id: u64) {
-        let below = (self.free.range(..id).next_back())
-            .filter(|&(_, &end)| end == id)
-            .map(|(&start, _)| start);
-        let start = match below {
-            Some(start) => {
-                self.cut(start);
-                start
-            }
-            None => id,
-        };
-        let end = self.cut(id + 1).unwrap_or(id + 1);
-        self.add(start, end);
-    }
-
-    /// Keeps `ids`, each below 2^32, from plain allocation for good, unless the pool started:
-    /// what Metal does with them ([`Space`]). 0 is no ID: a call of no other ID leaves the pool
-    /// as it was, and one of 0 alone marks it. One Metal hangs at or hands out IDs twice after
-    /// leaves the pool as it was too.
-    fn reserve(&mut self, ids: &[u64]) -> Reservation {
-        if self.started {
-            return Reservation::Ignored;
-        }
-        let zero = ids.contains(&0);
-        let ids: Vec<u64> = ids.iter().copied().filter(|&id| id != 0).collect();
-        if ids.is_empty() {
-            self.lone_zero |= zero;
-            return Reservation::Ignored;
-        }
-        if ids.iter().any(|&id| id >= 1 << 31) {
-            return Reservation::Hangs;
-        }
-        if self.lone_zero {
-            return Reservation::HandsOutTwice;
-        }
-        self.started = true;
-        for id in ids {
-            while id >= self.size {
-                self.grow();
-            }
-            if let Some((&start, &end)) = self.free.range(..=id).next_back()
-                && id < end
-            {
-                self.cut(start);
-                self.add(start, id);
-                self.add(id + 1, end);
-            }
-        }
-        Reservation::Taken
-    }
-}
-
 /// `reserveResourceIndicesForResourceType:indices:indexCount:` (`sel`) of indirect command
-/// buffers (type 5) on `device`: `ids` kept from plain allocation where Metal takes the
-/// reservation, else nothing, as Metal ignores or drops it; the thread parks for good where Metal
-/// spins, and the process dies where Metal goes on to hand out IDs twice ([`Space`]). A
-/// reservation Metal takes reaches the runtime too, which takes IDs to 2^31 - 1, as Metal does,
-/// and makes a buffer of any ID below that, so its IDs stay Metal's (the module docs). Its
-/// refusal of one it is given dies.
+/// buffers (type 5) on `device`: the runtime's reservation of `ids` where Metal takes it, else
+/// nothing, as Metal ignores or drops it; the thread parks for good where Metal spins, and the
+/// process dies where Metal goes on to hand out IDs twice ([`Ids`]). The runtime takes every
+/// reservation Metal takes, to 2^31 - 1; a refusal of its would die at the selector.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
-    // The space stays held until the runtime has the reservation too, so no creation comes
-    // between the two ([`IcbObject::reaches_its_records`]); no stop of an ended task comes between
-    // them either, which would leave the space's reservation without the runtime's for every
-    // later creation of the process.
-    let (reservation, _space) = plain(|| reserve_in(&SPACE, ids));
+    // The IDs stay held until the runtime has the reservation too, so no creation comes between
+    // the two; no stop of an ended task comes between them either, which would leave the
+    // reservation taken here without the runtime's for every later creation of the process.
+    let (reservation, _ids) = plain(|| reserve_in(&IDS, ids));
     #[cfg(test)]
     if let Some(amid) = AMID_RESERVATION.take() {
         amid();
@@ -460,26 +293,17 @@ pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> 
     }
 }
 
-/// Keeps `ids` from plain allocation in [`Space`] alone, as a reservation Metal takes, where the
-/// runtime is not given it: a test's way to part a buffer's IDs from the runtime's, which only
-/// the window the module docs name parts in a run.
-#[cfg(test)]
-pub(crate) fn reserve_apart(ids: &[u64]) {
-    let (reservation, _space) = reserve_in(&SPACE, ids);
-    assert_eq!(reservation, Reservation::Taken);
-}
-
 #[cfg(test)]
 thread_local! {
-    /// What a test runs in [`reserve`] on this thread once the space took the reservation, before
+    /// What a test runs in [`reserve`] on this thread once [`IDS`] took the reservation, before
     /// the runtime takes it.
     static AMID_RESERVATION: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
-/// What Metal does with `ids` reserved in `space` ([`Space::reserve`]), and `space`, still held.
+/// What Metal does with `ids` reserved in `space` ([`Ids::reserve`]), and `space`, still held.
 /// Where Metal spins, this thread parks for good holding `space`'s lock, as Metal's spinning
-/// thread holds its pool's: a later take of an ID or reservation waits on it for good.
-fn reserve_in<'a>(space: &'a Mutex<Space>, ids: &[u64]) -> (Reservation, MutexGuard<'a, Space>) {
+/// thread holds its pool's: a later creation or reservation waits on it for good.
+fn reserve_in<'a>(space: &'a Mutex<Ids>, ids: &[u64]) -> (Reservation, MutexGuard<'a, Ids>) {
     let mut held = space.lock();
     let reservation = held.reserve(ids);
     if reservation == Reservation::Hangs {
@@ -649,14 +473,12 @@ pub struct Inherits {
     pub buffers: bool,
 }
 
-/// An indirect command buffer: the runtime's, with Metal's numbers and what Metal answers of its
-/// commands that their records do not hold.
+/// An indirect command buffer: the runtime's, with what Metal answers of its commands that their
+/// records do not hold.
 #[derive(Debug)]
 pub struct IcbObject {
-    /// The runtime's buffer, dropped as its ID here is given back ([`IcbObject::drop`]).
-    pub raw: ManuallyDrop<rt::IndirectCommandBuffer>,
-    /// Metal's numbers of it.
-    numbers: Numbers,
+    /// The runtime's buffer.
+    pub raw: rt::IndirectCommandBuffer,
     /// Whether it was made after an encoder ([`encoder_made`]): its `uniqueIdentifier` dies.
     after_encoder: bool,
     /// Whether its commands take attribute strides.
@@ -1034,19 +856,6 @@ impl Sides {
     }
 }
 
-impl Drop for IcbObject {
-    /// Its ID is free again, as Metal's is once the buffer is released. The ID is given back and the runtime's buffer dropped
-    /// under the lock of [`Space`], which a creation holds while the runtime makes its buffer, so
-    /// no creation takes an ID between the two ([`IcbObject::reaches_its_records`]).
-    fn drop(&mut self) {
-        let mut space = SPACE.lock();
-        space.give_back(&self.numbers);
-        // SAFETY: `raw` is dropped once, here, as `self` goes, and never reached again.
-        unsafe { ManuallyDrop::drop(&mut self.raw) };
-        drop(space);
-    }
-}
-
 impl std::ops::Deref for IcbObject {
     type Target = rt::IndirectCommandBuffer;
     fn deref(&self) -> &rt::IndirectCommandBuffer {
@@ -1055,13 +864,6 @@ impl std::ops::Deref for IcbObject {
 }
 
 impl IcbObject {
-    /// Whether a kernel encoding commands through the guest's ID of the buffer reaches its
-    /// records: whether the runtime's ID of it, which the records' address follows, is Metal's
-    /// (the module docs).
-    pub(crate) fn reaches_its_records(&self) -> bool {
-        plain(|| self.raw.gpu_resource_id().0 == self.numbers.id)
-    }
-
     /// Runs `edit`, `sel`'s `access`, on what Metal answers of command `index`; a write leaves
     /// what it writes known. Where Metal's answer depends on whether the GPU ran a blit of the
     /// command yet ([`Blit::races`]), or a read's on whether it ran one of a failed command
@@ -1401,7 +1203,7 @@ pub type VulkanIcb = Obj<IcbObject>;
 
 /// Another reference to each indirect command buffer of `list`, which a `useResource` form made
 /// resident: its command buffer holds them, and their IDs, until it has run (the docs of
-/// [`Space`]).
+/// [`Ids`]).
 pub(crate) fn made_resident(list: &[Option<ResourceRef<'_, VulkanPlatform>>]) -> Vec<VulkanIcb> {
     list.iter()
         .flatten()
@@ -1482,11 +1284,13 @@ fn descriptor(desc: &IcbDesc) -> rt::IndirectCommandBufferDescriptor {
 
 /// `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:`: the runtime's buffer, with
 /// Metal's numbers (the module docs), placed at the descriptor's resource index when its low 32
-/// bits are nonzero, here and in the runtime. Metal answers no nil here. A placement past Metal's
-/// table of IDs dies, as Metal ends its process there; so does every refusal of the runtime's, as
-/// Metal crashes at memory it cannot back. The runtime makes what Metal makes of the descriptors
-/// its validation stops (no command types, render and compute types together, more than 31 buffers
-/// of a stage).
+/// bits are nonzero. Metal answers no nil here. A placement past Metal's table of IDs dies, as
+/// Metal ends its process there; so does every refusal of the runtime's, as Metal crashes at
+/// memory it cannot back. A buffer whose own ID is 2^23 or more, which plain allocation hands out
+/// past a reservation that large, the runtime makes as Metal does, at every ID below 2^31
+/// (`RECORDS_ID_LIMIT`) and any count of commands. The runtime makes what Metal makes of
+/// the descriptors its validation stops (no command types, render and compute types together,
+/// more than 31 buffers of a stage).
 pub(crate) fn new_indirect_command_buffer(
     device: &VulkanDevice,
     desc: &IcbDesc,
@@ -1495,11 +1299,10 @@ pub(crate) fn new_indirect_command_buffer(
 ) -> RaiseResult<Option<VulkanIcb>> {
     let sel = "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:";
     let overrun_shape = OverrunShape::of(desc, max_count, options);
-    // The space first, so every death here comes after the wait: Metal's creation waits on its
-    // pool's lock while a reservation spins, a placement past its table of IDs too ([`Space`]).
-    // The runtime's buffer is made under it, so the runtime takes its IDs in the order these are
-    // taken ([`IcbObject::reaches_its_records`]).
-    let mut space = plain(|| SPACE.lock());
+    // The IDs first, so every death here comes after the wait: Metal's creation waits on its
+    // pool's lock while a reservation spins, a placement past its table of IDs too ([`Ids`]).
+    // The runtime's buffer is made under it, so no reservation comes between the two.
+    let mut ids = plain(|| IDS.lock());
     let mut d = descriptor(desc);
     let options = crate::gpu::resource_options(sel, options);
     let placed = desc
@@ -1523,11 +1326,10 @@ pub(crate) fn new_indirect_command_buffer(
             .new_indirect_command_buffer(&d, max_count, options)
     })?;
     let after_encoder = ENCODED.load(Ordering::SeqCst);
-    let numbers = space.take(placed);
-    drop(space);
+    ids.started = true;
+    drop(ids);
     Ok(Some(Obj::new(IcbObject {
-        raw: ManuallyDrop::new(raw),
-        numbers,
+        raw,
         after_encoder,
         strides: d.support_dynamic_attribute_stride,
         inherits: Inherits {
@@ -1544,9 +1346,9 @@ pub(crate) fn new_indirect_command_buffer(
 }
 
 impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
-    /// Metal's ID of the buffer, not the runtime's (the module docs).
+    /// The runtime's ID of the buffer, Metal's (the module docs).
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| self.numbers.id)
+        plain(|| self.raw.gpu_resource_id().0)
     }
 
     /// The runtime's setters of the command, which Metal hands out at any index and of a buffer
@@ -1583,9 +1385,9 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     }
 
     /// Metal's `resourceIndex` of an indirect command buffer is its `gpuResourceID` (measured,
-    /// placed or not).
+    /// placed or not), as the runtime's is.
     fn resource_index(&self) -> u64 {
-        plain(|| self.numbers.id)
+        plain(|| self.raw.resource_index())
     }
 
     fn size(&self) -> u64 {
@@ -2374,34 +2176,9 @@ mod tests {
         });
     }
 
-    /// The runtime's ID of a buffer, which its records' address follows, is the guest's, past a
-    /// reservation and for a placed buffer too; IDs are free again once their buffer goes, in
-    /// both
-    #[test]
-    fn the_runtimes_ids_are_metals() {
-        let d = dev();
-        d.reserve_resource_indices(5, &[2]).unwrap();
-        let placed = IcbDesc {
-            resource_index: Some(9),
-            ..compute_desc()
-        };
-        let ids = |b: &VulkanIcb| (b.gpu_resource_id(), b.raw.gpu_resource_id().0);
-        let a = make::<VulkanPlatform>(&d, &compute_desc(), 1);
-        let b = make::<VulkanPlatform>(&d, &compute_desc(), 1);
-        let mut seen = vec![ids(&a), ids(&b)];
-        drop((a, b));
-        let c = make::<VulkanPlatform>(&d, &compute_desc(), 1);
-        let p = make::<VulkanPlatform>(&d, &placed, 1);
-        let e = make::<VulkanPlatform>(&d, &compute_desc(), 1);
-        seen.extend([ids(&c), ids(&p), ids(&e)]);
-        let reach: Vec<bool> = [&c, &p, &e].map(|b| b.reaches_its_records()).to_vec();
-        assert_eq!(seen, [(1, 1), (3, 3), (1, 1), (9, 9), (3, 3)]);
-        assert_eq!(reach, [true, true, true]);
-    }
-
-    /// An isolated task that ends while its reservation is under way, once the space took it,
-    /// still gives it to the runtime, which then hands out what the space does to the process's
-    /// later buffers: 1 then 3, 2 reserved
+    /// An isolated task that ends while its reservation is under way, once [`IDS`] took it, still
+    /// gives it to the runtime, which then hands out Metal's IDs to the process's later buffers:
+    /// 1 then 3, 2 reserved
     #[test]
     fn a_task_that_ends_amid_its_reservation_leaves_the_runtimes_ids_metals() {
         use reims_vgpu_core::tasks::isolation::life::TaskLife;
@@ -2416,17 +2193,14 @@ mod tests {
         let made: Vec<VulkanIcb> = (0..2)
             .map(|_| make::<VulkanPlatform>(&d, &compute_desc(), 1))
             .collect();
-        let seen: Vec<(u64, u64)> = made
-            .iter()
-            .map(|b| (b.gpu_resource_id(), b.raw.gpu_resource_id().0))
-            .collect();
-        assert_eq!(seen, [(1, 1), (3, 3)]);
+        let seen: Vec<u64> = made.iter().map(|b| b.gpu_resource_id()).collect();
+        assert_eq!(seen, [1, 3]);
     }
 
     /// A device the host releases and opens again is the one runtime device, whose IDs go on with
     /// these, as Metal's device lives for the process: 2 reserved on a handle dropped after, the
-    /// device opened again hands out 1 then 3, the runtime's too, where a runtime device made
-    /// again would hand out 1 then 2. It holds no other handle ([`dev`]) before the drop.
+    /// device opened again hands out 1 then 3, where a runtime device made again would hand out 1
+    /// then 2. It holds no other handle ([`dev`]) before the drop.
     #[test]
     fn a_device_opened_again_keeps_its_ids() {
         let open = || VulkanPlatform::system_default_device().expect("a Vulkan device (MoltenVK)");
@@ -2437,24 +2211,20 @@ mod tests {
         let made: Vec<VulkanIcb> = (0..2)
             .map(|_| make::<VulkanPlatform>(&d, &compute_desc(), 1))
             .collect();
-        let seen: Vec<(u64, u64)> = made
-            .iter()
-            .map(|b| (b.gpu_resource_id(), b.raw.gpu_resource_id().0))
-            .collect();
-        assert_eq!(seen, [(1, 1), (3, 3)]);
+        let seen: Vec<u64> = made.iter().map(|b| b.gpu_resource_id()).collect();
+        assert_eq!(seen, [1, 3]);
     }
 
-    /// A reservation Metal spins at parks its thread for good holding the space's lock, as
-    /// Metal's spinning thread holds its pool's, so a take or another reservation would wait on
-    /// it for good: here the lock stays held past 500 ms. One Metal takes lets the lock go. The
-    /// test leaves the parked thread behind, holding a space of its own (leaked, not the
+    /// A reservation Metal spins at parks its thread for good holding the lock of [`IDS`], as
+    /// Metal's spinning thread holds its pool's, so a creation or another reservation would wait
+    /// on it for good: here the lock stays held past 500 ms. One Metal takes lets the lock go. The
+    /// test leaves the parked thread behind, holding an [`Ids`] of its own (leaked, not the
     /// process's), until the test's process exits
     #[test]
     fn a_reservation_metal_spins_at_holds_the_space() {
         use std::time::Duration;
 
-        let space =
-            || -> &'static Mutex<Space> { Box::leak(Box::new(Mutex::new(Space { pool: None }))) };
+        let space = || -> &'static Mutex<Ids> { Box::leak(Box::new(Mutex::new(Ids::default()))) };
         let taken = space();
         let (reservation, held) = reserve_in(taken, &[10]);
         assert_eq!(reservation, Reservation::Taken);
@@ -2477,56 +2247,40 @@ mod tests {
         assert!(spun.try_lock_for(Duration::from_millis(500)).is_none());
     }
 
-    /// The pool's order without a device: a free range below an ID in the second half of the
-    /// pool is handed out after the smaller one above it, a full pool doubles, and IDs given back
-    /// join their free neighbours
+    /// What Metal does with each reservation, without a device, where the selector would park or
+    /// die: an ID of 2^31 to 2^32 - 1 in a call Metal takes hangs, after a call of 0 alone too,
+    /// and a later call with an ID below 2^31 hands out twice; neither starts the IDs, and once a
+    /// buffer was made or a reservation taken every call is ignored, as is one holding an ID of
+    /// 2^32 or more, or none but 0
     #[test]
-    fn the_pool_hands_out_the_smallest_free_range_first() {
-        let mut pool = Pool::new(16);
-        assert_eq!(pool.reserve(&[10]), Reservation::Taken);
-        let first: Vec<u64> = (0..16).map(|_| pool.take()).collect();
-        assert_eq!(
-            first,
-            [11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17]
-        );
-        assert_eq!(pool.reserve(&[20]), Reservation::Ignored);
-        for id in [3, 4, 6] {
-            pool.give(id);
-        }
-        assert_eq!([pool.take(), pool.take(), pool.take()], [6, 3, 4]);
-        let mut empty = Pool::new(32);
-        assert_eq!(empty.reserve(&[0]), Reservation::Ignored);
-        assert!(!empty.started);
-    }
-
-    /// What the pool answers for the calls Metal spins at or hands out IDs twice after, without
-    /// a device, where the selector would park or die: an ID of 2^31 to 2^32 - 1 in a call Metal
-    /// takes hangs, after a call of 0 alone too, and a later call with an ID below 2^31 hands out
-    /// twice; neither changes the pool, and once a buffer was made both are ignored
-    #[test]
-    fn the_pool_knows_the_calls_metal_spins_at_or_hands_out_twice_after() {
+    fn the_ids_know_the_calls_metal_spins_at_or_hands_out_twice_after() {
         for ids in [
             &[1 << 31][..],
             &[0, (1 << 31) + 5],
             &[3, u64::from(u32::MAX)],
         ] {
-            let mut pool = Pool::new(FIRST_POOL);
-            assert_eq!(pool.reserve(ids), Reservation::Hangs, "{ids:?}");
-            assert_eq!(pool.take(), 1);
+            let mut fresh = Ids::default();
+            assert_eq!(fresh.reserve(ids), Reservation::Hangs, "{ids:?}");
+            assert!(!fresh.started);
         }
-        let mut edge = Pool::new(FIRST_POOL);
+        let mut edge = Ids::default();
+        assert_eq!(edge.reserve(&[1 << 32, 3]), Reservation::Ignored);
         assert_eq!(edge.reserve(&[(1 << 31) - 1]), Reservation::Taken);
-        assert_eq!(edge.take(), 1);
-        let mut zero = Pool::new(FIRST_POOL);
+        assert_eq!(edge.reserve(&[1 << 31]), Reservation::Ignored);
+        assert_eq!(edge.reserve(&[20]), Reservation::Ignored);
+        let mut zero = Ids::default();
         assert_eq!(zero.reserve(&[0, 0]), Reservation::Ignored);
         assert_eq!(zero.reserve(&[(1 << 31) + 5]), Reservation::Hangs);
         assert_eq!(zero.reserve(&[20]), Reservation::HandsOutTwice);
         assert_eq!(zero.reserve(&[(1 << 31) - 1]), Reservation::HandsOutTwice);
         assert!(!zero.started);
-        assert_eq!(zero.take(), 1);
+        zero.started = true;
         assert_eq!(zero.reserve(&[1 << 31]), Reservation::Ignored);
         assert_eq!(zero.reserve(&[20]), Reservation::Ignored);
-        assert_eq!(zero.take(), 2);
+        let mut none = Ids::default();
+        assert_eq!(none.reserve(&[]), Reservation::Ignored);
+        assert!(!none.lone_zero);
+        assert_eq!(none.reserve(&[0, 20]), Reservation::Taken);
     }
 
     /// The runtime's pipeline state of `add_one`, with indirect command buffer support, as core's
