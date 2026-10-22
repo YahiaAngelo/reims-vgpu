@@ -23,7 +23,9 @@
 //! A detach while a command buffer submitted and not yet completed took the object answers NO
 //! on both, a heap's at once and a buffer's once the command buffer completed, where Metal's
 //! buffer answers YES in some runs from the same state, an answer its test does not compare
-//! ([`in_flight`], [`expected_in_flight`]).
+//! ([`in_flight`], [`expected_in_flight`]). One made in the completed handler of the command
+//! buffer that took the object answers NO here, Metal's answer in most runs
+//! ([`in_a_completed_handler`]).
 //! One while a command buffer not yet committed used it detaches on both, an unnamed reach
 //! reading 0 and the holder failing with code 8 ([`held`]). An object detached at once and never
 //! replaced reads 0 on both where a kernel reaches it unnamed, its `contents` and the memory it
@@ -53,7 +55,7 @@ use reims_vgpu_core::platform::os::vm::{HostVm, VmProt};
 use reims_vgpu_core::platform::resource::{Buffer, Heap, Library, Texture};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddressRange};
 use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
-use reims_vgpu_core::platform::{HostRange, Platform};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
@@ -1794,19 +1796,18 @@ fn rounds(count: u64) -> HostPtr {
     guest
 }
 
-/// A buffer or a heap, as core makes them (over a temporary allocation or range, detached at
-/// once, replaced by the guest's pages), detached while a command buffer submitted and not yet
-/// completed runs a kernel over it (over a buffer placed in the heap): whether the kernel had
-/// ended as the detach returned, and the answer of a replace after it; the command buffer's
-/// status, error code and whether the kernel's write landed in the guest's pages, once it
-/// completed; then, once Metal retired its use ([`retire`]), the answer of a replace after a
-/// second detach.
-fn in_flight<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
-    let queue = dev.new_command_queue().unwrap();
+/// A buffer, or a heap and a buffer of a page placed in it, as core makes them (over a temporary
+/// allocation or range, detached at once), replaced by the 4 pages at `guest`: the buffer, and the
+/// heap where there is one.
+fn over_guest_pages<P: Platform>(
+    p: &P,
+    dev: &P::Device,
+    heap: bool,
+    guest: HostPtr,
+) -> (P::Buffer, Option<P::Heap>) {
     let size = 4 * PAGE;
-    let guest = rounds(4);
     let array = p.new_address_range_array(&[range(guest, 0, size)]).unwrap();
-    let (words, made) = if heap {
+    if heap {
         let dummy = pages(4, 0);
         let ranges = p.new_address_range_array(&[range(dummy, 0, size)]).unwrap();
         let made = dev
@@ -1832,7 +1833,21 @@ fn in_flight<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
         let buffer = detached_buffer::<P>(dev, 4);
         assert!(buffer.replace_backing(&array, false).unwrap());
         (buffer, None)
-    };
+    }
+}
+
+/// A buffer or a heap, as core makes them (over a temporary allocation or range, detached at
+/// once, replaced by the guest's pages), detached while a command buffer submitted and not yet
+/// completed runs a kernel over it (over a buffer placed in the heap): whether the kernel had
+/// ended as the detach returned, and the answer of a replace after it; the command buffer's
+/// status, error code and whether the kernel's write landed in the guest's pages, once it
+/// completed; then, once Metal retired its use ([`retire`]), the answer of a replace after a
+/// second detach.
+fn in_flight<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
+    let queue = dev.new_command_queue().unwrap();
+    let size = 4 * PAGE;
+    let guest = rounds(4);
+    let (words, made) = over_guest_pages(p, dev, heap, guest);
     let detach = || match &made {
         Some(heap) => heap.detach_backing().unwrap(),
         None => words.detach_backing().unwrap(),
@@ -1944,7 +1959,7 @@ fn detached_in_flight_on_metal() {
 
 /// [`in_flight`] on this crate, as on Metal ([`expected_in_flight`]): a detach answers NO while a
 /// command buffer the runtime submitted took the object, a buffer's once each such command
-/// buffer completed (the runtime's detach, `src/gpu/backing.rs`'s docs, "In flight")
+/// buffer completed (`src/gpu/backing.rs`'s `in_flight`)
 #[test]
 fn detached_in_flight_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
@@ -1953,6 +1968,145 @@ fn detached_in_flight_on_vulkan() {
     let p = VulkanPlatform::new(Box::new(NoLauncher));
     let seen = [true, false].map(|heap| in_flight(&p, &dev, heap));
     assert_eq!(seen, expected_in_flight());
+}
+
+/// A detach of `heap`, or of `words` where there is none, then a replace of it by `array`: the
+/// replace's answer.
+fn detach_then_replace<P: Platform>(
+    words: &P::Buffer,
+    heap: Option<&P::Heap>,
+    array: &P::AddressRangeArray,
+) -> bool {
+    match heap {
+        Some(heap) => {
+            heap.detach_backing().unwrap();
+            heap.replace_backing(array, false).unwrap()
+        }
+        None => {
+            words.detach_backing().unwrap();
+            words.replace_backing(array, false).unwrap()
+        }
+    }
+}
+
+/// A buffer or a heap, as core makes them, over the guest's pages ([`over_guest_pages`]), filled
+/// by a blit (through a buffer placed in the heap), and detached inside the completed handler of
+/// that command buffer: the answer of a replace after it, in the handler too, and the status and
+/// error code the handler sees; then, once Metal retired the use ([`retire`]), the answer of a
+/// replace after a second detach.
+fn in_a_completed_handler<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
+    let queue = dev.new_command_queue().unwrap();
+    let size = 4 * PAGE;
+    let guest = pages(4, 0);
+    let (words, made) = over_guest_pages(p, dev, heap, guest);
+    let fresh = pages(4, 0);
+    let array = p.new_address_range_array(&[range(fresh, 0, size)]).unwrap();
+    let cb = command_buffer::<P>(&queue);
+    let (seen, handler) = mpsc::channel();
+    let held = (
+        words.clone_ref(),
+        made.as_ref().map(Handle::clone_ref),
+        array.clone_ref(),
+    );
+    cb.add_completed_handler(
+        OnFault::Return,
+        Box::new(move |info| {
+            let (words, made, array) = held;
+            let replaced = detach_then_replace::<P>(&words, made.as_ref(), &array);
+            let code = info.error.map_or(0, |e| u64::try_from(e.code).unwrap());
+            let _ = seen.send(vec![u64::from(replaced), info.status.0, code]);
+        }),
+    )
+    .unwrap();
+    blit::<P>(&cb, vec![fill::<P>(&words, 0, 0x5a)]);
+    finish::<P>(&cb);
+    let mut steps: Steps = vec![(
+        "detached in its completed handler: replaced, status, error",
+        handler.recv().unwrap(),
+    )];
+    retire();
+    steps.push((
+        "detached once it completed: replaced",
+        vec![u64::from(detach_then_replace::<P>(
+            &words,
+            made.as_ref(),
+            &array,
+        ))],
+    ));
+    steps.push((
+        "the fill in the guest's pages",
+        vec![u64::from(read(guest, 0))],
+    ));
+    drop((cb, queue, words, made));
+    assert!(vm_free(guest, size) && vm_free(fresh, size));
+    steps
+}
+
+/// What Metal does in [`in_a_completed_handler`], a heap's and a buffer's alike: the detach in
+/// the handler answers NO in most runs, the object staying attached, so the replace after it
+/// answers NO, and YES in some, the replace answering YES (measured on the M3 Max: 197 of 200
+/// detaches made so on macOS 26.7, `src/gpu/backing.rs`'s docs; NO in 39 of 40 runs of each on
+/// macOS 27.0.1, 26A434); once the use retired, a detach detaches; the fill landed in the
+/// guest's pages. [`detached_in_a_completed_handler_on_metal`] compares the rest, and not the
+/// answer in the handler ([`handler_answer_not_compared`]). This crate's NO is Metal's answer in
+/// most runs, and [`detached_in_a_completed_handler_on_vulkan`] compares it.
+fn expected_in_a_completed_handler() -> Steps {
+    vec![
+        (
+            "detached in its completed handler: replaced, status, error",
+            vec![0, 4, 0],
+        ),
+        ("detached once it completed: replaced", vec![1]),
+        ("the fill in the guest's pages", vec![0x5a]),
+    ]
+}
+
+/// `steps` of [`in_a_completed_handler`] without the answer of the replace after the detach in
+/// the handler, which Metal does not decide ([`expected_in_a_completed_handler`]): the status and
+/// error the handler sees stay.
+fn handler_answer_not_compared(mut steps: Steps) -> Steps {
+    let (name, words) = &mut steps[0];
+    assert_eq!(
+        *name,
+        "detached in its completed handler: replaced, status, error"
+    );
+    *name = "detached in its completed handler: status, error";
+    words.remove(0);
+    steps
+}
+
+/// [`in_a_completed_handler`] on Metal, a heap and a buffer, the answer in the handler not
+/// compared ([`handler_answer_not_compared`])
+#[test]
+fn detached_in_a_completed_handler_on_metal() {
+    let Some(dev) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = MetalPlatform::new(Box::new(NoLauncher));
+    for heap in [true, false] {
+        let seen = in_a_completed_handler(&p, &dev, heap);
+        assert_eq!(
+            handler_answer_not_compared(seen),
+            handler_answer_not_compared(expected_in_a_completed_handler()),
+            "heap {heap}"
+        );
+    }
+}
+
+/// [`in_a_completed_handler`] on this crate, a heap and a buffer, as on Metal
+/// ([`expected_in_a_completed_handler`]): a detach answers NO until the command buffer that took
+/// the object closed, after its completed handlers ran, though the runtime let go of what its
+/// work took before them (`src/gpu/backing.rs`'s docs, "In flight")
+#[test]
+fn detached_in_a_completed_handler_on_vulkan() {
+    let Some(dev) = VulkanPlatform::system_default_device() else {
+        return;
+    };
+    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    for heap in [true, false] {
+        let seen = in_a_completed_handler(&p, &dev, heap);
+        assert_eq!(seen, expected_in_a_completed_handler(), "heap {heap}");
+    }
 }
 
 /// A buffer, or a buffer placed in a heap, as core makes them, over the guest's pages, used by a
