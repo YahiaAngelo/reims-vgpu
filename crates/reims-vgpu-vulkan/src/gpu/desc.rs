@@ -996,8 +996,9 @@ impl RenderPassDescriptorObject {
     /// The first property the runtime holds raw ([`RawPass`]), by attachment then setter: the
     /// attachment's name, the setter and the value.
     pub fn raw_value(&self) -> Option<(String, &'static str, u64)> {
-        let raw = plain(|| self.raw.lock().clone());
-        raw.0.into_iter().next().map(|((attachment, sel), value)| {
+        let first =
+            plain(|| (self.raw.lock().0.first_key_value()).map(|(&at, &value)| (at, value)));
+        first.map(|((attachment, sel), value)| {
             let name = match attachment {
                 DEPTH => "the depth attachment".to_owned(),
                 STENCIL => "the stencil attachment".to_owned(),
