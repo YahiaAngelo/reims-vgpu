@@ -1254,9 +1254,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// Nil for memory the device cannot allocate, and for a descriptor Metal makes no texture
-    /// of ([`crate::gpu::desc::metal_makes_none`], and a format Metal makes no texture of from a
-    /// descriptor alone, which the runtime answers as Metal does,
-    /// [`crate::gpu::no_texture::descriptor`]), as Metal answers. It holds what Metal's space
+    /// of, as Metal answers, which the runtime answers as Metal does: a type Metal makes none of
+    /// in the format (a two-plane extended-range cube or cube array that passes every check
+    /// Metal's validation makes), and a format Metal makes no texture of from a descriptor alone
+    /// ([`crate::gpu::no_texture::descriptor`]). It holds what Metal's space
     /// gives a texture of memory of its own ([`metal_space::texture_space`]): a range of
     /// Metal's heap size for it ([`metal_space::own_heap_size`]: the runtime's model of Metal's
     /// answer, [`VulkanDevice::metal_answer_at`], on every device, where the device's own answer
@@ -1278,14 +1279,18 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let sel = "newTextureWithDescriptor:";
         let fields = descriptor.fields();
         let desc = fields.descriptor(sel, Maker::Other);
-        if crate::gpu::desc::metal_makes_none(&desc) {
-            return Ok(None);
-        }
         let raw = fields.raw_pixel_format();
         let kind = match desc.resource_options.storage_mode() {
             Ok(rt::StorageMode::Memoryless) => TextureKind::Memoryless,
             _ => {
                 let metal = self.metal_answer_at(sel, &desc);
+                // A type Metal makes no texture of in the format, which the runtime's model of
+                // Metal's size answers 0 bytes for, is nil before any of Metal's space is taken
+                // for it; a format Metal makes no texture of from a descriptor alone goes on to
+                // the runtime's nil.
+                if metal.is_some_and(|metal| metal.size == 0) && fields.formatless().is_none() {
+                    return Ok(None);
+                }
                 let answer = |desc: &rt::TextureDescriptor| self.size_and_align_at(sel, desc);
                 let (heap_size, heard) =
                     hearing(|| metal_space::own_heap_size(&desc, metal, answer));

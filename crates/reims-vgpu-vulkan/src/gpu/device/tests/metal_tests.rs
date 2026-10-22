@@ -2401,9 +2401,9 @@ fn a_texture_takes_a_live_ones_id_where_metal_gives_it() {
 /// A two-plane extended-range texture of type cube or cube array is nil where Metal answers
 /// nil: where it passes every check Metal was measured to make. One that fails one dies,
 /// where Metal's validation asserts, and so does a memoryless one, which Metal makes, and a
-/// multisample one, as every other type the runtime refuses for the format does
-/// ([`crate::gpu::desc::metal_makes_none`]). Metal's side runs for the nil ones and the
-/// memoryless one: its assert ends the process at the others
+/// multisample one, as every other type the runtime refuses for the format does: the runtime's
+/// answers. Metal's side runs for the nil ones and the memoryless one: its assert ends the
+/// process at the others
 #[test]
 fn two_plane_cubes_are_nil_where_metal_answers_nil() {
     use reims_vgpu_core::platform::Platform as _;
