@@ -729,10 +729,11 @@ const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9
 /// vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad strip restarting at
 /// its index type's all-ones index, and from indirect arguments, over indices too, at
 /// `setProvokingVertexMode:` 0 and 1, but the line loop's lines at 1
-/// (`lines_take_metals_flat_inputs_at_the_last_vertex`): under a state whose colour is each
-/// vertex's, flat, one whose colour is its provoking vertex's `[[vertex_id]]`, and one whose
-/// colour is its primitive's `[[primitive_id]]`. All but a fan or quads after the restart index
-/// set draw something
+/// (`lines_take_metals_flat_inputs_at_the_last_vertex`), and as an indirect command buffer's
+/// command, over its vertices and over indices, inheriting the encoder's state and buffers or
+/// with its own: under a state whose colour is each vertex's, flat, one whose colour is its
+/// provoking vertex's `[[vertex_id]]`, and one whose colour is its primitive's
+/// `[[primitive_id]]`. All but a fan or quads after the restart index set draw something
 #[test]
 fn private_types_draw_over_indices_and_arguments_as_metals() {
     let (p, d) = (platform(), dev());
@@ -745,6 +746,12 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
         indices,
         arguments,
     };
+    let executed = |inherits, primitive_type, count, indices| Provoked::Executed {
+        inherits,
+        primitive_type,
+        count,
+        indices,
+    };
     let clear = vec![[0, 0, 0, 0xff]; 256];
     let mut blank = 0;
     for t in 5..=8 {
@@ -756,6 +763,10 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
             (Provoked::Indirect(t, [9, 2, 0, 0]), None),
             (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
             (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+            (executed(false, t, 10, None), None),
+            (executed(true, t, 9, None), None),
+            (executed(false, t, 0, Some((U16, SCRAMBLED))), None),
+            (executed(true, t, 0, Some((U32, SCRAMBLED))), None),
         ];
         if t == 8 {
             cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
@@ -888,8 +899,9 @@ fn blob_state<P: Platform>(
 
 /// A draw of [`provoked`]'s: `(type, start, count, instances)` over the vertices; over `indices`
 /// of an index type, from a base vertex, of instances; from indirect arguments, over `indices`
-/// too; or an execution of an indirect command buffer's one command of `count` vertices of a type
-/// from vertex 0, which inherits the encoder's state and buffers or sets its own.
+/// too; or an execution of an indirect command buffer's one command of a type, of `count` vertices
+/// from vertex 0, or of `indices` of an index type where it has them, which inherits the
+/// encoder's state and buffers or sets its own.
 #[derive(Clone, Copy, Debug)]
 enum Provoked<'a> {
     Vertices(u64, u64, u64, u64),
@@ -911,6 +923,7 @@ enum Provoked<'a> {
         inherits: bool,
         primitive_type: u64,
         count: u64,
+        indices: Option<(u64, &'a [u32])>,
     },
 }
 
@@ -950,11 +963,13 @@ fn provoked<P: Platform>(
             inherits,
             primitive_type,
             count,
+            indices,
         } => {
             let icb = d
                 .new_indirect_command_buffer(
                     &IcbDesc {
-                        command_types: 1,
+                        // `MTLIndirectCommandTypeDrawIndexed`, or `Draw`.
+                        command_types: if indices.is_some() { 2 } else { 1 },
                         inherit_pipeline_state: inherits,
                         inherit_buffers: inherits,
                         max_vertex_buffer_bind_count: 2,
@@ -984,12 +999,24 @@ fn provoked<P: Platform>(
                     },
                 ]);
             }
-            cmds.push(IcbRenderCmd::DrawPrimitives {
-                primitive_type,
-                vertex_start: 0,
-                vertex_count: count,
-                instance_count: 1,
-                base_instance: 0,
+            cmds.push(match indices {
+                Some((index_type, indices)) => IcbRenderCmd::DrawIndexedPrimitives {
+                    primitive_type,
+                    index_count: u64::try_from(indices.len()).unwrap(),
+                    index_type,
+                    index_buffer: Some(&index_buffer),
+                    index_buffer_offset: 0,
+                    instance_count: 1,
+                    base_vertex: 0,
+                    base_instance: 0,
+                },
+                None => IcbRenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: count,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
             });
             for cmd in cmds {
                 c.encode(cmd).unwrap();
@@ -1003,6 +1030,7 @@ fn provoked<P: Platform>(
             Some(ResourceRef::Icb(icb)),
             Some(ResourceRef::Buffer(&pos)),
             Some(ResourceRef::Buffer(&colours)),
+            Some(ResourceRef::Buffer(&index_buffer)),
         ]
     });
     let mut cmds = vec![
@@ -1059,6 +1087,10 @@ fn provoked_buffers<P: Platform>(d: &P::Device, draw: Provoked<'_>) -> (P::Buffe
             arguments,
             ..
         } => (index_bytes(index_type, indices), u32s(&arguments)),
+        Provoked::Executed {
+            indices: Some((index_type, indices)),
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
         _ => (Vec::new(), Vec::new()),
     };
     (
@@ -1167,6 +1199,7 @@ fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
         inherits,
         primitive_type,
         count,
+        indices: None,
     };
     let cases = [
         (Provoked::Vertices(3, 0, 6, 1), None),
@@ -8039,6 +8072,183 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
         let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
         for ((shape, o), t) in shapes.iter().zip(&ours).zip(&theirs) {
             assert!(o == t, "after a released map, reset, load {shape:?}");
+        }
+    }
+}
+
+/// A pass that draws over a mutable rasterization rate map draws as Metal's GPU reads the map
+/// as it runs the pass: not yet reset by then, it rasterizes nothing and stores its clear; reset
+/// after the pass ended and before its command buffer's commit, or after the commit while the
+/// command buffer waits for an event signalled after the reset, to the identity over the map's
+/// screen, it draws by the map as reset, as Metal's does, and a map of the identity made over a
+/// screen smaller than the target draws its corner, as Metal's. A reset to a map of another
+/// screen size dies while the pass may run: Metal's GPU draws the pass over the screen the map
+/// had at the encoder's creation (all of a 16-pixel target from a 16-pixel screen reset to 8,
+/// the corner from 8 reset to 16), where the runtime's draws over the screen as reset
+#[test]
+fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
+    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use reims_vgpu_core::raise::death::DeathSite;
+
+    const SIDE: u64 = 16;
+    const HALF: u64 = SIDE / 2;
+
+    /// How the pass's map is made, and when it is reset, if at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reset {
+        /// A mutable map, never reset.
+        Never,
+        /// A mutable map, reset after the pass ended and before the commit.
+        BeforeCommit,
+        /// A mutable map, reset after the commit, before the event its command buffer waits for.
+        AfterCommit,
+        /// An immutable map, never reset.
+        Made,
+    }
+
+    /// A descriptor of a `side` by `side` screen of `mutability` (Immutable when unset), with
+    /// one layer of one sample of 1 on each axis.
+    fn identity<P: Platform>(p: &P, side: u64, mutability: Option<u64>) -> P::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            mutability,
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 1.0 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    /// The `SIDE` by `SIDE` target's bytes after a full-screen triangle in a pass, which a
+    /// command buffer waiting for an event runs, over a map of the identity over a `from` by
+    /// `from` screen: mutable and not yet reset, reset `when` to an immutable descriptor of the
+    /// identity over a `to` by `to` screen; or, `Made`, an immutable map of `to`. The event is
+    /// signalled after the commit. A death at the reset is answered once the command buffer, if
+    /// committed, completed.
+    fn drawn<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        (when, from, to): (Reset, u64, u64),
+    ) -> Result<Vec<u8>, DeathSite> {
+        let map = match when {
+            Reset::Made => d.new_rate_map(&identity(p, to, None)),
+            _ => d.new_rate_map(&identity(p, from, Some(1))),
+        };
+        let map = map.unwrap().unwrap();
+        let (dst, pass) = pass_of(p, d, (SIDE, SIDE));
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&map)),
+            ..Default::default()
+        });
+        let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+        let q = d.new_command_queue().unwrap();
+        let event = d.new_shared_event().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        let out = buffer::<P>(d, SIDE * SIDE * 4, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(SIDE, SIDE, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: SIDE * 4,
+                destination_bytes_per_image: SIDE * SIDE * 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        let reset = |at| match when == at {
+            true => catch_death(|| map.reset(&identity(p, to, None))),
+            false => Ok(()),
+        };
+        let before = reset(Reset::BeforeCommit);
+        if before.is_ok() {
+            cb.commit(OnFault::Die).unwrap();
+        }
+        let after = reset(Reset::AfterCommit);
+        event.set_signaled_value(1).unwrap();
+        before?;
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        after?;
+        let n = usize::try_from(SIDE * SIDE * 4).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after the blit completed.
+        Ok(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
+    }
+
+    /// The target as cleared, with the top left `side` by `side` texels of the fragment
+    /// function's colour, (1, 0.5, 0.25, 1) as BGRA8.
+    fn shaded(side: u64) -> Vec<u8> {
+        (0..SIDE * SIDE)
+            .flat_map(|i| match (i % SIDE < side, i / SIDE < side) {
+                (true, true) => [64, 128, 255, 255],
+                _ => [0, 0, 0, 255],
+            })
+            .collect()
+    }
+
+    let same = [
+        ((Reset::Never, SIDE, SIDE), 0),
+        ((Reset::BeforeCommit, SIDE, SIDE), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE), SIDE),
+        ((Reset::Never, HALF, HALF), 0),
+        ((Reset::BeforeCommit, HALF, HALF), HALF),
+        ((Reset::AfterCommit, HALF, HALF), HALF),
+        ((Reset::Made, 0, HALF), HALF),
+    ];
+    let resized = [
+        ((Reset::BeforeCommit, SIDE, HALF), SIDE),
+        ((Reset::AfterCommit, SIDE, HALF), SIDE),
+        ((Reset::BeforeCommit, HALF, SIDE), HALF),
+        ((Reset::AfterCommit, HALF, SIDE), HALF),
+    ];
+    let p = platform();
+    let d = dev();
+    for (case, side) in same {
+        assert!(drawn(&p, &d, case) == Ok(shaded(side)), "{case:?}");
+    }
+    for (case, _) in resized {
+        let site = drawn(&p, &d, case).unwrap_err();
+        assert_eq!(site.file, "resetUsingDescriptor:", "{case:?}");
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        for (case, side) in same.into_iter().chain(resized) {
+            assert!(drawn(&mp, &md, case) == Ok(shaded(side)), "{case:?}");
         }
     }
 }

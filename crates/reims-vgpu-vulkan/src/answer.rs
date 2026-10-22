@@ -27,11 +27,12 @@
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
 //!
-//! **A write the runtime refuses where Metal's GPU writes or drops it** dies at the command: a
+//! **A write the runtime refuses where Metal's GPU writes it** dies at the command: a
 //! dispatch's or a draw's write through a texture over a surface of the 4:4:4 two-plane YCbCr
 //! formats whose writes the runtime does not store as Metal does, the `_sRGB` twins 523 and 527
-//! and the packed 510 and 530 ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the
-//! writes of 503, 507, 542 and 545 into the surface's planes as Metal's GPU does, and refuses
+//! ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the writes of 503, 507, 542 and
+//! 545 into the surface's planes as Metal's GPU does, drops those of the packed 510 and 530 as
+//! Metal's GPU drops them on this host, and refuses
 //! where the command is encoded the writes of those it does not store: through a texture over
 //! plane 1, which dies there naming the refusal (`writes_of_444_textures_over_plane_1_die`), and
 //! through a slot that also reads the texture, or by a command that writes the planes through the
@@ -357,6 +358,13 @@ pub fn create<T>(
 ///   after the device released a map of layers, which writes nothing where Metal draws rows of
 ///   the pass. Announced at the draw, inside its call, which dies at its selector. No draw over a
 ///   map of no layers reaches the runtime here ([`crate::gpu::rate_map`]);
+/// - `RateMapResetUnencoded`: a render pass over a rasterization rate map reset after the pass
+///   took it and before its command buffer's submission, in an encoder the runtime could not
+///   encode again (a command predication's command buffer, an encoder opened while a buffer of
+///   the device was detached, or one that left work for a host step), which draws by the map as
+///   it took it, where Metal's GPU draws by the map as reset. Announced at the commit, inside its
+///   call, or at the reset of a map whose pass's command buffer was committed, inside
+///   `resetUsingDescriptor:`, which die at their selectors ([`crate::gpu::rate_map`]);
 /// - `HeapTextureBlockCompressedLayout`: a texture made in a heap over the guest's pages of a
 ///   block-compressed format whose placement the device's Metal level does not measure (PVRTC
 ///   at every level; BC, ETC2, EAC and ASTC are measured at macOS 26.7 and at 27.0.1), whose
@@ -1107,7 +1115,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 131] = [
+pub const DIES: [rt::Degradation; 132] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1115,6 +1123,7 @@ pub const DIES: [rt::Degradation; 131] = [
     rt::Degradation::RotatedBlendRounding,
     rt::Degradation::EncodedUseRebound,
     rt::Degradation::ZeroLayerMapAfterRelease,
+    rt::Degradation::RateMapResetUnencoded,
     rt::Degradation::HeapTextureBlockCompressedLayout,
     rt::Degradation::BiasedDepthPastUnitRange,
     rt::Degradation::UnormDepthBias,
@@ -1298,27 +1307,28 @@ pub const DIES: [rt::Degradation; 131] = [
 ///   (in strict mode die at their selector, [`crate::gpu::encode_render`]). Relayed the first
 ///   time alone ([`RELAYED_ONCE`]);
 /// - `HeapTextureUntiledLayout`, a texture in a heap over the guest's pages that the runtime does
-///   not lay out in Metal's tiles: a layout not measured (a format whose layout in Metal's heaps
-///   is not probed), an image that holds other bytes than Metal's elements, moves past the
-///   device's limits, or a multisample texture whose samples the device does not move to and from
-///   a buffer (a 16-bit depth where its multisampled copies go by draws), in memory of its own; a
+///   not lay out in Metal's tiles: a layout not measured (a format whose layout in Metal's heaps is
+///   not probed), an image that holds other bytes than Metal's elements, moves past the device's
+///   limits, or a multisample texture whose samples the device does not move to and from a buffer
+///   (a 16-bit depth where its multisampled copies go by draws), in memory of its own; a
 ///   multisample depth or stencil texture Metal keeps uncompressed lies in Metal's tiles, its
-///   samples side by side, on MoltenVK as elsewhere. The runtime announces it too of a texture in
-///   a heap over the device's memory whose bytes there are not Metal's layout: its image in the
+///   samples side by side, on MoltenVK as elsewhere. The runtime announces it too of a texture in a
+///   heap over the device's memory whose bytes there are not Metal's layout: its image in the
 ///   driver's layout (any colour image on a driver other than MoltenVK, a depth or stencil image
-///   the runtime does not tile), a shadow of the bytes in rows, a multisample texture, its colour
-///   ones on MoltenVK among them, or a layout not measured. In a heap over no address ranges,
-///   core's legacy heap, whose bytes core copies to and from the guest's pages, it is relayed
-///   alone ([`crate::gpu::resource::Placements`]). Its reads, writes and copies are Metal's, but its bytes
-///   in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or texture
-///   over them would meet other bytes than on Metal. Announced at each such texture, inside
+///   the runtime does not tile), a shadow of the bytes in rows, a multisample texture (but a colour
+///   one Metal keeps uncompressed on MoltenVK, whose multisample colour images the runtime measured
+///   lying as Metal's heap textures), or a layout not measured. In a heap over no address ranges,
+///   core's legacy heap, whose bytes core copies to and from the guest's pages, it is relayed alone
+///   ([`crate::gpu::resource::Placements`]). Its reads, writes and copies are Metal's, but its
+///   bytes in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or
+///   texture over them would meet other bytes than on Metal. Announced at each such texture, inside
 ///   `newTextureWithDescriptor:offset:`, which hears it. Over the guest's pages the heap keeps it
-///   apart, as an optimized one: a buffer or texture placed over a byte of it while it lives
-///   dies at its placement, and so does such a texture placed over a byte of a buffer or texture
-///   that lives, or while its heap's cover lives, the buffer over all of the heap's bytes core
-///   makes with each heap, so in every heap core makes: the cover's bytes and the guest's pages
-///   under them would hold the runtime's layout where Metal's hold its tiles, which the guest reads
-///   with no call to die at (`crate::gpu::resource::Placements`). Relayed the first time alone
+///   apart, as an optimized one: a buffer or texture placed over a byte of it while it lives dies
+///   at its placement, and so does such a texture placed over a byte of a buffer or texture that
+///   lives, or while its heap's cover lives, the buffer over all of the heap's bytes core makes
+///   with each heap, so in every heap core makes: the cover's bytes and the guest's pages under
+///   them would hold the runtime's layout where Metal's hold its tiles, which the guest reads with
+///   no call to die at (`crate::gpu::resource::Placements`). Relayed the first time alone
 ///   ([`RELAYED_ONCE`]), where nothing shares its bytes;
 /// - `HeapTextureLosslessLayout`, a texture in a heap over the guest's pages that Metal keeps
 ///   losslessly compressed, whose bytes on Metal are no layout of its texels: a single-sample one

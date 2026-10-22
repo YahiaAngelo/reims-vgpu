@@ -50,6 +50,15 @@
 //!   attribute strides). Metal's arguments getters
 //!   read a record of any kind as their own; core reads each only for a command of its kind, and
 //!   another kind's dies here ([`another_kind`]).
+//! - **Metal's private primitive types** 5 to 8, a line loop, a triangle fan, quads and a quad
+//!   strip, which a command's draws take, direct and over indices, go to the runtime, whose
+//!   executions draw each as an encoder's draw of the type draws ([`rt::DrawPrimitiveType`];
+//!   compared with Metal's pixel for pixel, inheriting the encoder's state or not,
+//!   `private_types_draw_over_indices_and_arguments_as_metals`); the arguments getters answer
+//!   the type set, but 0 for quads and a quad strip, as Metal's do ([`answered_type`]). A draw of
+//!   type 9, at which Metal's GPU fails the command buffer that runs it, dies at its setter, as
+//!   does a type past it ([`primitive`]). A kernel's draw of a type past Metal's five writes
+//!   points, as Metal's encoding does (the runtime's).
 //! - **An indexed patch draw of no control-point index buffer** is a patch draw, as Metal records
 //!   it (measured: `getCommandType` answers `DrawPatches` and `drawPatchesArguments` its
 //!   arguments, whatever the descriptor's types); a nil index or tessellation factor buffer,
@@ -77,7 +86,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
+use metal2vulkan::metal::{IndexType, IndirectCommandType};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::Truncate;
 use reims_vgpu_core::platform::Handle;
@@ -93,8 +102,8 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
-    Inexact, Policy, decide, get, hang, inexact, metal_aborts, plain, send, unrepresentable,
-    unstopped_at,
+    Inexact, Policy, decide, get, hang, inexact, metal_aborts, plain, refused, send,
+    unrepresentable, unstopped_at,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -1031,10 +1040,40 @@ impl CommandObject<rt::IndirectComputeCommand> {
     }
 }
 
-/// A raw `MTLPrimitiveType`, sent with `sel`.
-fn primitive(sel: &'static str, raw: u64) -> PrimitiveType {
-    metal_value(sel, "primitive type", raw)
+/// A draw's raw primitive type, sent with `sel`: a public `MTLPrimitiveType`, or one of Metal's
+/// private types 5 to 8, which the runtime's executions draw as an encoder's draw of the type
+/// draws ([`rt::DrawPrimitiveType`]; the module docs). Type 9 dies ([`TYPE_9`]), and so does a
+/// type past it, which no `MTLPrimitiveType` is.
+fn primitive(sel: &'static str, raw: u64) -> rt::DrawPrimitiveType {
+    match raw {
+        5..=8 => rt::DrawPrimitiveType::from_raw(raw).unwrap_or_else(|e| refused(sel, &e)),
+        9 => unrepresentable(sel, TYPE_9),
+        _ => rt::DrawPrimitiveType::Public(metal_value(sel, "primitive type", raw)),
+    }
 }
+
+/// The primitive type Metal's arguments getters answer of a command's draw of `t`: its raw value,
+/// but 0 for quads and a quad strip (7 and 8), which Metal's getters answer of a command set
+/// with either, direct or over indices, though its execution draws the type set (measured:
+/// `render_commands_read_back_as_on_metal`,
+/// `private_types_draw_over_indices_and_arguments_as_metals`), where the runtime's record answers
+/// the type set.
+fn answered_type(t: rt::DrawPrimitiveType) -> u64 {
+    match t {
+        rt::DrawPrimitiveType::Quads | rt::DrawPrimitiveType::QuadStrip => 0,
+        t => t.raw(),
+    }
+}
+
+/// Why a command's draw of primitive type 9 dies at its setter: the runtime fails the command
+/// buffer at one only among a range given at the execution's call, as the records stand then,
+/// and nothing here tells the command buffer, whose commit dies where it fails another way too
+/// (`crate::gpu::command`); one written after the call, or among a range a buffer holds, runs
+/// nothing, where Metal's GPU fails the command buffer.
+const TYPE_9: &str = "a draw of primitive type 9 in an indirect command, which Metal's GPU \
+     fails the command buffer at as it runs the command: the runtime fails it only at one among \
+     a range given at the execution's call, as the records stand then, and runs nothing of one \
+     written after the call or among a range a buffer holds";
 
 impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
@@ -1265,7 +1304,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
                 instance_count,
                 base_instance,
             }) => Some(DrawArgs {
-                primitive_type: u64::from(primitive_type.as_raw()),
+                primitive_type: answered_type(primitive_type),
                 vertex_start,
                 vertex_count,
                 instance_count,
@@ -1290,7 +1329,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
                 base_instance,
             }) => Some(DrawIndexedArgs {
                 index_buffer_gpu_virtual_address: index_buffer.0,
-                primitive_type: u64::from(primitive_type.as_raw()),
+                primitive_type: answered_type(primitive_type),
                 index_type: u64::from(index_type.as_raw()),
                 index_count,
                 instance_count,
@@ -2229,6 +2268,55 @@ mod tests {
         let read = crate::answer::relaxed(|| later[0].guest_unique_identifier());
         assert_eq!(read, released);
         assert_eq!(command.pipeline_state_unique_identifier(), released);
+    }
+
+    /// A command's draw of primitive type 9, direct or over indices, dies at its setter
+    /// ([`TYPE_9`]), and so does one of a type past it, which no `MTLPrimitiveType` is; types 5
+    /// to 8 are set (`private_types_draw_over_indices_and_arguments_as_metals` draws them)
+    #[test]
+    fn a_command_of_type_9_or_past_it_dies_at_its_setter() {
+        let d = dev();
+        let icb = make::<VulkanPlatform>(&d, &render_desc(), 1);
+        let indices = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let c = icb.render_command(0).unwrap().unwrap();
+        let direct = |primitive_type| IcbRenderCmd::DrawPrimitives {
+            primitive_type,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        };
+        let indexed = |primitive_type| IcbRenderCmd::DrawIndexedPrimitives {
+            primitive_type,
+            index_count: 3,
+            index_type: 0,
+            index_buffer: Some(&indices),
+            index_buffer_offset: 0,
+            instance_count: 1,
+            base_vertex: 0,
+            base_instance: 0,
+        };
+        for primitive_type in 5..=8 {
+            c.encode(direct(primitive_type)).unwrap();
+            c.encode(indexed(primitive_type)).unwrap();
+        }
+        let sels = [
+            "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
+            "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:\
+             instanceCount:baseVertex:baseInstance:",
+        ];
+        for primitive_type in [9, 10] {
+            for (cmd, sel) in [direct(primitive_type), indexed(primitive_type)]
+                .into_iter()
+                .zip(sels)
+            {
+                let site = catch_death(|| c.encode(cmd)).unwrap_err();
+                assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+            }
+        }
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at

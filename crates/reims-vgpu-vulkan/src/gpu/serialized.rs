@@ -48,15 +48,15 @@
 //!   the last value read winning, and decided once their block has been read, as a missing
 //!   function is. Those the runtime's descriptor holds as Metal takes them go to it at every
 //!   value ([`SpiRule::Runtime`]: the render descriptor's `PrivateRenderState`, the compute
-//!   descriptor's `needs_custom_border_color_samplers`): `sampleMask`, which the runtime
-//!   applies as Metal does, and `pointCoordLowerLeft`, `pointSizeOutputVS`, `twoSideEnabled`,
-//!   `vertexDepthCompareClampMask` and `needsCustomBorderColorSamplers`, which change nothing
-//!   Metal draws (`serialized/draws.rs` draws each on both platforms). Any other dies naming its
-//!   property ([`unrepresentable`]) where Metal's state would draw or write otherwise than one
-//!   the runtime makes without it, and decodes to nothing elsewhere ([`SpiRule`],
-//!   [`render_spi`]). A later entry's function is resolved first, so the resolver's raise stays
-//!   the guest's, as on Metal. Measured by serializing each property alone, then by drawing
-//!   under it, one case per process:
+//!   descriptor's `needs_custom_border_color_samplers`): `sampleCoverage` and `sampleMask`,
+//!   which the runtime applies as Metal does, and `pointCoordLowerLeft`, `pointSizeOutputVS`,
+//!   `twoSideEnabled`, `vertexDepthCompareClampMask` and `needsCustomBorderColorSamplers`,
+//!   which change nothing Metal draws (`serialized/draws.rs` draws each on both platforms).
+//!   Any other dies naming its property ([`unrepresentable`]) where Metal's state would draw or
+//!   write otherwise than one the runtime makes without it, and decodes to nothing elsewhere
+//!   ([`SpiRule`], [`render_spi`]). A later entry's function is resolved first, so the
+//!   resolver's raise stays the guest's, as on Metal. Measured by serializing each property
+//!   alone, then by drawing under it, one case per process:
 //!   - **Defaults**, for which the serializer writes no entry: 0, but `sampleCoverage` (27),
 //!     1.0; `sampleMask` (28), all 64 bits; `clipDistanceEnableMask` (48), `0xff`; and
 //!     `explicitVisibilityGroupID` (58), `0xffffffff`. A value is written in 4 bytes, a float
@@ -69,6 +69,10 @@
 //!   - **`sampleMask`** drops the samples it has no bit for: 0 and 2 draw nothing at 1 sample,
 //!     5 half the samples at 4. One with a bit for each of the state's raster samples draws as
 //!     the default does. The runtime applies it so, at every value.
+//!   - **`sampleCoverage`** keeps a fraction of the samples, dithered over each 2x2 quad of
+//!     window pixels (0.5 draws nothing at 1 sample, and half the samples at 4), beside the
+//!     sample mask. The runtime applies it so at 1, 2 and 4 samples, the only counts it takes,
+//!     and refuses it where the fragment function writes an attachment itself, which dies.
 //!   - **Unchanged at the values drawn**, which the runtime takes as Metal's no-ops:
 //!     `pointCoordLowerLeft` and `pointSizeOutputVS` (points sized by the vertex function, and
 //!     their `[[point_coord]]`), `twoSideEnabled` (a fragment's `[[front_facing]]`, of both
@@ -83,10 +87,9 @@
 //!     fragment's colour as no operation does, under a partial write mask too, where no colour
 //!     attachment blends, and writes it unblended where one does; 0 writes zero, `0xa` the
 //!     colour's exclusive or with the attachment's. On dies but at 2 with nothing blending.
-//!   - **The rest die at every value but the default**: `sampleCoverage` (0.5 draws nothing at
-//!     1 sample, half the samples at 4), `pointSmoothEnabled` (a triangle strip draws
-//!     nothing), `fragmentDepthCompareClampMask`, which the runtime refuses at a value but 0,
-//!     `vertexAmplificationMode` and `explicitVisibilityGroupID`, which it has no field for.
+//!   - **The rest die at every value but the default**: `pointSmoothEnabled` (a triangle strip
+//!     draws nothing), `fragmentDepthCompareClampMask`, which the runtime refuses at a value but
+//!     0, `vertexAmplificationMode` and `explicitVisibilityGroupID`, which it has no field for.
 //!
 //!   The host's OpenGL on Metal (`4.1 Metal - 90.5`) sets `logicOperation` 2, `sampleMask`
 //!   `0xffffffff` and, where its depth and stencil writes are off, `depthStencilWriteDisabled` 1
@@ -278,13 +281,7 @@ pub const RENDER_SPI: &[Spi] = &[
         SpiRule::DiesBut(0),
         "a vertex amplification mode the runtime has no field for",
     ),
-    spi(
-        27,
-        "sampleCoverage",
-        SpiRule::DiesBut(SAMPLE_COVERAGE_ALL),
-        "a coverage fraction Metal masks the samples by (0.5 draws nothing at 1 sample, and \
-         half the samples at 4)",
-    ),
+    spi(27, "sampleCoverage", SpiRule::Runtime, ""),
     spi(28, "sampleMask", SpiRule::Runtime, ""),
     spi(
         45,
@@ -326,9 +323,6 @@ pub const RENDER_SPI: &[Spi] = &[
         "a visibility group the runtime has no field for",
     ),
 ];
-
-/// `sampleCoverage`'s default, 1.0, as its serializer writes the float's bits.
-pub const SAMPLE_COVERAGE_ALL: u32 = 0x3f80_0000;
 
 /// What a render blob's SPI keys (`values`, by key, each the last value read) ask of a state of
 /// colour attachments `colors`: the runtime's private state of the keys it holds
@@ -378,6 +372,7 @@ pub fn render_spi(
     let mut private = PrivateRenderState::new();
     for (&key, &v) in values {
         match key {
+            27 => private.sample_coverage = f32::from_bits(v),
             28 => private.sample_mask = u64::from(v),
             50 => private.point_coord_lower_left = v != 0,
             51 => private.point_size_output_vs = v != 0,
@@ -2444,10 +2439,6 @@ pub(crate) mod tests {
             ("render_objects_malformed_truncated", basic[..5].to_vec()),
             ("colour index 8", color(8)),
             ("no vertex function", hex("01 02 04 22000000")),
-            (
-                "sampleCoverage 0.5",
-                hex("02 1b 04 0000003f 01 04 21000000"),
-            ),
             ("alphaTestEnabled", hex("02 2d 04 01000000 01 04 21000000")),
             (
                 "a value of 8 bytes",
@@ -2673,6 +2664,8 @@ pub(crate) mod tests {
         assert_eq!(d.desc.private, PrivateRenderState::new());
         // The keys the runtime holds, each the last value read.
         let held = [
+            "1b 04 00000040",
+            "1b 04 0000003f",
             "1c 04 ffffffff",
             "1c 04 05000000",
             "32 04 02000000",
@@ -2685,6 +2678,7 @@ pub(crate) mod tests {
         let (d, _) = rendered(&blob(&held, &[]), &f);
         assert!(d.ignored.is_empty());
         let mut private = PrivateRenderState::new();
+        private.sample_coverage = 0.5;
         private.sample_mask = 5;
         private.point_coord_lower_left = true;
         private.point_size_output_vs = true;
@@ -2694,8 +2688,6 @@ pub(crate) mod tests {
         assert_eq!(d.desc.private, private);
         type Dying<'a> = (Vec<&'a str>, &'a [(u8, u32)]);
         let mut dying: Vec<Dying<'_>> = vec![
-            (vec!["1b 04 0000003f"], &[]),
-            (vec!["1b 04 00000040"], &[]),
             (vec!["3a 04 00000000"], &[]),
             (vec!["2d 04 01000000"], &[]),
             (vec!["2d 04 01000000", "2e 04 04000000"], &[]),

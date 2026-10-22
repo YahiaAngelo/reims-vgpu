@@ -108,7 +108,8 @@
 //! sets change in their order; its attachments hold the runtime's textures they are given, as
 //! Metal's attachments retain theirs, until the descriptor goes. The encoder's creation checks it
 //! as Metal's does. Its rate map
-//! is held by reference, as Metal holds it, and an encoder takes the map as it is at the
+//! is held by reference, as Metal holds it, and an encoder takes the runtime's map, which draws
+//! the pass by the map as the GPU runs it, and decides what it decides by the map's class at the
 //! encoder's creation ([`crate::gpu::rate_map`]).
 
 use metal2vulkan::metal::PixelFormat;
@@ -560,8 +561,8 @@ pub type VulkanTextureDescriptor = Obj<TextureDescriptorObject>;
 pub struct RenderPassDescriptorObject {
     /// The runtime's descriptor.
     pub desc: Mutex<rt::RenderPassDescriptor>,
-    /// The rate map set, held by reference as Metal holds it: an encoder takes the map as it is at
-    /// the encoder's creation.
+    /// The rate map set, held by reference as Metal holds it: an encoder takes its class as it is
+    /// at the encoder's creation ([`crate::gpu::rate_map`]).
     rate_map: Mutex<Option<VulkanRateMap>>,
     /// What the attachments' textures are beyond the runtime's textures.
     sources: Mutex<Sources>,
@@ -900,8 +901,8 @@ impl RenderPassDescriptorObject {
         plain(|| self.desc.lock().clone())
     }
 
-    /// The runtime's descriptor as it stands, without its rate map, and the rate map set, which an
-    /// encoder of it takes as the map is at the encoder's creation ([`crate::gpu::rate_map`]).
+    /// The runtime's descriptor as it stands, without its rate map, and the rate map set, whose
+    /// class an encoder of it takes at the encoder's creation ([`crate::gpu::rate_map`]).
     pub fn pass(&self) -> (rt::RenderPassDescriptor, Option<VulkanRateMap>) {
         let map = plain(|| self.rate_map.lock().as_ref().map(Handle::clone_ref));
         (self.descriptor(), map)

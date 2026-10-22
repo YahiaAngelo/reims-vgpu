@@ -2240,7 +2240,8 @@ fn packed_textures_copy_nothing_and_their_blits_and_plane_1_die() {
 }
 
 /// A kernel's `write()` into a texture of a 4:2:0 or 4:2:2 format of the family over a surface,
-/// packed or not, leaves the surface's bytes as they were, as Metal's does
+/// packed or not, or of a packed 4:4:4 one (510, 530), leaves the surface's bytes as they were,
+/// as Metal's does on this host
 #[test]
 fn kernel_writes_metal_drops_are_dropped_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
@@ -2319,8 +2320,7 @@ fn writes_of_444_textures_are_metals() {
 
 /// A kernel's `write()` into a texture over a surface of a 4:4:4 format of the family whose
 /// writes the runtime refuses dies at the dispatch, naming the write and the format: the `_sRGB`
-/// twins 523 and 527, whose planes Metal's changes, and the packed 510 and 530, whose writes
-/// Metal's GPU drops on this host, leaving the surface's bytes as they were
+/// twins 523 and 527, whose planes Metal's changes
 #[test]
 fn writes_the_runtime_refuses_die() {
     let md = MetalPlatform::system_default_device();
@@ -2330,7 +2330,7 @@ fn writes_the_runtime_refuses_die() {
         super::writes_refused(PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap())
     });
     let refused: Vec<u64> = refused.collect();
-    assert_eq!(refused, [510, 523, 527, 530]);
+    assert_eq!(refused, [523, 527]);
     for format in refused {
         let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
         let (s, other) = noisy_pair(format, size, 9);
@@ -2350,8 +2350,7 @@ fn writes_the_runtime_refuses_die() {
             let (s, other) = noisy_pair(format, size, 9);
             let before = bytes_of(&s);
             let theirs = written(&mp, md, Op::Kernel, format, (&s, &other), size);
-            let packed = matches!(format, 510 | 530);
-            assert_eq!(theirs[0] == before, packed, "Metal: {format}");
+            assert!(theirs[0] != before, "Metal: {format}");
         }
     }
 }

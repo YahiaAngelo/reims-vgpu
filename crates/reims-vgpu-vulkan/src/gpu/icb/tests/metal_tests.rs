@@ -500,7 +500,8 @@ fn compute_commands_read_back_as_on_metal() {
 }
 
 /// What a render command's getters answer core, fresh, after each draw kind with its
-/// buffers, a barrier set and cleared, and a reset, as on Metal
+/// buffers, of Metal's private primitive types 5 to 8 too, a barrier set and cleared, and a
+/// reset, as on Metal
 #[test]
 fn render_commands_read_back_as_on_metal() {
     fn reads<P: Platform>(d: &P::Device) -> Vec<Vec<u64>> {
@@ -673,6 +674,27 @@ fn render_commands_read_back_as_on_metal() {
             instance_stride: 4,
         });
         out.push(read(&c));
+        for primitive_type in 5..=8 {
+            send(IcbRenderCmd::DrawPrimitives {
+                primitive_type,
+                vertex_start: 2,
+                vertex_count: 8,
+                instance_count: 1,
+                base_instance: 3,
+            });
+            out.push(read(&c));
+            send(IcbRenderCmd::DrawIndexedPrimitives {
+                primitive_type,
+                index_count: 12,
+                index_type: 0,
+                index_buffer: Some(&b),
+                index_buffer_offset: 32,
+                instance_count: 2,
+                base_vertex: 1,
+                base_instance: 0,
+            });
+            out.push(read(&c));
+        }
         send(IcbRenderCmd::SetBarrier);
         send(IcbRenderCmd::Reset);
         out.push(read(&c));

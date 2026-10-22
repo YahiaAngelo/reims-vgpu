@@ -187,16 +187,17 @@ fn the_parameter_copy_is_metals() {
     }
 }
 
-/// A map of no layers is made, from an immutable descriptor and by a mutable one's reset, as
-/// Metal makes it: its layer count is 0, its parameter data Metal's byte for byte, and its
-/// physical sizes at layers 0 and 1 Metal's; its coordinate maps die at
-/// their selectors, where Metal ends the process, which Metal's side does not run
+/// A map of no layers is made, from an immutable descriptor, by a mutable one's reset and by a
+/// compiled map's reset, which compiles over the tables the map held, as Metal makes it: its
+/// layer count is 0, its parameter data Metal's byte for byte, and its physical sizes at
+/// layers 0 and 1 Metal's; its coordinate maps die at their selectors, where Metal ends the
+/// process, which Metal's side does not run
 #[test]
 fn maps_of_no_layers_are_made_as_metals() {
-    /// What `P` answers of a map of no layers made from an immutable descriptor, and of a
-    /// mutable one reset to none: the layer count, the physical sizes at layers 0 and 1, and
-    /// the 30000 bytes of a buffer of 0xee after the parameter copy at offset 4; then the
-    /// maps.
+    /// What `P` answers of a map of no layers made from an immutable descriptor, of a mutable
+    /// one reset to none and of an immutable one of quality 0.1 reset to none: the layer count,
+    /// the physical sizes at layers 0 and 1, and the 30000 bytes of a buffer of 0xee after the
+    /// parameter copy at offset 4; then the maps.
     fn made<P: Platform>(p: &P, d: &P::Device) -> (Vec<Vec<u64>>, Vec<P::RateMap>) {
         let none = |mutable: bool| {
             p.rate_map_descriptor(&RateMapDesc {
@@ -208,7 +209,9 @@ fn maps_of_no_layers_are_made_as_metals() {
         let immutable = d.new_rate_map(&none(false)).unwrap().unwrap();
         let reset = d.new_rate_map(&descriptor(p, 0.1, true)).unwrap().unwrap();
         reset.reset(&none(false));
-        let answers = [&immutable, &reset]
+        let compiled = d.new_rate_map(&descriptor(p, 0.1, false)).unwrap().unwrap();
+        compiled.reset(&none(false));
+        let answers = [&immutable, &reset, &compiled]
             .map(|m| {
                 let mut out = vec![m.layer_count()];
                 for layer in [0, 1] {
@@ -228,7 +231,7 @@ fn maps_of_no_layers_are_made_as_metals() {
                 out
             })
             .to_vec();
-        (answers, vec![immutable, reset])
+        (answers, vec![immutable, reset, compiled])
     }
     let p = platform();
     let d = dev();
@@ -246,7 +249,8 @@ fn maps_of_no_layers_are_made_as_metals() {
     }
     if let Some((mp, md)) = metal() {
         let (theirs, _maps) = made(&mp, &md);
-        for (which, (o, t)) in ["immutable", "reset"].iter().zip(ours.iter().zip(&theirs)) {
+        let which = ["immutable", "reset", "compiled and reset"];
+        for (which, (o, t)) in which.iter().zip(ours.iter().zip(&theirs)) {
             assert_eq!(o[..7], t[..7], "{which}: layer count and physical sizes");
             assert!(o[7..] == t[7..], "{which}: the parameter copy");
         }

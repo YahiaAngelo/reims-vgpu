@@ -398,8 +398,7 @@ fn spi_values_that_decode_draw_as_metals() {
         let without = case_on(&mp, &md, (vertex, &[], format, samples, colour)).unwrap();
         assert!(theirs == without, "{case:?}");
     }
-    let dying: [Case<'_>; 4] = [
-        ("cover", &["1b 04 0000003f"], RGBA8, 4, none),
+    let dying: [Case<'_>; 3] = [
         ("cover", &["2d 04 01000000"], RGBA8, 1, none),
         (
             "cover",
@@ -593,6 +592,9 @@ fn border_dispatched<P: Platform>(
 /// Apple M3 Max), where the runtime's measurement of it is an M4's (the module docs):
 /// - `sampleMask` without a bit for each sample: 0 and 2 at 1 sample, and 0, 5 and `0xa` at 4,
 ///   each of which Metal draws otherwise than without it;
+/// - `sampleCoverage` below 1: 0.5 and 0.25 at 1 sample, 0.5 at 2, and 0.25, 0.5 and 0.75 at 4,
+///   0.5 beside the sample mask 5 and `0xa`, each of which Metal draws otherwise than without
+///   it;
 /// - `pointCoordLowerLeft`, `pointSizeOutputVS`, `twoSideEnabled`, `vertexDepthCompareClampMask`
 ///   and `needsCustomBorderColorSamplers` (render 57), each at 1 and at `0xffffffff`: over a
 ///   triangle; over points of a size the vertex function writes, coloured by their
@@ -645,12 +647,32 @@ fn spi_values_the_runtime_holds_draw_as_metals() {
         })
     };
     let none: &[(u8, u32)] = &[];
-    let masks: [Case<'_>; 5] = [
+    let masks: [Case<'_>; 13] = [
         ("cover", &["1c 04 00000000"], RGBA8, 1, none),
         ("cover", &["1c 04 02000000"], RGBA8, 1, none),
         ("cover", &["1c 04 00000000"], RGBA8, 4, none),
         ("cover", &["1c 04 05000000"], RGBA8, 4, none),
         ("cover", &["1c 04 0a000000"], RGBA8, 4, none),
+        ("cover", &["1b 04 0000003f"], RGBA8, 1, none),
+        ("cover", &["1b 04 0000803e"], RGBA8, 1, none),
+        ("cover", &["1b 04 0000003f"], RGBA8, 2, none),
+        ("cover", &["1b 04 0000803e"], RGBA8, 4, none),
+        ("cover", &["1b 04 0000003f"], RGBA8, 4, none),
+        ("cover", &["1b 04 0000403f"], RGBA8, 4, none),
+        (
+            "cover",
+            &["1b 04 0000003f", "1c 04 05000000"],
+            RGBA8,
+            4,
+            none,
+        ),
+        (
+            "cover",
+            &["1b 04 0000003f", "1c 04 0a000000"],
+            RGBA8,
+            4,
+            none,
+        ),
     ];
     for case @ (vertex, _, format, samples, colour) in masks {
         let ours = survived(&|| case_on(&p, &d, case).unwrap());

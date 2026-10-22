@@ -45,9 +45,6 @@
 //! | `maxVertexAmplificationCount` (private, key 20) | 2, Metal's answer at the device's Metal level as the runtime records it (`MetalLevel::private_count`), or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
 //! | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (private, keys 23 and 24) | yes | the runtime makes tile pipelines and imageblocks, a `half4` member over `RGBA8Unorm` among them. **Pending support** (below): it answers no on every device (`Device::private_properties`), as its audit of Apple9 refuses part of each row (`TileShaders` and `NonsquareTileDispatch` tile shading it has not built, `Imageblocks` imageblock masters), which dies at its selector |
 //! | the address an indirect command's arguments answer for a nil patch or control-point index buffer (`icb::NIL_BUFFER_ADDRESS`) | `0x1eeee1111` | Metal's private getters' answer, which no record holds |
-//! | a rate map's `parameterBufferSizeAndAlign` of a map not yet compiled ([`crate::gpu::rate_map`]'s `PARAMETER_DATA`) | 24,624 bytes aligned to 4, Metal's for every map, which a compiled map's runtime answers too (its parameter data is Metal's) | a map not yet compiled has no runtime map to answer it |
-//! | a rate map's `physicalGranularity` (`rate_map::GRANULARITY`) | 32 by 32, depth 1, compiled or not | a map not yet compiled has no runtime map to answer it |
-//! | what a mutable rate map not yet reset answers ([`crate::gpu::rate_map`]) | its descriptor's screen size and layer count, a physical size of 0 by 0 (depth 1) for every layer, screen-to-physical (0, 0), parameter data of zeros | the runtime has no map until the reset compiles one |
 //!
 //! **Pending support.** In the rows marked so, Metal has the capability and the runtime's support
 //! for it is pending at the pinned runtime. The answer is kept Metal's, as the guest sees an M3

@@ -259,13 +259,13 @@ fn ask(
 fn points_drawn(draw: Option<rt::IndirectDraw>) -> bool {
     match draw {
         Some(rt::IndirectDraw::Primitives {
-            primitive_type: PrimitiveType::Point,
+            primitive_type: rt::DrawPrimitiveType::Public(PrimitiveType::Point),
             vertex_count,
             instance_count,
             ..
         }) => vertex_count != 0 && instance_count != 0,
         Some(rt::IndirectDraw::IndexedPrimitives {
-            primitive_type: PrimitiveType::Point,
+            primitive_type: rt::DrawPrimitiveType::Public(PrimitiveType::Point),
             index_count,
             instance_count,
             ..

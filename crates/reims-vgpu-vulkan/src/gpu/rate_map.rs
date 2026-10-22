@@ -26,21 +26,25 @@
 //!   after a released map of one layer, here too), where the runtime's draw nothing, so a draw and
 //!   an execution of indirect commands in it die, and a tile dispatch, which only draws were
 //!   measured against, relays it, and dies in strict mode ([`crate::gpu::encode_render`]).
-//!   Its coordinate maps end Metal's process, so they die here
-//!   ([`unmapped`]).
-//! - **A mutable map** (`setMutability:` Mutable, 1) is not compiled until it is reset. Until then
-//!   it answers the descriptor's screen size and layer count, a physical size of 0 by 0 for every
-//!   layer, screen-to-physical (0, 0), and parameter data of zeros. Metal makes it whatever its
-//!   descriptor holds (three layers, a screen side of 0 or 40000), and crashes at
-//!   physical-to-screen. `resetUsingDescriptor:` compiles the descriptor given into the map, which
-//!   keeps its own mutability. A reset the runtime refuses dies, as no path reaches it under a
-//!   handler.
+//!   Its coordinate maps end Metal's process, and the runtime refuses them, so they die here
+//!   ([`mapped`]).
+//! - **A mutable map** (`setMutability:` Mutable, 1) is the runtime's map of that mutability,
+//!   not compiled until it is reset. Until then it answers, as Metal's does, the descriptor's
+//!   screen size and layer count, a physical size of 0 by 0 for every layer, screen-to-physical
+//!   (0, 0), and parameter data of zeros. Metal makes it whatever its descriptor holds (three
+//!   layers, a screen side of 0 or 40000), as the runtime does, and crashes at
+//!   physical-to-screen, which the runtime refuses, so it dies here ([`mapped`]).
+//!   `resetUsingDescriptor:` is the runtime's: it compiles
+//!   the descriptor given into the map over the tables it holds, keeping the map's own
+//!   mutability, and past the layers the widths the map held below layer 2 (Metal's answer). A
+//!   reset the runtime refuses dies, as no path reaches it under a handler.
 //! - **`parameterBufferSizeAndAlign`** is 24,624 bytes aligned to 4 for every map, compiled or
 //!   not. A compiled map's parameter data is the runtime's, which is Metal's, in Apple's layout,
 //!   byte for byte, and which the translated decoder of a function reads with
 //!   Apple's arithmetic; its copy writes all of it. A map not yet compiled writes 24,624 zeros,
 //!   as Metal's does.
-//! - **The granularity** is 32 by 32, depth 1, compiled or not; a physical size has depth 1.
+//! - **The granularity** is the runtime's, Metal's 32 by 32, depth 1, compiled or not; a
+//!   physical size has depth 1.
 //!
 //! **In a pass.** A pass descriptor holds the map by reference (`desc.rs`).
 //! - **A pass of a map whose rates vary** (a tile spanning other than as many screen pixels as
@@ -48,29 +52,46 @@
 //!   coordinate maps are Metal's, but the runtime's draws in it rasterize by regions whose lines
 //!   are the map's tiles' exact lines, where Metal's are its fixed-point ones. The runtime
 //!   announces it as it compiles the map, at its creation or a
-//!   reset (`rasterization-rate-map`, [`Regions`]), which is relayed, and a draw, an execution of
-//!   indirect commands that is not empty and a tile dispatch in such a pass relay it again, and
-//!   die in strict mode ([`crate::answer::Inexact::RateMap`], [`crate::gpu::encode_render`]).
+//!   reset (`rasterization-rate-map`, [`Class::Varying`]), which is relayed, and a draw, an
+//!   execution of indirect commands that is not empty and a tile dispatch in such a pass relay it
+//!   again, and die in strict mode ([`crate::answer::Inexact::RateMap`],
+//!   [`crate::gpu::encode_render`]).
 //! - **A pass of a mutable map not yet reset** rasterizes nothing, as on Metal (measured: a
 //!   full-screen triangle's vertex function writes its buffer, its fragment function never runs,
-//!   and the colour, depth and stencil attachments keep their clears), so its encoder keeps its
-//!   scissor rectangles empty, and a tile dispatch in it, which only draws were measured
-//!   against, dies ([`crate::gpu::encode_render`]).
+//!   and the colour, depth and stencil attachments keep their clears), as the runtime's pass
+//!   does. A tile dispatch in it, which only draws were measured against, dies, and so does the
+//!   `endEncoding` of a pass over a mutable map of layers, or not yet reset, that nothing drew in,
+//!   at which Metal's GPU hangs, where the runtime's stores what the pass loaded or cleared
+//!   ([`crate::gpu::encode_render`]).
 //! - **When the map is read.** Metal's pass reads the map as the GPU runs it (measured: a reset
 //!   after the encoder is made, after its draw, after `endEncoding` and just after `commit` each
-//!   shows in the pass, from a map not yet reset and from a compiled one). The runtime plans each
-//!   draw by the map as it is encoded, so an encoder takes the map as it is at its creation, and
-//!   the map keeps the command buffers whose passes took it, by their progress
-//!   ([`crate::gpu::command::Progress`]), which outlives core's handle: a reset while one of them
-//!   may still run on the GPU (not committed, or committed and not complete) dies, as this
-//!   platform would draw by the map Metal no longer holds. One that goes uncommitted runs nothing,
-//!   and no longer counts. What an encoder takes and the registration of its command buffer, once
-//!   the encoder exists, are under the map's lock, which a reset's check and compile hold too.
+//!   shows in the pass, from a map not yet reset and from a compiled one). So does the runtime's:
+//!   a reset encodes again each pass that took the map and whose command buffer is not yet
+//!   submitted, by the map as reset. One it cannot encode again (an encoder that kept no log,
+//!   such as one that left work for the runtime's host step) draws by the map as it took it,
+//!   which it announces (`rate-map-reset-unencoded`), relayed, dying in strict mode
+//!   ([`crate::answer::DIES`]). What the pass's encoder decides by the map (the deaths and relays
+//!   of [`Class`]) it decides by the map's class at its creation, and the map keeps the command
+//!   buffers whose passes took it, by their progress ([`crate::gpu::command::Progress`]), which
+//!   outlives core's handle, with the class and the screen size each took. A reset while one of
+//!   them may still run on the GPU (not committed, or committed and not complete) dies where the
+//!   map as reset is of a class the one it took does not hold over ([`Class::holds_over`]), as
+//!   the encoder's decisions would no longer be Metal's, and where it is of another screen size:
+//!   Metal's GPU draws the pass over the screen the map had at the encoder's creation, where the
+//!   runtime's draws it over the screen as reset (measured: a full-screen triangle in a pass of a
+//!   16-pixel target over a mutable map of a 16-pixel screen reset, before or after the commit, to
+//!   the identity over 8 pixels shaded all 256 pixels, where the runtime's shaded the 8 by 8
+//!   corner, and over a map of 8 reset to 16 the 8 by 8 corner, where the runtime's shaded all of
+//!   them; a map of 8 made and drawn over shaded the corner on both). One that goes uncommitted
+//!   runs nothing, and no longer counts. What an encoder takes and the
+//!   registration of its command buffer, once the encoder exists, are under the map's lock, which
+//!   a reset's compile and check hold too.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use metal2vulkan::bind;
+use metal2vulkan::metal::Mutability;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::Handle;
@@ -80,7 +101,7 @@ use reims_vgpu_core::platform::values::RateMapDesc;
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
-use crate::answer::{Policy, get, hearing, plain, send, unrepresentable};
+use crate::answer::{Policy, get, hearing, plain, plain_at, refused, send, unrepresentable};
 use crate::gpu::command::{Progress, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::resource::VulkanBuffer;
@@ -92,16 +113,12 @@ const IMMUTABLE: u64 = 2;
 /// `MTLMutabilityMutable`: a map made of a descriptor of it is compiled only at its reset.
 const MUTABLE: u64 = 1;
 
-/// Metal's `parameterBufferSizeAndAlign` of every map on this host, which the runtime's compiled
-/// maps answer too.
+/// Metal's `parameterBufferSizeAndAlign` of every map on this host, which the runtime answers
+/// too.
 const PARAMETER_DATA: SizeAndAlign = SizeAndAlign {
     size: 24624,
     align: 4,
 };
-
-/// The physical granularity of every map, compiled or not, as Metal answers it (the runtime's
-/// compiled maps answer it too).
-const GRANULARITY: u64 = 32;
 
 // ---- Layers.
 
@@ -223,19 +240,8 @@ impl DescriptorObject {
             side(self.screen_size.height),
         ]);
         d.layers = self.counted().iter().map(|l| l.samples()).collect();
+        d.mutability = mutability(self.mutability);
         d
-    }
-}
-
-/// Dies at `sel`, a coordinate map of `map`, where it has no layers: Metal's ends the process
-/// there, where the runtime's answers 0 (the module docs).
-fn unmapped(sel: &'static str, map: &rt::RasterizationRateMap) {
-    if map.layer_count() == 0 {
-        unrepresentable(
-            sel,
-            "a coordinate map of a rasterization rate map of no layers, which ends Metal's \
-             process",
-        );
     }
 }
 
@@ -284,91 +290,128 @@ impl RateMapDescriptor<VulkanPlatform> for VulkanRateMapDescriptor {
 
 // ---- Maps.
 
-/// What a map is now.
-#[derive(Debug)]
-enum State {
-    /// The runtime's compile of its descriptor, and whether its rates vary, which the runtime
-    /// announced as it compiled it (`rasterization-rate-map`, [`Regions`]).
-    Compiled(rt::RasterizationRateMap, Regions),
-    /// A mutable map not yet reset: its descriptor's screen size and layer count.
-    Unset { screen_size: MtlSize, layers: u64 },
-}
-
-/// Whether a compiled map's rates vary, which the runtime announces as it compiles one
-/// (`rasterization-rate-map`, [`crate::answer::HEARD`]): a pass over such a map draws by regions
-/// whose lines are its tiles' exact lines, where Apple's are its fixed-point ones, so a draw, an
-/// execution of indirect commands that is not empty and a tile dispatch in it relay it, and die
-/// in strict mode ([`crate::answer::Inexact::RateMap`], [`crate::gpu::encode_render`]). The runtime announces nothing for a map whose every tile spans
-/// as many screen pixels as physical ones, whose passes draw.
+/// What a map is, as far as a pass's deaths and relays tell maps apart
+/// (`crate::gpu::encode_render`): a pass takes the class of the map as it is at its encoder's
+/// creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Regions {
-    /// The identity inside the screen: the runtime announced nothing.
+pub(crate) enum Class {
+    /// A mutable map not yet reset, whose pass rasterizes nothing, as Metal's.
+    Unset,
+    /// A compiled map of no layers, whose draws Metal rasterizes by what earlier maps left.
+    NoLayers,
+    /// A compiled map of layers that the runtime takes as the identity inside the screen: it
+    /// announced nothing as it compiled it.
     Identity,
-    /// Its rates vary.
+    /// A compiled map whose rates vary (a tile spanning other than as many screen pixels as
+    /// physical ones), which the runtime announced as it compiled it (`rasterization-rate-map`,
+    /// [`crate::answer::HEARD`]): a pass over it draws by regions whose lines are its tiles'
+    /// exact lines, where Apple's are its fixed-point ones, so a draw, an execution of indirect
+    /// commands that is not empty and a tile dispatch in it relay it, and die in strict mode
+    /// ([`crate::answer::Inexact::RateMap`], [`crate::gpu::encode_render`]).
     Varying,
 }
 
-impl Regions {
-    /// What the runtime announced as it compiled a map, `heard` inside the call.
-    fn of(heard: &[rt::Degradation]) -> Regions {
-        if heard.contains(&rt::Degradation::RasterizationRateMap) {
-            Regions::Varying
+impl Class {
+    /// The class of `map`, just compiled, the runtime having announced `heard` as it compiled
+    /// it.
+    fn compiled(map: &rt::RasterizationRateMap, heard: &[rt::Degradation]) -> Class {
+        if plain(|| map.layer_count()) == 0 {
+            Class::NoLayers
+        } else if heard.contains(&rt::Degradation::RasterizationRateMap) {
+            Class::Varying
         } else {
-            Regions::Identity
+            Class::Identity
         }
+    }
+
+    /// Whether a pass that took a map of this class, and may still run, draws as Metal's, or
+    /// relayed where it does not, once the map is reset to one of class `to`: the runtime encodes
+    /// it again by the map as reset, as Metal's GPU reads the map as it runs, but what the pass's
+    /// encoder decided by the class it took stands (a tile dispatch's death in a pass that
+    /// rasterizes nothing, a draw's in a pass of no layers, a resolve dropped or refused, a relay
+    /// where the rates vary). Under any class a draw is exact, relayed or dead, and a resolve of
+    /// another format is dropped only under the identity, so a reset to the identity, or to the
+    /// same class, draws as Metal's or as relayed.
+    fn holds_over(self, to: Class) -> bool {
+        self == to || to == Class::Identity
     }
 }
 
-/// `id<MTLRasterizationRateMap>`: the runtime's map once compiled, and its mutability.
+/// `id<MTLRasterizationRateMap>`: the runtime's map, made with its descriptor's mutability, and
+/// that mutability as the guest set it.
 #[derive(Debug)]
 pub struct RateMapObject {
-    /// The device, which compiles a reset.
-    device: rt::Device,
-    /// `mutability`: its descriptor's, which a reset keeps.
+    /// The runtime's map, which answers every query and takes the resets.
+    raw: rt::RasterizationRateMap,
+    /// `mutability`: its descriptor's raw value, which a reset keeps.
     mutability: u64,
     /// What it is now, and the passes that took it, under one lock.
     inner: Mutex<Inner>,
 }
 
-/// A map's state and its passes.
+/// A map's class and its passes.
 #[derive(Debug)]
 struct Inner {
     /// What it is now.
-    state: State,
-    /// The progress of the command buffers whose passes took the map, while the GPU may run them.
-    passes: Vec<Arc<Progress>>,
+    class: Class,
+    /// The passes that took the map, while the GPU may run them.
+    passes: Vec<Took>,
+}
+
+/// What a pass took of its map, at its encoder's creation.
+#[derive(Debug)]
+struct Took {
+    /// The progress of the pass's command buffer.
+    progress: Arc<Progress>,
+    /// The map's class.
+    class: Class,
+    /// The map's screen size, width and height: Metal's GPU draws the pass over it, reset or not.
+    screen: (u64, u64),
+}
+
+/// The screen size of the runtime's map `raw`, width and height.
+fn screen(raw: &rt::RasterizationRateMap) -> (u64, u64) {
+    let s = plain(|| raw.screen_size());
+    (s.width, s.height)
 }
 
 /// `id<MTLRasterizationRateMap>`.
 pub type VulkanRateMap = Obj<RateMapObject>;
 
-/// `newRasterizationRateMapWithDescriptor:`: a mutable descriptor's map not yet compiled, and an
-/// immutable one's compiled, dying where the runtime refuses it (the module docs). Metal answers
-/// no nil here.
+/// The runtime's mutability of a descriptor's raw `mutability`: a map of any value but
+/// `MTLMutabilityMutable` is compiled at its creation, on Metal (measured) as in the runtime.
+fn mutability(raw: u64) -> Mutability {
+    match raw {
+        MUTABLE => Mutability::Mutable,
+        0 => Mutability::Default,
+        _ => Mutability::Immutable,
+    }
+}
+
+/// `newRasterizationRateMapWithDescriptor:`: the runtime's map of the descriptor, a mutable one
+/// not yet compiled, dying where the runtime refuses it (the module docs). Metal answers no nil
+/// here.
 pub(crate) fn new_map(
     device: &VulkanDevice,
     descriptor: &VulkanRateMapDescriptor,
 ) -> RaiseResult<Option<VulkanRateMap>> {
     let sel = "newRasterizationRateMapWithDescriptor:";
-    let state = if descriptor.mutability == MUTABLE {
-        State::Unset {
-            screen_size: descriptor.screen_size,
-            layers: descriptor.layer_count(),
-        }
-    } else {
-        let d = descriptor.compiled(sel);
-        let (made, heard) = hearing(|| {
-            send(sel, Policy::Dies, || {
-                device.raw.new_rasterization_rate_map(&d)
-            })
-        });
-        State::Compiled(made?, Regions::of(&heard))
+    let d = descriptor.compiled(sel);
+    let (made, heard) = hearing(|| {
+        send(sel, Policy::Dies, || {
+            device.raw.new_rasterization_rate_map(&d)
+        })
+    });
+    let raw = made?;
+    let class = match descriptor.mutability {
+        MUTABLE => Class::Unset,
+        _ => Class::compiled(&raw, &heard),
     };
     Ok(Some(Obj::new(RateMapObject {
-        device: device.raw.clone(),
+        raw,
         mutability: descriptor.mutability,
         inner: Mutex::new(Inner {
-            state,
+            class,
             passes: Vec::new(),
         }),
     })))
@@ -376,45 +419,40 @@ pub(crate) fn new_map(
 
 impl RateMapObject {
     /// `open`, the creation of an encoder of a pass on `command_buffer` that takes the map, given
-    /// the runtime's map as it is now and whether its rates vary (none for a mutable map not yet
-    /// reset, whose pass rasterizes nothing), under the map's lock. Once it answers an encoder,
-    /// the map keeps the command buffer's progress while the GPU may run it; one that answers
-    /// none leaves it unregistered. No reset comes between what the encoder takes and the
-    /// registration.
+    /// the runtime's map and its class now, under the map's lock. Once it answers an encoder, the
+    /// map keeps the command buffer's progress and the class the pass took while the GPU may run
+    /// it; one that answers none leaves it unregistered. No reset comes between what the encoder
+    /// takes and the registration.
     pub(crate) fn for_pass<T>(
         &self,
         command_buffer: &VulkanCommandBuffer,
-        open: impl FnOnce(Option<(rt::RasterizationRateMap, Regions)>) -> RaiseResult<Option<T>>,
+        open: impl FnOnce(rt::RasterizationRateMap, Class) -> RaiseResult<Option<T>>,
     ) -> RaiseResult<Option<T>> {
         let mut inner = plain(|| self.inner.lock());
-        let map = match &inner.state {
-            State::Compiled(map, regions) => Some((map.clone(), *regions)),
-            State::Unset { .. } => None,
-        };
-        let opened = open(map)?;
+        let class = inner.class;
+        let opened = open(self.raw.clone(), class)?;
         if opened.is_some() {
             let progress = command_buffer.progress("renderCommandEncoderWithDescriptor:");
-            inner.passes.retain(|p| p.running());
-            if !inner.passes.iter().any(|p| Arc::ptr_eq(p, &progress)) {
-                inner.passes.push(progress);
+            let screen = screen(&self.raw);
+            inner.passes.retain(|t| t.progress.running());
+            let known = (inner.passes.iter()).any(|t| {
+                Arc::ptr_eq(&t.progress, &progress) && t.class == class && t.screen == screen
+            });
+            if !known {
+                inner.passes.push(Took {
+                    progress,
+                    class,
+                    screen,
+                });
             }
         }
         Ok(opened)
     }
 
-    /// `answer` of the compiled map, or `unset`'s of one not yet reset.
-    fn of<T>(
-        &self,
-        answer: impl FnOnce(&rt::RasterizationRateMap) -> T,
-        unset: impl FnOnce(MtlSize, u64) -> T,
-    ) -> T {
-        match &plain(|| self.inner.lock()).state {
-            State::Compiled(map, _) => answer(map),
-            &State::Unset {
-                screen_size,
-                layers,
-            } => unset(screen_size, layers),
-        }
+    /// Whether the map was made of a `Mutable` descriptor, whose pass of no draws Metal's GPU
+    /// hangs at (`crate::gpu::encode_render`).
+    pub(crate) fn is_mutable(&self) -> bool {
+        self.mutability == MUTABLE
     }
 }
 
@@ -433,98 +471,87 @@ fn mtl_size(s: rt::Size) -> MtlSize {
     MtlSize::new(s.width, s.height, s.depth)
 }
 
+/// The runtime's coordinate map `sel`, `map`: where it refuses as Metal ends the process (a map
+/// of no layers, and physical-to-screen of a mutable map not yet reset) it dies naming why, and
+/// any other refusal dies naming it.
+fn mapped(
+    sel: &'static str,
+    map: impl FnOnce() -> Result<rt::Coordinate2D, rt::Error>,
+) -> MtlCoordinate2D {
+    let ends = |e: &rt::Error| match e {
+        rt::Error::Invalid(i) => match i.problem {
+            rt::Problem::RateMap(rt::RateMapProblem::NoLayers) => Some(
+                "a coordinate map of a rasterization rate map of no layers, which ends Metal's \
+                 process",
+            ),
+            rt::Problem::RateMap(rt::RateMapProblem::NotCompiled) => {
+                Some("a mutable rate map not yet reset, which Metal crashes at")
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    match plain_at(sel, map) {
+        Ok(c) => mtl_coordinate(c),
+        Err(e) => match ends(&e) {
+            Some(why) => unrepresentable(sel, why),
+            None => refused(sel, &e),
+        },
+    }
+}
+
 impl RateMap<VulkanPlatform> for VulkanRateMap {
-    /// Metal's 24,624 bytes at `offset`: a compiled map's parameter data, the runtime's, which is
-    /// Metal's; zeros for a map not yet compiled. Core checks the buffer's room for them first. A
-    /// refusal of the runtime's (a `Private` buffer, where Metal's copy ends the process) dies.
+    /// Metal's 24,624 bytes at `offset`, the runtime's, which are Metal's: a compiled map's
+    /// parameter data, and zeros for a mutable map not yet reset. Core checks the buffer's room
+    /// for them first. A refusal of the runtime's (a `Private` buffer, where Metal's copy ends the
+    /// process) dies.
     fn copy_parameter_data(&self, buffer: &VulkanBuffer, offset: u64) -> RaiseResult<()> {
         let sel = "copyParameterDataToBuffer:offset:";
-        let compiled = self.of(
-            |map| {
-                send(sel, Policy::Dies, || {
-                    map.copy_parameter_data_to_buffer(&buffer.raw, offset)
-                })
-                .map(|()| true)
-            },
-            |_, _| Ok(false),
-        )?;
-        if compiled {
-            return Ok(());
-        }
-        let contents = plain(|| buffer.raw.contents())
-            .unwrap_or_else(|| unrepresentable(sel, "a Private buffer, where Metal's copy ends"));
-        let end = offset + PARAMETER_DATA.size;
-        if end > plain(|| buffer.raw.length()) {
-            unrepresentable(sel, "parameter data past the buffer's end");
-        }
-        let (from, end) = (
-            usize::try_from(offset).unwrap_or(usize::MAX),
-            usize::try_from(end).unwrap_or(usize::MAX),
-        );
-        // SAFETY: the buffer's mapping holds its length's bytes from `contents`, and `end` is at
-        // most that length. A command that reads or writes those bytes meanwhile races, as on
-        // Metal.
-        unsafe { std::ptr::write_bytes(contents.as_ptr().add(from), 0, end - from) };
-        Ok(())
+        send(sel, Policy::Dies, || {
+            self.raw.copy_parameter_data_to_buffer(&buffer.raw, offset)
+        })
     }
 
     fn layer_count(&self) -> u64 {
-        self.of(rt::RasterizationRateMap::layer_count, |_, layers| layers)
+        plain(|| self.raw.layer_count())
     }
 
-    /// Metal crashes at a map not yet compiled.
+    /// The runtime's map; Metal ends its process at a map of no layers and at a mutable map not
+    /// yet reset, which die ([`mapped`]).
     fn physical_to_screen(
         &self,
         physical_coordinates: MtlCoordinate2D,
         layer_index: u64,
     ) -> RaiseResult<MtlCoordinate2D> {
         let sel = "mapPhysicalToScreenCoordinates:forLayer:";
-        Ok(self.of(
-            |map| {
-                unmapped(sel, map);
-                mtl_coordinate(map.map_physical_to_screen_coordinates(
-                    coordinate(physical_coordinates),
-                    layer_index,
-                ))
-            },
-            |_, _| {
-                unrepresentable(
-                    sel,
-                    "a mutable rate map not yet reset, which Metal crashes at",
-                )
-            },
-        ))
+        Ok(mapped(sel, || {
+            self.raw
+                .map_physical_to_screen_coordinates(coordinate(physical_coordinates), layer_index)
+        }))
     }
 
+    /// The runtime's map, (0, 0) for a mutable map not yet reset, as Metal's; Metal ends its
+    /// process at a map of no layers, which dies ([`mapped`]).
     fn screen_to_physical(
         &self,
         screen_coordinates: MtlCoordinate2D,
         layer_index: u64,
     ) -> RaiseResult<MtlCoordinate2D> {
         let sel = "mapScreenToPhysicalCoordinates:forLayer:";
-        Ok(self.of(
-            |map| {
-                unmapped(sel, map);
-                mtl_coordinate(map.map_screen_to_physical_coordinates(
-                    coordinate(screen_coordinates),
-                    layer_index,
-                ))
-            },
-            |_, _| MtlCoordinate2D { x: 0.0, y: 0.0 },
-        ))
+        Ok(mapped(sel, || {
+            self.raw
+                .map_screen_to_physical_coordinates(coordinate(screen_coordinates), layer_index)
+        }))
     }
 
     fn mutability(&self) -> u64 {
         self.mutability
     }
 
-    /// Metal's (the module docs), which a compiled map's runtime answers too: a runtime answer
-    /// of another size dies, as its copy would write other bytes than Metal's.
+    /// Metal's (the module docs), which the runtime answers too: a runtime answer of another
+    /// size dies, as its copy would write other bytes than Metal's.
     fn parameter_buffer_size_and_align(&self) -> SizeAndAlign {
-        let size = self.of(
-            |map| map.parameter_buffer_size_and_align().size,
-            |_, _| PARAMETER_DATA.size,
-        );
+        let size = plain(|| self.raw.parameter_buffer_size_and_align()).size;
         if size != PARAMETER_DATA.size {
             unrepresentable(
                 "parameterBufferSizeAndAlign",
@@ -538,33 +565,56 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     }
 
     fn physical_granularity(&self) -> MtlSize {
-        MtlSize::new(GRANULARITY, GRANULARITY, 1)
+        mtl_size(plain(|| self.raw.physical_granularity()))
     }
 
+    /// The runtime's, which is Metal's: 0 by 0 for a mutable map not yet reset, and past the
+    /// layers the width the map last held for that layer below 2, which a reset keeps.
     fn physical_size(&self, layer_index: u64) -> RaiseResult<MtlSize> {
-        Ok(self.of(
-            |map| mtl_size(map.physical_size_for_layer(layer_index)),
-            |_, _| MtlSize::new(0, 0, 1),
-        ))
+        Ok(mtl_size(plain(|| {
+            self.raw.physical_size_for_layer(layer_index)
+        })))
     }
 
-    /// The descriptor compiled into the map, which keeps its mutability; a refusal dies, and so
-    /// does a reset while a pass that took the map may still run on the GPU (the module docs).
-    /// The check and the compile hold the map's lock, which a pass's creation holds too.
+    /// The runtime's reset, which compiles the descriptor over the map's tables, keeps its
+    /// mutability, and encodes again each pass that took the map whose command buffer is not yet
+    /// submitted (the module docs); a refusal dies. So does a reset while a pass that took the
+    /// map may still run, where what its encoder decided by the class it took does not hold over
+    /// the map as reset ([`Class::holds_over`]), or where the map's screen size changes, which
+    /// Metal's GPU draws the pass over as it was at the encoder's creation and the runtime's as
+    /// reset. The reset holds the map's lock, which a pass's creation holds too.
     fn reset(&self, descriptor: &VulkanRateMapDescriptor) {
         let sel = "resetUsingDescriptor:";
         let mut inner = plain(|| self.inner.lock());
-        inner.passes.retain(|p| p.running());
-        if !inner.passes.is_empty() {
+        let d = descriptor.compiled(sel);
+        let ((), heard) = hearing(|| get(sel, || self.raw.reset_using_descriptor(&d)));
+        let class = Class::compiled(&self.raw, &heard);
+        let (width, height) = screen(&self.raw);
+        inner.passes.retain(|t| t.progress.running());
+        if let Some(took) = inner.passes.iter().find(|t| !t.class.holds_over(class)) {
             unrepresentable(
                 sel,
-                "a reset before a pass of the map has run, which Metal's pass would read and the \
-                 runtime's, planned as it was encoded, would not",
+                &format!(
+                    "a reset to a map of class {class:?} before a pass that took the map as \
+                     {:?} has run: the runtime draws the pass by the map as reset, as Metal's \
+                     GPU reads it, but what its encoder decided by the map it took stands",
+                    took.class
+                ),
             );
         }
-        let d = descriptor.compiled(sel);
-        let (map, heard) = hearing(|| get(sel, || self.device.new_rasterization_rate_map(&d)));
-        inner.state = State::Compiled(map, Regions::of(&heard));
+        if let Some(took) = inner.passes.iter().find(|t| t.screen != (width, height)) {
+            let (w, h) = took.screen;
+            unrepresentable(
+                sel,
+                &format!(
+                    "a reset to a map of a {width} by {height} screen before a pass that took the \
+                     map of a {w} by {h} screen has run: Metal's GPU draws the pass over the \
+                     screen the map had at the encoder's creation, where the runtime's draws it \
+                     over the screen of the map as reset"
+                ),
+            );
+        }
+        inner.class = class;
     }
 }
 

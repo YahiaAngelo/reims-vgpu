@@ -6296,10 +6296,11 @@ fn legacy_heap_depth_textures_are_metals_where_metal_keeps_them_plain() {
 /// `R32Uint` or `RGBA8Uint` render target of 16x16 or more, a 3D `RGBA8Unorm` render target, an
 /// extended-range `BGRA10_XR` texture: measured, their bytes copied out or in differing from
 /// Metal's on MoltenVK), depth and stencil textures with `allowGPUOptimizedContents` among them
-/// (`Depth32Float` and `Stencil8`, 64x64), and a 4-sample render target without the property
-/// (`heap-texture-untiled-layout`). An 8x8 `Depth16Unorm` texture with the property, which Metal
-/// keeps uncompressed, is laid out in Metal's tiles on MoltenVK, announcing nothing, and in the
-/// driver's layout on any other driver (`heap-texture-untiled-layout`)
+/// (`Depth32Float` and `Stencil8`, 64x64). An 8x8 `Depth16Unorm` texture with the property, which
+/// Metal keeps uncompressed, is laid out in Metal's tiles on MoltenVK, announcing nothing, and in
+/// the driver's layout on any other driver (`heap-texture-untiled-layout`); so is an 8x8 4-sample
+/// `RGBA8Unorm` render target without the property, whose image MoltenVK lays out as Metal's
+/// heap texture (the runtime's measured fact, `MultisampleColorImagesLieAsMetalHeapTextures`)
 #[test]
 fn legacy_heap_textures_announce_the_runtimes_layouts() {
     let Some(metal) = MetalPlatform::system_default_device() else {
@@ -6420,8 +6421,9 @@ fn legacy_heap_textures_announce_the_runtimes_layouts() {
     assert!(placed.is_some(), "the multisample texture");
     let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
     let untiled = rt::Degradation::HeapTextureUntiledLayout;
-    assert!(
+    assert_eq!(
         relayed.contains(&untiled),
+        !moltenvk,
         "the multisample texture: {relayed:?}"
     );
 }
