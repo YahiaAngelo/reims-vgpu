@@ -3,8 +3,10 @@
 //! Each answer comes from one of three sources, in this order:
 //! - **the runtime's answer** of the Metal query (`DeviceProperties`,
 //!   `Device::heap_buffer_size_and_align`): the name, the threadgroup sizes, the public queries,
-//!   and, in [`crate::gpu::format_info`], Apple's private pixel format description and level
-//!   layout (`Device::pixel_format_info`, `Device::texture_level_info`);
+//!   `supportsTextureWriteRoundingMode:` (Apple's SPI: yes for 1 and 2, as Metal answers; what a
+//!   state of mode 2 does that the runtime does not is [`crate::gpu::serialized`]'s), and, in
+//!   [`crate::gpu::format_info`], Apple's private pixel format description and level layout
+//!   (`Device::pixel_format_info`, `Device::texture_level_info`);
 //! - **the runtime's answer of Apple's private property** on the device
 //!   (`Device::private_properties`), read from what the runtime acts on: its argument tables'
 //!   entries, the texture sides and layers its descriptors take (Metal's, or the device's where
@@ -34,7 +36,6 @@
 //! | `supports_compute_compressed_texture_write` | no | undocumented, unmeasured |
 //! | `supports_texture_2d_multisample_array` | yes | undocumented |
 //! | `supportsPrimitiveType:` of the raw values 5 to 9 | yes, yes, yes, yes, no | no public `MTLPrimitiveType` is one, and the runtime draws only the public types. **Pending support** (below): the render encoder draws a private type as Metal does where it is built to, and a draw it is not built for dies at the draw's selector (`encode_render`) |
-//! | `supportsTextureWriteRoundingMode:` of 1 and 2 | yes, yes | undocumented. **Pending support** (below): a state of mode 1 writes as at the default; at mode 2 the runtime rounds a render state's half-float colour attachments to nearest even, as Metal does, where they store the fragment function's output as written, of 1, 2 or 4 samples (Metal's resolve of the samples does not take the mode); a render state of mode 2 whose fragment function may write a half-float attachment otherwise (of another sample count, whose resolve nothing measured, blended other than one and zero, or its alpha under alpha to coverage), or a texture under indirect command buffer support, dies as it is made ([`crate::gpu::serialized::rounded_writes`]); one whose fragment function may write a texture otherwise is made, and a draw under it that may write a texture of a half-float format (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`), of `RG11B10Float` or of `RGB9E5Float` dies at the draw ([`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], [`crate::gpu::serialized::rounded_texture_writes`]): the runtime takes no mode for a fragment function's texture write, for every format, and Metal's mode 2 rounds the half-float ones measured to nearest even and `RG11B10Float` otherwise than its default, where `RGBX16Float`'s and `RGB9E5Float`'s are not measured; a kernel's writes are Metal's at every mode, as Metal's mode takes none of them |
 //! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536 | undocumented, and not the public `maxThreadgroupMemoryLength` (32768 on both platforms, the runtime's answer) |
 //! | `maxVertexAmplificationCount` (private, key 20) | 2, or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
 //! | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (private, keys 23 and 24) | yes | the runtime makes tile pipelines and imageblocks, a `half4` member over `RGBA8Unorm` among them. **Pending support** (below): it answers no on every device (`Device::private_properties`), as its audit of Apple9 refuses part of each row (`TileShaders` and `NonsquareTileDispatch` tile shading it has not built, `Imageblocks` imageblock masters), which dies at its selector |
@@ -197,8 +198,6 @@ pub mod stand_in {
     pub const TEXTURE_2D_MULTISAMPLE_ARRAY: bool = true;
     /// `supportsPrimitiveType:` of the raw values 5 to 9.
     pub const PRIVATE_PRIMITIVE_TYPES: [bool; 5] = [true, true, true, true, false];
-    /// `supportsTextureWriteRoundingMode:` of 1 and 2.
-    pub const WRITE_ROUNDING_MODES: [bool; 2] = [true, true];
 }
 
 /// The runtime's answer of a query whose runtime piece may not be built yet: a gap dies at the
@@ -454,7 +453,8 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
             })
         }),
         families: stand_in::FAMILIES.map(Ok),
-        write_rounding_modes: stand_in::WRITE_ROUNDING_MODES.map(Ok),
+        write_rounding_modes: WRITE_ROUNDING_MODES
+            .map(|mode| Ok(props.supports_texture_write_rounding_mode(mode.cast_unsigned()))),
         heap_buffer_page_private: heap_buffer_size_and_align(device, page_size, HEAP_QUERY_OPTIONS),
         min_linear_alignment_bgra8: send(
             "minimumLinearTextureAlignmentForPixelFormat:",
@@ -467,7 +467,6 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
 // The tables core asks are as long as the answers here hold.
 const _: () = assert!(FAMILIES.len() == stand_in::FAMILIES.len());
 const _: () = assert!(PRIMITIVE_TYPE_COUNT == PUBLIC_PRIMITIVE_TYPES + 5);
-const _: () = assert!(WRITE_ROUNDING_MODES.len() == stand_in::WRITE_ROUNDING_MODES.len());
 
 #[cfg(test)]
 mod tests {

@@ -214,8 +214,8 @@ fn stand_ins_are_the_metal_platforms_here() {
         stand_in::EXTENDED_XR10_FORMATS
     );
     assert_eq!(
-        m.write_rounding_modes,
-        stand_in::WRITE_ROUNDING_MODES.map(Ok)
+        ours.write_rounding_modes, m.write_rounding_modes,
+        "the runtime's answer"
     );
     // The answers both platforms take from the device agree where the runtime reproduces
     // Metal's, and `gpuCoreCount` is Metal's own for this GPU.
