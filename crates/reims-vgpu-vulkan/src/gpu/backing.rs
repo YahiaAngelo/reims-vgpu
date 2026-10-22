@@ -696,6 +696,10 @@ struct Registry {
     /// it, or after, finds no command buffer that took it ([`in_flight`]).
     noted: AtomicU64,
     state: Mutex<Detached>,
+    /// For tests: run in [`Registry::released`] between its stores of `latest` and `detached`,
+    /// where a reader without the lock may run.
+    #[cfg(test)]
+    between: Option<fn(&Registry)>,
 }
 
 /// The objects detached now and those released detached since the oldest open command buffer
@@ -807,6 +811,8 @@ impl Registry {
                 open: BTreeMap::new(),
                 fewest: 0,
             }),
+            #[cfg(test)]
+            between: None,
         }
     }
 
@@ -840,21 +846,29 @@ impl Registry {
     }
 
     /// Object `id` released detached: kept while a command buffer is open, which may have been
-    /// made before it.
+    /// made before it. The release is stored before the count of the objects detached: a reader
+    /// without the lock that sees the object no longer detached sees it released, so a command
+    /// buffer open before the release can fail by the object at every moment ([`Registry::any`]),
+    /// and no close forgets the release while that command buffer is open.
     fn released(&self, id: rt::ObjectId) {
         let mut state = self.state.lock();
         state.detached.remove(&id);
-        self.detached.store(state.detached.len(), Ordering::SeqCst);
         let number = state.number();
         if !state.open.is_empty() {
             state.released.insert(id, number);
             state.releases.push_back((number, id));
             self.latest.store(number + 1, Ordering::SeqCst);
         }
+        #[cfg(test)]
+        if let Some(between) = self.between {
+            between(self);
+        }
+        self.detached.store(state.detached.len(), Ordering::SeqCst);
     }
 
     /// Whether a command buffer made at `made` can fail by any object: one is detached, or the
-    /// latest release kept came after it. Read without the lock.
+    /// latest release kept came after it. Read without the lock, the count of the objects
+    /// detached first, in the order opposite to [`Registry::released`]'s stores.
     fn any(&self, made: u64) -> bool {
         self.detached.load(Ordering::SeqCst) > 0
             || self.latest.load(Ordering::SeqCst) > made.saturating_add(1)
@@ -2113,6 +2127,28 @@ mod tests {
         d.released(buffer);
         let state = d.state.lock();
         assert!(state.detached.is_empty() && state.released.is_empty());
+    }
+
+    /// A command buffer open before an object's release, the only object detached, can fail by
+    /// it at every moment of the release, as a reader without the lock sees it ([`Registry::any`]):
+    /// between the release's stores as before and after them, the object is detached or released
+    #[test]
+    fn a_release_is_seen_by_a_reader_at_every_moment() {
+        static SEEN: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        let d = Registry {
+            between: Some(|d| SEEN.lock().push(d.any(0))),
+            ..Registry::new()
+        };
+        let [buffer] = ids();
+        let open = made(&d, None);
+        assert_eq!(open, 0);
+        let open = committed(&d, open);
+        d.detached(buffer);
+        assert!(d.any(open));
+        d.released(buffer);
+        assert_eq!(*SEEN.lock(), [true], "between the stores");
+        assert!(d.any(open) && d.fails(&[buffer], open), "after them");
+        d.closed(open);
     }
 
     /// Releases made while an old command buffer stays open fail the command buffers made before
