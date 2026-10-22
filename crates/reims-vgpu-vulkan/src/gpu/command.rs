@@ -3,7 +3,9 @@
 //!
 //! - **Handlers** run on the runtime's handler threads, in the queue's order. A completed
 //!   handler reads its buffer's `status` and `error` when it runs, as on the Metal platform, and
-//!   runs marked as ours, so a panic in it aborts.
+//!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
+//!   code of the isolated task that added it, if one did: once that task ended, nothing dies
+//!   there, as core's handlers of the task run none ([`completed_handler`]).
 //! - **`encodeSignalEventScheduled:value:`** has no runtime call: it is a scheduled handler that
 //!   sets the event's value, which is what Metal's does when the buffer is scheduled.
 //! - **A nil event**, which the runtime's calls cannot take, dies at the send.
@@ -1296,13 +1298,39 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
     Some(command_buffer_error(e, cb.error_description()))
 }
 
-/// What a completed handler learns of `cb`: its `status` and `error` as they are now.
-fn completed_info(cb: &rt::CommandBuffer) -> CompletedInfo {
-    let error = failure_error(cb);
-    CompletedInfo {
-        status: CommandBufferStatus(cb.status().raw()),
-        error,
-    }
+/// The runtime's handler of core's completed handler `block`, added by the code of `task`, the
+/// isolated task whose code runs, if one's does: it hands `block` the command buffer's `status`
+/// and `error` as they are then, after `read`, its read of the failure, which dies for a failure
+/// that is none of Metal's ([`failure`]). The read is the task's code ([`as_task`]), as the
+/// death in [`Ending`] is: once the task ended, core's handlers of it run none
+/// (`TaskLife::carry`), so none reads the failure, and nothing dies; `block` is called all the
+/// same, with the failure as its code says ([`command_buffer_error`]), and decides itself
+/// whether it runs.
+fn completed_handler(
+    block: CompletedHandler,
+    task: Option<Arc<TaskLife>>,
+    read: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
+) -> rt::Handler {
+    #[cfg(test)]
+    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    Box::new(move |cb: &rt::CommandBuffer| {
+        // A callout on the runtime's thread: marked ours, so a panic here aborts.
+        let _env = BlockEnv::foreign();
+        let run = || {
+            as_task(task.as_ref(), || read(cb));
+            let error = cb
+                .error()
+                .map(|e| command_buffer_error(e, cb.error_description()));
+            block(CompletedInfo {
+                status: CommandBufferStatus(cb.status().raw()),
+                error,
+            });
+        };
+        #[cfg(test)]
+        reims_vgpu_core::testkit::capture::with_slot(slot, run);
+        #[cfg(not(test))]
+        run();
+    })
 }
 
 /// The runtime's form of an event core passes; a nil one dies at `sel`.
@@ -1315,18 +1343,12 @@ fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> 
 }
 
 impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
-    /// Refused once the buffer is committed, as Metal's validation refuses it.
+    /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
+    /// none of Metal's dies as the handler reads it, unless the isolated task whose code added
+    /// the handler ended ([`completed_handler`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
-        #[cfg(test)]
-        let slot = reims_vgpu_core::testkit::capture::current_slot();
-        let handler: rt::Handler = Box::new(move |cb: &rt::CommandBuffer| {
-            // A callout on the runtime's thread: marked ours, so a panic here aborts.
-            let _env = BlockEnv::foreign();
-            let run = || block(completed_info(cb));
-            #[cfg(test)]
-            reims_vgpu_core::testkit::capture::with_slot(slot, run);
-            #[cfg(not(test))]
-            run();
+        let handler = completed_handler(block, TaskLife::current(), |cb| {
+            failure(cb);
         });
         send("addCompletedHandler:", Policy::Dies, || {
             self.raw.add_completed_handler(handler)
@@ -2070,6 +2092,37 @@ mod tests {
         assert!(life.exit());
         e.end(Stage::Failed, Some(refused));
         assert_eq!(progress.stage(), Stage::Failed);
+    }
+
+    /// Core's completed handler reads a failure that dies as the code of the isolated task that
+    /// added it: outside isolation and while the task runs it dies, and once the task ended it
+    /// dies at nothing, the handler still handed the command buffer's status
+    #[test]
+    fn a_completed_handlers_read_of_an_ended_tasks_failure_dies_at_nothing() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let handler = |task, seen: mpsc::Sender<CompletedInfo>| {
+            let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
+            completed_handler(block, task, |_| {
+                unrepresentable("commit", "a failure none of Metal's");
+            })
+        };
+        let life = TaskLife::new();
+        for task in [None, Some(Arc::clone(&life))] {
+            let (tx, rx) = mpsc::channel();
+            let h = handler(task, tx);
+            let site = catch_death(|| h(&cb.raw)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
+            assert!(rx.try_recv().is_err());
+        }
+        // Added by the task's code, as core adds it: the task is the handler's.
+        let (tx, rx) = mpsc::channel();
+        let h = life.run(|| handler(TaskLife::current(), tx)).unwrap();
+        assert!(life.exit());
+        h(&cb.raw);
+        assert_eq!(rx.recv().unwrap().status, CommandBufferStatus::COMPLETED);
     }
 
     /// A thread of an isolated task that ended stops at commit before the runtime's commit, and
