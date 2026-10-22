@@ -11,37 +11,39 @@
 //!   reset. An execution the GPU replays binds a nil buffer's bits as the address Metal's function
 //!   sees, and one replayed on the host binds none and announces `indirect-nil-buffer-offset`,
 //!   which dies ([`crate::answer::DIES`]).
+//!   A threadgroup memory length's getter is the runtime's too
+//!   (`IndirectComputeCommand::threadgroup_memory_length`), past the 31 a record holds as well,
+//!   which Metal keeps for its getter alone, as the runtime does: 38 a command, an index of 38 or
+//!   more reaching a later command's, as Metal's, which the runtime's blits move with the
+//!   records.
 //! - **What Metal answers that a record does not hold** is kept beside the commands
 //!   ([`CommandSide`]), as Metal's getters answer it on this host without the API validation
-//!   layer (measured, macOS 26.7, M3 Max):
-//!   - a threadgroup memory length set past the 31 a record holds, which Metal keeps for its
-//!     getter alone, as the runtime does too (38 a command, an index of 38 or more setting a
-//!     later command's, as Metal's), so this answers what the runtime's record would;
-//!   - the pipeline state core set on each command, by its numbers, whose `uniqueIdentifier`
-//!     the getter answers. The numbers, not the handle: the guest's release of the state lets it
-//!     go, as Metal's indirect command keeps no state alive ([`SetPipeline`]).
-//!     A record the GPU wrote (a kernel's, or a blit's copy) names a state no setter gave the
-//!     command, by its resource ID: the getter answers the runtime's identifier of the state made
-//!     with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
-//!     (measured: a kernel's set of a compute and of a render state read from an argument
-//!     buffer). A record names its state by the state's resource ID, which the runtime reads
-//!     whether or not the state still lives (`pipeline_id`), and one naming none answers 0, as
-//!     Metal's does. Metal answers the identifier of the state the record was written with, a
-//!     released one included, though a state made later took its ID (measured), and the record
-//!     does not say which state of its ID it was written with. So the getter answers the state
-//!     that held the ID when the record can have been written ([`named_state`]): core's set,
-//!     and each state that held the ID during a span since core's set in which the GPU may have
-//!     written the buffer's records ([`Window`]: from a dispatch of a kernel that can encode
-//!     indirect commands, or any execution of an indirect command buffer, in a compute encoder
-//!     that made the buffer resident for writing, or from a render encoder's making it so, to the
-//!     end of its command buffer; a blit's copy carries the source's spans). Where those name one
-//!     state, it answers that state's identifier;
-//!     where they name two or more, or a state no longer kept
-//!     ([`crate::gpu::unique_id::HISTORY`]), it dies. Core's set keeps the state's numbers
-//!     ([`CommandSide`]), not the state, and the runtime's command names its state without
-//!     holding it, as Metal's does: the guest's release gives the ID back, and a state made later
-//!     takes it, with the released one's identifier too, as on Metal (measured), which the
-//!     command then answers ([`IcbObject::pipeline_identifier`]).
+//!   layer (measured, macOS 26.7, M3 Max): the pipeline state core set on each command, by its
+//!   numbers, whose `uniqueIdentifier` the getter answers. The numbers, not the handle: the
+//!   guest's release of the state lets it go, as Metal's indirect command keeps no state alive
+//!   ([`SetPipeline`]).
+//!   A record the GPU wrote (a kernel's, or a blit's copy) names a state no setter gave the
+//!   command, by its resource ID: the getter answers the runtime's identifier of the state made
+//!   with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
+//!   (measured: a kernel's set of a compute and of a render state read from an argument
+//!   buffer). A record names its state by the state's resource ID, which the runtime reads
+//!   whether or not the state still lives (`pipeline_id`), and one naming none answers 0, as
+//!   Metal's does. Metal answers the identifier of the state the record was written with, a
+//!   released one included, though a state made later took its ID (measured), and the record
+//!   does not say which state of its ID it was written with. So the getter answers the state
+//!   that held the ID when the record can have been written ([`named_state`]): core's set,
+//!   and each state that held the ID during a span since core's set in which the GPU may have
+//!   written the buffer's records ([`Window`]: from a dispatch of a kernel that can encode
+//!   indirect commands, or any execution of an indirect command buffer, in a compute encoder
+//!   that made the buffer resident for writing, or from a render encoder's making it so, to the
+//!   end of its command buffer; a blit's copy carries the source's spans). Where those name one
+//!   state, it answers that state's identifier;
+//!   where they name two or more, or a state no longer kept
+//!   ([`crate::gpu::unique_id::HISTORY`]), it dies. Core's set keeps the state's numbers
+//!   ([`CommandSide`]), not the state, and the runtime's command names its state without
+//!   holding it, as Metal's does: the guest's release gives the ID back, and a state made later
+//!   takes it, with the released one's identifier too, as on Metal (measured), which the
+//!   command then answers ([`IcbObject::pipeline_identifier`]).
 //! - **A blit's copy and reset of commands** move and reset what is kept beside them once the
 //!   blit's command buffer completed, as Metal's GPU has run the blit by then. Until it commits,
 //!   the GPU ran none of it: a getter answers what stands, and a setter comes before the blit.
@@ -132,6 +134,11 @@ pub const NIL_BUFFER_ADDRESS: u64 = 0x1_eeee_1111;
 /// more, which ends its process at random (measured: 16383 always made, 16384 to 50367 made or
 /// crashed from run to run, 100000 crashed).
 const ID_LIMIT: u64 = 16384;
+
+/// How many threadgroup memory lengths Metal keeps a command of a compute buffer, in one array
+/// of the buffer's, so that an index of 38 or more reaches a later command's length, as the
+/// runtime keeps them (`IndirectComputeCommand::set_threadgroup_memory_length`).
+const LENGTHS_A_COMMAND: u64 = 38;
 
 /// The lock of Metal's pool of indirect command buffer IDs, of the process (one device's, as the
 /// host has one), which a reservation Metal spins at holds for good ([`reserve`]) and every
@@ -272,9 +279,6 @@ thread_local! {
 /// What Metal answers of one command that its record does not hold (the module docs).
 #[derive(Debug, Default)]
 struct CommandSide {
-    /// Each threadgroup memory length core set, by index, which the getter answers past the
-    /// lengths the record holds.
-    lengths: BTreeMap<u32, u32>,
     /// The pipeline state core set on the command.
     pipeline: Option<SetPipeline>,
     /// The point of [`crate::gpu::unique_id::now`]'s order at which core set it.
@@ -291,7 +295,6 @@ impl CommandSide {
     /// A copy.
     fn copy(&self) -> CommandSide {
         CommandSide {
-            lengths: self.lengths.clone(),
             pipeline: self.pipeline,
             pipeline_at: self.pipeline_at,
             unknown: self.unknown.clone(),
@@ -300,17 +303,11 @@ impl CommandSide {
     }
 
     /// What the getters may answer apart for this command and `other`: what either does not
-    /// know, and each value they keep differently, one core never set counting as a fresh
-    /// command's (0, and no pipeline state).
+    /// know, and the pipeline state where they keep it differently, one core never set counting
+    /// as a fresh command's (none).
     fn differs(&self, other: &CommandSide) -> Unknown {
         let mut unknown = self.unknown.clone();
         unknown.join(&other.unknown);
-        for key in self.lengths.keys().chain(other.lengths.keys()) {
-            let length = |side: &CommandSide| side.lengths.get(key).copied().unwrap_or(0);
-            if length(self) != length(other) {
-                unknown.lengths.insert(*key);
-            }
-        }
         unknown.pipeline |= match (&self.pipeline, &other.pipeline) {
             (None, None) => false,
             (Some(a), Some(b)) => a != b,
@@ -328,21 +325,18 @@ impl CommandSide {
 /// over it; one that copies an unknown one over it carries what is unknown.
 #[derive(Debug, Clone, Default)]
 struct Unknown {
-    lengths: BTreeSet<u32>,
     pipeline: bool,
 }
 
 impl Unknown {
     /// `other`'s are unknown too.
     fn join(&mut self, other: &Unknown) {
-        self.lengths.extend(other.lengths.iter().copied());
         self.pipeline |= other.pipeline;
     }
 
     /// Whether `kept` is unknown.
     fn holds(&self, kept: Kept) -> bool {
         match kept {
-            Kept::Length(at) => self.lengths.contains(&at),
             Kept::Pipeline => self.pipeline,
             Kept::All => !self.is_empty(),
         }
@@ -351,9 +345,6 @@ impl Unknown {
     /// `kept` is known again: core set it.
     fn settle(&mut self, kept: Kept) {
         match kept {
-            Kept::Length(at) => {
-                self.lengths.remove(&at);
-            }
             Kept::Pipeline => self.pipeline = false,
             Kept::All => *self = Unknown::default(),
         }
@@ -361,15 +352,13 @@ impl Unknown {
 
     /// Whether nothing is unknown.
     fn is_empty(&self) -> bool {
-        self.lengths.is_empty() && !self.pipeline
+        !self.pipeline
     }
 }
 
 /// What a getter reads of what is kept of a command, or a setter writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kept {
-    /// A threadgroup memory length, by index.
-    Length(u32),
     /// The pipeline state.
     Pipeline,
     /// All of it: a reset of the command.
@@ -1806,7 +1795,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
 impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
-    /// none of, dies; a threadgroup memory length past the record is kept ([`CommandSide`]).
+    /// none of, dies.
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -1884,12 +1873,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                 let length = u32::try_from(length)
                     .unwrap_or_else(|_| unrepresentable(sel, &format!("a length of {length}")));
                 let at = slot(sel, index);
-                set(sel, || c.set_threadgroup_memory_length(length, at))?;
-                self.icb
-                    .side(sel, Access::Write(Kept::Length(at)), self.index, |s| {
-                        s.lengths.insert(at, length)
-                    });
-                Ok(())
+                set(sel, || c.set_threadgroup_memory_length(length, at))
             }
         }
     }
@@ -1946,20 +1930,25 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
         )
     }
 
-    /// The record's length where it holds the index, else the one core set there, or 0.
+    /// The runtime's length where Metal keeps it, at the index's low 32 bits, as Metal's getter
+    /// takes them: the command's below 38, a later command's at 38 or more
+    /// ([`LENGTHS_A_COMMAND`]), past the last command's too. A command whose record Metal's copy
+    /// past the buffer's end may have written over dies ([`IcbObject::overrun`]).
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
-        let lengths = self.record(sel).threadgroup_memory_lengths;
-        let held = usize::try_from(index).ok().and_then(|i| lengths.get(i));
-        let length = match (held, u32::try_from(index)) {
-            (Some(&l), _) => l,
-            (None, Ok(at)) => self
-                .icb
-                .side(sel, Access::Read(Kept::Length(at)), self.index, |s| {
-                    s.lengths.get(&at).copied().unwrap_or(0)
-                }),
-            (None, Err(_)) => 0,
-        };
+        let flat = u64::from(self.index) * LENGTHS_A_COMMAND + u64::from(index.low_u32());
+        if let Ok(reached) = u32::try_from(flat / LENGTHS_A_COMMAND)
+            && u64::from(reached) < self.icb.raw.size()
+        {
+            self.icb.intact(sel, reached);
+        }
+        let length = get(sel, || self.raw.threadgroup_memory_length(index));
+        let length = length.unwrap_or_else(|| {
+            unrepresentable(
+                sel,
+                "a threadgroup memory length the runtime answers none of",
+            )
+        });
         Ok(u64::from(length))
     }
 
@@ -3299,13 +3288,12 @@ mod tests {
         }
     }
 
-    /// A blit's reset and copy change what Metal answers beside the records (a threadgroup
-    /// length past them) once the command buffer completed: before the commit the getters answer
-    /// what stands, while it may run a getter of what a blit writes dies, as does a setter of
-    /// what one reaches, and a getter of a copy's source answers. What the records hold, a
-    /// barrier, answers as they stand, as the GPU left them
+    /// A blit's reset and copy move a threadgroup length past the 31 a record holds as they move
+    /// the record, as the GPU runs them: while the blit waits on an event, the getters answer
+    /// what stands and a setter of a command it copies goes, the copy carrying what it set; once
+    /// it ran, the copy's destination answers its source's, and the reset command 0
     #[test]
-    fn blits_move_what_is_kept_beside_the_records_once_they_ran() {
+    fn blits_move_lengths_past_the_record_as_they_run() {
         use std::sync::mpsc;
 
         use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
@@ -3316,10 +3304,10 @@ mod tests {
             make::<VulkanPlatform>(&d, &lengths_desc(), 2),
         );
         let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
-        let stride = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 40 };
+        let length = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 33 };
         for i in [0, 1] {
             command(&a, i).encode(IcbComputeCmd::SetBarrier).unwrap();
-            command(&a, i).encode(stride(20)).unwrap();
+            command(&a, i).encode(length(20)).unwrap();
         }
         let q = d.new_command_queue().unwrap();
         let event = d.new_shared_event().unwrap();
@@ -3342,136 +3330,43 @@ mod tests {
             blit.encode(OnFault::Return, cmd).unwrap();
         }
         let barriers = |icb: &VulkanIcb| [0, 1].map(|i| command(icb, i).has_barrier());
-        let strides = |icb: &VulkanIcb| {
-            [0, 1].map(|i| command(icb, i).threadgroup_memory_length(40).unwrap())
+        let lengths = |icb: &VulkanIcb| {
+            [0, 1].map(|i| command(icb, i).threadgroup_memory_length(33).unwrap())
         };
-        assert_eq!((barriers(&a), barriers(&b)), ([true, true], [false, false]));
-        assert_eq!((strides(&a), strides(&b)), ([20, 20], [0, 0]));
         let (tx, rx) = mpsc::channel();
         cb.add_completed_handler(OnFault::Return, Box::new(move |_| tx.send(()).unwrap()))
             .unwrap();
         cb.commit(OnFault::Return).unwrap();
-        for (icb, i, write) in [(&a, 1, false), (&b, 1, false), (&a, 0, true)] {
-            let site = catch_death(|| {
-                let c = command(icb, i);
-                if write {
-                    c.encode(stride(24)).unwrap();
-                } else {
-                    c.threadgroup_memory_length(40).unwrap();
-                }
-            })
-            .unwrap_err();
-            let sel = if write {
-                "setThreadgroupMemoryLength:atIndex:"
-            } else {
-                "getThreadgroupMemoryLengthAtIndex:"
-            };
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, sel),
-                "{i} {write}"
-            );
-        }
-        assert_eq!(
-            (
-                command(&a, 0).threadgroup_memory_length(40).unwrap(),
-                command(&b, 0).threadgroup_memory_length(40).unwrap()
-            ),
-            (20, 0)
-        );
         assert_eq!((barriers(&a), barriers(&b)), ([true, true], [false, false]));
+        assert_eq!((lengths(&a), lengths(&b)), ([20, 20], [0, 0]));
+        command(&a, 0).encode(length(24)).unwrap();
+        assert_eq!(lengths(&a), [24, 20]);
         event.set_signaled_value(1).unwrap();
         rx.recv().unwrap();
+        assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
         assert_eq!((barriers(&a), barriers(&b)), ([true, false], [false, true]));
-        assert_eq!((strides(&a), strides(&b)), ([20, 0], [0, 20]));
-        command(&a, 0).encode(stride(24)).unwrap();
-        assert_eq!(command(&a, 0).threadgroup_memory_length(40).unwrap(), 24);
+        assert_eq!((lengths(&a), lengths(&b)), ([24, 0], [0, 24]));
     }
 
-    /// Once the command buffer of a blit's copy and reset failed, which may or may not have run
-    /// them, the getter of each value they would have changed dies, until core sets it again or
-    /// resets the command; a value they would have left as it stands answers it, and so do a
-    /// copy's source and the values and commands they do not reach
-    #[test]
-    fn a_failed_blit_leaves_what_it_would_change_unknown_until_set() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
-
-        let d = dev();
-        let (a, b) = (
-            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
-            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
-        );
-        let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
-        let stride = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 40 };
-        for (icb, i) in [(&a, 0), (&a, 1), (&b, 0)] {
-            command(icb, i).encode(stride(20)).unwrap();
-        }
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        for cmd in [
-            BlitCmd::CopyIndirectCommandBuffer {
-                source: &a,
-                source_range: NsRange::new(0, 2),
-                destination: &b,
-                destination_index: 0,
-            },
-            BlitCmd::ResetCommandsInBuffer {
-                buffer: &a,
-                range: NsRange::new(1, 1),
-            },
-            BlitCmd::EndEncoding,
-        ] {
-            blit.encode(OnFault::Return, cmd).unwrap();
-        }
-        cb.commit_failed(rt::CommitFailure::new(2));
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        assert_eq!(cb.status(), CommandBufferStatus::ERROR);
-        let read = |icb: &VulkanIcb, i, at| {
-            catch_death(|| command(icb, i).threadgroup_memory_length(at).unwrap())
-                .map_err(|site| (site.kind, site.file))
-        };
-        let unknown = Err((DeathKind::Abort, "getThreadgroupMemoryLengthAtIndex:"));
-        assert_eq!(
-            [
-                read(&a, 0, 40),
-                read(&a, 1, 40),
-                read(&b, 0, 40),
-                read(&b, 1, 40)
-            ],
-            [Ok(20), unknown, Ok(20), unknown]
-        );
-        assert_eq!((read(&a, 1, 39), read(&b, 1, 39)), (Ok(0), Ok(0)));
-        command(&b, 1).encode(stride(24)).unwrap();
-        command(&a, 1).encode(IcbComputeCmd::Reset).unwrap();
-        assert_eq!((read(&a, 1, 40), read(&b, 1, 40)), (Ok(0), Ok(24)));
-    }
-
-    /// What two commands would answer apart is unknown: each length kept differently, one never
-    /// set counting as 0, a pipeline state of another handle or of none, and what either does not
-    /// know; a value set again is known
+    /// What two commands would answer apart is unknown: a pipeline state of another handle or of
+    /// none, and what either does not know; a value set again is known
     #[test]
     fn what_commands_would_answer_apart_is_unknown() {
         let d = dev();
         let (p, q) = (icb_pipeline(&d), icb_pipeline(&d));
-        let side = |length, pipeline: Option<&VulkanComputePipeline>| {
-            let mut side = CommandSide::default();
-            side.lengths.insert(40, length);
-            side.pipeline = pipeline.map(SetPipeline::compute);
-            side
+        let side = |pipeline: Option<&VulkanComputePipeline>| CommandSide {
+            pipeline: pipeline.map(SetPipeline::compute),
+            ..CommandSide::default()
         };
-        assert!(side(64, Some(&p)).differs(&side(64, Some(&p))).is_empty());
-        assert!(side(0, None).differs(&CommandSide::default()).is_empty());
-        let apart = side(64, Some(&p)).differs(&side(32, Some(&q)));
-        for kept in [Kept::Length(40), Kept::Pipeline] {
-            assert!(apart.holds(kept), "{kept:?}");
-        }
-        assert!(!apart.holds(Kept::Length(0)));
-        let mut unknown = side(64, None).differs(&side(64, Some(&p)));
+        assert!(side(Some(&p)).differs(&side(Some(&p))).is_empty());
+        assert!(side(None).differs(&CommandSide::default()).is_empty());
+        let apart = side(Some(&p)).differs(&side(Some(&q)));
+        assert!(apart.holds(Kept::Pipeline));
+        let mut unknown = side(None).differs(&side(Some(&p)));
         assert!(unknown.holds(Kept::Pipeline) && unknown.holds(Kept::All));
-        let mut joined = side(64, None);
+        let mut joined = side(None);
         joined.unknown = apart;
-        assert!(joined.differs(&joined.copy()).holds(Kept::Length(40)));
+        assert!(joined.differs(&joined.copy()).holds(Kept::Pipeline));
         unknown.settle(Kept::Pipeline);
         assert!(unknown.is_empty());
     }

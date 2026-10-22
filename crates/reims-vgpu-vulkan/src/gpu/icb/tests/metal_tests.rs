@@ -891,6 +891,59 @@ fn lengths_past_the_record_read_back_as_on_metal() {
     }
 }
 
+/// A blit's copy and reset of commands move and clear the threadgroup memory lengths past the
+/// 31 a record holds as they do the record's, as on Metal: lengths at 30, 33 and 37 of two
+/// commands, the first copied over a second buffer's command 1 and the second reset
+#[test]
+fn blits_move_lengths_past_the_record_as_metals() {
+    fn reads<P: Platform>(d: &P::Device) -> Vec<u64> {
+        let desc = IcbDesc {
+            max_kernel_threadgroup_memory_bind_count: 40,
+            ..compute_desc()
+        };
+        let (a, b) = (make::<P>(d, &desc, 2), make::<P>(d, &desc, 2));
+        let command = |icb: &P::Icb, i| icb.compute_command(i).unwrap().unwrap();
+        for (i, base) in [(0, 16), (1, 48)] {
+            for (index, add) in [(30, 0), (33, 4), (37, 8)] {
+                let length = base + add;
+                command(&a, i)
+                    .encode(IcbComputeCmd::SetThreadgroupMemoryLength { length, index })
+                    .unwrap();
+            }
+        }
+        let cb = blits::<P>(
+            d,
+            vec![
+                BlitCmd::CopyIndirectCommandBuffer {
+                    source: &a,
+                    source_range: NsRange::new(0, 1),
+                    destination: &b,
+                    destination_index: 1,
+                },
+                BlitCmd::ResetCommandsInBuffer {
+                    buffer: &a,
+                    range: NsRange::new(1, 1),
+                },
+            ],
+        );
+        assert_eq!(cb.status().0, COMPLETED);
+        let mut lengths = Vec::new();
+        for icb in [&a, &b] {
+            for i in [0, 1] {
+                for index in [30, 33, 37] {
+                    lengths.push(command(icb, i).threadgroup_memory_length(index).unwrap());
+                }
+            }
+        }
+        lengths
+    }
+    let vulkan = reads::<VulkanPlatform>(&dev());
+    assert_eq!(vulkan, [16, 20, 24, 0, 0, 0, 0, 0, 0, 16, 20, 24]);
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
+    }
+}
+
 /// A buffer set at an offset past 32 bits answers the buffer's address plus the offset's low
 /// 32 bits, of each stage and form, as on Metal
 #[test]

@@ -339,18 +339,6 @@ fn aborts_encoders(options: u64) -> bool {
     matches!(options, 1 | 3 | 7)
 }
 
-#[cfg(test)]
-impl CommandBufferObject {
-    /// Commits it as failed with `failure`, as `commit` commits it: the runtime's extension for
-    /// error injection ([`rt::CommandBuffer::commit_failed`]), which fails it with no GPU fault.
-    pub(crate) fn commit_failed(&self, failure: rt::CommitFailure) {
-        if let Some(progress) = &*self.progress.lock() {
-            progress.committing();
-        }
-        self.raw.commit_failed(failure).unwrap();
-    }
-}
-
 impl CommandBufferObject {
     /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
     /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
