@@ -820,14 +820,20 @@ enum RefusedWait {
 /// - any wait for a command buffer not yet finished once the process is exiting (`Exiting`), on
 ///   any thread: Metal's goes on waiting, and the exit ends the thread with the process, so the
 ///   thread parks (the library registers no exit handler that waits);
+/// - a handler's wait for another queue's command buffer that would leave the device's handler
+///   threads none free (`HandlerThreadCap`), the 512th such wait: Metal ran 511 at once, and at
+///   the 512th its process's dispatch threads ran out and it never returned (measured on the M3
+///   Max), so a hang stays a hang. Metal's other handlers stop there too, where the runtime's go
+///   on, and Metal counts the process's threads, the runtime each device's;
 /// - a handler's wait for another queue's command buffer that would close a cycle of handlers'
-///   waits (`Cycle`), or leave the device's handler threads none free (`HandlerThreadCap`, the
-///   runtime's cap, past the 256 such waits measured on Metal), and any cause the runtime adds:
-///   Metal's answer is not measured, so it dies, unless the process is exiting, when it parks
-///   as an exiting process's wait does. Only these ask whether the process is exiting.
+///   waits (`Cycle`), and any cause the runtime adds: Metal's answer is not measured, so it
+///   dies, unless the process is exiting, when it parks as an exiting process's wait does. Only
+///   these ask whether the process is exiting.
 fn refused_wait(cause: rt::DeadlockCause, exiting: impl FnOnce() -> bool) -> RefusedWait {
     match cause {
-        rt::DeadlockCause::OwnQueue | rt::DeadlockCause::Exiting => RefusedWait::Hangs,
+        rt::DeadlockCause::OwnQueue
+        | rt::DeadlockCause::HandlerThreadCap
+        | rt::DeadlockCause::Exiting => RefusedWait::Hangs,
         _ if exiting() => RefusedWait::Hangs,
         _ => RefusedWait::Unmeasured,
     }
@@ -1870,9 +1876,9 @@ mod tests {
     }
 
     /// A wait the runtime refuses hangs where Metal's never returns, a handler's wait in its own
-    /// queue, and any once the process is exiting, and dies for the causes where Metal's answer
-    /// is not measured while it is not; only those ask whether the process is exiting. A live
-    /// process is not exiting
+    /// queue or past the device's handler threads, and any once the process is exiting, and dies
+    /// for the causes where Metal's answer is not measured while it is not; only those ask
+    /// whether the process is exiting. A live process is not exiting
     #[test]
     fn refused_waits_hang_only_where_metal_does() {
         use rt::DeadlockCause::{Cycle, Exiting, HandlerThreadCap, OwnQueue};
@@ -1884,16 +1890,14 @@ mod tests {
             }
         };
         for answer in [false, true] {
-            for cause in [OwnQueue, Exiting] {
+            for cause in [OwnQueue, HandlerThreadCap, Exiting] {
                 assert_eq!(refused_wait(cause, exiting(answer)), RefusedWait::Hangs);
             }
         }
         assert_eq!(asked.get(), 0);
-        for cause in [Cycle, HandlerThreadCap] {
-            assert_eq!(refused_wait(cause, exiting(false)), RefusedWait::Unmeasured);
-            assert_eq!(refused_wait(cause, exiting(true)), RefusedWait::Hangs);
-        }
-        assert_eq!(asked.get(), 4);
+        assert_eq!(refused_wait(Cycle, exiting(false)), RefusedWait::Unmeasured);
+        assert_eq!(refused_wait(Cycle, exiting(true)), RefusedWait::Hangs);
+        assert_eq!(asked.get(), 2);
         assert!(!rt::process_exiting());
     }
 
