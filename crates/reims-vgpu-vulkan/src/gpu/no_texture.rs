@@ -38,13 +38,12 @@
 //! - the runtime answers each of those creators and the size query as Metal does, its nil and its 0
 //!   bytes at Metal's alignment, and its validation stops what Metal's aborts at, but for usage
 //!   bits Metal does not define, at which [`descriptor`] dies first ([`runtime_passes`]; it dies
-//!   first at two more, which the runtime's validation stops too), and two it makes and Metal does
-//!   not, which [`descriptor`] leaves out of its descriptor: a texture buffer of more than one
-//!   level, which Metal takes within the chain, and a swizzle under `ShaderWrite` or `RenderTarget`
-//!   usage of a descriptor of `writeSwizzleEnabled`. Compared at every case of the tests for each
-//!   of the 73 formats, these and the two-plane ones: the runtime validates before it answers nil,
-//!   and before each creator's own checks, but at `newSharedTextureWithDescriptor:`, which
-//!   validates first;
+//!   first at two more, which the runtime's validation stops too). Its nil comes before what it
+//!   does not build yet, as Metal's does: a texture buffer of more than one level, within the
+//!   chain, and a swizzle under `ShaderWrite` or `RenderTarget` usage of a descriptor of
+//!   `writeSwizzleEnabled`. Compared at every case of the tests for each of the 73 formats, these
+//!   and the two-plane ones: the runtime validates before it answers nil, and before each
+//!   creator's own checks, but at `newSharedTextureWithDescriptor:`, which validates first;
 //! - a view of a texture of any format Metal makes one of on this host, made by any of the view
 //!   selectors (with or without a resource index, and with any type, levels, slices or swizzle,
 //!   the source's or not), in a format [`NO_VIEW`] lists is nil, before the view's swizzle, type,
@@ -57,7 +56,7 @@
 //!   makes over a surface ([`crate::gpu::ycbcr`]) in its own format, or in its `_sRGB` twin, is
 //!   not nil: Metal makes it, and so does the runtime (`own_format_views_are_metals`).
 
-use metal2vulkan::metal::{PixelFormat, TextureSwizzleChannels, TextureType};
+use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan_runtime as rt;
 
 use crate::answer::metal_aborts;
@@ -124,11 +123,8 @@ pub fn no_view(raw: u64) -> bool {
 /// from a descriptor alone ([`TextureFields::formatless`]), for `sel`, a creator or the heap's
 /// size query the runtime answers as Metal does for it (the module's docs). Dies first where
 /// Metal's validation aborts and the runtime's passes the descriptor ([`runtime_passes`]). Its
-/// fields are those set, `framebufferOnly`, the rotation and `isDrawable` among them, with none
-/// of the checks Metal makes after its nil, but for the two the runtime's validation makes and
-/// Metal's does not: a texture buffer of more than one level, within the chain its width takes,
-/// is the runtime's of one level, and the swizzle of a descriptor of `writeSwizzleEnabled`
-/// the identity, which Metal takes under `ShaderWrite` and `RenderTarget` usage there.
+/// fields are those set, `framebufferOnly`, the rotation, `isDrawable` and
+/// `writeSwizzleEnabled` among them, with none of the checks Metal makes after its nil.
 pub(crate) fn descriptor(
     sel: &'static str,
     fields: &TextureFields,
@@ -142,16 +138,7 @@ pub(crate) fn descriptor(
     desc.framebuffer_only = fields.framebuffer_only == Some(true);
     desc.rotation = fields.rotation;
     desc.is_drawable = fields.is_drawable == Some(true);
-    if fields.write_swizzle_enabled == Some(true) {
-        desc.swizzle = TextureSwizzleChannels::DEFAULT;
-    }
-    // The full chain of the width: floor(log2(width)) + 1 levels.
-    let chain = u64::from(u64::BITS - desc.width.max(desc.height).leading_zeros());
-    if desc.texture_type == TextureType::TextureBuffer
-        && (1..=chain).contains(&desc.mipmap_level_count)
-    {
-        desc.mipmap_level_count = 1;
-    }
+    desc.write_swizzle_enabled = fields.write_swizzle_enabled == Some(true);
     desc
 }
 
