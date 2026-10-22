@@ -22,10 +22,15 @@
 //!   the state the program set on the command and released since, of which nothing here holds
 //!   what decides, and a command a death would ask of dies.
 //!
-//!   A buffer into whose records no route wrote a draw or a dispatch runs nothing
-//!   (`IndirectCommandBuffer::command_writes`, every route's writes so far), and the commit
-//!   reads none of them: a buffer of no command types among them, whose execution in a pass
-//!   Metal runs nothing of, and whose records the runtime refuses to read.
+//!   The commit reads the records only where what every route wrote into them so far
+//!   (`IndirectCommandBuffer::command_writes`) leaves it something to find ([`may_find`]), as
+//!   the runtime's host step reads them for its check only so (`IndirectCommandCheckNeeds`). A
+//!   buffer into whose records no route wrote a draw or a dispatch runs nothing: a buffer of no
+//!   command types among them, whose execution in a pass Metal runs nothing of, and whose
+//!   records the runtime refuses to read. Where the execution asks of no ID of the guest's and
+//!   its encoder made no buffer resident for writing, a draw of points is the only death to
+//!   find, so a buffer whose records hold none, as one of draws of triangles, is read at the
+//!   commit by the runtime alone.
 //! - **Records the GPU may write** ([`gpu_writes`]): a blit's copy into a buffer or reset of
 //!   it, and a command, direct or executed, whose state can encode indirect commands in an
 //!   encoder that made the buffer resident for writing, may write its records as the GPU runs,
@@ -131,10 +136,7 @@ impl Execution {
             writable.iter().for_each(|w| gpu_writes("commit", w));
             return None;
         }
-        // Records no route wrote a draw or a dispatch into run nothing, and ask nothing: a buffer
-        // of no command types among them, whose execution in a pass Metal runs nothing of, and
-        // whose records the runtime refuses to read.
-        if !plain(|| icb.raw.command_writes()).may(RUNS) {
+        if !may_find(&icb, points, guest_id.is_some() || !writable.is_empty()) {
             return decides.then_some(icb);
         }
         let range = range.unwrap_or(0..icb.size());
@@ -183,6 +185,20 @@ impl Execution {
         });
         Some((check, needs))
     }
+}
+
+/// Whether the commit's reading of `icb`'s records may find a death or a write ([`ask`]): whether
+/// what every route wrote into them so far (`command_writes`), the CPU's setters alone where the
+/// GPU may have written none, holds a draw or a dispatch, and, where the execution asks of
+/// neither a guest's ID nor a buffer made resident for writing (`by_state`), a draw of points
+/// where `points` asks of them. Records no route wrote a draw or a dispatch into run nothing and
+/// ask nothing: a buffer of no command types among them, whose execution in a pass Metal runs
+/// nothing of, and whose records the runtime refuses to read.
+fn may_find(icb: &VulkanIcb, points: Points, by_state: bool) -> bool {
+    let writes = plain(|| icb.raw.command_writes());
+    let point_draws =
+        points != Points::Unasked && writes.may_draw_primitive_type(PrimitiveType::Point.as_raw());
+    writes.may(RUNS) && (by_state || point_draws)
 }
 
 /// Asks command `index` of `execution`'s indirect command buffer, `command`, of the death a direct
@@ -367,14 +383,103 @@ impl Drop for Read {
 
 #[cfg(test)]
 mod tests {
+    use metal2vulkan::metal::PixelFormat;
+    use metal2vulkan::pipeline::{
+        ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
+    };
+    use reims_vgpu_core::platform::Handle as _;
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
     use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
     use reims_vgpu_core::platform::types::NsRange;
     use reims_vgpu_core::platform::values::IcbDesc;
     use reims_vgpu_core::raise::OnFault;
+    use reims_vgpu_core::testkit::capture::catch_death;
 
+    use super::*;
+    use crate::gpu::device::VulkanDevice;
     use crate::gpu::device::tests::dev;
+    use crate::gpu::resource::VulkanRenderPipeline;
+
+    const VERT: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/vert.metallib");
+    const FRAG: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/frag.metallib");
+
+    /// `tri_vert` and `tri_frag` into `BGRA8Unorm`, with indirect command buffer support: its
+    /// vertex function writes no `[[point_size]]`, of no input primitive topology class.
+    fn state(d: &VulkanDevice) -> VulkanRenderPipeline {
+        let function = |bytes, name| {
+            d.raw
+                .new_library_with_data(bytes)
+                .unwrap()
+                .new_function_with_name(name)
+                .unwrap()
+                .function_descriptor()
+        };
+        let mut desc =
+            RenderPipelineDescriptor::new(StageSource::Function(function(VERT, "tri_vert")));
+        desc.fragment = Some(StageSource::Function(function(FRAG, "tri_frag")));
+        desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
+        desc.support_indirect_command_buffers = true;
+        crate::gpu::resource::render_pipeline(
+            d.raw
+                .new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
+                .unwrap(),
+        )
+    }
+
+    /// A buffer of `n` draws of `primitive_type` (three vertices, one instance) under `state`.
+    fn draws(
+        d: &VulkanDevice,
+        state: &VulkanRenderPipeline,
+        n: u64,
+        primitive_type: u64,
+    ) -> VulkanIcb {
+        let icb = d
+            .new_indirect_command_buffer(
+                &IcbDesc {
+                    command_types: 1,
+                    max_vertex_buffer_bind_count: 2,
+                    max_fragment_buffer_bind_count: 2,
+                    ..IcbDesc::default()
+                },
+                n,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        for i in 0..n {
+            let c = icb.render_command(i).unwrap().unwrap();
+            for cmd in [
+                IcbRenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                IcbRenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
+            ] {
+                c.encode(cmd).unwrap();
+            }
+        }
+        icb
+    }
+
+    /// A render encoder's execution of `icb`'s commands `range`, whose commands name their own
+    /// states, as `crate::gpu::encode_render` makes it.
+    fn execution(icb: &VulkanIcb, range: Range<u64>) -> Execution {
+        Execution {
+            sel: "executeCommandsInBuffer:withRange:",
+            icb: icb.clone_ref(),
+            range: Some(range),
+            guest_id: None,
+            points: Points::Own,
+            writable: Vec::new(),
+        }
+    }
 
     /// A render pass's execution of a buffer of no command types runs nothing, as Metal's does,
     /// whose records the runtime refuses to read: its commit reads none and completes
@@ -401,5 +506,39 @@ mod tests {
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert_eq!(cb.error(), None);
+    }
+
+    /// The commit reads an execution's records only where what they may hold leaves a death to
+    /// find: of a buffer of draws of triangles under a state that sizes no points, none, its
+    /// buffer still held as read; once one command draws points there, every command of the
+    /// range, dying at that one
+    #[test]
+    fn the_commit_reads_records_only_where_a_death_may_lie() {
+        let d = dev();
+        let s = state(&d);
+        let icb = draws(&d, &s, 4, 3);
+        let reads = || d.raw.work_counts().indirect_records_read;
+        let before = reads();
+        assert!(execution(&icb, 0..4).check().is_some());
+        assert_eq!(reads() - before, 0);
+        let c = icb.render_command(2).unwrap().unwrap();
+        c.encode(IcbRenderCmd::DrawPrimitives {
+            primitive_type: 0,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        })
+        .unwrap();
+        *crate::answer::LAST_LINE.lock() = None;
+        let before = reads();
+        let site = catch_death(|| execution(&icb, 0..4).check()).unwrap_err();
+        assert_eq!(site.file, "commit");
+        assert_eq!(reads() - before, 4);
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert!(
+            line.contains("command 2 of executeCommandsInBuffer"),
+            "{line}"
+        );
     }
 }
