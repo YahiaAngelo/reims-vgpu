@@ -3029,9 +3029,12 @@ fn captured_reach_rewrites_the_tiles_metal_does() {
 /// as Metal's: a compile's refusal is the `NSError` (a float fragment's colour 0 of
 /// `R32Uint`, beside a half-float colour 1); a half-float attachment of write mask none makes
 /// its state, and so does one the function has no output for (colour 1 of `RGBA16Float`
-/// beside a written colour 0 of `RGBA8Unorm`), and one it writes, unblended, of 1 sample, of 2
-/// or of 4; one it writes blended by one and one, or whose alpha alpha to coverage reads dies
-/// as the state is made, where Metal makes each
+/// beside a written colour 0 of `RGBA8Unorm`), one it writes, unblended, of 1 sample, of 2
+/// or of 4, and one it writes blended by one and one, whose draw dies naming the runtime's
+/// notice (`blended-write-rounding`: the device's blend rounds the result by its own rule).
+/// `RGBA16Float` at colour 0 whose alpha alpha to coverage reads dies as the state is made, where
+/// Metal makes each: made by default (`answer::relaxed`), its draw stores another alpha than
+/// Metal's over the sweeps, which the runtime leaves to the device's conversion
 #[test]
 fn mode_2_render_states_are_decided_once_made() {
     use reims_vgpu_core::platform::resource::Library as _;
@@ -3091,7 +3094,15 @@ fn mode_2_render_states_are_decided_once_made() {
         (7, 1),
         (8, 0),
     ]];
-    let dies: [Blob<'_>; 2] = [(&[], &additive), (&["05 04 01000000"], &written)];
+    let dies: [Blob<'_>; 1] = [(&["05 04 01000000"], &written)];
+    let made: [Blob<'_>; 6] = [
+        made[0],
+        made[1],
+        made[2],
+        made[3],
+        made[4],
+        (&[], &additive),
+    ];
     for (entries, colours) in made {
         assert!(
             matches!(state::<VulkanPlatform>(&d, entries, colours), Ok(Some(_))),
@@ -3110,12 +3121,36 @@ fn mode_2_render_states_are_decided_once_made() {
             "{entries:?} {colours:?}"
         );
     }
+    let blended = Drawn {
+        colour: &additive[0][2..],
+        ..PLAIN
+    };
+    let p = platform();
+    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, blended)
+    });
+    assert!(line.contains("blended-write-rounding"), "{line}");
     if let Some(md) = &metal {
         assert!(state::<MetalPlatform>(md, &[], &refused).is_err());
         for (entries, colours) in made.into_iter().chain(dies) {
             assert!(
                 matches!(state::<MetalPlatform>(md, entries, colours), Ok(Some(_))),
                 "{entries:?} {colours:?}"
+            );
+        }
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let covered = Drawn {
+            render: &["05 04 01000000"],
+            ..PLAIN
+        };
+        for kind in [0, 1, 3] {
+            let ours = crate::answer::relaxed(|| {
+                swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, covered)
+            });
+            let theirs = swept(&mp, md, (false, NEAREST_EVEN), (115, 8), kind, covered);
+            assert!(
+                ours != theirs,
+                "the covered alpha's sweep {kind} stores Metal's"
             );
         }
     }
@@ -3750,23 +3785,51 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
 }
 
 /// The bytes of a 256 by 256 texture of `format`, `bytes` a texel, after `write_fragment`
-/// writes the sweep `kind` (`rounding.metal`) into it, bound at fragment texture 0, under a
-/// [`texture_writing_state`] of `textureWriteRoundingMode` `mode`, drawn over an `RGBA8Unorm`
-/// colour attachment.
+/// writes the sweep `kind` (`rounding.metal`) into it, bound at fragment texture 0, or, where
+/// `held`, `write_args_fragment` through the argument buffer at fragment buffer 1 that holds its
+/// ID, made resident for writing, under a [`texture_writing_state`] of
+/// `textureWriteRoundingMode` `mode`, drawn over an `RGBA8Unorm` colour attachment.
 fn fragment_written<P: Platform>(
     p: &P,
     d: &P::Device,
-    mode: u32,
+    (mode, held): (u32, bool),
     (format, bytes): (u64, u64),
     kind: u32,
 ) -> Vec<u8> {
-    let state = texture_writing_state::<P>(d, mode, "write_fragment", false)
+    use reims_vgpu_core::platform::blit::ResourceRef;
+    use reims_vgpu_core::platform::resource::Texture as _;
+
+    let fragment = if held {
+        "write_args_fragment"
+    } else {
+        "write_fragment"
+    };
+    let state = texture_writing_state::<P>(d, mode, fragment, false)
         .unwrap()
         .unwrap()
         .unwrap();
     let t = texture(p, d, format, READ | 2, (256, 256), None);
     let target = texture(p, d, 70, READ | TARGET, (256, 256), None);
     let kinds = buffer::<P>(d, 4, 0, &kind.to_le_bytes());
+    let args = buffer::<P>(d, 8, 0, &t.gpu_resource_id().to_le_bytes());
+    let resident = [Some(ResourceRef::Texture(&t))];
+    let bind = match held {
+        true => vec![
+            RenderCmd::SetFragmentBuffer {
+                buffer: Some(&args),
+                offset: 0,
+                index: 1,
+            },
+            RenderCmd::UseResources {
+                resources: &resident,
+                usage: 2,
+            },
+        ],
+        false => vec![RenderCmd::SetFragmentTexture {
+            texture: Some(&t),
+            index: 0,
+        }],
+    };
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let pass = p.render_pass_descriptor();
@@ -3788,19 +3851,26 @@ fn fragment_written<P: Platform>(
             offset: 0,
             index: 0,
         },
-        RenderCmd::SetFragmentTexture {
-            texture: Some(&t),
-            index: 0,
-        },
+    ]
+    .into_iter()
+    .chain(bind)
+    .chain([
         RenderCmd::DrawPrimitives {
             primitive_type: 3,
             vertex_start: 0,
             vertex_count: 3,
         },
         RenderCmd::EndEncoding,
-    ] {
+    ]) {
         e.encode(OnFault::Die, cmd).unwrap();
     }
+    // The draw's command buffer completes before the copy's is made: in one command buffer,
+    // Metal's copy read some texels the draw writes through the argument buffer before the
+    // writes landed (measured here, other texels each run).
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let length = 256 * 256 * bytes;
     let out = buffer::<P>(d, length, 0, &[]);
     let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -3836,9 +3906,9 @@ fn fragment_written<P: Platform>(
 /// `RG16Float`, `RGBA16Float`), which Metal's mode 2 rounds to nearest even, or of
 /// `RG11B10Float`, which it rounds otherwise than its default (in the sweep through unorm
 /// values; past 1 and past the largest half as its default), dies at the draw's selector,
-/// and so does one writing `RGBX16Float` or `RGB9E5Float`, which nothing measured at the mode
-/// ([`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`]). At modes 0 and 1 every format's
-/// writes that Metal's are compared with are Metal's
+/// naming the runtime's refusal of a write at the mode it has not built, and so does one writing
+/// `RGBX16Float` or `RGB9E5Float`, which nothing measured at the mode. At modes 0 and 1 every
+/// format's writes that Metal's are compared with are Metal's
 #[test]
 fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3849,15 +3919,12 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let draw = |format: (u64, u64), kind| {
-        let site =
-            catch_death(|| fragment_written(&p, &d, NEAREST_EVEN, format, kind)).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
-                "drawPrimitives:vertexStart:vertexCount:"
-            ),
-            "{format:?} sweep {kind}"
+        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+            fragment_written(&p, &d, (NEAREST_EVEN, false), format, kind)
+        });
+        assert!(
+            line.contains("TextureWriteRounding"),
+            "{format:?} sweep {kind}: {line}"
         );
     };
     let half = [(25, 2), (65, 4), (115, 8)];
@@ -3869,10 +3936,10 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     for kind in [0, 1, 3] {
         for format in rest.into_iter().chain(rounded) {
             for mode in 0..=2 {
-                let theirs = fragment_written(&mp, &md, mode, format, kind);
+                let theirs = fragment_written(&mp, &md, (mode, false), format, kind);
                 if mode == NEAREST_EVEN && rounded.contains(&format) {
                     draw(format, kind);
-                    let rounds = theirs != fragment_written(&mp, &md, 0, format, kind);
+                    let rounds = theirs != fragment_written(&mp, &md, (0, false), format, kind);
                     if format == rg11b10 {
                         rg11b10_rounded.extend(rounds.then_some(kind));
                     } else {
@@ -3883,7 +3950,7 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
                     }
                     continue;
                 }
-                let ours = fragment_written(&p, &d, mode, format, kind);
+                let ours = fragment_written(&p, &d, (mode, false), format, kind);
                 assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
             }
         }
@@ -3899,84 +3966,51 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
 }
 
 /// A render state of `textureWriteRoundingMode` 2 whose fragment function writes a texture
-/// through an argument buffer is made, as Metal's is, and its draw dies, as which textures
-/// it writes no draw tells; one of `supportIndirectCommandBuffers`, whose indirect commands'
-/// draws tell nothing either, dies as it is made, where Metal makes it. At modes 0 and 1
-/// both are made
+/// through an argument buffer is made, as Metal's is, of `supportIndirectCommandBuffers` or not,
+/// and so is each at modes 0 and 1. Its draw writes Metal's bytes into an `RGBA8Unorm` or an
+/// `RGBA32Float` texture the buffer holds, which Metal's mode 2 writes as its default does, as a
+/// state of mode 0 does, over the sweeps through unorm values, past 1 by float steps and past
+/// the largest half; it dies at the draw, naming the runtime's refusal, where the buffer holds a
+/// texture of a half-float format or `RG11B10Float`, whose write at the mode the runtime has not
+/// built
 #[test]
-fn mode_2_fragment_writes_through_handles_die() {
+fn mode_2_fragment_writes_through_handles_are_metals_or_die_at_the_draw() {
     use crate::gpu::serialized::NEAREST_EVEN;
-    use reims_vgpu_core::raise::death::DeathKind;
 
     type V = crate::platform::VulkanPlatform;
     let d = dev();
     let p = platform();
-    if let Some(md) = MetalPlatform::system_default_device() {
-        for mode in 0..=2 {
-            for icb in [false, true] {
+    let md = MetalPlatform::system_default_device();
+    for mode in 0..=2 {
+        for icb in [false, true] {
+            let made = texture_writing_state::<V>(&d, mode, "write_args_fragment", icb);
+            assert!(matches!(made, Ok(Ok(Some(_)))), "{mode} {icb}");
+            if let Some(md) = &md {
                 let made =
-                    texture_writing_state::<MetalPlatform>(&md, mode, "write_args_fragment", icb);
+                    texture_writing_state::<MetalPlatform>(md, mode, "write_args_fragment", icb);
                 assert!(matches!(made, Ok(Ok(Some(_)))), "Metal: {mode} {icb}");
             }
         }
     }
-    for mode in [0, 1] {
-        for icb in [false, true] {
-            let made = texture_writing_state::<V>(&d, mode, "write_args_fragment", icb);
-            assert!(matches!(made, Ok(Ok(Some(_)))), "{mode} {icb}");
+    for format in [(115, 8), (25, 2), (92, 4)] {
+        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+            fragment_written(&p, &d, (NEAREST_EVEN, true), format, 0)
+        });
+        assert!(line.contains("TextureWriteRounding"), "{format:?}: {line}");
+    }
+    let Some(md) = md else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    for format in [(70, 4), (125, 16)] {
+        for kind in [0, 1, 3] {
+            for mode in [0, NEAREST_EVEN] {
+                let ours = fragment_written(&p, &d, (mode, true), format, kind);
+                let theirs = fragment_written(&mp, &md, (mode, true), format, kind);
+                assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
+            }
         }
     }
-    let site = catch_death(|| {
-        texture_writing_state::<V>(&d, NEAREST_EVEN, "write_args_fragment", true).is_ok()
-    })
-    .unwrap_err();
-    assert_eq!(
-        (site.kind, site.file),
-        (
-            DeathKind::Abort,
-            "newRenderPipelineStateWithDescriptor:options:reflection:error:"
-        )
-    );
-    let state = texture_writing_state::<V>(&d, NEAREST_EVEN, "write_args_fragment", false)
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let target = texture(&p, &d, 70, READ | TARGET, (16, 16), None);
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let pass = p.render_pass_descriptor();
-    let attachment = ColorAttachmentSet {
-        texture: Some(Some(&target)),
-        load_action: Some(CLEAR),
-        store_action: Some(STORE),
-        ..ColorAttachmentSet::default()
-    };
-    pass.set_color_attachment(OnFault::Die, 0, &attachment)
-        .unwrap();
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    e.encode(
-        OnFault::Die,
-        RenderCmd::SetRenderPipelineState {
-            pipeline_state: Some(&state),
-        },
-    )
-    .unwrap();
-    let site = catch_death(|| {
-        e.encode(
-            OnFault::Die,
-            RenderCmd::DrawPrimitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-            },
-        )
-        .is_ok()
-    })
-    .unwrap_err();
-    assert_eq!(
-        (site.kind, site.file),
-        (DeathKind::Abort, "drawPrimitives:vertexStart:vertexCount:")
-    );
 }
 
 /// The resolved bytes of a 256 by 256 `format` (`bytes` a texel) colour attachment of

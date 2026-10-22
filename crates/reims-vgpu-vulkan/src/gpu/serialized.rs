@@ -106,36 +106,30 @@
 //!   `7bff` and infinity), and its other writes, depth among them, are the same, but for the
 //!   textures its fragment function writes of `RG11B10Float`, which Metal's mode 2 rounds
 //!   otherwise than its default (the runtime's probe, on the M3 Max as on the M4), and of
-//!   `RGB9E5Float` and `RGBX16Float`, which nothing measured at this mode. The runtime's writes
-//!   are Metal's default, but for a render state of its
-//!   `TextureWriteRoundingMode::NearestEven`, which a render blob of mode 2 ([`NEAREST_EVEN`])
-//!   decodes to: its half-float colour attachments that store the fragment function's output as
-//!   written (no blend, or one adding the source at one to the destination at zero) round to
-//!   nearest even, as Metal's do, whether the function outputs a `float` or a `half` (byte for byte
-//!   over the sweeps, unblended and one-and-zero, `R16Float`, `RG16Float` and `RGBA16Float`), of 1,
-//!   2 or 4 samples: Metal's mode 2 rounds each sample of a multisampled attachment as a write of
-//!   one sample, and its resolve does not take the mode, as the runtime's (measured at 2 and 4
-//!   samples, fully covered and a quarter pixel in, resolved by the drawing pass and by a later one
-//!   that loads the samples and draws nothing; the runtime's device rounds the average at a tie as
-//!   at mode 0, which it announces as `device-rounded-resolve`; Metal's device here makes none
-//!   of 8 samples, so nothing measured them). The rest of its rounding is not built, so a mode 2
-//!   state is decided once the runtime made it, as Metal's compile answers a refusal with the
-//!   `NSError` first ([`rounded_writes`]): one with a fragment function (none where rasterization
-//!   is off) that may write a half-float colour attachment ([`MODE_2_ATTACHMENT_FORMATS`], of a
-//!   write mask with a channel, at an index the function has an output for:
-//!   `fragment_color_outputs`) of another sample count, whose resolve nothing measured at this
-//!   mode, or blended otherwise, or
-//!   whose alpha alpha to coverage reads, or that may write a texture (`fragment_writes_textures`)
-//!   and supports indirect command buffers, whose commands' draws tell nothing of the textures,
-//!   dies there. A half-float attachment no output names is never written, so nothing of it rounds,
-//!   and its state is made. So is one whose fragment function may write a texture otherwise. The
-//!   runtime takes no mode for a texture write, for every format: it rounds a half-float one
-//!   toward zero, and an `RG11B10Float` one by the device's conversion. So a draw under such a
-//!   state dies at its selector where the function may write a texture of a half-float format
-//!   (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`), of `RG11B10Float` or of
-//!   `RGB9E5Float` ([`MODE_2_TEXTURE_FORMATS`]), and runs where it writes only textures of other
-//!   formats, which Metal's mode 2 writes as its default does ([`rounded_texture_writes`]). Every
-//!   other state of a mode the device supports is made as at the default.
+//!   `RGB9E5Float` and `RGBX16Float`, which nothing measured at this mode. The runtime decodes
+//!   mode 2 to its `TextureWriteRoundingMode::NearestEven` ([`NEAREST_EVEN`]) and builds it: its
+//!   half-float colour attachments round to nearest even, as Metal's do, whether the function
+//!   outputs a `float` or a `half` (byte for byte over the sweeps, unblended and one-and-zero,
+//!   `R16Float`, `RG16Float` and `RGBA16Float`), of 1, 2 or 4 samples:
+//!   Metal's mode 2 rounds each sample of a multisampled attachment as a write of one sample, and
+//!   its resolve does not take the mode, as the runtime's (measured at 2 and 4 samples, fully
+//!   covered and a quarter pixel in, resolved by the drawing pass and by a later one that loads
+//!   the samples and draws nothing; the runtime's device rounds the average at a tie as at mode 0,
+//!   which it announces as `device-rounded-resolve`; Metal's device here makes none of 8
+//!   samples, so nothing measured them). A blend of other factors the device's blend rounds by
+//!   its own rule, which the runtime announces at the draw (`blended-write-rounding`); the alpha
+//!   alpha to coverage reads it leaves to the device's conversion (`device-color-conversion`),
+//!   which MoltenVK rounds toward zero, where Metal rounds it to nearest even. A fragment
+//!   function's texture write of a half-float or small-float format it refuses, not built: as the
+//!   state is made where the function's slot declares the format, else at a draw or an execution
+//!   that binds such a texture at a slot the function writes, or reaches one through a heap or an
+//!   argument buffer. So a mode 2 state is decided once the runtime made it, as Metal's compile
+//!   answers a refusal with the `NSError` first, and dies there where a half-float colour
+//!   attachment it writes ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an
+//!   index the function has an output for: `fragment_color_outputs`) is of a sample count whose
+//!   resolve nothing measured at this mode, or is `RGBA16Float` at colour 0 under alpha to
+//!   coverage with alpha in its write mask ([`rounded_writes`]). Every other state of a mode the
+//!   device supports is made as at the default.
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
@@ -166,9 +160,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use metal2vulkan::metal::{
-    AttributeFormat, BlendFactor, BlendOperation, ColorWriteMask, IndexType, Mutability,
-    PixelFormat, PrimitiveTopologyClass, TextureWriteRoundingMode, VertexFormat,
-    VertexStepFunction,
+    AttributeFormat, ColorWriteMask, IndexType, Mutability, PixelFormat, PrimitiveTopologyClass,
+    TextureWriteRoundingMode, VertexFormat, VertexStepFunction,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, PrivateRenderState,
@@ -185,7 +178,6 @@ use reims_vgpu_core::rt::Hold;
 use crate::answer::{metal_aborts, plain, unrepresentable};
 use crate::gpu::metal_value;
 use crate::gpu::resource::VulkanFunction;
-use crate::gpu::writes::Slots;
 use crate::platform::VulkanPlatform;
 
 /// The compute form's selector.
@@ -455,23 +447,6 @@ pub const MODE_2_ATTACHMENT_FORMATS: [PixelFormat; 3] = [
     PixelFormat::RGBA16Float,
 ];
 
-/// The formats of the textures a fragment function writes that a render state of
-/// [`NEAREST_EVEN`] may write otherwise than the runtime, which takes no mode for a texture write
-/// (the module docs): the half-float formats `R16Float`, `RG16Float`, `RGBA16Float` and
-/// `RGBX16Float`, which the runtime rounds toward zero, where Metal's mode 2 rounds the first
-/// three to nearest even (`RGBX16Float`'s are not measured); `RG11B10Float`, which the runtime
-/// writes by the device's conversion, where Metal's mode 2 rounds it otherwise than its default;
-/// and `RGB9E5Float`, which nothing measured at this mode. A draw that may write a texture of one
-/// dies ([`rounded_texture_writes`]).
-pub const MODE_2_TEXTURE_FORMATS: [PixelFormat; 6] = [
-    PixelFormat::R16Float,
-    PixelFormat::RG16Float,
-    PixelFormat::RGBA16Float,
-    PixelFormat::RGBX16Float,
-    PixelFormat::RG11B10Float,
-    PixelFormat::RGB9E5Float,
-];
-
 /// The runtime's rounding of a render blob's `textureWriteRoundingMode` `mode`, one of
 /// [`ROUNDING_MODES`]: nearest even at [`NEAREST_EVEN`], else toward zero, Metal's default.
 fn texture_write_rounding(mode: u32) -> TextureWriteRoundingMode {
@@ -481,59 +456,34 @@ fn texture_write_rounding(mode: u32) -> TextureWriteRoundingMode {
     }
 }
 
-/// Whether colour attachment `c` stores what the fragment function writes as written: it blends
-/// nothing, or blends by adding the source at factor one to the destination at factor zero, in
-/// its colour and its alpha alike.
-fn stores_as_written(c: &ColorAttachmentDescriptor) -> bool {
-    let replace = (BlendFactor::One, BlendFactor::Zero, BlendOperation::Add);
-    !c.blending_enabled
-        || ((
-            c.source_rgb_blend_factor,
-            c.destination_rgb_blend_factor,
-            c.rgb_blend_operation,
-        ) == replace
-            && (
-                c.source_alpha_blend_factor,
-                c.destination_alpha_blend_factor,
-                c.alpha_blend_operation,
-            ) == replace)
-}
-
-/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that Metal rounds to nearest
-/// even and the runtime does not, `None` where its writes are the runtime's (the module docs).
-/// The runtime rounds a half-float colour attachment's channels to nearest even where the
-/// attachment stores the fragment function's output as written ([`stores_as_written`]), as
-/// Metal does, of a state of one sample or of a count of [`RESOLVE_MEASURED`], whose resolve Metal
-/// takes from the samples so rounded, as the runtime does (the module docs); with a fragment
-/// function that rasterizes (with rasterization off none runs), these stay:
-/// - a half-float colour attachment whose write mask has a channel to write and whose index the
-///   function has an output for (`color_outputs`, the state's `fragment_color_outputs`), of a
-///   state of another sample count, whose resolve nothing measured at this mode
-///   ([`resolve_measured`]);
-/// - one that blends otherwise, whose result Metal rounds to nearest even and the runtime's
-///   device converts by its own rounding;
+/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that Metal rounds otherwise
+/// than the runtime, or that nothing measured at this mode, `None` where its writes are Metal's
+/// (the module docs). With a fragment function that rasterizes (with rasterization off none
+/// runs), these stay, of a half-float colour attachment whose write mask has a channel to write
+/// and whose index the function has an output for (`color_outputs`, the state's
+/// `fragment_color_outputs`):
+/// - one of a state of a sample count above one whose resolve nothing measured at this mode
+///   ([`resolve_measured`]): the runtime rounds each sample as Metal does, and Metal's resolve
+///   does not take the mode at 2 and 4 samples, as the runtime's does not; Metal's device here
+///   makes none of 8;
 /// - `RGBA16Float` at colour 0 under alpha to coverage, of a write mask with alpha, whose alpha
-///   the runtime leaves to the device's conversion;
-/// - a texture where the function may write one and the state supports indirect command buffers
-///   (`commands_write_textures`: the descriptor's `supportIndirectCommandBuffers` and the
-///   state's `fragment_writes_textures`), which the runtime does not round at this mode: an
-///   indirect command's draw runs it with no draw here to tell the textures it writes. A state
-///   without that support is made, and its draws decide its texture writes
-///   ([`rounded_texture_writes`]). This is the narrowing that remains: Metal makes such a state,
-///   and one that writes only textures of other formats runs as Metal's would; deciding it at an
-///   execution needs what its commands' argument buffers hold.
+///   the runtime leaves to the device's conversion (`device-color-conversion`, which MoltenVK
+///   rounds toward zero), where Metal rounds it to nearest even (`encode_render`'s
+///   `mode_2_render_states_are_decided_once_made`).
+///
+/// The rest of the mode is the runtime's: it rounds the half-float attachments to nearest even,
+/// blended or not, announcing a blend of other factors than one and zero, which the device's
+/// blend rounds by its own rule (`blended-write-rounding`), and refuses a fragment function's
+/// half-float and small-float texture writes, which it has not built: where the function's slot
+/// declares such a format as the state is made, else at a draw or an execution that binds such a
+/// texture at a slot the function writes or reaches one through a heap or an argument buffer.
 ///
 /// An attachment no output names is never written, so nothing of it rounds.
-pub fn rounded_writes(
-    desc: &RenderPipelineDescriptor,
-    color_outputs: &[u32],
-    commands_write_textures: bool,
-) -> Option<String> {
+pub fn rounded_writes(desc: &RenderPipelineDescriptor, color_outputs: &[u32]) -> Option<String> {
     if desc.fragment.is_none() || !desc.rasterization_enabled {
         return None;
     }
-    let half = desc
-        .color_attachments
+    desc.color_attachments
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -554,10 +504,6 @@ pub fn rounded_writes(
                     "of {samples} samples, whose resolve at this mode nothing measured (Metal's \
                      was measured at 1 sample and at each of {RESOLVE_MEASURED:?})"
                 )
-            } else if !stores_as_written(&c) {
-                "blended with factors or operations other than one, zero and add, whose result \
-                 the runtime's device converts by its own rounding"
-                    .into()
             } else if coverage_alpha {
                 "whose alpha alpha to coverage reads, which the runtime leaves to the device's \
                  conversion"
@@ -569,65 +515,6 @@ pub fn rounded_writes(
                 "colour attachment {index} of {}, {why}",
                 c.pixel_format.name()
             ))
-        });
-    half.or_else(|| {
-        commands_write_textures.then(|| {
-            "a fragment function that may write a texture, of a state that supports indirect \
-             command buffers, whose indirect commands' draws tell nothing of the textures it \
-             writes, and whose half-float writes the runtime does not round at this mode"
-                .into()
-        })
-    })
-}
-
-/// What a draw under a render state of [`NEAREST_EVEN`] whose fragment function may write a
-/// texture (the state's `fragment_writes_textures`) may write that Metal's mode 2 writes
-/// otherwise than the runtime, or that nothing measured at the mode, `None` where it writes no
-/// texture of one of [`MODE_2_TEXTURE_FORMATS`] there (the module docs): `fragment`, the
-/// function's slots by the state's reflection, or why it cannot tell them, and `formats`, the
-/// fragment stage's texture slots holding a texture of one of [`MODE_2_TEXTURE_FORMATS`], by
-/// Metal's name of its format (a view's own). These stay:
-/// - a texture of one of those formats bound at a slot the function writes (`access::write` or
-///   `access::read_write`);
-/// - a function that reaches textures through handles (an argument buffer's), whose textures no
-///   draw tells, or whose slots the reflection cannot tell;
-/// - a function that writes no slot and takes no handles, whose texture writes go by a path the
-///   reflection does not show.
-///
-/// A texture of any other format is written as Metal's default writes it, which Metal's mode 2
-/// writes alike (measured: the module docs), so the draw runs.
-pub fn rounded_texture_writes(
-    fragment: Result<&Slots, &str>,
-    formats: &BTreeMap<u64, &'static str>,
-) -> Option<String> {
-    let f = match fragment {
-        Ok(f) => f,
-        Err(why) => {
-            return Some(format!(
-                "a fragment function that may write textures, at slots its reflection cannot \
-                 tell ({why})"
-            ));
-        }
-    };
-    if f.handles {
-        return Some(
-            "a fragment function that may write textures through handles (an argument \
-             buffer's), whose formats no draw tells"
-                .into(),
-        );
-    }
-    if f.textures.is_empty() {
-        return Some(
-            "a fragment function that may write textures by a path its reflection does not \
-             show (no texture slot it writes, and no handles)"
-                .into(),
-        );
-    }
-    formats
-        .iter()
-        .find(|&(&slot, _)| f.texture(slot))
-        .map(|(slot, name)| {
-            format!("texture {slot} of {name}, at a slot the fragment function writes")
         })
 }
 
@@ -654,31 +541,15 @@ fn resolve_measured(samples: u32) -> bool {
 pub(crate) static RESOLVE_PROBED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-/// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of a draw or
-/// an execution of indirect commands that inherit the encoder's state, under a render state of
-/// [`NEAREST_EVEN`] whose fragment function may write `what` ([`rounded_texture_writes`]): the
-/// runtime rounds those writes by its default.
-pub fn rounded_texture_writes_inexact(sel: &'static str, what: &str) {
-    crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
-        format!(
-            "a draw or execution under a state of textureWriteRoundingMode {NEAREST_EVEN:#x}, \
-             with {what}: Metal's mode 2 rounds a fragment function's texture writes of \
-             R16Float, RG16Float, RGBA16Float and RG11B10Float otherwise than its default, and \
-             nothing measured RGBX16Float's and RGB9E5Float's, where the runtime takes no mode \
-             for a texture write"
-        )
-    });
-}
-
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of a render
 /// state of [`NEAREST_EVEN`] that writes `what` ([`rounded_writes`]): the state is made, and
-/// rounds those writes by the runtime's default.
+/// stores those writes by the runtime's rules.
 pub fn rounded_writes_inexact(sel: &'static str, what: &str) {
     crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
         format!(
-            "textureWriteRoundingMode {NEAREST_EVEN:#x} of a descriptor with {what}: Metal rounds \
-             the fragment function's half-float writes there to nearest even, and the runtime \
-             rounds to nearest even only an attachment that stores them as written"
+            "textureWriteRoundingMode {NEAREST_EVEN:#x} of a descriptor with {what}: Metal \
+             rounds the fragment function's half-float writes there to nearest even, and the \
+             runtime is not measured to store them so"
         )
     });
 }
@@ -2935,63 +2806,15 @@ pub(crate) mod tests {
         ))
     }
 
-    /// A draw under a mode 2 state whose fragment function may write textures names what may
-    /// write a texture of one of [`MODE_2_TEXTURE_FORMATS`]: one bound at a slot the function
-    /// writes, and any where the function takes handles, writes no slot, or its reflection cannot
-    /// tell; one bound at a slot the function does not write runs, and so does every draw with
-    /// none bound
-    #[test]
-    fn rounded_texture_writes_name_what_may_write_a_half_float_texture() {
-        use crate::gpu::writes::Slots;
-
-        let mut writes = Slots::default();
-        writes.textures.push(0..2);
-        let at = |slot| BTreeMap::from([(slot, "RGBA16Float")]);
-        let none = BTreeMap::new();
-        let named = rounded_texture_writes(Ok(&writes), &at(1)).unwrap();
-        assert!(named.starts_with("texture 1 of RGBA16Float"), "{named}");
-        assert_eq!(rounded_texture_writes(Ok(&writes), &at(2)), None);
-        assert_eq!(rounded_texture_writes(Ok(&writes), &none), None);
-        let handles = Slots {
-            handles: true,
-            ..writes.clone()
-        };
-        for untold in [
-            rounded_texture_writes(Ok(&handles), &none),
-            rounded_texture_writes(Ok(&Slots::default()), &none),
-            rounded_texture_writes(Err("a refused reflection"), &none),
-        ] {
-            assert!(untold.is_some());
-        }
-    }
-
-    /// A mode 2 draw decides its fragment function's texture writes of the four half-float
-    /// formats, `RG11B10Float` and `RGB9E5Float`, whose writes the runtime takes no mode for; a
-    /// mode 2 state decides its colour attachments of the three half-float formats the runtime
-    /// rounds to nearest even, each also a texture format a draw decides
+    /// A mode 2 state decides its colour attachments of the three half-float formats the runtime
+    /// rounds to nearest even
     #[test]
     fn mode_2_decides_the_formats_it_may_write_otherwise() {
         use PixelFormat as F;
         let names = |formats: &[PixelFormat]| formats.iter().map(|f| f.name()).collect::<Vec<_>>();
         assert_eq!(
-            names(&MODE_2_TEXTURE_FORMATS),
-            names(&[
-                F::R16Float,
-                F::RG16Float,
-                F::RGBA16Float,
-                F::RGBX16Float,
-                F::RG11B10Float,
-                F::RGB9E5Float
-            ])
-        );
-        assert_eq!(
             names(&MODE_2_ATTACHMENT_FORMATS),
             names(&[F::R16Float, F::RG16Float, F::RGBA16Float])
-        );
-        assert!(
-            MODE_2_ATTACHMENT_FORMATS
-                .iter()
-                .all(|f| MODE_2_TEXTURE_FORMATS.contains(f))
         );
     }
 
@@ -3015,7 +2838,7 @@ pub(crate) mod tests {
             assert_eq!(d.nearest_even, mode == NEAREST_EVEN, "{mode}");
             // As the creator decides it: only a state decoded to nearest even.
             d.nearest_even
-                .then(|| rounded_writes(&d.desc, &[0], false))
+                .then(|| rounded_writes(&d.desc, &[0]))
                 .flatten()
         };
         let named = of(8, NEAREST_EVEN).unwrap_or_default();
@@ -3058,11 +2881,7 @@ pub(crate) mod tests {
                     let (d, _) = rendered(&rounded_render_of(entries, &[colour], mode), &f);
                     let kept = d.desc.fragment.is_some();
                     assert_eq!(kept, fragment, "{mode} {format} {entries:?}");
-                    assert_eq!(
-                        rounded_writes(&d.desc, &[0], false),
-                        None,
-                        "{mode} {format}"
-                    );
+                    assert_eq!(rounded_writes(&d.desc, &[0]), None, "{mode} {format}");
                     assert_eq!(d.nearest_even, mode == NEAREST_EVEN, "{mode} {format}");
                 }
                 let (d, _) = rendered(&rounded_render(mode, format), &f);

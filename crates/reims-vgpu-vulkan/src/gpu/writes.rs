@@ -7,9 +7,7 @@
 //! ([`crate::os::dropped_write`]): a blit's (`crate::gpu::encode_blit`), a dispatch's
 //! (`crate::gpu::predication`) and a draw's (`crate::gpu::encode_render`). So does a dispatch's
 //! or a draw's write through a texture of a 4:4:4 two-plane YCbCr format whose writes the runtime
-//! refuses ([`crate::gpu::ycbcr::refused_write`]). A render state that
-//! rounds its texture writes as the runtime does not reads its fragment function's slots too
-//! ([`crate::gpu::serialized::rounded_texture_writes`]).
+//! refuses ([`crate::gpu::ycbcr::refused_write`]).
 //!
 //! A write through an object over memory the runtime imports through a writable twin of
 //! read-only pages ([`Memory::kept`]; on Linux, [`crate::os::TWINS_READ_ONLY`]) would reach those

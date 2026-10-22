@@ -386,10 +386,6 @@ pub struct RenderEncoderObject {
     varying_rates: bool,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
-    /// The state set, where it rounds texture writes as the runtime does not, and the fragment
-    /// stage's textures of a format whose writes it may round so: a draw that may write one dies
-    /// ([`RoundedTextures`]).
-    rounded: Mutex<RoundedTextures>,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
@@ -399,68 +395,6 @@ pub struct RenderEncoderObject {
     /// Whether it drew primitive type 9, which Metal's GPU hangs at: its end holds what comes
     /// after it ([`VulkanRenderEncoder::hangs`]).
     hung: AtomicBool,
-}
-
-/// What a draw under a render state of `textureWriteRoundingMode` 2 whose fragment function may
-/// write a texture may write that Metal's mode 2 writes otherwise than the runtime, or that
-/// nothing measured at the mode ([`crate::gpu::serialized::rounded_texture_writes`]): the
-/// state's reflection, and the fragment stage's slots holding a texture of one of
-/// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], as the guest binds them, a view by its own
-/// format.
-#[derive(Debug, Default, Clone)]
-struct RoundedTextures {
-    /// The reflection of the state set, where it rounds texture writes otherwise than the
-    /// runtime ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
-    state: Option<Arc<Reflection>>,
-    /// The fragment stage's slots holding a texture of one of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], each with Metal's name of it.
-    formats: BTreeMap<u64, &'static str>,
-}
-
-impl RoundedTextures {
-    /// `textures` bound to the fragment stage from slot `first`, to the last slot a `u64` names: a
-    /// slot past `u32`, which the runtime cannot hold, dies at the command's selector after it
-    /// ([`small`]).
-    fn bind(&mut self, first: u64, textures: &[Option<&VulkanTexture>]) {
-        for (slot, t) in (first..=u64::MAX).zip(textures) {
-            self.formats.remove(&slot);
-            let format = t
-                .map(|t| t.raw.pixel_format())
-                .filter(|f| crate::gpu::serialized::MODE_2_TEXTURE_FORMATS.contains(f));
-            if let Some(format) = format {
-                self.formats.insert(slot, format.name());
-            }
-        }
-    }
-
-    /// The pipeline state of `reflection` set, which rounds texture writes otherwise than the
-    /// runtime where `rounds` ([`StateFacts::rounds`]).
-    fn set(&mut self, reflection: &Arc<Reflection>, rounds: bool) {
-        self.state = rounds.then(|| Arc::clone(reflection));
-    }
-
-    /// What a draw, or an execution whose commands inherit the state set (`execution`), may
-    /// write under the state set that Metal's mode 2 writes otherwise than the runtime, `None`
-    /// where it writes no texture of one of [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`]
-    /// ([`crate::gpu::serialized::rounded_texture_writes`]).
-    /// An execution's commands bind no texture, and reach one only through an argument buffer,
-    /// whose formats nothing tells.
-    fn rounded(&self, execution: bool) -> Option<String> {
-        let reflection = self.state.as_ref()?;
-        if execution {
-            return Some(
-                "indirect commands that inherit it, whose fragment function may write the \
-                 textures their argument buffers hold, whose formats nothing here tells"
-                    .into(),
-            );
-        }
-        let fragment = reflection.slots().and_then(|slots| {
-            slots
-                .get(FRAGMENT)
-                .ok_or("a state of no fragment function's")
-        });
-        crate::gpu::serialized::rounded_texture_writes(fragment, &self.formats)
-    }
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -473,9 +407,6 @@ pub(crate) struct StateFacts {
     /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
     /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
     writes: [bool; 3],
-    /// Whether it rounds texture writes otherwise than the runtime
-    /// ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
-    rounds: bool,
     /// [`Marks::flat`].
     flat: bool,
     /// [`Marks::barycentric`].
@@ -494,7 +425,6 @@ impl StateFacts {
     /// What `state` tells.
     fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
         let raw = &state.raw;
-        let rounds = state.rounds_texture_writes();
         let apart = match state.reflection.descriptor() {
             Some(Reflected::Render(RenderDescriptor::Render(d))) => {
                 half_apart(d, &plain(|| raw.fragment_color_outputs()))
@@ -507,7 +437,6 @@ impl StateFacts {
                 raw.fragment_writes_textures(),
                 raw.tile_writes_textures(),
             ],
-            rounds,
             flat: raw.has_flat_fragment_inputs(),
             barycentric: raw.reads_barycentric_coord(),
             routed: raw.writes_render_target_array_index() || raw.writes_viewport_array_index(),
@@ -1815,7 +1744,6 @@ fn opened(
         rasterizes,
         varying_rates,
         reach: Mutex::new(Reach::default()),
-        rounded: Mutex::new(RoundedTextures::default()),
         bfloat_loaded: bfloat_loaded(&d),
         nan_resolve_kept: nan_resolve_kept(&d),
         pass: d,
@@ -2362,17 +2290,6 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw, or an
-    /// execution whose commands inherit the encoder's state (`execution`), under a state that
-    /// rounds texture writes otherwise than the runtime, where it may write a texture of one of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`] ([`RoundedTextures::rounded`]). One
-    /// that draws nothing, which writes nothing, is not asked.
-    fn rounds(&self, sel: &'static str, execution: bool) {
-        if let Some(what) = plain(|| self.rounded.lock().rounded(execution)) {
-            crate::gpu::serialized::rounded_texture_writes_inexact(sel, &what);
-        }
-    }
-
     /// Runs `call` on the open encoder for `sel`: a refusal dies at the send, naming the
     /// runtime's error, as Metal raises at none of these commands.
     fn run(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
@@ -2445,7 +2362,7 @@ impl VulkanRenderEncoder {
     /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
     /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
     /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
-    /// may write ([`Self::issues`], [`Self::rounds`]) and the indirect commands its state may
+    /// may write ([`Self::issues`]) and the indirect commands its state may
     /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
     /// ([`Self::primitives`]).
     fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
@@ -2454,7 +2371,6 @@ impl VulkanRenderEncoder {
             self.layered(sel);
             self.sized(sel, shape);
             self.issues(sel, None);
-            self.rounds(sel, false);
             self.encodes(sel, "a draw");
         }
     }
@@ -2603,9 +2519,6 @@ impl VulkanRenderEncoder {
         if !empty {
             self.layered(sel);
             self.issues(sel, Some(icb.inherits));
-            if icb.inherits.pipeline {
-                self.rounds(sel, true);
-            }
         }
         let inherits_pipeline = icb.inherits.pipeline;
         if !empty && self.rotates(sel, Shape::Execution { inherits_pipeline }) {
@@ -3321,7 +3234,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.set_fragment_sampler_states(&list, None, at))
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
-                plain(|| self.rounded.lock().bind(index, &[texture]));
                 let index = small(sel, index);
                 let texture = texture.map(|t| t.texels(sel));
                 self.run(sel, &mut |e| e.set_fragment_texture(texture, index))
@@ -3331,7 +3243,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                plain(|| self.rounded.lock().bind(u64::from(at), list));
                 let list = textures(sel, list);
                 encoded(&mut |e| e.set_fragment_textures(&list, at))
             }
@@ -3391,7 +3302,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     plain(|| {
                         *self.nil_pipeline.lock() = false;
                         self.reach.lock().set(&state.reflection, f.writes);
-                        self.rounded.lock().set(&state.reflection, f.rounds);
                         let mut m = self.marks.lock();
                         m.flat = f.flat;
                         m.barycentric = f.barycentric;

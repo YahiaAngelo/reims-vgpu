@@ -680,9 +680,8 @@ pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
 /// for one ([`nil_pipeline_descriptor`]). A pixel format the runtime holds raw dies here
 /// ([`serialized::RawFormat`]). A blob's `textureWriteRoundingMode` of
 /// [`serialized::NEAREST_EVEN`] is decided once the runtime made the state, its compile's refusal
-/// staying the `NSError`: it dies where Metal rounds a write the state may make otherwise than
-/// the runtime ([`serialized::rounded_writes`]), but a texture write of a state without indirect
-/// command buffer support, which its draws decide ([`serialized::rounded_texture_writes`]).
+/// staying the `NSError`: it dies where the state writes what nothing measured at the mode
+/// ([`serialized::rounded_writes`]).
 pub(crate) fn new_render_pipeline_state_from_descriptor(
     device: &VulkanDevice,
     descriptor: Option<&VulkanRenderPipelineDescriptor>,
@@ -709,13 +708,8 @@ pub(crate) fn new_render_pipeline_state_from_descriptor(
                 });
             if descriptor.nearest_even
                 && let Ok(raw) = &state
-                && let Some(what) = plain(|| {
-                    serialized::rounded_writes(
-                        &d,
-                        &raw.fragment_color_outputs(),
-                        d.support_indirect_command_buffers && raw.fragment_writes_textures(),
-                    )
-                })
+                && let Some(what) =
+                    plain(|| serialized::rounded_writes(&d, &raw.fragment_color_outputs()))
             {
                 serialized::rounded_writes_inexact(sel, &what);
             }

@@ -1074,24 +1074,6 @@ pub enum RenderDescriptor {
     Tile(Box<TileRenderPipelineDescriptor>),
 }
 
-impl RenderPipelineObject {
-    /// Whether the state is of `textureWriteRoundingMode` 2, the runtime's
-    /// `TextureWriteRoundingMode::NearestEven` (a guest's blob of it), and its fragment function
-    /// may write a texture: its draws decide its texture writes of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], which Metal's mode 2 writes otherwise
-    /// than the runtime, or which nothing measured at the mode
-    /// ([`crate::gpu::serialized::rounded_texture_writes`]).
-    pub fn rounds_texture_writes(&self) -> bool {
-        let nearest_even = matches!(
-            self.reflection.descriptor(),
-            Some(Reflected::Render(RenderDescriptor::Render(d)))
-                if d.texture_write_rounding_mode
-                    == metal2vulkan::metal::TextureWriteRoundingMode::NearestEven
-        );
-        nearest_even && plain(|| self.raw.fragment_writes_textures())
-    }
-}
-
 /// `id<MTLRenderPipelineState>`.
 pub type VulkanRenderPipeline = Obj<RenderPipelineObject>;
 

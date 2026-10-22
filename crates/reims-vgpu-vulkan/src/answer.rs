@@ -1989,7 +1989,9 @@ pub enum Inexact {
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.
     BfloatLoaded,
-    /// A write under `textureWriteRoundingMode` 2 that the runtime rounds by its default.
+    /// A colour attachment write under `textureWriteRoundingMode` 2 the runtime stores otherwise
+    /// than Metal, or is not measured to store as Metal does: the alpha alpha to coverage reads,
+    /// and a resolve at a sample count nothing measured.
     WriteRounding,
     /// A heap texture's size, alignment or bytes in the heap the runtime answers or lays out as
     /// its device's image, where Metal's are not measured or are its own: a texture is made, and
