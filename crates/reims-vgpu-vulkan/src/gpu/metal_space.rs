@@ -405,15 +405,12 @@ pub fn paired(
 /// Metal's on every device, where the device's own answer, which a heap places the texture by,
 /// may be larger (`heap-texture-larger-than-metal`: every texture on NVIDIA, whose
 /// `bufferImageGranularity` is 1024 bytes) or is for a depth or stencil texture without
-/// GPU-optimized contents (`optimized-depth-stencil-texture`). Where the model has none (a format
-/// or a sample count whose layout is not measured), of `answer`, the runtime's answer to the
-/// query for a descriptor: Metal's for a depth or stencil texture without GPU-optimized contents
-/// ([`metal_size_and_align`]), else the runtime's for `desc`, which is Metal's but for such a
-/// texture of a format or storage Metal's is not measured for, at which a device's texture dies
-/// (`crate::gpu::device`), and but for the texture the model has none for (a PVRTC format; 8
-/// samples are refused first), whose size the runtime answers as its device's image's, larger
-/// or smaller than Metal's, and announces so (`unmeasured-heap-texture-size`,
-/// [`crate::answer::HEARD`]), at which a device's texture dies too ([`unmeasured_size`]).
+/// GPU-optimized contents (`optimized-depth-stencil-texture`), each of which the model answers.
+/// Where the model has none (a format or a sample count whose layout is not measured), of
+/// `answer`, the runtime's answer to the query for `desc`, which the runtime answers as its
+/// device's image's, larger or smaller than Metal's, and announces so
+/// (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]: a PVRTC format; 8 samples are
+/// refused first), at which a device's texture dies ([`unmeasured_size`]).
 ///
 /// The space takes a range or a slot by that size as for any texture ([`texture_space`]):
 /// `vaprobe depthsizes` took a slot of the size rounded up to [`SLOT_STEP`] in the private pool
@@ -424,10 +421,7 @@ pub fn own_heap_size(
     metal: Option<SizeAndAlign>,
     answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
 ) -> Option<u64> {
-    metal
-        .or_else(|| metal_size_and_align(desc, &answer))
-        .or_else(|| answer(desc))
-        .map(|answer| answer.size)
+    metal.or_else(|| answer(desc)).map(|answer| answer.size)
 }
 
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of `what` a

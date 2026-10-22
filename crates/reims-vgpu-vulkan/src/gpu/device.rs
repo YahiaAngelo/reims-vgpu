@@ -723,12 +723,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// the sizes are Metal's; [`crate::gpu::caps`]' list). The query hears the runtime announce
     /// it (`OptimizedDepthStencilTexture`, [`crate::answer::HEARD`]) and answers Metal's: the
     /// runtime's model of Metal's answer ([`VulkanDevice::metal_answer_at`]), the size
-    /// `newTextureWithDescriptor:` gives such a texture's range of Metal's space, and where the
-    /// model has none, Metal's made of the runtime's answers for colour formats
-    /// ([`metal_space::metal_size_and_align`]). It dies at the selector where neither answers. An
-    /// `X32_Stencil8` texture, which the model answers as a `Stencil8` one of its shape and the
-    /// colour rule does not, takes the model's, the Metal platform's answer at each shape
-    /// measured (`resource`'s `x32_stencil8_size_queries_are_metals`); it died here before. One of
+    /// `newTextureWithDescriptor:` gives such a texture's range of Metal's space, which answers
+    /// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8` textures, and an
+    /// `X32_Stencil8` one as a `Stencil8` one of its shape: the Metal platform's answer at each
+    /// shape measured (`resource`'s
+    /// `heap_depth_stencil_shapes_with_optimized_contents_off_are_metals` and
+    /// `x32_stencil8_size_queries_are_metals`). It dies at the selector where the model has
+    /// none. One of
     /// `ShaderAtomic` usage, at which Metal asserts, the runtime refuses first (`Invalid`), which
     /// dies at the selector too. A heap's placement of such a texture still
     /// dies where the runtime's size decides it, as its image needs that size in the heap
@@ -763,10 +764,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })
         });
         if heard.contains(&rt::Degradation::OptimizedDepthStencilTexture) {
-            let answer = |desc: &rt::TextureDescriptor| self.size_and_align_at(sel, desc);
-            let metal = (self.metal_answer_at(sel, &desc))
-                .or_else(|| metal_space::metal_size_and_align(&desc, answer));
-            match metal {
+            match self.metal_answer_at(sel, &desc) {
                 Some(metal) => return Ok(metal),
                 None => crate::gpu::resource::optimized_size(sel, "the size and alignment of"),
             }
