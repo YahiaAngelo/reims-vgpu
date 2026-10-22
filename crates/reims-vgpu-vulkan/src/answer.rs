@@ -1584,8 +1584,10 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
 
 /// The kinds of [`DIES`] that die by default too, not only in strict mode, as the guest or the
 /// host would otherwise go on past a break of what it relies on, which no log line repairs:
-/// - `ReleasedCommandState`: the command runs nothing, or another state's program, where Metal
-///   runs the state the GPU's write named;
+/// - `ReleasedCommandState`: a command whose record the GPU wrote naming a released state whose
+///   program the buffer does not keep runs nothing, and one naming the ID of a released state the
+///   CPU set, which another state held while the GPU could write the record, runs the set state's
+///   program, where Metal runs the state the GPU's write named in both;
 /// - `PrivateResourceOption`: the GPU's writes reach the guest's pages, which Metal's never do
 ///   for such a resource (announced off macOS for no-copy memory, as `DIES` says);
 /// - `HostDeallocatorDelayed`: the deallocator, which the host sees as the release, runs after
