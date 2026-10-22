@@ -2412,7 +2412,7 @@ const LEAST_KEPT: u32 = 256;
 /// as many or fewer draws over its first indices, and a pass's draws make one buffer a kind
 /// where each would make its own. The runtime holds each buffer for every command that draws
 /// over it until its command buffer completes, as for a buffer made for the draw, and nothing
-/// writes it after it is made.
+/// writes it after it is made; the encoder lets go of them at `endEncoding`.
 #[derive(Debug, Default)]
 struct OwnIndices(Vec<(Listed, u32, rt::Buffer)>);
 
@@ -3319,6 +3319,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let ended = self
                     .encoder
                     .end(sel, rt::RenderCommandEncoder::end_encoding);
+                // No draw follows: the command buffer holds the lists its draws took.
+                let kept = plain(|| std::mem::take(&mut *self.own_indices.lock()));
+                drop(kept);
                 if ended.is_ok()
                     && self.hung.load(Ordering::SeqCst)
                     && let Some(cb) = self.encoder.command_buffer()
