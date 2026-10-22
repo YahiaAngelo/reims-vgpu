@@ -1855,7 +1855,10 @@ impl Work<'_> {
                 ref check,
                 ..
             } => match check.take() {
-                Some(check) => e.execute_commands_in_buffer_checked(icb, range.clone(), check),
+                Some(check) => {
+                    let needs = rt::IndirectCommandCheckNeeds::ALL;
+                    e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
+                }
                 None => e.execute_commands_in_buffer(icb, range.clone()),
             },
             Work::ExecuteIndirect {
