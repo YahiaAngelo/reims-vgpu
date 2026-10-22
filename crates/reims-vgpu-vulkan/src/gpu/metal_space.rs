@@ -72,6 +72,8 @@
 //!   ([`FirstUse`]), which lie among the guest's ranges. How they grow with more work is not
 //!   modelled.
 
+mod gaps;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
@@ -987,6 +989,10 @@ impl Default for Samplers {
 pub struct MetalSpace {
     /// Each held run's first byte and its end. Runs never overlap.
     held: BTreeMap<u64, u64>,
+    /// The gaps between the held runs, for the lowest start a range fits at
+    /// ([`MetalSpace::lowest_gap`]), changed with `held` alone ([`MetalSpace::hold`],
+    /// [`MetalSpace::unhold`]).
+    gaps: gaps::Gaps,
     /// Whether the device's heap is held ([`BASE`]): from the space's first use.
     device: bool,
     /// Metal's own allocations made ([`FirstUse`]).
@@ -1004,6 +1010,7 @@ impl MetalSpace {
     pub const fn new() -> MetalSpace {
         MetalSpace {
             held: BTreeMap::new(),
+            gaps: gaps::Gaps::new(),
             device: false,
             own: BTreeSet::new(),
             pools: Vec::new(),
@@ -1025,7 +1032,7 @@ impl MetalSpace {
         if !self.device {
             self.device = true;
             let (_, span) = MetalSpace::plain_span(DEVICE_HEAP).unwrap_or_default();
-            self.held.insert(BASE, BASE + span);
+            self.hold(BASE, BASE + span);
         }
     }
 
@@ -1216,8 +1223,34 @@ impl MetalSpace {
             .map(|(&start, _)| start.max(range.start))
     }
 
-    /// The lowest [`SLOT`]-aligned start from [`BASE`] where `span` bytes are free.
+    /// `start..end` held from now on, in place of a run held from `start` before.
+    fn hold(&mut self, start: u64, end: u64) {
+        if self.held.contains_key(&start) {
+            self.unhold(start);
+        }
+        self.held.insert(start, end);
+        self.gaps.made(&self.held, start);
+    }
+
+    /// The run held from `start`, if any, free from now on.
+    fn unhold(&mut self, start: u64) {
+        if self.held.remove(&start).is_some() {
+            self.gaps.gone(&self.held, start);
+        }
+    }
+
+    /// The lowest [`SLOT`]-aligned start from [`BASE`] where `span` bytes are free: walking the
+    /// held runs in order, [`BASE`] or the first run's end rounded up to [`SLOT`] whose bytes end
+    /// at or before the next run's start, or past every run; `None` where they would pass [`END`].
+    /// The gaps answer the walk's start in O(log n) ([`gaps`]).
     fn lowest_gap(&self, span: u64) -> Option<u64> {
+        let at = self.gaps.lowest(span)?;
+        (at.checked_add(span)? <= END).then_some(at)
+    }
+
+    /// [`MetalSpace::lowest_gap`] by the walk itself, which the gaps answer as.
+    #[cfg(test)]
+    fn walked_gap(&self, span: u64) -> Option<u64> {
         let mut at = BASE;
         for (&start, &end) in &self.held {
             if end <= at {
@@ -1241,7 +1274,7 @@ impl MetalSpace {
         let (pages, span) = MetalSpace::plain_span(length)?;
         let start = self.lowest_gap(span)?;
         let end = start.checked_add(span)?;
-        self.held.insert(start, end);
+        self.hold(start, end);
         let pages_end = start.checked_add(pages)?;
         Some(Held {
             address: start,
@@ -1272,7 +1305,7 @@ impl MetalSpace {
         if let Some(held) = self.first_held(&requested) {
             return Err(PinRefused::Held { requested, held });
         }
-        self.held.insert(first, span_end);
+        self.hold(first, span_end);
         Ok(Held {
             address,
             pages: first..end,
@@ -1311,7 +1344,7 @@ impl MetalSpace {
     /// `held`'s resource released, or never made after all: its whole span free again, a
     /// pin's as a plain range's.
     pub fn release(&mut self, held: Held) {
-        self.held.remove(&held.pages.start);
+        self.unhold(held.pages.start);
     }
 }
 
@@ -1897,7 +1930,7 @@ mod tests {
         fn taken(&mut self, span: u64) -> u64 {
             self.device();
             let start = self.lowest_gap(span).unwrap();
-            self.held.insert(start, start + span);
+            self.hold(start, start + span);
             start
         }
     }
@@ -3555,6 +3588,82 @@ mod tests {
             })
             .collect();
         assert_eq!(spans, [0x8000, 0x10000, 0x10000, 0x18000, 0x18000]);
+    }
+
+    /// The gaps answer the lowest start where a range fits as the walk of the held runs does
+    /// ([`MetalSpace::lowest_gap`]), over random sequences of placements, pins (below the base,
+    /// over it, among the ranges and past the space's end) and releases, at spans of whole slots,
+    /// of parts of one, of none and past the space; and the space places the same ranges
+    #[test]
+    fn the_gaps_answer_the_lowest_start_as_the_walk_does() {
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..8 {
+            let mut space = MetalSpace::new();
+            let mut held: Vec<Held> = Vec::new();
+            for step in 0..3000 {
+                let roll = next() % 16;
+                if roll < 8 {
+                    // A placement, mostly of a few pages, now and then of many.
+                    let pages = if next() % 8 == 0 {
+                        next() % 512
+                    } else {
+                        next() % 6
+                    };
+                    let length = pages * PAGE + next() % PAGE;
+                    // A placement holds the device's range first.
+                    space.device();
+                    let expected =
+                        MetalSpace::plain_span(length).and_then(|(_, span)| space.walked_gap(span));
+                    let placed = space.place(length);
+                    let lowest = placed.as_ref().map(Held::address);
+                    assert_eq!(lowest, expected, "round {round} step {step}");
+                    held.extend(placed);
+                } else if roll < 10 {
+                    // A pin, aligned or not, below the base, among the ranges or far past them.
+                    let around = match next() % 4 {
+                        0 => BASE - (next() % 64) * SLOT,
+                        1 => START + (next() % 4096) * SLOT,
+                        2 => END - (next() % 8) * SLOT,
+                        _ => START + (next() % 4096) * PAGE,
+                    };
+                    let length = (next() % 8) * PAGE + next() % 0x100;
+                    if let Ok(pinned) = space.pin(around + next() % 2 * 0x10, length) {
+                        held.push(pinned);
+                    }
+                } else if !held.is_empty() {
+                    let at = usize::try_from(next()).unwrap() % held.len();
+                    space.release(held.swap_remove(at));
+                }
+                for span in [
+                    0,
+                    1,
+                    SLOT - 1,
+                    SLOT,
+                    SLOT + 1,
+                    2 * SLOT,
+                    3 * SLOT,
+                    (next() % 64) * SLOT,
+                    (next() % 1024) * SLOT,
+                    next() % (64 * SLOT),
+                    END - BASE,
+                    END,
+                    u64::MAX - next() % SLOT,
+                    u64::MAX,
+                ] {
+                    assert_eq!(
+                        space.lowest_gap(span),
+                        space.walked_gap(span),
+                        "round {round} step {step} span {span:#x}"
+                    );
+                }
+            }
+        }
     }
 
     /// The lowest freed range goes first, not the one freed last.
