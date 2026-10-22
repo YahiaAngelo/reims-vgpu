@@ -49,14 +49,13 @@
 //!   run.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::PrimitiveType;
 use metal2vulkan::pipeline::CommandWrites;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{get, plain, unrepresentable};
 use crate::gpu::command::Progress;
@@ -315,45 +314,16 @@ fn dies_unsized(at: &str) -> ! {
     )
 }
 
-/// What the commits know of an indirect command buffer's records.
-#[derive(Debug, Default)]
-struct Records {
-    /// How many committed command buffers that have not ended execute them as their commit read
-    /// them ([`reads`]).
-    readers: AtomicUsize,
-}
-
-/// The [`Records`] of each live indirect command buffer one was asked of.
-static RECORDS: Mutex<Vec<(Weak<IcbObject>, Arc<Records>)>> = Mutex::new(Vec::new());
-
 /// Whether `a` and `b` are one buffer.
 fn same(a: &VulkanIcb, b: &VulkanIcb) -> bool {
     std::ptr::eq::<IcbObject>(&**a, &**b)
-}
-
-/// The [`Records`] of `icb`, added where it had none.
-fn records(icb: &VulkanIcb) -> Arc<Records> {
-    plain(|| {
-        let mut records = RECORDS.lock();
-        records.retain(|(weak, _)| weak.strong_count() > 0);
-        let at = records
-            .iter()
-            .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), &**icb));
-        if let Some((_, r)) = at {
-            return Arc::clone(r);
-        }
-        let r = Arc::<Records>::default();
-        records.push((icb.downgrade(), Arc::clone(&r)));
-        r
-    })
 }
 
 /// A command encoded at `sel` may write `icb`'s records on the GPU (the module docs). It dies
 /// where a committed command buffer that has not ended executes them as its commit read them
 /// ([`reads`]): the write may land before those run.
 pub(crate) fn gpu_writes(sel: &'static str, icb: &VulkanIcb) {
-    let r = records(icb);
-    if r.readers.load(Ordering::SeqCst) != 0 {
+    if icb.readers.load(Ordering::SeqCst) != 0 {
         unrepresentable(
             sel,
             "a write on the GPU of the records of an indirect command buffer that a committed \
@@ -367,17 +337,17 @@ pub(crate) fn gpu_writes(sel: &'static str, icb: &VulkanIcb) {
 /// A committed command buffer of `progress` executes `icb` as its commit read its records,
 /// until it ends ([`gpu_writes`]).
 pub(super) fn reads(icb: &VulkanIcb, progress: &Progress) {
-    let r = records(icb);
-    r.readers.fetch_add(1, Ordering::SeqCst);
-    progress.hold(Read(r));
+    icb.readers.fetch_add(1, Ordering::SeqCst);
+    progress.hold(Read(Arc::clone(&icb.readers)));
 }
 
-/// A reader of [`Records`], which ends as its command buffer's progress lets go of it.
-struct Read(Arc<Records>);
+/// A reader of an indirect command buffer's records ([`IcbObject::readers`]), which ends as its
+/// command buffer's progress lets go of it.
+struct Read(Arc<AtomicUsize>);
 
 impl Drop for Read {
     fn drop(&mut self) {
-        self.0.readers.fetch_sub(1, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

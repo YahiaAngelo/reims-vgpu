@@ -104,7 +104,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use metal2vulkan::bind::indirect_commands::{BufferBinding, RECORDS_ID_LIMIT};
 use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
@@ -765,6 +765,9 @@ pub struct IcbObject {
     /// Which shape of those Metal's copies past a buffer's end were measured at it is, if any
     /// ([`OverrunShape::of`]).
     pub(crate) overrun_shape: Option<OverrunShape>,
+    /// How many committed command buffers that have not ended execute it as their commit read
+    /// its records ([`crate::gpu::command::executions::reads`]).
+    pub(crate) readers: Arc<AtomicUsize>,
 }
 
 /// A buffer of a shape Metal's copies of commands past a buffer's end were measured at, on this
@@ -1727,6 +1730,7 @@ pub(crate) fn new_indirect_command_buffer(
             ..Sides::default()
         })),
         overrun_shape,
+        readers: Arc::default(),
     })))
 }
 
