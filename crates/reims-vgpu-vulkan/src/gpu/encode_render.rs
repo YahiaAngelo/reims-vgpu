@@ -401,9 +401,6 @@ pub struct RenderEncoderObject {
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
-    /// The pass's multisampled float attachment it clears to a NaN and resolves, where it has
-    /// one: a draw the runtime records nothing for relays it ([`nan_resolve_kept`]).
-    nan_resolve_kept: Option<String>,
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -1161,9 +1158,8 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits
-/// (`rgbx`'s `nan_clears_are_metals`), but for the resolve of a multisampled float attachment in
-/// a pass whose only draws record nothing, at which such a draw dies ([`nan_resolve_kept`]).
+/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits, and
+/// so is its resolve (`rgbx`'s `nan_clears_are_metals`).
 /// A colour attachment that resolves into a texture of another format the runtime refuses is
 /// made without the resolve where plain Metal was measured to leave the texture untouched, in
 /// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
@@ -1238,55 +1234,6 @@ pub(crate) fn open(
         plain(|| e.reach.lock().visibility = visibility);
     }
     made
-}
-
-/// The multisampled 32-bit float colour attachment (`R32Float`, `RG32Float`, `RGBA32Float`) of
-/// the pass `d` that it clears to a NaN other than the plain quiet one as a `float` (Metal clears
-/// to the double's conversion, its sign and top payload bits kept) and resolves, if any, named: a
-/// draw the runtime records nothing for relays it, or in strict mode dies
-/// ([`RenderEncoderObject::empty_drawn`]). Metal counts that draw a draw call, and its resolve
-/// stores `0x7fc00000` in the NaN's channels; the runtime's resolve of a pass whose only draws
-/// record nothing keeps the NaN's bits where Metal keeps the texture compressed and both sides
-/// are 16 or more (`rgbx`'s `nan_clears_are_metals`, the M3 Max: a negative NaN resolves to
-/// `ffc00000`), and stores Metal's word elsewhere, which this does not tell apart. A pass with a
-/// draw the runtime records resolves as Metal's, and so does every other clear to a NaN, which
-/// the runtime writes as Metal does (its `nan_clear.rs`).
-fn nan_resolve_kept(d: &rt::RenderPassDescriptor) -> Option<String> {
-    d.color_attachments
-        .iter()
-        .enumerate()
-        .find_map(|(index, a)| {
-            let t = a.texture.as_ref()?;
-            let channels = match t.pixel_format() {
-                PixelFormat::R32Float => 1,
-                PixelFormat::RG32Float => 2,
-                PixelFormat::RGBA32Float => 4,
-                _ => return None,
-            };
-            let resolves = a.resolve_texture.is_some()
-                && matches!(
-                    a.store_action,
-                    rt::StoreAction::MultisampleResolve
-                        | rt::StoreAction::StoreAndMultisampleResolve
-                );
-            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 || !resolves {
-                return None;
-            }
-            let c = a.clear_color;
-            let values = [c.red, c.green, c.blue, c.alpha];
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the clear's channel as Metal converts it to a float"
-            )]
-            let kept = |v: &f64| (*v as f32).is_nan() && (*v as f32).to_bits() != 0x7fc0_0000;
-            values[..channels].iter().any(kept).then(|| {
-                format!(
-                    "the {}-sample colour attachment {index} ({}) cleared to {values:?}",
-                    t.sample_count(),
-                    t.pixel_format().name()
-                )
-            })
-        })
 }
 
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
@@ -1721,7 +1668,6 @@ fn opened(
         varying_rates,
         reach: Mutex::new(Reach::default()),
         bfloat_loaded: bfloat_loaded(&d),
-        nan_resolve_kept: nan_resolve_kept(&d),
         pass: d,
     });
     if let Some(what) = aborts {
@@ -2088,24 +2034,6 @@ impl VulkanRenderEncoder {
         drawn
     }
 
-    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw the
-    /// runtime records nothing for, of no vertices, indices, patches or instances (`nothing`), in
-    /// a pass that clears a multisampled float attachment to a NaN and resolves it
-    /// ([`nan_resolve_kept`]): the runtime's resolve may keep the NaN's bits there, where Metal's
-    /// stores `0x7fc00000`. A draw of vertices that make no primitive records the draw, and the
-    /// pass resolves as Metal's.
-    fn empty_drawn(&self, sel: &'static str, nothing: bool) {
-        if nothing && let Some(attachment) = &self.nan_resolve_kept {
-            crate::answer::inexact(sel, crate::answer::Inexact::Clear, || {
-                format!(
-                    "a draw of nothing in a pass that resolves {attachment}, whose NaN the \
-                     runtime's resolve keeps where the pass draws nothing else, where Metal \
-                     counts the draw and resolves to 0x7fc00000"
-                )
-            });
-        }
-    }
-
     /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw (of
     /// anything, or of nothing), an execution of render commands or a tile dispatch, in a pass
     /// that loads and stores a bfloat colour attachment ([`bfloat_loaded`]): the tiles the pass
@@ -2163,9 +2091,9 @@ impl VulkanRenderEncoder {
     /// commit dies where it fails another way too
     /// ([`crate::gpu::command::CommandBufferObject::fails_at_type_9`]), and asks the pass's rate
     /// map as a draw does ([`Self::layered`]): Metal's failure was measured in no pass over a rate
-    /// map. One that fails nothing is a draw the runtime records nothing of
-    /// ([`Self::empty_drawn`]). After `setRenderPipelineState:` of nil it dies as every draw does
-    /// ([`Self::pipelined`]), and with no pipeline state set, which nothing measured, it dies.
+    /// map. One that fails nothing is a draw the runtime records nothing of. After
+    /// `setRenderPipelineState:` of nil it dies as every draw does ([`Self::pipelined`]), and with
+    /// no pipeline state set, which nothing measured, it dies.
     fn nine(
         &self,
         sel: &'static str,
@@ -2183,8 +2111,6 @@ impl VulkanRenderEncoder {
         if let Some(error) = fails {
             self.layered(sel);
             self.encoder.fails_at_type_9(error.metal_code());
-        } else {
-            self.empty_drawn(sel, true);
         }
         self.run(sel, call)
     }
@@ -2414,7 +2340,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
-                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_indexed_patches(
                         points,
@@ -2528,7 +2453,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
-                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_patches(
                         points,
@@ -3457,7 +3381,6 @@ impl VulkanRenderEncoder {
             return self.nine(sel, hang, &mut |e| call(e, t));
         }
         self.pipelined(sel);
-        self.empty_drawn(sel, count == 0 || instances == 0);
         let empty = instances == 0 || draws_none(t, count);
         self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call)
     }
@@ -3496,7 +3419,6 @@ impl VulkanRenderEncoder {
             return self.nine(sel, fault, &mut |e| call(e, (t, i)));
         }
         let empty = instances == 0 || kinds.is_some_and(|(t, _)| draws_none(t, count));
-        self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
         let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
         self.draw(sel, (drawn, empty), call)
     }

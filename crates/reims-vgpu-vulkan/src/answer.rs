@@ -58,7 +58,7 @@
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
-//! blend, a NaN or bfloat clear, a bfloat attachment's codes, a `textureWriteRoundingMode` the
+//! blend, a bfloat attachment's codes, a `textureWriteRoundingMode` the
 //! runtime does not take), or an answer it gives otherwise (a texture of protection options made
 //! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
 //! of an indirect command buffer made after an encoder), is relayed alike, its first occurrence
@@ -2043,9 +2043,6 @@ pub enum Inexact {
     /// or converted at its attachment (`HalfOutputPrecision`, `crate::gpu::encode_render`'s
     /// `half_apart`).
     HalfOutputBlend,
-    /// A multisampled float attachment cleared to a NaN whose resolve, in a pass that draws
-    /// nothing but a draw of nothing, the runtime stores otherwise than Metal.
-    Clear,
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.
     BfloatLoaded,
@@ -2103,9 +2100,8 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 14] = [
         Self::HalfOutputBlend,
-        Self::Clear,
         Self::BfloatLoaded,
         Self::WriteRounding,
         Self::HeapLayout,
@@ -2125,7 +2121,6 @@ impl Inexact {
     pub const fn code(self) -> &'static str {
         match self {
             Self::HalfOutputBlend => "inexact-half-output-blend",
-            Self::Clear => "inexact-clear",
             Self::BfloatLoaded => "inexact-bfloat-loaded",
             Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
@@ -2759,7 +2754,6 @@ mod tests {
         for kind in Inexact::ALL {
             match kind {
                 Inexact::HalfOutputBlend
-                | Inexact::Clear
                 | Inexact::BfloatLoaded
                 | Inexact::WriteRounding
                 | Inexact::HeapLayout
@@ -2784,22 +2778,22 @@ mod tests {
     fn an_inexact_value_is_relayed_but_in_strict_mode() {
         let counted = || {
             (inexact_counts().into_iter())
-                .find(|&(k, _)| k == Inexact::Clear)
+                .find(|&(k, _)| k == Inexact::LineWidth)
                 .map_or(0, |(_, n)| n)
         };
         let before = counted();
-        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
-        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
         let site = reims_vgpu_core::testkit::capture::catch_death(|| {
-            inexact("sel:", Inexact::Clear, || "a value".into());
+            inexact("sel:", Inexact::LineWidth, || "a value".into());
         })
         .unwrap_err();
         assert_eq!(site.file, "sel:");
         let line = LAST_LINE.lock().take().unwrap_or_default();
         assert!(line.contains("cannot hold a value"), "{line}");
-        assert!(line.contains("(inexact-clear)"), "{line}");
+        assert!(line.contains("(inexact-line-width)"), "{line}");
         assert_eq!(counted(), before + 2);
     }
 

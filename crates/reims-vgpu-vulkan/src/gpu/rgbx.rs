@@ -1993,12 +1993,10 @@ const CLEAR_NANS: [u64; 5] = [
 /// of `RENDER` usage, which Metal keeps losslessly compressed, and of shader writes too, which it
 /// keeps uncompressed; at one sample, and at two and four of the half, float and `RG11B10Float`
 /// formats, the resolve's bytes and, at 16 a side, each sample's; in a pass with no draw call,
-/// and, of the plain and the negative NaN, in one with a draw call of no vertices or of one. A
-/// draw of none in a pass that clears a multisampled float attachment to a NaN other than the
-/// plain quiet one and resolves it dies, naming the clear (`encode_render`'s
-/// `nan_resolve_kept`): the runtime's resolve keeps a negative NaN's bits (`ffc00000`) at 16 a
-/// side of `RENDER` usage, where Metal counts the draw and resolves to `7fc00000`. The runtime
-/// refuses a pass of an RGBX format (the module docs), and of a multisampled extended-range one,
+/// and, of the plain and the negative NaN, in one with a draw call of no vertices or of one, the
+/// resolve of a multisampled float attachment cleared to a NaN in a pass whose draw draws nothing
+/// among them (Metal counts the draw and resolves to `7fc00000`, which the runtime writes after
+/// the pass, its `nan_clear.rs`). The runtime refuses a pass of an RGBX format (the module docs), and of a multisampled extended-range one,
 /// whatever it clears to; Metal makes no multisampled texture of a bfloat format, nor a bfloat
 /// view of one
 #[test]
@@ -2029,18 +2027,6 @@ fn nan_clears_are_metals() {
         (550, 4, "RGB10A8_2P_XR10", &[1]),
         (551, 4, "RGB10A8_2P_XR10_sRGB", &[1]),
     ];
-    // Whether the draw of none in a pass of a clear of `format` at `samples` samples to `colour`
-    // dies, naming the clear: of a float format of a NaN other than the plain quiet one.
-    let held = |format, samples, colour: [f64; 4]| {
-        let channels = match format {
-            55 => 1,
-            105 => 2,
-            125 => 4,
-            _ => 0,
-        };
-        let unplain = |v: &f64| v.is_nan() && v.to_bits() != CLEAR_NANS[0];
-        samples > 1 && colour[..channels].iter().any(unplain)
-    };
     let mut differ = Vec::new();
     let mut cases = 0;
     for (format, texel, name, counts) in formats {
@@ -2066,23 +2052,6 @@ fn nan_clears_are_metals() {
                         let mine =
                             survived(|| nan_cleared(&ours, (format, texel), shape, colour, drawn));
                         cases += 1;
-                        if drawn == Some(0) && held(format, samples, colour) {
-                            let named = "a draw of nothing in a pass that resolves";
-                            match mine {
-                                Err((site, line))
-                                    if (site.kind, site.file)
-                                        == (
-                                            DeathKind::Abort,
-                                            "drawPrimitives:vertexStart:vertexCount:",
-                                        )
-                                        && line.contains(named) => {}
-                                Err((site, line)) => {
-                                    differ.push(format!("{of}: died at {site:?}: {line}"));
-                                }
-                                Ok(_) => differ.push(format!("{of}: drew")),
-                            }
-                            continue;
-                        }
                         match mine {
                             Ok(Some(mine)) if mine == metals => {}
                             Ok(None) => differ.push(format!("{of}: no texture made")),
