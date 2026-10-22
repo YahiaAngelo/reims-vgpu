@@ -1081,10 +1081,9 @@ pub fn create<T>(
 ///   strip whose vertex function computes `[[primitive_id]]` into its varying reads each
 ///   primitive's last vertex's, and a layer or viewport selected in a synthesized geometry stage
 ///   comes from each primitive's first vertex (`ProvokingVertexUnmatched`). On every device a
-///   mode from 2 up, which Metal draws a third way, is drawn as mode 1, announced at the setter
-///   (`ProvokingVertexUnmatched`). Announced at each such draw, or at the setter, inside its
-///   call, which dies at its selector. No mode reaches the runtime's setter here: this platform
-///   draws the last provoking vertex itself ([`crate::gpu::encode_render`]);
+///   mode from 2 up, its top bit set or not, which Metal draws a third way, is drawn as mode 1,
+///   announced at the setter (`ProvokingVertexUnmatched`). Announced at each such draw, or at the
+///   setter, inside its call, which dies at its selector;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -2075,10 +2074,6 @@ pub enum Inexact {
     /// (a host's release the runtime has not measured, a format's description or view at a
     /// release other than macOS 26.7).
     MetalLevel,
-    /// A draw at the last vertex provoking, under a state that reads a flat input, barycentrics
-    /// or a layer or viewport index, which has no exact rotation: drawn as it stands, its first
-    /// vertex provoking.
-    ProvokingVertex,
     /// Lines at a line width other than 1: drawn 1 pixel wide.
     LineWidth,
     /// A draw or tile dispatch in a pass of a rasterization rate map whose rates vary, or a tile
@@ -2110,14 +2105,13 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::HalfOutputBlend,
         Self::Clear,
         Self::BfloatLoaded,
         Self::WriteRounding,
         Self::HeapLayout,
         Self::MetalLevel,
-        Self::ProvokingVertex,
         Self::LineWidth,
         Self::RateMap,
         Self::YcbcrView,
@@ -2136,7 +2130,6 @@ impl Inexact {
             Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
             Self::MetalLevel => "inexact-metal-level",
-            Self::ProvokingVertex => "inexact-provoking-vertex",
             Self::LineWidth => "inexact-line-width",
             Self::RateMap => "inexact-rate-map",
             Self::YcbcrView => "inexact-ycbcr-view",
@@ -2767,7 +2760,6 @@ mod tests {
                 | Inexact::WriteRounding
                 | Inexact::HeapLayout
                 | Inexact::MetalLevel
-                | Inexact::ProvokingVertex
                 | Inexact::LineWidth
                 | Inexact::RateMap
                 | Inexact::YcbcrView

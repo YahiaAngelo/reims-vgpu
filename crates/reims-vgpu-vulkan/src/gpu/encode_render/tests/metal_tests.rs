@@ -725,68 +725,579 @@ fn set_draw<P: Platform>(
     )
 }
 
-/// A list or strip of triangles under a state with a flat input draws what Metal draws at
-/// every provoking vertex mode, the last vertex's colour filling each triangle after a
-/// nonzero one, from vertex 0 and later, one instance and two
+/// A guest's state of the fixtures `vertex` and `fragment` for a BGRA8 target, with the render
+/// descriptor's `entries` past its functions' (key 11 the input primitive topology class, 12 the
+/// tessellation partition mode, 25 indirect command buffer support), decoded from a blob as core
+/// decodes one.
+fn blob_state<P: Platform>(
+    d: &P::Device,
+    (vertex, fragment): (&str, &str),
+    entries: &[&str],
+) -> P::RenderPipeline {
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::serialized::tests::hex;
+
+    let functions = [fixture::<P>(d, vertex), fixture::<P>(d, fragment)];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    // The colour attachments' array follows the entries, its own entry among them, at a 4-byte
+    // boundary.
+    let n = entries.len() + 3;
+    let end = 1 + 6 * n;
+    let at = end.next_multiple_of(4);
+    let blob = hex(&format!(
+        "{n:02x} 08 04 {at:02x}000000 01 04 01000000 02 04 02000000 {} {} \
+         01000000 08000000 02 00 04 00000000 01 04 50000000",
+        entries.join(" "),
+        "00".repeat(at - end)
+    ));
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+/// A draw of [`provoked`]'s: `(type, start, count, instances)` over the vertices; over `indices`
+/// of an index type, from a base vertex, of instances; from indirect arguments, over `indices`
+/// too; or an execution of an indirect command buffer's one command of `count` vertices of a type
+/// from vertex 0, which inherits the encoder's state and buffers or sets its own.
+#[derive(Clone, Copy, Debug)]
+enum Provoked<'a> {
+    Vertices(u64, u64, u64, u64),
+    Indices {
+        primitive_type: u64,
+        index_type: u64,
+        indices: &'a [u32],
+        base_vertex: i64,
+        instances: u64,
+    },
+    Indirect(u64, [u32; 4]),
+    IndexedIndirect {
+        primitive_type: u64,
+        index_type: u64,
+        indices: &'a [u32],
+        arguments: [u32; 5],
+    },
+    Executed {
+        inherits: bool,
+        primitive_type: u64,
+        count: u64,
+    },
+}
+
+/// The bytes of `indices` as indices of `index_type`, a 16-bit one each index's low half.
+fn index_bytes(index_type: u64, indices: &[u32]) -> Vec<u8> {
+    if index_type == U16 {
+        let low = |i: u32| u16::try_from(i & 0xffff).unwrap();
+        indices.iter().flat_map(|&i| low(i).to_le_bytes()).collect()
+    } else {
+        u32s(indices)
+    }
+}
+
+/// The pixels of [`pass_pixels`] after `draw` under a state of the fixtures `functions` (of
+/// indirect command buffer support for an execution) over [`flat_vertices`] in buffers 0 and 1,
+/// at `setProvokingVertexMode:` of `mode`, after `restart`'s `setPrimitiveRestartEnabled:index:`
+/// where it has one.
+fn provoked<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    functions: (&str, &str),
+    (mode, restart): (u64, Option<(bool, u64)>),
+    draw: Provoked<'_>,
+) -> Vec<[u8; 4]> {
+    use reims_vgpu_core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
+    use reims_vgpu_core::platform::values::IcbDesc;
+
+    let executed = matches!(draw, Provoked::Executed { .. });
+    let entries: &[&str] = if executed { &["19 04 01000000"] } else { &[] };
+    let state = blob_state::<P>(d, functions, entries);
+    let (pos, colours) = flat_vertices::<P>(d, 64);
+    let (indices, arguments) = match draw {
+        Provoked::Indices {
+            index_type,
+            indices,
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
+        Provoked::Indirect(_, arguments) => (Vec::new(), u32s(&arguments)),
+        Provoked::IndexedIndirect {
+            index_type,
+            indices,
+            arguments,
+            ..
+        } => (index_bytes(index_type, indices), u32s(&arguments)),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let index_buffer = buffer::<P>(d, 256, 0, &indices);
+    let indirect_buffer = buffer::<P>(d, 64, 0, &arguments);
+    let icb = match draw {
+        Provoked::Executed {
+            inherits,
+            primitive_type,
+            count,
+        } => {
+            let icb = d
+                .new_indirect_command_buffer(
+                    &IcbDesc {
+                        command_types: 1,
+                        inherit_pipeline_state: inherits,
+                        inherit_buffers: inherits,
+                        max_vertex_buffer_bind_count: 2,
+                        ..IcbDesc::default()
+                    },
+                    1,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+            let c = icb.render_command(0).unwrap().unwrap();
+            let mut cmds = Vec::new();
+            if !inherits {
+                cmds.extend([
+                    IcbRenderCmd::SetRenderPipelineState {
+                        pipeline_state: Some(&state),
+                    },
+                    IcbRenderCmd::SetVertexBuffer {
+                        buffer: Some(&pos),
+                        offset: 0,
+                        index: 0,
+                    },
+                    IcbRenderCmd::SetVertexBuffer {
+                        buffer: Some(&colours),
+                        offset: 0,
+                        index: 1,
+                    },
+                ]);
+            }
+            cmds.push(IcbRenderCmd::DrawPrimitives {
+                primitive_type,
+                vertex_start: 0,
+                vertex_count: count,
+                instance_count: 1,
+                base_instance: 0,
+            });
+            for cmd in cmds {
+                c.encode(cmd).unwrap();
+            }
+            Some(icb)
+        }
+        _ => None,
+    };
+    let used = icb.as_ref().map(|icb| {
+        [
+            Some(ResourceRef::Icb(icb)),
+            Some(ResourceRef::Buffer(&pos)),
+            Some(ResourceRef::Buffer(&colours)),
+        ]
+    });
+    let mut cmds = vec![
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&pos),
+            offset: 0,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&colours),
+            offset: 0,
+            index: 1,
+        },
+    ];
+    if let Some((enabled, index)) = restart {
+        cmds.push(RenderCmd::SetPrimitiveRestartEnabled { enabled, index });
+    }
+    cmds.push(RenderCmd::SetProvokingVertexMode { mode });
+    match draw {
+        Provoked::Vertices(primitive_type, start, count, instances) => {
+            cmds.push(RenderCmd::DrawPrimitivesInstances {
+                primitive_type,
+                vertex_start: start,
+                vertex_count: count,
+                instance_count: instances,
+            });
+        }
+        Provoked::Indices {
+            primitive_type,
+            index_type,
+            indices,
+            base_vertex,
+            instances,
+        } => cmds.push(RenderCmd::DrawIndexedPrimitivesBase {
+            primitive_type,
+            index_count: u64::try_from(indices.len()).unwrap(),
+            index_type,
+            index_buffer: &index_buffer,
+            index_buffer_offset: 0,
+            instance_count: instances,
+            base_vertex,
+            base_instance: 0,
+        }),
+        Provoked::Indirect(primitive_type, _) => cmds.push(RenderCmd::DrawPrimitivesIndirect {
+            primitive_type,
+            indirect_buffer: &indirect_buffer,
+            indirect_buffer_offset: 0,
+        }),
+        Provoked::IndexedIndirect {
+            primitive_type,
+            index_type,
+            ..
+        } => cmds.push(RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type,
+            index_type,
+            index_buffer: &index_buffer,
+            index_buffer_offset: 0,
+            indirect_buffer: &indirect_buffer,
+            indirect_buffer_offset: 0,
+        }),
+        Provoked::Executed { .. } => {
+            let (icb, used) = (icb.as_ref().unwrap(), used.as_ref().unwrap());
+            cmds.extend([
+                RenderCmd::UseResources {
+                    resources: used,
+                    usage: 1,
+                },
+                RenderCmd::ExecuteCommandsInBuffer {
+                    indirect_command_buffer: icb,
+                    execution_range: NsRange::new(0, 1),
+                },
+            ]);
+        }
+    }
+    pass_pixels(p, d, cmds)
+}
+
+/// A draw of `indices` of `index_type` as `primitive_type`, from `base_vertex`, of `instances`.
+fn over<'a>(
+    (primitive_type, index_type): (u64, u64),
+    indices: &'a [u32],
+    (base_vertex, instances): (i64, u64),
+) -> Provoked<'a> {
+    Provoked::Indices {
+        primitive_type,
+        index_type,
+        indices,
+        base_vertex,
+        instances,
+    }
+}
+
+/// Indices of a list of three triangles, of a strip of six, of a strip restarting at the 16-bit
+/// all-ones index after one triangle, then of five more (the 32-bit all-ones index at the same
+/// place), and of a strip of eleven indices restarting at 3 after one triangle.
+const LIST: &[u32] = &[5, 0, 9, 1, 7, 3, 2, 8, 4];
+const STRIP_OF_SIX: &[u32] = &[0, 3, 1, 4, 2, 5, 7, 6];
+const RESTARTED: &[u32] = &[0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 8];
+const RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 0xffff_ffff, 4, 5, 6, 7, 8];
+const RESTARTED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9];
+
+/// A state with a flat input draws at `setProvokingVertexMode:` 0 and 1 what Metal draws at
+/// every kind of draw of triangles: lists and strips over their vertices, from vertex 0 and
+/// later, of one instance and two; over 16- and 32-bit indices from a base vertex; strips
+/// restarting at the all-ones index and at the index `setPrimitiveRestartEnabled:index:` set,
+/// each piece its own parity; from indirect arguments, over indices too; Metal's private types
+/// 6 to 8; and an execution of an indirect command buffer's strip or list, whose commands take
+/// the first vertex at both modes, inheriting the encoder's state or with their own. The last
+/// vertex's colours fill the triangles at mode 1, but an execution's. A draw of too few
+/// vertices for a triangle draws nothing at either mode
 #[test]
-fn a_flat_input_takes_the_provoking_vertex_metal_takes() {
+fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    let executed = |inherits, primitive_type, count| Provoked::Executed {
+        inherits,
+        primitive_type,
+        count,
+    };
+    let cases = [
+        (Provoked::Vertices(3, 0, 6, 1), None),
+        (Provoked::Vertices(3, 1, 9, 2), None),
+        (Provoked::Vertices(STRIP, 0, 5, 1), None),
+        (Provoked::Vertices(STRIP, 3, 8, 2), None),
+        (Provoked::Vertices(6, 2, 6, 2), None),
+        (Provoked::Vertices(7, 1, 8, 1), None),
+        (Provoked::Vertices(8, 0, 8, 1), None),
+        (over((3, U16), LIST, (2, 1)), None),
+        (over((3, U32), LIST, (0, 2)), None),
+        (over((STRIP, U16), STRIP_OF_SIX, (0, 1)), None),
+        (over((STRIP, U32), STRIP_OF_SIX, (1, 1)), None),
+        (over((STRIP, U16), RESTARTED, (0, 1)), None),
+        (over((STRIP, U32), RESTARTED_WIDE, (0, 2)), None),
+        (over((STRIP, U16), RESTARTED_AT_3, (0, 1)), Some((true, 3))),
+        (over((STRIP, U32), RESTARTED_AT_3, (0, 1)), Some((false, 3))),
+        (Provoked::Indirect(3, [9, 2, 1, 0]), None),
+        (Provoked::Indirect(STRIP, [8, 1, 3, 0]), None),
+        (indirect(STRIP, U16, RESTARTED, [10, 1, 0, 0, 0]), None),
+        (indirect(3, U32, LIST, [9, 1, 0, 2, 0]), None),
+        (executed(true, STRIP, 7), None),
+        (executed(false, STRIP, 7), None),
+        (executed(false, 3, 9), None),
+    ];
     let clear = vec![[0, 0, 0, 0xff]; 256];
-    for draw in [
-        (3, 0, 6, 1),
-        (3, 1, 10, 2),
-        (4, 0, 5, 1),
-        (4, 3, 8, 2),
-        (3, 0, 2, 1),
-        (4, 0, 2, 1),
-    ] {
-        let first = flat_pass(&p, &d, FLAT, 0, draw);
-        let last = flat_pass(&p, &d, FLAT, 1, draw);
-        assert_eq!(flat_pass(&p, &d, FLAT, 7, draw), last, "{draw:?}");
-        if draw.2 >= 3 {
-            assert_ne!(first, last, "{draw:?}: the last vertex's colours");
-            assert_ne!(last, clear, "{draw:?}");
-        } else {
-            assert_eq!(last, clear, "{draw:?}");
-        }
+    for (draw, restart) in cases {
+        let first = provoked(&p, &d, FLAT, (0, restart), draw);
+        let last = provoked(&p, &d, FLAT, (1, restart), draw);
+        assert_ne!(first, clear, "{draw:?}");
+        let execution = matches!(draw, Provoked::Executed { .. });
+        assert_eq!(first == last, execution, "{draw:?}");
         if let Some((mp, md)) = &metal {
             for (mode, ours) in [(0, &first), (1, &last)] {
-                let theirs = flat_pass(mp, md, FLAT, mode, draw);
-                assert_eq!(*ours, theirs, "{draw:?} at mode {mode}");
+                let theirs = provoked(mp, md, FLAT, (mode, restart), draw);
+                assert!(*ours == theirs, "{draw:?} at mode {mode}");
+            }
+        }
+    }
+    for draw in [
+        Provoked::Vertices(3, 0, 2, 1),
+        Provoked::Vertices(STRIP, 0, 2, 1),
+    ] {
+        for mode in [0, 1] {
+            assert_eq!(
+                provoked(&p, &d, FLAT, (mode, None), draw),
+                clear,
+                "{draw:?}"
+            );
+        }
+    }
+}
+
+/// The set of colours `pixels` hold, black aside.
+fn colours_of(pixels: &[[u8; 4]]) -> std::collections::BTreeSet<[u8; 4]> {
+    (pixels.iter().copied())
+        .filter(|&px| px != [0, 0, 0, 0xff])
+        .collect()
+}
+
+/// A state with a flat input draws lines, line strips and Metal's line loop at
+/// `setProvokingVertexMode:` 0 as Metal does, over their vertices, over indices (restarting too)
+/// and from indirect arguments. At 1 it draws them as Metal does where the device has the last
+/// vertex; elsewhere the runtime draws each line from its last vertex to its first, which dies in
+/// strict mode (`provoking-vertex-lines`), and by default draws, relayed, the colours Metal's
+/// lines take, over pixels a few of which differ from Metal's
+#[test]
+fn lines_take_metals_flat_inputs_at_the_last_vertex() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let kind = rt::Degradation::ProvokingVertexLines;
+    for draw in [
+        Provoked::Vertices(1, 0, 8, 1),
+        Provoked::Vertices(2, 3, 7, 2),
+        Provoked::Vertices(5, 0, 6, 1),
+        over((1, U16), STRIP_OF_SIX, (0, 1)),
+        over((2, U16), RESTARTED, (0, 1)),
+        Provoked::Indirect(2, [7, 1, 3, 0]),
+    ] {
+        let first = provoked(&p, &d, FLAT, (0, None), draw);
+        let native = super::last_vertex_native();
+        let last = if native {
+            provoked(&p, &d, FLAT, (1, None), draw)
+        } else {
+            crate::answer::dies_of(kind, || provoked(&p, &d, FLAT, (1, None), draw));
+            let before = super::relayed_kind(kind);
+            let last = crate::answer::relaxed(|| provoked(&p, &d, FLAT, (1, None), draw));
+            assert!(super::relayed_kind(kind) > before, "{draw:?}");
+            last
+        };
+        assert!(first != last, "{draw:?}");
+        if let Some((mp, md)) = &metal {
+            assert!(first == provoked(mp, md, FLAT, (0, None), draw), "{draw:?}");
+            let theirs = provoked(mp, md, FLAT, (1, None), draw);
+            if native {
+                assert!(last == theirs, "{draw:?}");
+            } else {
+                assert_eq!(colours_of(&last), colours_of(&theirs), "{draw:?}");
             }
         }
     }
 }
 
-/// At the last vertex, a state whose fragment function reads `[[barycentric_coord]]` and no
-/// flat input draws a list of triangles as it stands, as Metal draws it, and dies at a strip,
-/// whose odd triangles' weights Metal moves; one that also reads a flat input dies at both,
-/// as its rotated draw would move them. At the first vertex all of them draw
+/// At `setProvokingVertexMode:` 1, a state whose fragment function reads `[[barycentric_coord]]`
+/// and no flat input draws what Metal draws: a list's weights in mode 0's order and a strip's odd
+/// triangles' moved, over their vertices, over indices, restarting, from indirect arguments, and
+/// Metal's triangle fan. One that also reads a flat input draws as Metal does where the device
+/// has the last vertex; elsewhere the runtime draws its triangles from their last vertices, their
+/// weights in that order, which dies in strict mode (`provoking-vertex-unmatched`). At mode 0 all
+/// of them draw as Metal's
 #[test]
-fn a_barycentric_reader_draws_only_lists_at_the_last_vertex() {
+fn barycentric_weights_take_metals_order_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let smooth = ("barycentric:smooth_vertex", "barycentric:smooth_weights");
     let flat = ("barycentric:flat_vertex", "barycentric:flat_weights");
-    let list = (3, 1, 9, 2);
-    let ours = flat_pass(&p, &d, smooth, 1, list);
-    assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256]);
+    let draws = [
+        Provoked::Vertices(3, 1, 9, 2),
+        Provoked::Vertices(STRIP, 3, 8, 1),
+        Provoked::Vertices(6, 0, 6, 1),
+        over((STRIP, U16), STRIP_OF_SIX, (0, 1)),
+        over((STRIP, U16), RESTARTED, (0, 1)),
+        Provoked::Indirect(STRIP, [8, 1, 3, 0]),
+    ];
+    for draw in draws {
+        for mode in [0, 1] {
+            let ours = provoked(&p, &d, smooth, (mode, None), draw);
+            assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256], "{draw:?}");
+            if let Some((mp, md)) = &metal {
+                let theirs = provoked(mp, md, smooth, (mode, None), draw);
+                assert!(ours == theirs, "{draw:?} at mode {mode}");
+            }
+        }
+    }
+    for draw in [
+        Provoked::Vertices(3, 1, 9, 1),
+        Provoked::Vertices(STRIP, 3, 8, 1),
+        over((3, U16), LIST, (0, 1)),
+    ] {
+        let first = provoked(&p, &d, flat, (0, None), draw);
+        let kind = rt::Degradation::ProvokingVertexUnmatched;
+        let last = if super::last_vertex_native() {
+            Some(provoked(&p, &d, flat, (1, None), draw))
+        } else {
+            crate::answer::dies_of(kind, || provoked(&p, &d, flat, (1, None), draw));
+            None
+        };
+        if let Some((mp, md)) = &metal {
+            assert!(first == provoked(mp, md, flat, (0, None), draw), "{draw:?}");
+            if let Some(last) = last {
+                assert!(last == provoked(mp, md, flat, (1, None), draw), "{draw:?}");
+            }
+        }
+    }
+}
+
+/// The pixels of [`pass_pixels`] after a draw of two triangle patches of `corner_patch_vertex`
+/// and `ids_fragment` (`vertex_ids.metal`), each tessellated at factor 1, at
+/// `setProvokingVertexMode:` of `mode`: each patch's triangle in the colour of the corner its
+/// provoking vertex lies at.
+fn patch_pixels<P: Platform>(p: &P, d: &P::Device, mode: u64) -> Vec<[u8; 4]> {
+    let functions = ("vertex_ids:corner_patch_vertex", "vertex_ids:ids_fragment");
+    let state = blob_state::<P>(d, functions, &["0c 04 01000000"]);
+    let corners = [
+        -0.9, -0.9, 0.9, -0.8, 0.1, 0.9, 0.9, 0.9, -0.9, 0.8, -0.1, -0.9,
+    ];
+    let corners = buffer::<P>(d, 64, 0, &bytes(&corners));
+    let factors = buffer::<P>(d, 64, 0, &[0x00, 0x3c].repeat(8));
+    pass_pixels(
+        p,
+        d,
+        vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&corners),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::SetTessellationFactorBuffer {
+                buffer: Some(&factors),
+                offset: 0,
+                instance_stride: 0,
+            },
+            RenderCmd::SetProvokingVertexMode { mode },
+            RenderCmd::DrawPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 2,
+                patch_index_buffer: None,
+                patch_index_buffer_offset: 0,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        ],
+    )
+}
+
+/// Triangle patches draw at `setProvokingVertexMode:` 0 what Metal draws, each triangle in its
+/// first vertex's flat colour, where Metal's mode 1 takes another. Where the device lacks the
+/// last vertex, the runtime takes the first at mode 1 too, relayed (`provoking-vertex-unmatched`);
+/// where it has it, it relays nothing of the provoking vertex. A patch draw dies in strict mode
+/// on every device here ([`super::patch_draw_death`]), so each runs by default
+#[test]
+fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
+    let (p, d) = (platform(), dev());
+    let kind = rt::Degradation::ProvokingVertexUnmatched;
+    let first = crate::answer::relaxed(|| patch_pixels(&p, &d, 0));
+    assert_ne!(first, vec![[0, 0, 0, 0xff]; 256]);
+    let before = super::relayed_kind(kind);
+    let last = crate::answer::relaxed(|| patch_pixels(&p, &d, 1));
+    let native = super::last_vertex_native();
+    assert_eq!(super::relayed_kind(kind) > before, !native);
+    if !native {
+        assert!(last == first);
+    }
     if let Some(md) = MetalPlatform::system_default_device() {
         let mp = MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(ours, flat_pass(&mp, &md, smooth, 1, list));
+        let theirs = patch_pixels(&mp, &md, 0);
+        assert!(first == theirs);
+        assert!(patch_pixels(&mp, &md, 1) != theirs);
     }
-    let draw = "drawPrimitives:vertexStart:vertexCount:";
-    for (functions, list_draws) in [(smooth, true), (flat, false)] {
-        let (e, _indices) = drawing_encoder(functions.0, functions.1);
-        send_all(&e, vec![three(3, None), three(STRIP, None)]);
-        send_all(&e, vec![RenderCmd::SetProvokingVertexMode { mode: 1 }]);
-        if list_draws {
-            send_all(&e, vec![three(3, None)]);
-        } else {
-            assert_eq!(dies_at(&e, three(3, None)), draw, "{functions:?}");
+}
+
+/// Metal draws every `setProvokingVertexMode:` mode from 2 up alike, its top bit set or not: a
+/// list's triangles as at mode 1, and a strip, a line strip and points as at neither 0 nor 1.
+/// This platform draws each as mode 1, which a list's triangles share with Metal's, relayed
+/// (`provoking-vertex-unmatched`, which dies at the setter in strict mode)
+#[test]
+fn modes_past_1_draw_metals_third_way() {
+    let (p, d) = (platform(), dev());
+    let modes = [
+        2,
+        7,
+        0xff,
+        1 << 32,
+        1 << 62,
+        (1 << 63) - 1,
+        1 << 63,
+        u64::MAX,
+    ];
+    let kind = rt::Degradation::ProvokingVertexUnmatched;
+    let list = (FLAT, Provoked::Vertices(3, 1, 9, 1));
+    let others = [
+        (FLAT, Provoked::Vertices(STRIP, 0, 7, 1)),
+        (FLAT, Provoked::Vertices(2, 3, 7, 1)),
+        (SIZED, Provoked::Vertices(0, 0, 3, 1)),
+    ];
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    for (at, (functions, draw)) in [list].into_iter().chain(others).enumerate() {
+        let ours =
+            |mode| crate::answer::relaxed(|| provoked(&p, &d, functions, (mode, None), draw));
+        let last = ours(1);
+        for mode in modes {
+            let before = super::relayed_kind(kind);
+            assert!(ours(mode) == last, "{draw:?} at {mode:#x}");
+            assert!(super::relayed_kind(kind) > before, "{draw:?} at {mode:#x}");
         }
-        assert_eq!(dies_at(&e, three(STRIP, None)), draw, "{functions:?}");
+        let Some((mp, md)) = &metal else {
+            continue;
+        };
+        let theirs = |mode| provoked(mp, md, functions, (mode, None), draw);
+        let third = theirs(2);
+        for mode in modes {
+            assert!(theirs(mode) == third, "{draw:?} at {mode:#x}");
+        }
+        if at == 0 {
+            assert!(third == last, "{draw:?}");
+        } else {
+            assert!(third != theirs(0) && third != theirs(1), "{draw:?}");
+        }
     }
 }
 
@@ -1337,9 +1848,9 @@ fn vertex_runs<P: Platform>(
         .collect()
 }
 
-/// A draw over indices of its own (a private type, or triangles the last vertex rotates)
-/// runs its vertex function as many times at each vertex as Metal's draw, as a draw as it
-/// stands does: once for each primitive the vertex is in, on both
+/// A draw over indices of the platform's own (a private type's) or of the runtime's (a strip at
+/// the last vertex, without the device's) runs its vertex function as many times at each vertex
+/// as Metal's draw, as a draw as it stands does: once for each primitive the vertex is in, on both
 #[test]
 fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     let (p, d) = (platform(), dev());
@@ -6103,51 +6614,30 @@ fn resolves_as_metals(samples: u64) {
 }
 
 /// A guest's state of the fixture `vertex` and `vertex_ids`' `plain_fragment` for a BGRA8
-/// target, of the triangle input primitive topology class, which Metal asks of a vertex
-/// function that writes a layer or viewport index, decoded from a blob as core decodes one.
-fn routed_state<P: Platform>(d: &P::Device, vertex: &str) -> P::RenderPipeline {
-    use reims_vgpu_core::rt::Hold;
-
-    use crate::gpu::serialized::tests::hex;
-
-    let functions = [
-        fixture::<P>(d, vertex),
-        fixture::<P>(d, "vertex_ids:plain_fragment"),
-    ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
-    let blob = hex(
-        "04 08 04 1c000000 01 04 01000000 02 04 02000000 0b 04 03000000 000000 \
-         01000000 08000000 02 00 04 00000000 01 04 50000000",
-    );
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+/// target, of the input primitive topology `class` (2 lines, 3 triangles), which Metal asks of a
+/// vertex function that writes a layer or viewport index, decoded from a blob as core decodes
+/// one.
+fn routed_state<P: Platform>(d: &P::Device, vertex: &str, class: u8) -> P::RenderPipeline {
+    let class = format!("0b 04 {class:02x}000000");
+    blob_state::<P>(d, (vertex, "vertex_ids:plain_fragment"), &[&class])
 }
 
 /// The pixels of both slices of a 16 by 16 BGRA8 2D array of 2, cleared to black, after
 /// `draw` in a pass of both, its render target array length 2, under a [`routed_state`] of
-/// `vertex` over [`flat_vertices`] in buffer 0 and `indices`, each vertex's layer or
+/// `vertex` and `class` over [`flat_vertices`] in buffer 0 and `indices`, each vertex's layer or
 /// viewport, in buffer 1, at `setProvokingVertexMode:` of `mode`, with two viewports, the
 /// target's left and right halves.
 fn routed_pass<P: Platform>(
     p: &P,
     d: &P::Device,
-    vertex: &str,
+    (vertex, class): (&str, u8),
     (indices, mode): (&[u32], u64),
     draw: RenderCmd<'_, P>,
 ) -> Vec<[u8; 4]> {
     use reims_vgpu_core::platform::types::MtlViewport;
     use reims_vgpu_core::platform::values::PassSet;
 
-    let state = routed_state::<P>(d, vertex);
+    let state = routed_state::<P>(d, vertex, class);
     let (pos, _) = flat_vertices::<P>(d, 16);
     let mut words: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
     words.resize(64, 0);
@@ -6241,52 +6731,93 @@ fn routed_pass<P: Platform>(
     texels.as_chunks::<4>().0.to_vec()
 }
 
-/// Under a vertex function that writes a layer or a viewport index, a list or strip of
-/// triangles at the last vertex lands where Metal's does, each primitive in its last
-/// vertex's layer or viewport, and at the first in its first's; what has no rotation dies
+/// Under a vertex function that writes a layer or a viewport index, triangles land where Metal's
+/// do at either provoking vertex, each primitive in its first vertex's layer or viewport at mode 0
+/// and in its last's at mode 1: lists and strips over their vertices, over indices and from
+/// indirect arguments. Line strips land where Metal's do where the device has the last vertex;
+/// elsewhere the runtime draws each line from its last vertex to its first, which dies in strict
+/// mode at mode 1 (`provoking-vertex-lines`), and by default lands, relayed
 #[test]
 fn the_last_vertex_routes_layers_and_viewports_as_metals() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
-    fn draw<'a, P: Platform>(primitive_type: u64, count: u64) -> RenderCmd<'a, P> {
-        RenderCmd::DrawPrimitives {
+    /// The draw of `kind`: 0 a list of 6 vertices, 1 a strip of 6, 2 a list over [`LIST`]'s
+    /// first 6 indices, 3 a strip over [`STRIP_OF_SIX`], 4 a strip of 6 from indirect
+    /// arguments, 5 a line strip of 6, over `bytes`, the indices or arguments.
+    fn draw<'a, P: Platform>(kind: usize, bytes: &'a P::Buffer) -> RenderCmd<'a, P> {
+        let indexed = |primitive_type, index_count| RenderCmd::DrawIndexedPrimitives {
+            primitive_type,
+            index_count,
+            index_type: U16,
+            index_buffer: bytes,
+            index_buffer_offset: 0,
+        };
+        let vertices = |primitive_type| RenderCmd::DrawPrimitives {
             primitive_type,
             vertex_start: 0,
-            vertex_count: count,
+            vertex_count: 6,
+        };
+        match kind {
+            0 => vertices(3),
+            1 => vertices(STRIP),
+            2 => indexed(3, 6),
+            3 => indexed(STRIP, 8),
+            4 => RenderCmd::DrawPrimitivesIndirect {
+                primitive_type: STRIP,
+                indirect_buffer: bytes,
+                indirect_buffer_offset: 0,
+            },
+            _ => vertices(2),
         }
     }
+    /// The buffer of [`draw`]'s `kind`.
+    fn bytes<P: Platform>(d: &P::Device, kind: usize) -> P::Buffer {
+        let contents = match kind {
+            2 => index_bytes(U16, &LIST[..6]),
+            3 => index_bytes(U16, STRIP_OF_SIX),
+            _ => u32s(&[6, 1, 0, 0]),
+        };
+        buffer::<P>(d, 64, 0, &contents)
+    }
     let routes: [&[u32]; 3] = [
-        &[0, 0, 1, 1, 1, 0],
-        &[0, 1, 0, 1, 1, 0],
-        &[1, 0, 0, 0, 1, 1],
+        &[0, 0, 1, 1, 1, 0, 0, 1],
+        &[0, 1, 0, 1, 1, 0, 1, 1],
+        &[1, 0, 0, 0, 1, 1, 1, 0],
     ];
+    let native = super::last_vertex_native();
     for vertex in ["vertex_ids:layer_vertex", "vertex_ids:viewport_vertex"] {
         for indices in routes {
             for mode in [0, 1] {
-                for (primitive_type, count) in [(3, 6), (STRIP, 6)] {
+                for kind in 0..6 {
+                    let class = if kind == 5 { 2 } else { 3 };
                     let shape = (indices, mode);
-                    let ours = routed_pass(&p, &d, vertex, shape, draw(primitive_type, count));
+                    let ours_bytes = bytes::<VulkanPlatform>(&d, kind);
+                    let ours =
+                        || routed_pass(&p, &d, (vertex, class), shape, draw(kind, &ours_bytes));
+                    let ours = if kind == 5 && mode == 1 && !native {
+                        let lines = rt::Degradation::ProvokingVertexLines;
+                        crate::answer::dies_of(lines, ours);
+                        crate::answer::relaxed(ours)
+                    } else {
+                        ours()
+                    };
                     let lit = ours.iter().filter(|px| **px != [0, 0, 0, 0xff]).count();
-                    assert!(lit > 0, "{vertex} {indices:?} {mode} {primitive_type}");
-                    if let Some((mp, md)) = &metal {
+                    assert!(lit > 0, "{vertex} {indices:?} {mode} {kind}");
+                    if let Some((mp, md)) = &metal
+                        && (kind < 5 || mode == 0 || native)
+                    {
+                        let theirs_bytes = bytes::<MetalPlatform>(md, kind);
                         let theirs =
-                            routed_pass(mp, md, vertex, shape, draw(primitive_type, count));
+                            routed_pass(mp, md, (vertex, class), shape, draw(kind, &theirs_bytes));
                         assert!(
                             ours == theirs,
-                            "{vertex} {indices:?} at mode {mode}, type {primitive_type}"
+                            "{vertex} {indices:?} at mode {mode}, draw {kind}"
                         );
                     }
                 }
             }
         }
-        let (e, indices) = open_drawing(&routed_state::<VulkanPlatform>(&d, vertex));
-        send_all(&e, vec![RenderCmd::SetProvokingVertexMode { mode: 1 }]);
-        let sel = "drawPrimitives:vertexStart:vertexCount:";
-        let indexed = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
-        assert_eq!(dies_at(&e, three(1, None)), sel, "{vertex}");
-        assert_eq!(dies_at(&e, three(6, None)), sel, "{vertex}");
-        assert_eq!(dies_at(&e, three(3, Some(&indices))), indexed, "{vertex}");
     }
 }
 

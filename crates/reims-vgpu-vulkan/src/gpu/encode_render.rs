@@ -51,8 +51,8 @@
 //!   indices or indirect arguments dies, as the GPU alone reads them. The index buffer lies
 //!   outside the Metal address space ([`crate::gpu::own_buffer`]), so no guest buffer's
 //!   `gpuAddress` depends on when the draw's command buffer completes.
-//! - **A draw over indices of the platform's own**, a private type's and a rotated list or strip
-//!   of triangles at the last vertex ([`last_first`]), takes its first vertex as its base vertex.
+//! - **A draw over indices of the platform's own**, a private type's, takes its first vertex as
+//!   its base vertex.
 //!   Metal's non-indexed draws, of every type, give `[[base_vertex]]` as their first vertex and
 //!   `[[vertex_id]]` as each vertex's (measured on the M3 Max, from 0 to `0xfffffffd`), and so
 //!   does such a draw, whose base vertex the runtime gives as `[[base_vertex]]`.
@@ -87,7 +87,9 @@
 //!   (`mutgap_dec_render_depth_stencil_cleared`), encode nothing. The rest go to the runtime,
 //!   which answers each at Metal's default or refuses it.
 //! - **The draw-state setters** encode nothing and mark the encoder; each draw then draws what
-//!   Metal draws under them, or dies where it has no exact form ([`VulkanRenderEncoder::rotates`]).
+//!   Metal draws under them, or relays or dies where it has no exact form
+//!   ([`VulkanRenderEncoder::marked`]). `setPrimitiveRestartEnabled:index:` and
+//!   `setProvokingVertexMode:` go to the runtime, which draws what Metal draws under them.
 //!   A draw of no primitive, patch or instance, and an execution of no command, draw nothing
 //!   whatever they left, as Metal's do, and go on. Measured on Metal on this host, against a 16
 //!   by 16 target:
@@ -108,28 +110,26 @@
 //!   - `setLineWidth:` of anything but 1 (0, 0.5 to 8, -1, NaN) widens line and line-strip
 //!     draws, and triangles filled as lines; points and filled triangles are unchanged. No line
 //!     drawn here is wider than 1, so those draws, and executions, die after another width.
-//!   - `setProvokingVertexMode:` of 0 is the first vertex, Metal's default and Vulkan's; every
-//!     other mode is the last: a list triangle's third vertex, strip triangle i's vertex i + 2,
-//!     an indexed list's third index, a line segment's second vertex. Smooth inputs interpolate
-//!     alike in every vertex order (200 random perspective triangles, pixel for pixel). A draw
-//!     under a pipeline state that reads no flat input (`has_flat_fragment_inputs`) and whose
-//!     vertex function writes no layer or viewport index (below) draws as it stands; points draw
-//!     as they stand; under one that reads a flat input, a list or strip of triangles over its
-//!     vertices in order draws as a list over its triangles' vertices last first
-//!     ([`last_first`]), Vulkan's first vertex then Metal's last, and the rest dies. Metal also
-//!     routes a primitive to the layer and the viewport its provoking vertex writes
-//!     (`[[render_target_array_index]]`, `[[viewport_array_index]]`: a triangle whose vertices
-//!     write layers 0, 0 and 1 lands in layer 0 at mode 0 and in layer 1 at the last, and so for
-//!     every mix and for viewports). So a state whose vertex function writes either
-//!     (`writes_render_target_array_index`, `writes_viewport_array_index`) is taken as one that
-//!     reads a flat input: a list or strip of triangles over its vertices in order draws
-//!     rotated, last vertex first, and the rest dies but points.
-//!   - `[[barycentric_coord]]` under the last vertex: Metal orders a list's as at mode 0, over
-//!     its vertices and over indices, and moves a strip's odd triangles' one place, `(b2, b0,
-//!     b1)` of mode 0's, its even ones unchanged. So a list drawn as it stands is exact, and a
-//!     strip, or any rotated draw, is not: under a state whose fragment function reads it
-//!     (`reads_barycentric_coord`), a draw at the last vertex dies but a list of triangles over
-//!     its vertices or indices under a state that reads no flat input.
+//!   - `setProvokingVertexMode:` of 0 takes a primitive's flat inputs, and the layer and the
+//!     viewport its vertex function writes (`[[render_target_array_index]]`,
+//!     `[[viewport_array_index]]`), from its first vertex, Metal's default and Vulkan's; 1 from
+//!     its last (a line's second vertex, a list triangle's third, strip triangle i's vertex
+//!     i + 2, a private type's list primitive's last), in direct, indexed (each piece of a
+//!     restarted strip its own parity), indirect and instanced draws and patches, where an
+//!     execution of an indirect command buffer's commands takes the first vertex at every mode.
+//!     `[[barycentric_coord]]` is in mode 0's order at mode 1 but for a strip's odd triangles,
+//!     `(b2, b0, b1)` of mode 0's. Every other mode, its top bit set or not (2, 7, 255, `2^32`,
+//!     `2^62`, `2^63`, `u64::MAX`), draws a third way: a list triangle from its last vertex, a
+//!     patch from its first, and strips, lines and points otherwise than at 0 and at 1
+//!     (`modes_past_1_draw_metals_third_way`). The runtime takes the mode and draws it: mode 1
+//!     through `VK_EXT_provoking_vertex` where the device has its last vertex, elsewhere
+//!     (MoltenVK) from lists of the primitives led by their last vertices, which give a triangle
+//!     Metal's flat inputs, layer, viewport and weights. What it draws otherwise than Metal it
+//!     announces: a line drawn from its last vertex to its first (`provoking-vertex-lines`);
+//!     triangles that read flat inputs and weights, and patches, without the last vertex, a
+//!     layer or viewport selected in a synthesized geometry stage with it, and a mode from 2 up,
+//!     drawn as 1 (`provoking-vertex-unmatched`). Each is relayed, and dies in strict mode
+//!     ([`crate::answer::DIES`]).
 //!   - `setPrimitiveRestartEnabled:index:` sets the index an indexed strip restarts at, `k`,
 //!     whatever `enabled` says (`{0, k}` draws as `{1, k}`, at `k` of 0, 3, 7, 15, `0xffff`
 //!     and `0xffffffff`). Without it a strip restarts at its index type's all-ones index, as
@@ -407,12 +407,6 @@ pub(crate) struct StateFacts {
     /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
     /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
     writes: [bool; 3],
-    /// [`Marks::flat`].
-    flat: bool,
-    /// [`Marks::barycentric`].
-    barycentric: bool,
-    /// [`Marks::routed`].
-    routed: bool,
     /// [`Marks::points_sized`].
     points_sized: bool,
     /// Whether it can encode indirect commands (the runtime's `can_encode_indirect_commands`).
@@ -437,9 +431,6 @@ impl StateFacts {
                 raw.fragment_writes_textures(),
                 raw.tile_writes_textures(),
             ],
-            flat: raw.has_flat_fragment_inputs(),
-            barycentric: raw.reads_barycentric_coord(),
-            routed: raw.writes_render_target_array_index() || raw.writes_viewport_array_index(),
             points_sized: raw.writes_point_size()
                 || state.input_primitive_topology == PrimitiveTopologyClass::Point,
             encodes: raw.can_encode_indirect_commands(),
@@ -466,7 +457,7 @@ fn past_the_eighth(attachment: Attachment) -> bool {
 }
 
 /// What the private setters left of how the encoder's draws draw, and what of the pipeline state
-/// and fill mode decides whether a draw under them is exact ([`VulkanRenderEncoder::rotates`]).
+/// and fill mode decides whether a draw under them is exact ([`VulkanRenderEncoder::marked`]).
 #[derive(Debug, Default, Clone, Copy)]
 struct Marks {
     /// The arguments of the last `setPrimitiveRestartEnabled:index:`, which the runtime's
@@ -478,16 +469,6 @@ struct Marks {
     wide_lines: bool,
     /// `setTriangleFillMode:` set `Lines`: a triangle draws its edges, at the line width.
     line_fill: bool,
-    /// `setProvokingVertexMode:` set a mode other than 0: a primitive's last vertex provokes.
-    last_vertex: bool,
-    /// The pipeline state set reads a flat fragment input, which the provoking vertex decides.
-    flat: bool,
-    /// The pipeline state set reads `[[barycentric_coord]]`, which Metal orders by the vertices
-    /// as drawn, not by the provoking vertex (the module docs).
-    barycentric: bool,
-    /// The pipeline state set's vertex function writes `[[render_target_array_index]]` or
-    /// `[[viewport_array_index]]`, which Metal takes from the provoking vertex (the module docs).
-    routed: bool,
     /// A pipeline state was set.
     pipeline: bool,
     /// The pipeline state set sizes its points as Metal does: its vertex function writes
@@ -516,42 +497,31 @@ fn amplification_count(mode: u64, value: u64) -> Option<u64> {
     (1..=8).contains(&count).then_some(count)
 }
 
-/// What a draw draws, for what the private setters left ([`VulkanRenderEncoder::rotates`]).
+/// What a draw draws, for what the private setters left ([`VulkanRenderEncoder::marked`]).
 #[derive(Clone, Copy, Debug)]
 enum Shape {
-    /// Primitives of a type, over the vertices in order, or over indices (`indexed`), from
-    /// indirect arguments or not (`indirect`), the GPU reading both.
-    Primitives {
-        topology: Topology,
-        indexed: bool,
-        indirect: bool,
-    },
+    /// Primitives of a type, over the vertices in order, over indices or from indirect arguments.
+    Primitives(Topology),
     /// Patches, over a control-point index buffer or not.
-    Patches { indexed: bool },
-    /// An indirect command buffer's draws, whose types its records hold: their pipeline state
-    /// the encoder's where they inherit it.
-    Execution { inherits_pipeline: bool },
+    Patches,
+    /// An indirect command buffer's draws, whose types its records hold.
+    Execution,
 }
 
 impl Shape {
     /// A draw of the public type `p`.
-    fn public(p: PrimitiveType, indexed: bool, indirect: bool) -> Shape {
-        Shape::Primitives {
-            topology: Topology::Public(p),
-            indexed,
-            indirect,
-        }
+    fn public(p: PrimitiveType) -> Shape {
+        Shape::Primitives(Topology::Public(p))
     }
 
     /// Whether it draws lines: a line or line strip, or Metal's line loop.
     fn lines(self) -> bool {
         matches!(
             self,
-            Shape::Primitives {
-                topology: Topology::Public(PrimitiveType::Line | PrimitiveType::LineStrip)
-                    | Topology::Private(Private::LineLoop),
-                ..
-            }
+            Shape::Primitives(
+                Topology::Public(PrimitiveType::Line | PrimitiveType::LineStrip)
+                    | Topology::Private(Private::LineLoop)
+            )
         )
     }
 
@@ -559,13 +529,13 @@ impl Shape {
     /// and patches.
     fn triangles(self) -> bool {
         match self {
-            Shape::Primitives { topology, .. } => matches!(
+            Shape::Primitives(topology) => matches!(
                 topology,
                 Topology::Public(PrimitiveType::Triangle | PrimitiveType::TriangleStrip)
                     | Topology::Private(Private::TriangleFan | Private::Quads | Private::QuadStrip)
             ),
-            Shape::Patches { .. } => true,
-            Shape::Execution { .. } => false,
+            Shape::Patches => true,
+            Shape::Execution => false,
         }
     }
 }
@@ -1970,43 +1940,6 @@ impl Private {
     }
 }
 
-/// The indices of the vertices `start..start + count` of a list (`p` `Triangle`) or strip
-/// (`TriangleStrip`) of triangles, relative to `start`, which the draw takes as its base vertex
-/// ([`VulkanRenderEncoder::primitives`]), as a list of its triangles each with its last vertex
-/// first, in its winding: a list's (a, b, c) as (c, a, b), a strip's triangle i, (i, i + 1,
-/// i + 2) when i is even and (i + 1, i, i + 2) when odd, as (i + 2, i, i + 1) and (i + 2, i + 1,
-/// i). Drawn from its first vertex, each triangle takes its flat inputs from the vertex Metal's
-/// last-vertex mode takes them from (`setProvokingVertexMode:`), and its smooth ones as Metal
-/// draws them (the module docs). Vertex IDs past `u32`, and more indices than
-/// [`MAX_EMULATED_INDICES`], die at `sel`; another type has no such list.
-fn last_first(sel: &'static str, p: PrimitiveType, start: u32, count: u32) -> Vec<u32> {
-    let triangles = last_first_triangles(sel, p, count);
-    let n = 3 * u64::from(triangles);
-    listable(sel, (start, count), n, || {
-        format!("{p:?} of {count} vertices from {start}, last vertex first")
-    });
-    let at = |i: u32| i;
-    let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
-    for t in 0..triangles {
-        match p {
-            PrimitiveType::Triangle => out.extend([at(3 * t + 2), at(3 * t), at(3 * t + 1)]),
-            _ if t % 2 == 0 => out.extend([at(t + 2), at(t), at(t + 1)]),
-            _ => out.extend([at(t + 2), at(t + 1), at(t)]),
-        }
-    }
-    out
-}
-
-/// The triangles of `count` vertices of a list (`p` `Triangle`) or strip (`TriangleStrip`) of
-/// triangles ([`last_first`]); another type, which has no such list, dies at `sel`.
-fn last_first_triangles(sel: &'static str, p: PrimitiveType, count: u32) -> u32 {
-    match p {
-        PrimitiveType::Triangle => count / 3,
-        PrimitiveType::TriangleStrip => count.saturating_sub(2),
-        _ => unrepresentable(sel, &format!("{p:?} with its last vertex first")),
-    }
-}
-
 /// Dies at `sel`, `what` naming the draw, where a list of `n` indices of the platform's own of
 /// the vertices `start..start + count` is longer than [`MAX_EMULATED_INDICES`], or names a
 /// vertex past `u32`.
@@ -2023,8 +1956,6 @@ fn listable(sel: &'static str, (start, count): (u32, u32), n: u64, what: impl Fn
 enum Listed {
     /// One of Metal's private types' ([`Private::indices`]).
     Private(Private),
-    /// A list or strip of triangles, each with its last vertex first ([`last_first`]).
-    LastFirst(PrimitiveType),
 }
 
 impl Listed {
@@ -2032,28 +1963,23 @@ impl Listed {
     fn public(self) -> PrimitiveType {
         match self {
             Listed::Private(t) => t.public(),
-            Listed::LastFirst(_) => PrimitiveType::Triangle,
         }
     }
 
     /// How many indices it draws `count` vertices as.
-    fn index_count(self, sel: &'static str, count: u32) -> u64 {
+    fn index_count(self, count: u32) -> u64 {
         match self {
             Listed::Private(t) => t.index_count(u64::from(count)),
-            Listed::LastFirst(p) => 3 * u64::from(last_first_triangles(sel, p, count)),
         }
     }
 
     /// How many indices it draws the vertices `start..start + count` as, dying at `sel` as
     /// [`listable`] says.
     fn checked(self, sel: &'static str, start: u32, count: u32) -> u64 {
-        let n = self.index_count(sel, count);
+        let n = self.index_count(count);
         listable(sel, (start, count), n, || match self {
             Listed::Private(t) => {
                 format!("{t:?} of {count} vertices from {start} as an indexed draw")
-            }
-            Listed::LastFirst(p) => {
-                format!("{p:?} of {count} vertices from {start}, last vertex first")
             }
         });
         n
@@ -2064,7 +1990,6 @@ impl Listed {
     fn indices(self, sel: &'static str, start: u32, count: u32) -> Vec<u32> {
         match self {
             Listed::Private(t) => t.indices(sel, start, count),
-            Listed::LastFirst(p) => last_first(sel, p, start, count),
         }
     }
 
@@ -2133,7 +2058,7 @@ impl OwnIndices {
         }
         let more = kept.map_or(0, |at| self.0[at].1).saturating_mul(2);
         let wanted = count.max(more).max(LEAST_KEPT);
-        let vertices = if listed.index_count(sel, wanted) <= KEPT_INDICES {
+        let vertices = if listed.index_count(wanted) <= KEPT_INDICES {
             wanted
         } else {
             count
@@ -2148,7 +2073,7 @@ impl OwnIndices {
 }
 
 /// Whether a draw of `count` vertices or indices of `p` makes no primitive, which Metal draws
-/// nothing of whatever the private setters left ([`VulkanRenderEncoder::rotates`]).
+/// nothing of whatever the private setters left ([`VulkanRenderEncoder::marked`]).
 fn draws_none(p: PrimitiveType, count: u32) -> bool {
     let least = match p {
         PrimitiveType::Point => 1,
@@ -2160,6 +2085,12 @@ fn draws_none(p: PrimitiveType, count: u32) -> bool {
 
 /// The primitive type Metal's GPU hangs at ([`VulkanRenderEncoder::hangs`]).
 const HANGING_TYPE: u64 = 9;
+
+/// The `setProvokingVertexMode:` mode a mode whose top bit is set goes to the runtime as: one
+/// Metal draws the third way, as it draws those (`modes_past_1_draw_metals_third_way`, measured
+/// on this host), which the runtime draws as mode 1 and announces
+/// (`provoking-vertex-unmatched`), where it would draw a mode whose top bit is set as mode 0.
+const THIRD_WAY: u64 = 2;
 
 /// A draw's raw primitive type: a public one, or one of the private ones Metal draws (5 to 8).
 /// Type 9 dies here: where Metal's GPU fails the command buffer at it is the non-indexed draws'
@@ -2333,7 +2264,7 @@ impl VulkanRenderEncoder {
     /// crashes there ([`Self::pipelined`]), and so does one in a pass that loads and stores a
     /// bfloat colour attachment, empty or not ([`Self::bfloat_drawn`]). So do one of points
     /// Metal sizes none of ([`Self::sized`]) and one the private setters leave no exact form of
-    /// ([`Self::rotates`]), unless it is `empty`, of no primitive, patch or instance, which
+    /// ([`Self::marked`]), unless it is `empty`, of no primitive, patch or instance, which
     /// Metal draws nothing of whatever they left; `None` for one Metal completes without
     /// drawing, which encodes nothing.
     fn draw<K: Copy>(
@@ -2347,10 +2278,8 @@ impl VulkanRenderEncoder {
         match drawn {
             Some((shape, k)) => {
                 self.drawn(sel, shape, empty);
-                if !empty && self.rotates(sel, shape) {
-                    crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
-                        "a draw the provoking vertex rotates, as it stands".into()
-                    });
+                if !empty {
+                    self.marked(sel, shape);
                 }
                 self.binds(sel, &mut |e| call(e, k))
             }
@@ -2433,10 +2362,7 @@ impl VulkanRenderEncoder {
     fn sized(&self, sel: &'static str, shape: Shape) {
         let points = matches!(
             shape,
-            Shape::Primitives {
-                topology: Topology::Public(PrimitiveType::Point),
-                ..
-            }
+            Shape::Primitives(Topology::Public(PrimitiveType::Point))
         );
         let m = *plain(|| self.marks.lock());
         if points && m.pipeline && !m.points_sized {
@@ -2499,7 +2425,7 @@ impl VulkanRenderEncoder {
 
     /// An indirect command buffer's execution `sel`, of `icb`'s commands `range` (`None`: a range
     /// a buffer holds): it draws, so it dies as a draw does where the private setters leave it no
-    /// exact form ([`Self::rotates`]), unless it is `empty`, of no command, and after a nil
+    /// exact form ([`Self::marked`]), unless it is `empty`, of no command, and after a nil
     /// pipeline state where its commands inherit the encoder's ([`Self::pipelined`]). One that is
     /// not empty dies where it may write a surface whose GPU writes never reach its memory
     /// ([`Self::issues`]). Where its commands inherit the encoder's state, that state decides
@@ -2520,15 +2446,11 @@ impl VulkanRenderEncoder {
             self.layered(sel);
             self.issues(sel, Some(icb.inherits));
         }
-        let inherits_pipeline = icb.inherits.pipeline;
-        if !empty && self.rotates(sel, Shape::Execution { inherits_pipeline }) {
-            crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
-                "an execution the provoking vertex rotates".into()
-            });
-        }
         if empty {
             return None;
         }
+        self.marked(sel, Shape::Execution);
+        let inherits_pipeline = icb.inherits.pipeline;
         let execution = if inherits_pipeline {
             self.encodes(sel, "an execution of commands that inherit");
             let m = *plain(|| self.marks.lock());
@@ -2643,30 +2565,12 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// How a draw `sel` of `shape` draws what Metal draws after the private setters ([`Marks`]):
-    /// as it stands (`false`), or over its triangles' vertices rotated so each one's last comes
-    /// first (`true`), which only a list or strip of triangles over its vertices in order takes.
-    /// What has no exact form is drawn as it stands, relayed ([`crate::answer::inexact`]), but
-    /// for the amplification count, which dies; in strict mode each dies:
-    /// - at a line width other than 1, lines, triangles and patches filled as lines, and an
-    ///   execution: no line drawn here is wider than 1;
-    /// - at the last vertex provoking, under a pipeline state that reads a flat input or whose
-    ///   vertex function writes a layer or viewport index, what the first vertex's draw has no
-    ///   rotation for: lines, Metal's private types, a draw over indices or indirect arguments,
-    ///   patches, and an execution; points, and every draw under a state that reads no flat input
-    ///   and whose vertex function writes no layer or viewport index, draw as they stand, but
-    ///   where the state reads `[[barycentric_coord]]`, which only a list of triangles over its
-    ///   vertices or indices keeps, and no rotated draw;
-    /// - after `setVertexAmplificationMode:value:` left a count the runtime does not draw, or
-    ///   one not measured, every draw and execution.
-    fn rotates(&self, sel: &'static str, shape: Shape) -> bool {
-        self.rotation(sel, shape, true)
-    }
-
-    /// [`Self::rotates`], relaying what it relays only where `relay` holds: a caller that draws
-    /// by [`Self::draw`] where the draw is not rotated, which asks again and relays then, asks
-    /// so outside strict mode, so a draw relays each kind once.
-    fn rotation(&self, sel: &'static str, shape: Shape, relay: bool) -> bool {
+    /// Relays at a draw `sel` of `shape`, or dies there in strict mode, what the private setters
+    /// ([`Marks`]) leave it no exact form of ([`crate::answer::inexact`]): at a line width other
+    /// than 1, lines, triangles and patches filled as lines, and an execution, as no line drawn
+    /// here is wider than 1. After `setVertexAmplificationMode:value:` left a count the runtime
+    /// does not draw, or one not measured, every draw and execution dies, in either mode.
+    fn marked(&self, sel: &'static str, shape: Shape) {
         let m = *plain(|| self.marks.lock());
         if m.amplified {
             unrepresentable(
@@ -2675,68 +2579,12 @@ impl VulkanRenderEncoder {
                  runtime does not draw",
             );
         }
-        let (indexed, indirect) = match shape {
-            Shape::Primitives {
-                indexed, indirect, ..
-            } => (indexed, indirect),
-            Shape::Patches { indexed } => (indexed, false),
-            Shape::Execution { .. } => (true, true),
-        };
-        let execution = matches!(shape, Shape::Execution { .. });
-        if relay
-            && m.wide_lines
-            && (execution || shape.lines() || (m.line_fill && shape.triangles()))
-        {
+        let execution = matches!(shape, Shape::Execution);
+        if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
             crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
                 "lines at a line width other than 1, which no line drawn here has".into()
             });
         }
-        if !m.last_vertex {
-            return false;
-        }
-        let topology = match shape {
-            Shape::Primitives { topology, .. } => Some(topology),
-            _ => None,
-        };
-        if topology == Some(Topology::Public(PrimitiveType::Point)) {
-            return false;
-        }
-        // A list of triangles over its vertices or indices, which Metal's barycentrics order
-        // alike at either provoking vertex.
-        let list = topology == Some(Topology::Public(PrimitiveType::Triangle)) && !indirect;
-        let rotatable = matches!(
-            topology,
-            Some(Topology::Public(
-                PrimitiveType::Triangle | PrimitiveType::TriangleStrip
-            ))
-        ) && !indexed
-            && !indirect;
-        let inherited = matches!(
-            shape,
-            Shape::Execution {
-                inherits_pipeline: true
-            }
-        );
-        // The provoking vertex decides what the state draws: a flat input's value, or the layer
-        // and viewport a primitive lands in.
-        let provoked = m.flat || m.routed;
-        if (!provoked && (!execution || inherited)) && (!m.barycentric || list) {
-            return false;
-        }
-        if provoked && rotatable && !m.barycentric {
-            return true;
-        }
-        if !relay {
-            return false;
-        }
-        crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
-            "a draw with the last vertex provoking (setProvokingVertexMode:) under a pipeline \
-             state that reads a flat input or barycentric weights, or whose vertex function \
-             writes a layer or viewport index, which this draw's first-vertex form has no exact \
-             rotation for"
-                .into()
-        });
-        false
     }
 }
 
@@ -2788,7 +2636,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let points = small(sel, number_of_patch_control_points);
-                let shape = Shape::Patches { indexed: true };
+                let shape = Shape::Patches;
                 self.draw(sel, (Some((shape, ())), false), |e, ()| {
                     e.draw_indexed_patches_indirect(
                         points,
@@ -2815,7 +2663,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let points = small(sel, number_of_patch_control_points);
                 let (start, count) = (small(sel, patch_start), small(sel, patch_count));
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
-                let shape = Shape::Patches { indexed: true };
+                let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
                 self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
@@ -2881,7 +2729,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
-                let drawn = kinds.map(|(p, i)| (Shape::public(p, true, true), (p, i)));
+                let drawn = kinds.map(|(p, i)| (Shape::public(p), (p, i)));
                 self.draw(sel, (drawn, false), |e, (p, i)| {
                     e.draw_indexed_primitives_indirect(
                         p,
@@ -2901,7 +2749,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let points = small(sel, number_of_patch_control_points);
-                let shape = Shape::Patches { indexed: false };
+                let shape = Shape::Patches;
                 self.draw(sel, (Some((shape, ())), false), |e, ()| {
                     e.draw_patches_indirect(
                         points,
@@ -2924,7 +2772,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let points = small(sel, number_of_patch_control_points);
                 let (start, count) = (small(sel, patch_start), small(sel, patch_count));
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
-                let shape = Shape::Patches { indexed: false };
+                let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
                 self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
@@ -2945,7 +2793,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let p = public_type(sel, primitive_type);
-                let drawn = Some((Shape::public(p, false, true), p));
+                let drawn = Some((Shape::public(p), p));
                 self.draw(sel, (drawn, false), |e, p| {
                     e.draw_primitives_indirect(p, &indirect_buffer.raw, indirect_buffer_offset)
                 })
@@ -3257,7 +3105,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 })
             }
             // A width of 1 is every line's here; another is marked, and the draws it widens
-            // die ([`Self::rotates`]).
+            // relay, or die in strict mode ([`Self::marked`]).
             RenderCmd::SetLineWidth { line_width } => {
                 self.encoder.nothing(sel)?;
                 #[expect(clippy::float_cmp, reason = "Metal's default width, exactly")]
@@ -3277,13 +3125,13 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     Ok(())
                 })
             }
-            // Mode 0 is Metal's default and the runtime's, the first vertex provoking
-            // (`mutgap2_rdec_draw_state`); every other mode is the last vertex, which the draws
-            // after it take as they stand, rotated, or die ([`Self::rotates`]).
+            // The runtime draws the encoder's draws after it as Metal does at the mode, or
+            // announces what it draws otherwise (the module docs). Metal draws a mode whose top
+            // bit is set the third way, as every mode from 2 up, where the runtime takes such a
+            // mode as 0, so it goes to the runtime as one of the third way ([`THIRD_WAY`]).
             RenderCmd::SetProvokingVertexMode { mode } => {
-                self.encoder.nothing(sel)?;
-                plain(|| self.marks.lock().last_vertex = mode != 0);
-                Ok(())
+                let mode = if mode >> 63 == 1 { THIRD_WAY } else { mode };
+                encoded(&mut |e| e.set_provoking_vertex_mode(mode))
             }
             RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
                 None => {
@@ -3304,9 +3152,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         *self.nil_pipeline.lock() = false;
                         self.reach.lock().set(&state.reflection, f.writes);
                         let mut m = self.marks.lock();
-                        m.flat = f.flat;
-                        m.barycentric = f.barycentric;
-                        m.routed = f.routed;
                         m.pipeline = true;
                         m.points_sized = f.points_sized;
                         m.half_apart = f.half_apart;
@@ -3854,11 +3699,11 @@ impl VulkanRenderEncoder {
     /// A non-indexed draw of a raw primitive type: `(start, count, instances, base instance)`; one
     /// of no instances is an empty draw, which the runtime records nothing of (the module docs),
     /// and one of a private type encodes nothing. A private type draws as its public one over the
-    /// indices of its vertices ([`Private::indices`]), and a list or strip of triangles the
-    /// provoking vertex rotates ([`Self::rotates`]) as a list over its triangles' vertices last
-    /// first ([`last_first`]), each in a buffer the encoder keeps for its later draws of the kind
-    /// ([`OwnIndices`]) and the command buffer until it completes, and each asks what any draw asks
-    /// ([`Self::drawn`]); one of too few vertices draws nothing, as on Metal. The indices are
+    /// indices of its vertices ([`Private::indices`]), in a buffer the encoder keeps for its later
+    /// draws of the kind ([`OwnIndices`]) and the command buffer until it completes, and asks what
+    /// any draw asks ([`Self::drawn`]); one of too few vertices draws nothing, as on Metal. The
+    /// runtime draws it at the provoking vertex mode set as the indexed draw of its public type,
+    /// each list primitive's last vertex Metal's at mode 1 (the module docs). The indices are
     /// relative to `start`, the indexed draw's base vertex, so `[[base_vertex]]` reads `start` and
     /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module docs);
     /// a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal draws from,
@@ -3880,22 +3725,15 @@ impl VulkanRenderEncoder {
         if instances == 0 && matches!(topology, Topology::Private(_)) {
             return self.draw(sel, (None::<(Shape, ())>, true), |_, ()| Ok(()));
         }
-        let shape = Shape::Primitives {
-            topology,
-            indexed: false,
-            indirect: false,
-        };
+        let shape = Shape::Primitives(topology);
         let listed = match topology {
             Topology::Public(p) => {
                 self.pipelined(sel);
                 self.empty_drawn(sel, count == 0 || instances == 0);
                 let empty = instances == 0 || draws_none(p, count);
-                if empty || !self.rotation(sel, shape, crate::answer::strict()) {
-                    return self.draw(sel, (Some((shape, p)), empty), |e, p| {
-                        e.draw_primitives(p, start, count, instances, base)
-                    });
-                }
-                Listed::LastFirst(p)
+                return self.draw(sel, (Some((shape, p)), empty), |e, p| {
+                    e.draw_primitives(p, start, count, instances, base)
+                });
             }
             Topology::Private(t) => Listed::Private(t),
         };
@@ -3913,11 +3751,7 @@ impl VulkanRenderEncoder {
         self.pipelined(sel);
         crate::gpu::timing::count_draw();
         self.drawn(sel, shape, false);
-        if matches!(topology, Topology::Private(_)) && self.rotates(sel, shape) {
-            crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
-                "a private type the provoking vertex rotates".into()
-            });
-        }
+        self.marked(sel, shape);
         // These indices are this platform's, not the guest's: the draw restarts at the
         // all-ones index alone, which none of them is, and the guest's index holds again
         // after it.
@@ -3954,7 +3788,7 @@ impl VulkanRenderEncoder {
         let base_instance = small(sel, base_instance);
         let empty = instances == 0 || kinds.is_some_and(|(p, _)| draws_none(p, count));
         self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
-        let drawn = kinds.map(|(p, i)| (Shape::public(p, true, false), (p, i)));
+        let drawn = kinds.map(|(p, i)| (Shape::public(p), (p, i)));
         self.draw(sel, (drawn, empty), |e, (p, i)| {
             e.draw_indexed_primitives(
                 p,
@@ -4161,7 +3995,7 @@ pub(crate) mod tests {
         let sel = "drawPrimitives:vertexStart:vertexCount:";
         let mut kept = OwnIndices::default();
         let mut take = |listed: Listed, count: u32| {
-            let n = listed.index_count(sel, count);
+            let n = listed.index_count(count);
             let b = kept.take(sel, &d.raw, (listed, count, n));
             let n = usize::try_from(n).unwrap();
             let length = usize::try_from(b.length()).unwrap();
@@ -4186,8 +4020,6 @@ pub(crate) mod tests {
         for listed in [
             Listed::Private(Private::TriangleFan),
             Listed::Private(Private::QuadStrip),
-            Listed::LastFirst(PrimitiveType::Triangle),
-            Listed::LastFirst(PrimitiveType::TriangleStrip),
         ] {
             let (b, _) = take(listed, 7);
             assert!(b != grown, "{listed:?}");
@@ -4920,26 +4752,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Each triangle's indices, its last vertex first, in its winding
-    #[test]
-    fn last_first_rotates_each_triangle() {
-        let sel = "drawPrimitives:vertexStart:vertexCount:";
-        assert_eq!(
-            last_first(sel, PrimitiveType::Triangle, 1, 7),
-            [2, 0, 1, 5, 3, 4]
-        );
-        assert_eq!(
-            last_first(sel, PrimitiveType::TriangleStrip, 2, 5),
-            [2, 0, 1, 3, 2, 1, 4, 2, 3]
-        );
-        assert!(last_first(sel, PrimitiveType::TriangleStrip, 0, 2).is_empty());
-        let site = catch_death(|| last_first(sel, PrimitiveType::Line, 0, 4)).unwrap_err();
-        assert_eq!(site.file, sel);
-        let site =
-            catch_death(|| last_first(sel, PrimitiveType::Triangle, u32::MAX, 3)).unwrap_err();
-        assert_eq!(site.file, sel);
-    }
-
     /// An open encoder on a BGRA8 target with the state of the fixtures `vertex` and `fragment`
     /// set, and an index buffer.
     fn drawing_encoder(vertex: &str, fragment: &str) -> (VulkanRenderEncoder, VulkanBuffer) {
@@ -5180,12 +4992,35 @@ pub(crate) mod tests {
         reaches
     }
 
-    /// After a nonzero provoking vertex mode, a state that reads no flat input draws everything
-    /// as it stands; one that does dies in strict mode at what its first-vertex form has no
-    /// rotation for, and by default draws it as it stands, relayed, and draws points, and mode 0
-    /// again draws all
+    /// Whether the runtime draws the last provoking vertex through the device's own
+    /// (`VK_EXT_provoking_vertex`'s `provokingVertexLast`, with
+    /// `provokingVertexModePerPipeline`), where it draws lists led by each primitive's last
+    /// vertex elsewhere (MoltenVK among them).
+    pub(crate) fn last_vertex_native() -> bool {
+        use metal2vulkan::device::{VkExtension, VkFeature};
+        let d = dev();
+        let desc = &d.raw.properties().description;
+        desc.extensions.contains(&VkExtension::ExtProvokingVertex)
+            && desc.features.contains(&VkFeature::ProvokingVertexLast)
+            && desc.limits.provoking_vertex_mode_per_pipeline
+    }
+
+    /// How many times this process relayed `kind`, of [`crate::answer::DIES`].
+    pub(crate) fn relayed_kind(kind: rt::Degradation) -> u64 {
+        (crate::answer::relayed_counts().into_iter())
+            .find(|&(k, _)| k == kind)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// After `setProvokingVertexMode:` of 1, every draw of a state that reads no flat input draws,
+    /// and so do the triangles of one that does, direct, over indices and from indirect
+    /// arguments, and its points. Its lines and its line loop, which the runtime draws from their
+    /// last vertex to their first without the device's last vertex, die there in strict mode
+    /// (`provoking-vertex-lines`) and by default draw, relayed and counted. A mode from 2 up, its
+    /// top bit set or not, dies at the setter in strict mode (`provoking-vertex-unmatched`), and
+    /// mode 0 again draws all
     #[test]
-    fn the_last_vertex_kills_only_flat_draws_it_cannot_rotate() {
+    fn the_last_vertex_relays_only_what_the_runtime_announces() {
         let (e, indices) = drawing_encoder("vert:tri_vert", "frag:tri_frag");
         let indirect = |primitive_type| RenderCmd::DrawPrimitivesIndirect {
             primitive_type,
@@ -5204,15 +5039,23 @@ pub(crate) mod tests {
             ],
         );
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        let (e, indices) = drawing_encoder("rdec_flat_v", "rdec_flat_f");
-        let draw = "drawPrimitives:vertexStart:vertexCount:";
-        let indexed = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
+        let (e, indices) = drawing_encoder(FLAT.0, FLAT.1);
+        let indirect = |primitive_type| RenderCmd::DrawPrimitivesIndirect {
+            primitive_type,
+            indirect_buffer: &indices,
+            indirect_buffer_offset: 0,
+        };
         send_all(
             &e,
             vec![
-                RenderCmd::SetProvokingVertexMode { mode: u64::MAX },
+                RenderCmd::SetProvokingVertexMode { mode: 1 },
                 three(3, None),
                 three(STRIP, None),
+                three(3, Some(&indices)),
+                three(STRIP, Some(&indices)),
+                three(6, None),
+                indirect(3),
+                indirect(STRIP),
             ],
         );
         // Points, under a state that reads a flat input and sizes its points, where the device's
@@ -5222,39 +5065,37 @@ pub(crate) mod tests {
             send_all(
                 &sized,
                 vec![
-                    RenderCmd::SetProvokingVertexMode { mode: u64::MAX },
+                    RenderCmd::SetProvokingVertexMode { mode: 1 },
                     three(0, None),
                     three(0, Some(&sized_indices)),
                     RenderCmd::EndEncoding,
                 ],
             );
         }
-        assert_eq!(dies_at(&e, three(3, Some(&indices))), indexed);
-        assert_eq!(dies_at(&e, three(STRIP, Some(&indices))), indexed);
-        assert_eq!(dies_at(&e, three(1, None)), draw);
-        assert_eq!(dies_at(&e, three(2, None)), draw);
-        assert_eq!(dies_at(&e, three(6, None)), draw);
-        assert_eq!(
-            dies_at(
-                &e,
-                RenderCmd::DrawPrimitivesIndirect {
-                    primitive_type: 3,
-                    indirect_buffer: &indices,
-                    indirect_buffer_offset: 0,
-                }
-            ),
-            "drawPrimitives:indirectBuffer:indirectBufferOffset:"
-        );
-        // By default each draws as it stands, its first vertex provoking, relayed and counted.
-        let rotations = || relayed_of(crate::answer::Inexact::ProvokingVertex);
-        let before = rotations();
-        crate::answer::relaxed(|| {
-            send_all(
-                &e,
-                vec![three(3, Some(&indices)), three(1, None), three(6, None)],
-            );
-        });
-        assert_eq!(rotations(), before + 3);
+        let draw = "drawPrimitives:vertexStart:vertexCount:";
+        let indexed = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
+        let lines = || vec![three(1, None), three(2, Some(&indices)), three(5, None)];
+        if last_vertex_native() {
+            send_all(&e, lines());
+        } else {
+            let kind = rt::Degradation::ProvokingVertexLines;
+            for (cmd, at) in lines().into_iter().zip([draw, indexed, draw]) {
+                assert_eq!(
+                    crate::answer::dies_of(kind, || e.encode(OnFault::Return, cmd)).file,
+                    at
+                );
+            }
+            let before = relayed_kind(kind);
+            crate::answer::relaxed(|| send_all(&e, lines()));
+            assert_eq!(relayed_kind(kind), before + 3);
+        }
+        let setter = "setProvokingVertexMode:";
+        for mode in [2, 7, 1 << 32, 1 << 63, u64::MAX] {
+            let set = RenderCmd::SetProvokingVertexMode { mode };
+            let kind = rt::Degradation::ProvokingVertexUnmatched;
+            let site = crate::answer::dies_of(kind, || e.encode(OnFault::Return, set));
+            assert_eq!(site.file, setter, "{mode:#x}");
+        }
         send_all(
             &e,
             vec![
@@ -5270,7 +5111,10 @@ pub(crate) mod tests {
     /// A draw of no primitive draws nothing whatever the private setters left, as on Metal: of
     /// too few vertices or indices for one, and an execution of no command, after a restart, a
     /// line width of 2, triangles filled as lines and the last vertex provoking under a state
-    /// that reads a flat input; one of a primitive dies
+    /// that reads a flat input; one of a primitive dies. Where the device lacks the last vertex,
+    /// the runtime announces a line drawn from its last vertex to its first at a draw of lines
+    /// of one vertex or index, which makes none: it dies there in strict mode
+    /// (`provoking-vertex-lines`), and by default draws nothing, relayed
     #[test]
     fn empty_draws_go_on_after_the_private_setters() {
         use reims_vgpu_core::platform::values::IcbDesc;
@@ -5311,10 +5155,13 @@ pub(crate) mod tests {
                 RenderCmd::SetProvokingVertexMode { mode: 1 },
             ],
         );
+        let announced = !last_vertex_native();
         let mut empty = vec![drawn(0, 0), indexed(0, 0)];
         for (primitive_type, least) in [(1, 2), (2, 2), (3, 3), (STRIP, 3)] {
             for count in 0..least {
-                empty.extend([drawn(primitive_type, count), indexed(primitive_type, count)]);
+                if !(announced && least == 2 && count == 1) {
+                    empty.extend([drawn(primitive_type, count), indexed(primitive_type, count)]);
+                }
             }
         }
         empty.push(RenderCmd::ExecuteCommandsInBuffer {
@@ -5322,6 +5169,18 @@ pub(crate) mod tests {
             execution_range: NsRange::new(0, 0),
         });
         send_all(&e, empty);
+        if announced {
+            let lines = || [drawn(1, 1), indexed(1, 1), drawn(2, 1), indexed(2, 1)];
+            let kind = rt::Degradation::ProvokingVertexLines;
+            for cmd in lines() {
+                let sel = cmd.selector();
+                let site = crate::answer::dies_of(kind, || e.encode(OnFault::Return, cmd));
+                assert_eq!(site.file, sel);
+            }
+            let before = relayed_kind(kind);
+            crate::answer::relaxed(|| send_all(&e, lines().into()));
+            assert_eq!(relayed_kind(kind), before + 4);
+        }
         let draw = "drawPrimitives:vertexStart:vertexCount:";
         assert_eq!(dies_at(&e, drawn(1, 2)), draw);
         assert_eq!(dies_at(&e, drawn(3, 3)), draw);

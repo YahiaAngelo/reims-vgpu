@@ -10,6 +10,10 @@
 // input and writes white. `encoding_vertex` places its vertices as `point_vertex` does and takes
 // an indirect command buffer through the argument buffer at buffer 1, whose command 0 it resets
 // at a vertex ID past 2^24, which no test draws: a state of it can encode indirect commands.
+// `corner_patch_vertex` is a post-tessellation vertex function of triangle patches whose three
+// control points are float2 positions in buffer 0, its flat output its position in the patch,
+// so a triangle of a patch tessellated at factor 1 takes the colour of the corner its provoking
+// vertex lies at.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -89,4 +93,11 @@ vertex Ids encoding_vertex(uint vid [[vertex_id]], device Commands &held [[buffe
         render_command(held.commands, 0).reset();
     }
     return Ids{float4(centres[vid % 3], 0, 1), float4(float(vid) / 255.0, 0, 0, 1)};
+}
+
+[[patch(triangle, 3)]]
+vertex Ids corner_patch_vertex(uint pid [[patch_id]], float3 b [[position_in_patch]],
+                               const device float2 *corners [[buffer(0)]]) {
+    float2 p = corners[pid * 3] * b.x + corners[pid * 3 + 1] * b.y + corners[pid * 3 + 2] * b.z;
+    return Ids{float4(p, 0, 1), float4(b, 1)};
 }
