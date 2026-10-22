@@ -3103,7 +3103,8 @@ mod tests {
         computes.truncate(1);
         let (later, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
         drop((renders, later_renders));
-        assert_eq!(later[0].guest_unique_identifier(), released);
+        let read = crate::answer::relaxed(|| later[0].guest_unique_identifier());
+        assert_eq!(read, released);
         assert_eq!(command.pipeline_state_unique_identifier(), released);
     }
 

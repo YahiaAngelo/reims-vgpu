@@ -10,7 +10,9 @@
 //! answers 2^36 plus an offset in the runtime's allocation of such states, which reuses a
 //! released state's identifier, the last released first, by kind, as Metal's does, at offsets
 //! that are not Metal's (`unmeasured-unique-identifier`: Metal's follow its allocator and the
-//! process's history, as how the process was started).
+//! process's history, as how the process was started). The guest's read of such a state's is
+//! relayed as [`crate::answer::Inexact::UniqueIdentifier`], which dies in strict mode
+//! (`crate::gpu::resource`'s `guest_identifier`).
 //!
 //! **By resource ID.** An indirect command's record names its pipeline state by the state's
 //! resource ID, and a record the GPU wrote (a kernel's `set_compute_pipeline_state` or

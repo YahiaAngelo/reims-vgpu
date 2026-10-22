@@ -1039,6 +1039,28 @@ fn made_with(device: &rt::Device, id: rt::ResourceId, identifier: impl FnOnce() 
     identifier
 }
 
+/// What the guest reads (info command 460) of a pipeline state's runtime `uniqueIdentifier`,
+/// `identifier`: the same, but of a state made with indirect command buffer support (`indirect`)
+/// relayed as [`Inexact::UniqueIdentifier`](crate::answer::Inexact::UniqueIdentifier), not
+/// Metal's address, which dies in strict mode. A plain state's is one of a count, where Metal's
+/// is an address that differs from run to run (`plain-state-unique-identifier`, relayed).
+fn guest_identifier(identifier: u64, indirect: bool) -> u64 {
+    if indirect {
+        crate::answer::inexact(
+            "uniqueIdentifier",
+            crate::answer::Inexact::UniqueIdentifier,
+            || {
+                format!(
+                    "Metal's identifier of a pipeline state made with indirect command buffer \
+                     support: it answers the runtime's, {identifier:#x}, an offset of its own \
+                     allocation of such states"
+                )
+            },
+        );
+    }
+    identifier
+}
+
 /// The descriptor a render pipeline state was made of.
 #[derive(Debug, Clone)]
 pub enum RenderDescriptor {
@@ -2146,6 +2168,11 @@ impl ComputePipeline for VulkanComputePipeline {
     fn unique_identifier(&self) -> u64 {
         plain(|| self.unique_identifier)
     }
+
+    fn guest_unique_identifier(&self) -> u64 {
+        let indirect = ComputePipeline::support_indirect_command_buffers(self);
+        guest_identifier(self.unique_identifier, indirect)
+    }
 }
 
 /// The getters are the runtime's, and the unique identifier the one its creation took.
@@ -2192,6 +2219,13 @@ impl RenderPipeline for VulkanRenderPipeline {
 
     fn unique_identifier(&self) -> u64 {
         self.unique_identifier
+    }
+
+    fn guest_unique_identifier(&self) -> u64 {
+        guest_identifier(
+            self.unique_identifier,
+            self.support_indirect_command_buffers(),
+        )
     }
 }
 

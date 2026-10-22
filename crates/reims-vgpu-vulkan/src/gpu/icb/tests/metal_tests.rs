@@ -1332,8 +1332,9 @@ fn a_command_an_executed_kernel_wrote_answers_the_state_holding_its_id_then() {
 /// with it is an address of its own allocation of them, `0x1000000000` and up, the same in
 /// every process that makes the same states in the same order in one environment (here two
 /// child processes, each making [`twin_states`]); the runtime's is in that range, at offsets
-/// that are not Metal's (`unmeasured-unique-identifier`), and a render state made after one was
-/// released takes the released one's, the last released first, as Metal's does
+/// that are not Metal's, so the read is relayed (`inexact-unique-identifier`), dying in strict
+/// mode, and a render state made after one was released takes the released one's, the last
+/// released first, as Metal's does
 #[test]
 fn an_icb_capable_states_identifier_is_the_runtimes() {
     use reims_vgpu_core::platform::resource::{
@@ -1354,20 +1355,35 @@ fn an_icb_capable_states_identifier_is_the_runtimes() {
     let d = dev();
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
     let (computes, mut renders) = twin_states::<VulkanPlatform>(&d, &library);
+    let read = |read: &dyn Fn() -> u64| crate::answer::relaxed(read);
     let computes_read = computes
         .iter()
-        .map(|c| (c.guest_unique_identifier(), c.unique_identifier()));
+        .map(|c| (read(&|| c.guest_unique_identifier()), c.unique_identifier()));
     let renders_read = renders
         .iter()
-        .map(|r| (r.guest_unique_identifier(), r.unique_identifier()));
+        .map(|r| (read(&|| r.guest_unique_identifier()), r.unique_identifier()));
     for (read, identifier) in computes_read.chain(renders_read) {
         assert_eq!(read, identifier);
         assert!(identifier >= 1 << 36, "{identifier:#x}");
     }
+    let dies_in_strict_mode = |read: &dyn Fn() -> u64| {
+        *crate::answer::LAST_LINE.lock() = None;
+        let strict = catch_death(read);
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert!(
+            strict.is_err() && line.contains("(inexact-unique-identifier)"),
+            "{strict:?}: {line}"
+        );
+    };
+    dies_in_strict_mode(&|| computes[0].guest_unique_identifier());
+    dies_in_strict_mode(&|| renders[0].guest_unique_identifier());
     let released = renders[1].unique_identifier();
     renders.truncate(1);
     let (_later_computes, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
-    assert_eq!(later_renders[0].guest_unique_identifier(), released);
+    assert_eq!(
+        read(&|| later_renders[0].guest_unique_identifier()),
+        released
+    );
     let f = library
         .new_function(OnFault::Return, "nothing")
         .unwrap()

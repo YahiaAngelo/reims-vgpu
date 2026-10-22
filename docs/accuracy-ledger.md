@@ -83,4 +83,5 @@ process there instead.
 | A blit fill packed in another format repeats the packed texel | blits |
 | A late resolve texture beside a dropped resolve leaves the colour resolve dropped | render passes |
 | A texture of protection options from `newTextureWithDescriptor:` or `newSharedTextureWithDescriptor:` is made unprotected, as Metal's other creators make it, where Metal answers nil without the protected-content entitlement; its contents are not kept from the host | device textures |
+| The `uniqueIdentifier` of a pipeline state made with indirect command buffer support, which the guest reads, is the runtime's offset in its own allocation of such states, not Metal's address (`unmeasured-unique-identifier`); one value for the state's life, unique among live states, the last released taken again first by kind, as Metal's | pipeline states |
 
