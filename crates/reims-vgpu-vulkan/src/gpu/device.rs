@@ -96,9 +96,7 @@ impl fmt::Display for OnSurface<'_> {
             plane,
         } = self;
         let d = &fields.desc;
-        let format = (fields.ycbcr_format.or(fields.no_texture_format))
-            .or(fields.lacked_format)
-            .unwrap_or(u64::from(d.pixel_format.as_raw()));
+        let format = fields.raw_pixel_format();
         let name = u32::try_from(format)
             .ok()
             .and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok())
@@ -1358,10 +1356,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })?;
             return Ok(None);
         }
-        let mut desc = match fields.ycbcr_format {
-            Some(format) => fields.on_surface_ycbcr(sel, format),
-            None => fields.descriptor(sel, Maker::Surface),
-        };
+        let mut desc = fields.descriptor(sel, Maker::Surface);
         let usage = match crate::os::gpu_read_only(surface) {
             true => crate::gpu::resource::read_only_usage(&mut desc),
             false => 0,

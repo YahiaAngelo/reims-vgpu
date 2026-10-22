@@ -1,9 +1,6 @@
 //! The two-plane YCbCr pixel formats, which Metal makes textures of over an IOSurface's planes
-//! alone. Two of them ([`FORMATS`], 505 and 543), which the runtime makes over a surface and
-//! from no descriptor alone: a texture descriptor takes one at `setPixelFormat:` and keeps it raw,
-//! ahead of the runtime, which names them too. A descriptor holds each of the others as the
-//! runtime's format, and every creator but the one over a surface answers it as Metal does
-//! ([`answer`]). One harness measures them (`measure.rs`: the tests' surfaces of each OSType's
+//! alone. A texture descriptor holds each as the runtime's format, and every creator but the one
+//! over a surface answers it as Metal does ([`answer`]); 505 and 543 were measured first. One harness measures them (`measure.rs`: the tests' surfaces of each OSType's
 //! layout, and the probes that read a texture of any of the formats on Metal and here), and the
 //! tests compare the runtime's textures of each format it reads with Metal's (`sampling.rs`).
 //!
@@ -62,7 +59,7 @@
 //!
 //! **The other two-plane formats**, the 67 more of the runtime's `ycbcr_format` with 505 and 543
 //! ([`two_plane`]; `MTLPixelFormatYCBCR8_420_2P`, 500, and `MTLPixelFormatRGB8_420_2P`, 540,
-//! among them), the runtime has, so a descriptor holds one as the runtime's format. Every creator
+//! among them), a descriptor holds as the runtime's format too. Every creator
 //! but the one over an IOSurface answers a descriptor of one as Metal answers one of 505, and so
 //! does the runtime, which answers each of the 69 ([`crate::gpu::no_texture::descriptor`], where
 //! it does not). Measured on Metal on this host for each of the 69 where Metal answers (the
@@ -79,10 +76,9 @@
 //! layout of the texture's, and a texture over plane 1 of a packed surface die, naming the
 //! runtime's refusal (`packed_textures_copy_nothing_and_their_blits_and_plane_1_die`).
 //!
-//! The runtime makes no texture of 505 or 543 from a descriptor alone. So the descriptor keeps
+//! The runtime makes no texture of 505 or 543 from a descriptor alone. So the descriptor holds
 //! the format and answers it ([`crate::gpu::desc::TextureFields`]), and every creator but the one
-//! over an IOSurface passes it to the runtime as the runtime's format, which answers it as Metal
-//! does: nil, or 0 bytes from the heap's size query, where Metal answers so, and a death where
+//! over an IOSurface passes it to the runtime, which answers it as Metal does: nil, or 0 bytes from the heap's size query, where Metal answers so, and a death where
 //! Metal's validation aborts ([`crate::gpu::no_texture::descriptor`]). Over an IOSurface the
 //! runtime makes both, as it makes 500's ([`runtime_makes`]): over plane 0 of an 'x420', 'xf20',
 //! 'x422', 'xf22', 'x444' or 'xf44' surface whose `kIOSurfaceYCbCrMatrix` is BT.601, BT.709,
@@ -215,32 +211,6 @@ pub(crate) mod measure;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 pub(crate) mod sampling;
-
-/// The formats here a descriptor keeps raw, by Metal's raw values: `YCBCR10_420_2P` (505) and
-/// `RGB10_420_2P` (543).
-pub const FORMATS: [u64; 2] = [505, 543];
-
-/// Whether a descriptor's `setPixelFormat:` takes `raw` as a format of this module's
-/// ([`FORMATS`]).
-pub fn taken(raw: u64) -> bool {
-    FORMATS.contains(&raw)
-}
-
-/// The death of `sel` making a texture of `format`, one of [`FORMATS`], from the runtime's
-/// descriptor: the runtime has no texture of it. Every creator but the IOSurface one passes the
-/// runtime the format, which it answers as Metal does ([`crate::gpu::no_texture::descriptor`]),
-/// and the IOSurface one the runtime's format
-/// ([`crate::gpu::desc::TextureFields::on_surface_ycbcr`]), so none reaches this.
-pub fn unmade(sel: &'static str, format: u64) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "a texture of {} ({format}): it has no texture of a two-plane YCbCr format sampled \
-             as RGB",
-            crate::gpu::format_info::name(sel, format)
-        ),
-    )
-}
 
 /// Whether the runtime makes a texture of `pf` over an IOSurface's plane, given the surface's
 /// YCbCr facts (`crate::os::ycbcr_facts`), by its own answer

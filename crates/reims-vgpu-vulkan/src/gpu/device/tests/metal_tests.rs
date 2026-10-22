@@ -2279,8 +2279,8 @@ fn the_setter_takes_what_metals_takes() {
 }
 
 /// `texture2DDescriptorWithPixelFormat:width:height:mipmapped:` keeps and answers the formats
-/// `setPixelFormat:` keeps raw, as Metal's does: the two YCbCr formats measured first
-/// ([`crate::gpu::ycbcr`]) and the formats Metal makes no texture of
+/// Metal makes no texture of from a descriptor alone, as Metal's does: the two YCbCr formats
+/// measured first, 505 and 543 ([`crate::gpu::ycbcr`]), and those `setPixelFormat:` keeps raw
 /// ([`crate::gpu::no_texture`])
 #[test]
 fn two_d_descriptors_keep_raw_formats_as_the_setter_does() {
@@ -2289,7 +2289,7 @@ fn two_d_descriptors_keep_raw_formats_as_the_setter_does() {
     let p = crate::platform::tests::platform();
     let mp = reims_vgpu_metal::MetalPlatform::system_default_device()
         .map(|_| reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher)));
-    let raw = crate::gpu::ycbcr::FORMATS.into_iter();
+    let raw = [505, 543].into_iter();
     for format in raw.chain(crate::gpu::no_texture::FORMATS) {
         let ours = p.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
         assert_eq!(ours.unwrap().pixel_format(), format);

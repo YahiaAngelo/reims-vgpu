@@ -9,10 +9,13 @@ use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, Texture
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::MetalPlatform;
 
-use super::super::FORMATS;
 use super::*;
 use crate::os::tests::bgra_surface;
 use crate::platform::tests::platform;
+
+/// The two formats measured first (the module's docs): `YCBCR10_420_2P` (505) and
+/// `RGB10_420_2P` (543).
+const FORMATS: [u64; 2] = [505, 543];
 
 /// The raw values of the two-plane formats ([`super::super::two_plane`]): the 69 of the runtime's
 /// `ycbcr_format`, 505 and 543 among them.

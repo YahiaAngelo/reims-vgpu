@@ -594,12 +594,11 @@ impl Platform for VulkanPlatform {
         mipmapped: bool,
     ) -> RaiseResult<VulkanTextureDescriptor> {
         let sel = "texture2DDescriptorWithPixelFormat:width:height:mipmapped:";
-        let (format, ycbcr_format, no_texture_format, lacked_format) =
+        let (format, no_texture_format, lacked_format) =
             crate::gpu::desc::format_set(sel, pixel_format);
         let desc = plain(|| rt::TextureDescriptor::texture_2d(format, width, height, mipmapped));
         Ok(Obj::new(TextureDescriptorObject::new(TextureFields {
             desc,
-            ycbcr_format,
             no_texture_format,
             lacked_format,
             ..TextureFields::default()
