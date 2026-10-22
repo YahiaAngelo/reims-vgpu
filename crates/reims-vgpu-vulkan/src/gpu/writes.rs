@@ -353,6 +353,43 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
     Memory::over(contents.unwrap_or_default(), kept)
 }
 
+/// [`buffer_bound`] where it may decide what work through `b` asks: `b` lies on a surface, or the
+/// GPU's writes through it reach read-only memory ([`Backing::writes_kept`]); elsewhere, where its
+/// [`Bound`] holds no surface, no refused format and nothing kept, which a slot's bind keeps
+/// nothing of, the default one, of no memory, read without asking the runtime, as each draw binds
+/// its buffers anew.
+///
+/// [`Backing::writes_kept`]: crate::gpu::backing::Backing::writes_kept
+pub fn buffer_bind(b: &BufferObject) -> Bound {
+    let kept = match (&b.surface, &b.heap) {
+        (Some(_), _) => true,
+        (None, Some(h)) => h.backing.writes_kept(),
+        (None, None) => b.backing.writes_kept(),
+    };
+    if kept {
+        buffer_bound(b)
+    } else {
+        Bound::default()
+    }
+}
+
+/// [`texture_bound`] where it may decide what work through `t` asks, as [`buffer_bind`] reads a
+/// buffer's: `t` lies on a surface, over a buffer whose bind may, or in a heap whose writes reach
+/// read-only memory; elsewhere the default one, of no memory.
+pub fn texture_bind(t: &TextureObject) -> Bound {
+    let kept = match (&t.surface, &t.under) {
+        (Some(_), _) => true,
+        (None, Some(Under::Buffer(b, _))) => b.surface.is_some() || buffer_kept(b),
+        (None, Some(Under::Heap(h, _))) => h.backing.writes_kept(),
+        (None, None) => false,
+    };
+    if kept {
+        texture_bound(t)
+    } else {
+        Bound::default()
+    }
+}
+
 /// What a bind keeps of `b`'s memory: [`buffer_memory`]'s [`Bound`], read as it reads it, but
 /// without collecting the ranges of its bytes in the guest's pages, one a page run, as each draw
 /// binds its buffers anew.
