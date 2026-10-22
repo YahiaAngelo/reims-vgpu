@@ -1663,12 +1663,13 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         plain(|| self.raw.protection_options())
     }
 
-    /// The runtime reads `pixel_bytes` from a copy made first ([`host_bytes`]), as it takes only
-    /// a slice. Refused as Metal's validation refuses a region outside the level, rows that do
+    /// The runtime reads `pixel_bytes` in place, through their pointer ([`guest_bytes`]), each
+    /// byte once. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
     /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
     /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
-    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]).
+    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]). A surface's
+    /// reads a copy of them first ([`host_bytes`]), which it writes row by row.
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -1680,20 +1681,21 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     ) -> RaiseResult<()> {
         let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
         let raw = self.copied(sel);
-        let bytes = host_bytes(sel, pixel_bytes);
         if self.gpu_read_only() {
+            let bytes = host_bytes(sel, pixel_bytes);
             let rows = (bytes_per_row, bytes_per_image);
             return self.replaced_on_surface(sel, raw, (region, level, slice), &bytes, rows);
         }
+        let bytes = guest_bytes(sel, pixel_bytes);
         if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
         }
         send(sel, Policy::Dies, || {
-            raw.replace_region(
+            raw.replace_region_with_host_bytes(
                 crate::gpu::region(region),
                 level,
                 slice,
-                &bytes,
+                bytes,
                 bytes_per_row,
                 bytes_per_image,
             )
@@ -1742,20 +1744,41 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     }
 }
 
-/// A copy of the bytes of `range`, for a runtime call that takes only a slice. A non-empty range
-/// at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one that wraps past
-/// the top of the address space, dies at `sel`, as Metal's read of it faults: core's fill of a
-/// texture with bytes reads a buffer's `contents` plus an offset, NULL plus the offset for a
-/// buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:length:` ends
-/// the process with a segmentation fault there (measured on the M3 Max at offsets 0, 0x10 and
-/// 0x4000, on surfaces of their own memory and over the guest's pages).
+/// A copy of the bytes of `range`, for a write of this platform's own that takes a slice. A
+/// non-empty range at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one
+/// that wraps past the top of the address space, dies at `sel`, as Metal's read of it faults:
+/// core's fill of a texture with bytes reads a buffer's `contents` plus an offset, NULL plus the
+/// offset for a buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:
+/// length:` ends the process with a segmentation fault there (measured on the M3 Max at offsets
+/// 0, 0x10 and 0x4000, on surfaces of their own memory and over the guest's pages).
 ///
 /// The bytes are guest memory, which another vCPU or GPU work in flight may write while they are
 /// read: `HostRange` promises them mapped and readable for the call, never unchanged, so no
 /// shared slice is made over them. They are copied once, through the pointer, into memory this
-/// platform owns, and the runtime reads that copy.
+/// platform owns. A runtime call reads them in place instead ([`guest_bytes`]).
 pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
     first_bytes(sel, range, usize::MAX)
+}
+
+/// The bytes of `range`, for a runtime call that reads them through their pointer, each byte
+/// once, into memory of its own (`rt::HostBytes`: `replaceRegion:` and `newBufferWithBytes:`),
+/// with no copy of this platform's first. Where the range lies dies as [`host_bytes`] dies.
+pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::HostBytes<'a> {
+    let length =
+        usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
+    let first = range.ptr().addr();
+    let Some(start) = NonNull::new(range.ptr().as_ptr::<u8>()).filter(|_| length != 0) else {
+        return rt::HostBytes::from_slice(&[]);
+    };
+    if first < reims_vgpu_core::guest::ZERO_REGION_END || first.checked_add(length).is_none() {
+        crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
+    }
+    // SAFETY: `HostRange::new`'s contract keeps `start..start + length` mapped and readable for
+    // the call the bytes are given to, which reads them only while it runs and keeps nothing of
+    // the pointer. They are guest memory, which the guest's vCPUs and GPU work write outside the
+    // program's Rust while they are read, as `HostBytes::new` allows: the call copies each byte
+    // through the pointer, and no reference covers them.
+    unsafe { rt::HostBytes::new(start, length) }
 }
 
 /// The first `most` bytes of `range` (all of them where it holds fewer), copied as [`host_bytes`]
@@ -2373,6 +2396,37 @@ pub(crate) mod tests {
         // before reading.
         let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
         let site = catch_death(|| host_bytes("s", wraps)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
+    }
+
+    /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
+    /// length; an empty range is no bytes, even at NULL; a non-empty range in the zero region, or
+    /// wrapping past the top of the address space, dies at the selector as a NULL access, as a
+    /// copy of it does
+    #[test]
+    fn guest_bytes_are_the_range_in_place() {
+        let memory = [1u8, 2, 3, 4, 5];
+        let bytes = guest_bytes("s", HostRange::of_slice(&memory));
+        let at = (bytes.pointer().as_ptr().cast_const(), bytes.len());
+        assert_eq!(at, (memory.as_ptr(), 5));
+        // SAFETY: an empty range is never read.
+        let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
+        assert!(guest_bytes("s", empty).is_empty());
+        let last = u64::try_from(reims_vgpu_core::guest::ZERO_REGION_END - 1).unwrap();
+        for at in [0, 0x10, last] {
+            // SAFETY: a range of 4 bytes in the zero region, which dies before any read.
+            let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
+            let site = catch_death(|| guest_bytes("s", near_null)).unwrap_err();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::NullDeref, "s"),
+                "{at:#x}"
+            );
+        }
+        // SAFETY: a range that wraps past the top of the address space, which dies before any
+        // read.
+        let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
+        let site = catch_death(|| guest_bytes("s", wraps)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
     }
 

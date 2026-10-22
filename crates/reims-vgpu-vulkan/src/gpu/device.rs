@@ -1515,9 +1515,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let (placement, mut placing) =
             metal_space::placing(desc.length, bytes, desc.pinned_gpu_address);
-        // The copied contents, read once from the caller's memory before the runtime sees them:
-        // its descriptor takes only a slice, and guest memory may change while it is read.
-        let copied: Vec<u8>;
         // A no-copy buffer's memory, whose deallocator's run a detach may hold
         // ([`backing::Held`]).
         let mut own = None;
@@ -1529,8 +1526,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             (Some(bytes), false, None) if bytes.len() == desc.length => {
                 // A NULL pointer dies whatever the length, as the no-copy creators' does.
                 pointer(sel, bytes.ptr());
-                copied = crate::gpu::resource::host_bytes(sel, bytes);
-                rt::BufferContents::Copy(&copied)
+                // Read once, through the pointer, straight into the buffer's memory: guest memory
+                // may change while it is read.
+                rt::BufferContents::CopyHost(crate::gpu::resource::guest_bytes(sel, bytes))
             }
             (Some(bytes), true, slot) => {
                 let start = pointer(sel, bytes.ptr());
