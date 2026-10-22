@@ -176,6 +176,248 @@ fn compute_state_answers_are_metals_for_every_kernel_here() {
     assert!(compared > 100, "{compared} kernels");
 }
 
+/// What a texture `t` describes answers of the getters core reads, made on `d` (by
+/// `newSharedTextureWithDescriptor:` where `shared`): its width, height, depth, array length,
+/// levels, samples, pixel format, type, usage, storage mode, resource options, whether it is
+/// shareable and its protection options; `None` for nil.
+fn texture_answers<P: Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    t: &TextureDesc,
+    shared: bool,
+) -> Option<[u64; 13]> {
+    let desc = desc(t);
+    let made = match shared {
+        true => d.new_shared_texture(&desc),
+        false => d.new_texture(OnFault::Return, &desc),
+    };
+    made.unwrap().map(|t| {
+        [
+            t.width(),
+            t.height(),
+            t.depth(),
+            t.array_length(),
+            t.mipmap_level_count(),
+            t.sample_count(),
+            t.pixel_format(),
+            t.texture_type(),
+            t.usage(),
+            t.storage_mode(),
+            t.resource_options(),
+            u64::from(t.is_shareable()),
+            t.protection_options(),
+        ]
+    })
+}
+
+/// The texture descriptors [`textures_and_buffers_answer_as_metals_across_descriptors`] makes:
+/// RGBA8Unorm and RGBA16Float textures of every type, 8 texels wide, of one level and of the
+/// whole chain (one level for 1D and multisample types), of six usages (none, `ShaderRead`, with
+/// `ShaderWrite`, with `RenderTarget`, with `PixelFormatView`, and 0x8 alone; no render target
+/// of a 1D type, multisample ones read alone or with `RenderTarget`), under each resource
+/// option (the default, Shared, Managed, Private, untracked, tracked, write-combined, Private
+/// untracked; a multisample texture Private alone); Depth32Float ones of the 2D, 2D array,
+/// cube and cube array types, Private, Private untracked and Private tracked; and shareable
+/// Private 2D textures. Each is the descriptor and whether it is shareable.
+fn swept_textures() -> Vec<(TextureDesc, bool)> {
+    let shapes: [(u64, [u64; 3], u64, u64); 8] = [
+        (0, [8, 1, 1], 1, 1),
+        (1, [8, 1, 1], 2, 1),
+        (2, [8, 4, 1], 1, 1),
+        (3, [8, 4, 1], 3, 1),
+        (4, [8, 4, 1], 1, 4),
+        (5, [8, 8, 1], 1, 1),
+        (6, [8, 8, 1], 2, 1),
+        (7, [8, 4, 4], 1, 1),
+    ];
+    let options = [
+        None,
+        Some(0x0),
+        Some(0x10),
+        Some(0x20),
+        Some(0x100),
+        Some(0x200),
+        Some(0x1),
+        Some(0x120),
+    ];
+    let mut out = Vec::new();
+    for (texture_type, extent, array_length, sample_count) in shapes {
+        let one_dimensional = texture_type <= 1;
+        let multisample = sample_count > 1;
+        let levels: &[u64] = if one_dimensional || multisample {
+            &[1]
+        } else {
+            &[1, 4]
+        };
+        let usages: &[u64] = match (one_dimensional, multisample) {
+            (_, true) => &[1, 5],
+            (true, false) => &[0, 1, 3, 0x11, 0x8],
+            (false, false) => &[0, 1, 3, 5, 0x11, 0x8],
+        };
+        let resource_options: &[Option<u64>] = if multisample {
+            &[Some(0x20), Some(0x120)]
+        } else {
+            &options
+        };
+        for pixel_format in [70, 115] {
+            for &mipmap_level_count in levels {
+                for &usage in usages {
+                    for &resource_options in resource_options {
+                        let desc = TextureDesc {
+                            texture_type,
+                            pixel_format,
+                            width: extent[0],
+                            height: extent[1],
+                            depth: extent[2],
+                            mipmap_level_count,
+                            sample_count,
+                            array_length,
+                            usage,
+                            resource_options,
+                            ..TextureDesc::default()
+                        };
+                        out.push((desc, false));
+                    }
+                }
+            }
+        }
+        if matches!(texture_type, 2 | 3 | 5 | 6) {
+            for mipmap_level_count in [1, 4] {
+                for usage in [1, 5] {
+                    for resource_options in [Some(0x20), Some(0x120), Some(0x220)] {
+                        let desc = TextureDesc {
+                            texture_type,
+                            pixel_format: 252,
+                            width: extent[0],
+                            height: extent[1],
+                            mipmap_level_count,
+                            array_length,
+                            usage,
+                            resource_options,
+                            ..TextureDesc::default()
+                        };
+                        out.push((desc, false));
+                    }
+                }
+            }
+        }
+    }
+    for usage in [1, 3, 5] {
+        for resource_options in [Some(0x20), Some(0x120)] {
+            let desc = TextureDesc {
+                width: 8,
+                height: 4,
+                usage,
+                resource_options,
+                ..TextureDesc::default()
+            };
+            out.push((desc, true));
+        }
+    }
+    out
+}
+
+/// Every texture of [`swept_textures`] (1182 descriptors) answers the getters core reads
+/// ([`texture_answers`]) as Metal's does on this host, and a buffer of each of five lengths
+/// (1 byte to past 16 pages) and eleven resource options (Shared, Managed and Private, each
+/// default, untracked and tracked, write-combined and write-combined untracked) answers its
+/// length, resource options, storage mode and whether its contents are NULL as Metal's, but
+/// for three differences no answer of core's reaches (measured):
+/// - a texture's `resourceOptions` of the default hazard tracking mode: Metal's holds the
+///   tracked mode (0x200), this platform's the descriptor's options. Core reads no texture's
+///   options;
+/// - a texture of a descriptor that sets no resource options: Metal's is Managed (options
+///   0x210), this platform's Shared (0). Core reads a texture's storage mode only to refuse a
+///   memoryless one;
+/// - a Private buffer of at most a page (1 to 4096 bytes here; not 65537): Metal's `contents`
+///   is not NULL, from its private pool, this platform's is. Core reads only a Shared buffer's
+///   contents.
+#[test]
+fn textures_and_buffers_answer_as_metals_across_descriptors() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let p = platform();
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let vulkan_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let mut differ = Vec::new();
+    let textures = swept_textures();
+    for (t, shared) in &textures {
+        let theirs = texture_answers::<MetalPlatform>(&md, &metal_desc, t, *shared);
+        let ours = catch_death(|| texture_answers::<VulkanPlatform>(&d, &vulkan_desc, t, *shared));
+        // The two differences of the test's docs: the options and the storage mode.
+        let known = match (&ours, theirs) {
+            (Ok(Some(o)), Some(m)) => {
+                let (mut o, mut m) = (*o, m);
+                let (storage, options) = ((o[9], m[9]), (o[10], m[10]));
+                let tracked = options.1 == options.0 | 0x200 && options.0 & 0x300 == 0;
+                let unset =
+                    t.resource_options.is_none() && storage == (0, 1) && options == (0, 0x210);
+                (o[9], o[10], m[9], m[10]) = (0, 0, 0, 0);
+                o == m && (tracked && storage.0 == storage.1 || unset)
+            }
+            _ => false,
+        };
+        match ours {
+            Ok(ours) if ours == theirs || known => {}
+            ours => differ.push(format!(
+                "{t:?} shared {shared}: ours {ours:?}, Metal's {theirs:?}"
+            )),
+        }
+    }
+    for length in [1, 4, 100, 4096, 65537] {
+        for options in [
+            0, 0x100, 0x200, 0x10, 0x110, 0x210, 0x20, 0x120, 0x220, 0x1, 0x101,
+        ] {
+            let theirs = md
+                .new_buffer_of_length(OnFault::Return, length, options)
+                .unwrap()
+                .map(|b| {
+                    (
+                        b.length(),
+                        b.resource_options(),
+                        b.storage_mode(),
+                        b.contents().is_null(),
+                    )
+                });
+            let ours = catch_death(|| {
+                d.new_buffer_of_length(OnFault::Return, length, options)
+                    .unwrap()
+                    .map(|b| {
+                        (
+                            b.length(),
+                            b.resource_options(),
+                            b.storage_mode(),
+                            b.contents().is_null(),
+                        )
+                    })
+            });
+            // The third difference of the test's docs: a small Private buffer's contents.
+            let pooled = length <= 4096 && options & 0xf0 == 0x20;
+            let known = matches!(
+                (&ours, theirs),
+                (Ok(Some((l, o, 2, true))), Some((ml, mo, 2, false)))
+                    if pooled && (*l, *o) == (ml, mo)
+            );
+            match ours {
+                Ok(ours) if ours == theirs || known => {}
+                ours => differ.push(format!(
+                    "a buffer of {length} bytes, options {options:#x}: ours {ours:?}, Metal's \
+                     {theirs:?}"
+                )),
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} of {} differ:\n{}",
+        differ.len(),
+        textures.len() + 55,
+        differ.join("\n")
+    );
+}
+
 /// newBufferWithIOSurface: makes a Shared buffer over the surface's memory that holds one
 /// reference of the surface while it lives, whose contents are NULL, as Metal's; iosurface
 /// answers it, +1
