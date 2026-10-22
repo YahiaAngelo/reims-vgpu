@@ -1240,25 +1240,27 @@ pub(crate) fn open(
 /// `RGBA16Bfloat`) that the pass loads (`Load`) and stores (any store action but `DontCare`), if
 /// any, named: a draw (of anything, or of nothing), an execution of render commands or a tile
 /// dispatch in the pass dies ([`RenderEncoderObject::bfloat_drawn`]), where Metal's draws. The
-/// runtime draws into a bfloat attachment, holding its codes as `half` values in
-/// the pass as Metal's tile memory does, but what a pass leaves in the tiles is not Metal's:
-/// - its load pass moves each code of the attachment through `half` as a clear converts a value
-///   (NaNs to `0x7fc0`, magnitudes past 65504 to the infinity, those below 2^-14 to `half`'s
-///   steps) in every 32 by 32 tile until a draw's reach is known, announcing
-///   `unreached-tiles-rewritten`, where Metal's tile store rewrites only the tiles a draw's
-///   primitives reach, keeping the others' codes;
+/// runtime draws into a bfloat attachment, holding its codes as `half` values in the pass as
+/// Metal's tile memory does, and its load pass moves each code of the tiles Metal's tile store
+/// writes back through `half` as Metal's does (NaNs to `0x7fc0`; the runtime's measurement on an
+/// M4: every tile where a colour attachment is cleared and stored, else those a draw's primitives
+/// reach). What a pass leaves in the tiles is still not always Metal's:
+/// - where the runtime does not find the tiles the draws' primitives reach (the passes
+///   [`crate::answer`] lists, a pipeline's first passes among them), its load pass moves the
+///   codes of every tile within the draws' viewports and scissors, announcing
+///   `unreached-tiles-rewritten`, where Metal's tile store keeps the codes of the tiles no
+///   primitive reaches;
 /// - one its load pass does not take (multisampled, held as a shadow, sparse) keeps its codes,
 ///   where Metal moves the codes of the tiles a draw reaches through `half`
 ///   (`extended-range-bits-kept`).
 ///
 /// Both kinds are relayed for the extended-range formats on their guest reach
-/// ([`crate::answer`]), where only bytes no Metal write leaves tell them apart. Neither ground
-/// holds for bfloat: a kernel's write or a fill leaves codes `half` does not hold, and no guest is
-/// known to draw into a bfloat attachment. Which tiles Metal rewrites was measured on
-/// extended-range and padded attachments alone (the runtime's measurement: every tile where another
-/// colour attachment is cleared and stored, else those a draw's primitives reach), so a pass that
-/// also clears and stores another attachment dies too. Each such death is strict mode's: by default
-/// the draw relays it ([`crate::answer::Inexact::BfloatLoaded`]).
+/// ([`crate::answer`]), where only bytes no Metal write leaves tell them apart. That ground does
+/// not hold for bfloat: a kernel's write or a fill leaves codes `half` does not hold, and no guest
+/// is known to draw into a bfloat attachment. The runtime announces each kind once a device, not
+/// at the pass that meets it, so every such pass dies, those the runtime keeps Metal's among
+/// them. Each such death is strict mode's: by default the draw relays it
+/// ([`crate::answer::Inexact::BfloatLoaded`]).
 fn bfloat_loaded(d: &rt::RenderPassDescriptor) -> Option<String> {
     d.color_attachments
         .iter()
@@ -2043,11 +2045,11 @@ impl VulkanRenderEncoder {
             crate::answer::inexact(sel, crate::answer::Inexact::BfloatLoaded, || {
                 format!(
                     "a draw in a pass that loads and stores the bfloat {attachment}, whose codes \
-                     the runtime moves through half in tiles no draw reaches \
-                     (unreached-tiles-rewritten), or keeps in tiles a draw reaches \
+                     the runtime moves through half in tiles no draw reaches where it does not \
+                     find the draws' reach (unreached-tiles-rewritten), or keeps in tiles a draw \
+                     reaches where its load pass does not take the attachment \
                      (extended-range-bits-kept), where Metal's tile store moves those a draw \
-                     reaches and keeps the rest; which tiles Metal rewrites is not measured for \
-                     a bfloat attachment"
+                     reaches and keeps the rest"
                 )
             });
         }

@@ -72,7 +72,7 @@ process there instead.
 |---|---|
 | A line width other than 1 draws 1 pixel wide | `reims-vgpu-vulkan` draw encoding |
 | A `half` colour output stored past the bound its rounding was measured within, as blended or converted at its attachment, stores the runtime's `half` rounding | draw encoding |
-| A draw in a pass that loads and stores a bfloat colour attachment leaves the runtime's tiles of it: codes moved through `half` where no draw reaches, kept where one does | draw encoding |
+| A draw in a pass that loads and stores a bfloat colour attachment leaves the runtime's tiles of it: codes moved through `half` where no draw reaches, in a pass whose reach the runtime does not find, and kept where one does, in an attachment its load pass does not take | draw encoding |
 | Under `textureWriteRoundingMode` 2, a half-float attachment of a sample count no one measured at the mode resolves by the runtime's rules | render states |
 | A heap texture of unmeasured size or layout takes the runtime's size and layout | heaps |
 | A Metal-level answer for an unmeasured host release, or a format's description off macOS 26.7, comes from that release's description | device answers |
