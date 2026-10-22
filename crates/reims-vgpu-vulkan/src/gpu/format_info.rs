@@ -291,16 +291,14 @@ fn block_at(level: impl FnOnce() -> MetalLevel, sel: &'static str, raw: u64, wha
     let level = || {
         let level = level();
         if level != rules {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::MetalLevel,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
+                format!(
                     "{what} pixel format {raw}, which Metal at {level} describes {}: this \
                      platform's rule for it was measured at {rules}, which describes {}",
                     describes(level, raw),
                     describes(rules, raw),
-                ),
-            );
+                )
+            });
         }
         level
     };

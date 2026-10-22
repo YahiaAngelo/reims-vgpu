@@ -665,32 +665,28 @@ pub(crate) static RESOLVE_PROBED: std::sync::atomic::AtomicU32 =
 /// [`NEAREST_EVEN`] whose fragment function may write `what` ([`rounded_texture_writes`]): the
 /// runtime rounds those writes by its default.
 pub fn rounded_texture_writes_inexact(sel: &'static str, what: &str) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::WriteRounding,
-        &format!(
+    crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
+        format!(
             "a draw or execution under a state of textureWriteRoundingMode {NEAREST_EVEN:#x}, \
              with {what}: Metal's mode 2 rounds a fragment function's texture writes of \
              R16Float, RG16Float, RGBA16Float and RG11B10Float otherwise than its default, and \
              nothing measured RGBX16Float's and RGB9E5Float's, where the runtime takes no mode \
              for a texture write"
-        ),
-    );
+        )
+    });
 }
 
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of a render
 /// state of [`NEAREST_EVEN`] that writes `what` ([`rounded_writes`]): the state is made, and
 /// rounds those writes by the runtime's default.
 pub fn rounded_writes_inexact(sel: &'static str, what: &str) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::WriteRounding,
-        &format!(
+    crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
+        format!(
             "textureWriteRoundingMode {NEAREST_EVEN:#x} of a descriptor with {what}: Metal rounds \
              the fragment function's half-float writes there to nearest even, and the runtime \
              rounds to nearest even only an attachment that stores them as written"
-        ),
-    );
+        )
+    });
 }
 
 /// `MTLBufferLayoutStrideDynamic` (`NSUIntegerMax`) as the serializer writes it, in 4 bytes

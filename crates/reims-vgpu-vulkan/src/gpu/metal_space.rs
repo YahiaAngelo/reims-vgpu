@@ -436,10 +436,8 @@ pub fn own_heap_size(
 /// as its device's image's, larger or smaller than Metal's, and the call goes on with them. The
 /// line names the texture.
 pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescriptor) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::HeapLayout,
-        &format!(
+    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+        format!(
             "{what} a texture whose layout in Metal's heaps the runtime does not model, which it \
              sizes as its device's image, larger or smaller than Metal's \
              (unmeasured-heap-texture-size): a {:?} texture of pixel format {}, {}x{}x{}, {} \
@@ -452,8 +450,8 @@ pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescript
             desc.mipmap_level_count,
             desc.sample_count,
             desc.array_length
-        ),
-    );
+        )
+    });
 }
 
 /// A shareable texture of `desc`, made by `sel`.

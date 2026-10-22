@@ -330,17 +330,15 @@ fn half_apart(d: &RenderPipelineDescriptor, written: &[u32]) -> Option<(usize, P
 /// (`HalfOutputPrecision`), whose colour attachment `index` of `format` stores it past the bound
 /// the rounding is relayed within ([`half_apart`]).
 fn half_output_apart(sel: &'static str, (index, format): (usize, PixelFormat)) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::HalfOutputBlend,
-        &format!(
+    crate::answer::inexact(sel, crate::answer::Inexact::HalfOutputBlend, || {
+        format!(
             "a fragment function's half colour output into colour attachment {index}, \
              {format:?}, as blended or converted there: the runtime rounds it to half first, \
              where Metal carries it at float precision, and the stored value lies past the \
              bound that rounding is relayed within ({})",
             rt::Degradation::HalfOutputPrecision.code()
-        ),
-    );
+        )
+    });
 }
 
 /// An open runtime render encoder, and what Metal's encoder holds that the runtime's has no form
@@ -1281,7 +1279,7 @@ pub(crate) fn open(
         crate::answer::inexact(
             "renderCommandEncoderWithDescriptor:",
             crate::answer::Inexact::Clear,
-            &what,
+            || what,
         );
     }
     let sources = descriptor.sources();
@@ -2632,7 +2630,9 @@ impl VulkanRenderEncoder {
             );
         }
         if self.varying_rates {
-            crate::answer::inexact(sel, crate::answer::Inexact::RateMap, VARYING_RATES_DRAW);
+            crate::answer::inexact(sel, crate::answer::Inexact::RateMap, || {
+                VARYING_RATES_DRAW.into()
+            });
         }
     }
 
@@ -2665,11 +2665,9 @@ impl VulkanRenderEncoder {
             Some((shape, k)) => {
                 self.drawn(sel, shape, empty);
                 if !empty && self.rotates(sel, shape) {
-                    crate::answer::inexact(
-                        sel,
-                        crate::answer::Inexact::ProvokingVertex,
-                        "a draw the provoking vertex rotates, as it stands",
-                    );
+                    crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
+                        "a draw the provoking vertex rotates, as it stands".into()
+                    });
                 }
                 self.binds(sel, &mut |e| call(e, k))
             }
@@ -2716,18 +2714,16 @@ impl VulkanRenderEncoder {
     /// leaves of it are not Metal's.
     fn bfloat_drawn(&self, sel: &'static str) {
         if let Some(attachment) = &self.bfloat_loaded {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::BfloatLoaded,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::BfloatLoaded, || {
+                format!(
                     "a draw in a pass that loads and stores the bfloat {attachment}, whose codes \
                      the runtime moves through half in tiles no draw reaches \
                      (unreached-tiles-rewritten), or keeps in tiles a draw reaches \
                      (extended-range-bits-kept), where Metal's tile store moves those a draw \
                      reaches and keeps the rest; which tiles Metal rewrites is not measured for \
                      a bfloat attachment"
-                ),
-            );
+                )
+            });
         }
     }
 
@@ -2830,11 +2826,9 @@ impl VulkanRenderEncoder {
         }
         let inherits_pipeline = icb.inherits.pipeline;
         if !empty && self.rotates(sel, Shape::Execution { inherits_pipeline }) {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::ProvokingVertex,
-                "an execution the provoking vertex rotates",
-            );
+            crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
+                "an execution the provoking vertex rotates".into()
+            });
         }
         if empty {
             return None;
@@ -2932,15 +2926,16 @@ impl VulkanRenderEncoder {
         self.bfloat_drawn(sel);
         self.encodes(sel, "a tile dispatch");
         if self.no_layers {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::RateMap,
+            crate::answer::inexact(sel, crate::answer::Inexact::RateMap, || {
                 "a tile dispatch in a pass of a rasterization rate map of no layers, which Metal \
-                 is not measured at (only its draws were)",
-            );
+                 is not measured at (only its draws were)"
+                    .into()
+            });
         }
         if self.varying_rates {
-            crate::answer::inexact(sel, crate::answer::Inexact::RateMap, VARYING_RATES_TILES);
+            crate::answer::inexact(sel, crate::answer::Inexact::RateMap, || {
+                VARYING_RATES_TILES.into()
+            });
         }
         self.issues(sel, None);
         if !self.rasterizes {
@@ -2996,11 +2991,9 @@ impl VulkanRenderEncoder {
             && m.wide_lines
             && (execution || shape.lines() || (m.line_fill && shape.triangles()))
         {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::LineWidth,
-                "lines at a line width other than 1, which no line drawn here has",
-            );
+            crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
+                "lines at a line width other than 1, which no line drawn here has".into()
+            });
         }
         if !m.last_vertex {
             return false;
@@ -3040,14 +3033,13 @@ impl VulkanRenderEncoder {
         if !relay {
             return false;
         }
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::ProvokingVertex,
+        crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
             "a draw with the last vertex provoking (setProvokingVertexMode:) under a pipeline \
              state that reads a flat input or barycentric weights, or whose vertex function \
              writes a layer or viewport index, which this draw's first-vertex form has no exact \
-             rotation for",
-        );
+             rotation for"
+                .into()
+        });
         false
     }
 }
@@ -3447,17 +3439,15 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 if let Some(d) = self.dropped_resolve(index) {
                     // Relayed, it stays dropped: the texture is left untouched, as plain Metal
                     // leaves the descriptor's.
-                    crate::answer::inexact(
-                        sel,
-                        crate::answer::Inexact::LateResolve,
-                        &format!(
+                    crate::answer::inexact(sel, crate::answer::Inexact::LateResolve, || {
+                        format!(
                             "a late resolve texture of colour attachment {index}, whose resolve \
                              by {:?} into {} the pass was made without, as plain Metal leaves \
                              that texture untouched; a late resolve texture there is not measured",
                             d.store,
                             d.into.name()
-                        ),
-                    );
+                        )
+                    });
                     return self.encoder.nothing(sel);
                 }
                 if self.pass.color_attachments[at].resolve_texture.is_none()
@@ -4075,10 +4065,8 @@ impl VulkanRenderEncoder {
             Attachment::Depth => "depth",
             _ => "stencil",
         };
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::LateResolve,
-            &format!(
+        crate::answer::inexact(sel, crate::answer::Inexact::LateResolve, || {
+            format!(
                 "a late {name} resolve texture in a pass made without the resolve of colour \
                  attachment {} by {:?} into {}, as plain Metal leaves that texture untouched: \
                  the pass's depth or stencil attachment resolves, a shape that drop is not \
@@ -4086,8 +4074,8 @@ impl VulkanRenderEncoder {
                 d.index,
                 d.store,
                 d.into.name()
-            ),
-        );
+            )
+        });
     }
 
     /// Whether `attachment` resolves nowhere whatever its resolve texture: the descriptor knew
@@ -4261,11 +4249,9 @@ impl VulkanRenderEncoder {
         crate::gpu::timing::count_draw();
         self.drawn(sel, shape, false);
         if matches!(topology, Topology::Private(_)) && self.rotates(sel, shape) {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::ProvokingVertex,
-                "a private type the provoking vertex rotates",
-            );
+            crate::answer::inexact(sel, crate::answer::Inexact::ProvokingVertex, || {
+                "a private type the provoking vertex rotates".into()
+            });
         }
         // These indices are this platform's, not the guest's: the draw restarts at the
         // all-ones index alone, which none of them is, and the guest's index holds again

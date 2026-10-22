@@ -2070,19 +2070,22 @@ static RELAYED_INEXACT: [std::sync::atomic::AtomicU64; Inexact::ALL.len()] =
 /// A value of kind `kind` at `sel` that the runtime computes otherwise than Metal, `what` saying
 /// which: in strict mode the death of [`unrepresentable`], its line naming the kind's code, as a
 /// degradation's death names its; by default relayed, the process's first of the kind writing a
-/// line on stderr, and counted ([`inexact_counts`]).
-pub fn inexact(sel: &'static str, kind: Inexact, what: &str) {
+/// line on stderr, and counted ([`inexact_counts`]). `what` is asked only for a line, the death's
+/// or the first relay's, so a relay past the first of its kind, as a draw's can be at every draw
+/// of a pass, makes none.
+pub fn inexact(sel: &'static str, kind: Inexact, what: impl FnOnce() -> String) {
     use std::sync::atomic::Ordering;
     if strict() {
-        unrepresentable(sel, &format!("{what} ({})", kind.code()));
+        unrepresentable(sel, &format!("{} ({})", what(), kind.code()));
     }
     let at = Inexact::ALL.iter().position(|&k| k == kind);
     let first = (at.and_then(|at| RELAYED_INEXACT.get(at)))
         .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0);
     if first {
         let line = format!(
-            "reims-vgpu: {sel}: the Vulkan runtime cannot hold {what}; relayed ({}), the first of \
+            "reims-vgpu: {sel}: the Vulkan runtime cannot hold {}; relayed ({}), the first of \
              its kind: REIMS_VGPU_STRICT=1 makes it a death\n",
+            what(),
             kind.code()
         );
         let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
@@ -2712,12 +2715,12 @@ mod tests {
                 .map_or(0, |(_, n)| n)
         };
         let before = counted();
-        relaxed(|| inexact("sel:", Inexact::Clear, "a value"));
-        relaxed(|| inexact("sel:", Inexact::Clear, "a value"));
+        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
         let site = reims_vgpu_core::testkit::capture::catch_death(|| {
-            inexact("sel:", Inexact::Clear, "a value");
+            inexact("sel:", Inexact::Clear, || "a value".into());
         })
         .unwrap_err();
         assert_eq!(site.file, "sel:");
@@ -2725,6 +2728,23 @@ mod tests {
         assert!(line.contains("cannot hold a value"), "{line}");
         assert!(line.contains("(inexact-clear)"), "{line}");
         assert_eq!(counted(), before + 2);
+    }
+
+    /// A relay past the first of its kind writes no line, so it says nothing of what it relays:
+    /// what the value is goes unasked, and only the count moves
+    #[test]
+    fn a_relay_past_the_first_of_its_kind_asks_nothing() {
+        let asked = std::cell::Cell::new(0);
+        let what = || {
+            asked.set(asked.get() + 1);
+            String::from("a value")
+        };
+        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
+        let first = asked.get();
+        assert!(first <= 1, "asked {first} times for one line");
+        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
+        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
+        assert_eq!(asked.get(), first);
     }
 
     /// Every kind of value this platform does not follow is placed once: listed once, under a

@@ -415,14 +415,12 @@ impl VulkanBlitEncoder {
                 true => "follow no rule measured",
                 false => "were not compared with the runtime's",
             };
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::FillFormat,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::FillFormat, || {
+                format!(
                     "a colour in pixel format {format:?} into a texture of {own:?}, whose bytes \
                      on Metal {why}"
-                ),
-            );
+                )
+            });
         }
         let Some(place) = fill::place(sel, &shape, level, slice, region) else {
             return self.nothing(sel);

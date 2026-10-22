@@ -607,11 +607,9 @@ impl Alone {
 /// is not measured ([`crate::gpu::metal_space::metal_size_and_align`]); the call goes on with
 /// the runtime's size.
 pub(crate) fn optimized_size(sel: &'static str, what: &str) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::HeapLayout,
-        &optimized_line(what),
-    );
+    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+        optimized_line(what)
+    });
 }
 
 /// The line of [`optimized_size`] for `what`.
@@ -932,17 +930,15 @@ impl HeapObject {
             } else {
                 "the device's driver lays the runtime's image out in its own layout"
             };
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::HeapLayout,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+                format!(
                     "a texture of pixel format {}, {} sample(s), placed in a heap over no address \
                      ranges, whose bytes core copies to and from the guest's pages, which would \
                      carry the runtime's layout of the texture where Metal's carry its own: {why}",
                     desc.pixel_format.as_raw(),
                     desc.sample_count,
-                ),
-            );
+                )
+            });
             return;
         }
         let layout = if !moltenvk {
@@ -1471,14 +1467,12 @@ impl VulkanTexture {
             && u64::from(source.as_raw()) == pixel_format
             && kind != own
         {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::YcbcrView,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::YcbcrView, || {
+                format!(
                     "a {kind:?} view of a {source:?} texture, which Metal reads otherwise than \
                      the texture, and the runtime as the texture"
-                ),
-            );
+                )
+            });
         }
     }
 
@@ -1583,10 +1577,8 @@ fn no_view(sel: &'static str, pixel_format: u64) -> bool {
     let described = crate::gpu::format_info::describes_answer(sel, pixel_format);
     let level = crate::platform::metal_level(sel);
     if crate::gpu::format_info::level_decides(pixel_format) && level != rt::MetalLevel::MacOS26_7 {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
+        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
+            format!(
                 "a view in pixel format {pixel_format}, which Metal at {level} describes \
                  {}: whether Metal makes such a view was measured at macOS 26.7 alone",
                 if described {
@@ -1594,8 +1586,8 @@ fn no_view(sel: &'static str, pixel_format: u64) -> bool {
                 } else {
                     "no format for"
                 }
-            ),
-        );
+            )
+        });
     }
     !described
 }
@@ -2105,17 +2097,15 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 }
                 let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout);
                 if lossless && desc.sample_count > 1 {
-                    crate::answer::inexact(
-                        sel,
-                        crate::answer::Inexact::HeapLayout,
-                        &format!(
+                    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+                        format!(
                             "a {}-sample texture in a heap that Metal keeps losslessly \
                              compressed, whose image the runtime keeps in memory of its own, \
                              where Metal's lies in the heap's bytes, so a buffer or texture over \
                              them would neither see nor change it (heap-texture-lossless-layout)",
                             desc.sample_count
-                        ),
-                    );
+                        )
+                    });
                 }
                 // Its bytes in the heap; the rest of the heap where the size is not answered.
                 let size = plain_at(sel, || self.device.raw.heap_texture_size_and_align(&desc));

@@ -357,16 +357,14 @@ impl TextureFields {
     /// kept from the host's process.
     pub fn made_unprotected(&self, sel: &'static str) {
         if self.protected() {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::ProtectedContent,
-                &format!(
+            crate::answer::inexact(sel, crate::answer::Inexact::ProtectedContent, || {
+                format!(
                     "protected content, a texture of protection options {:#x}: made as without \
                      them, as Metal's other creators make one, where Metal answers nil without \
                      the protected-content entitlement",
                     self.protection_options
-                ),
-            );
+                )
+            });
         }
     }
 

@@ -241,16 +241,14 @@ static BELOW_HOST: AtomicBool = AtomicBool::new(false);
 pub(crate) fn answering_level(sel: &'static str, what: impl FnOnce() -> String) -> rt::MetalLevel {
     let level = metal_level(sel);
     if BELOW_HOST.load(Ordering::Relaxed) {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
+        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
+            format!(
                 "{}, which Metal's releases answer differently: this host's macOS release is not \
                  one the Vulkan runtime measured, and its devices answer as {level}, the newest \
                  measured release below it",
                 what()
-            ),
-        );
+            )
+        });
     }
     level
 }
@@ -296,13 +294,11 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
         level
     });
     if kept != level {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
+        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
+            format!(
                 "a device answering Metal as {level}, where this process's devices answer as {kept}"
-            ),
-        );
+            )
+        });
     }
 }
 
