@@ -4115,9 +4115,10 @@ pub(crate) mod tests {
     }
 
     /// The earliest after its commit that Metal failed a command buffer its GPU hung at, at a
-    /// draw of primitive type 9 (the runtime's measurement, `rt::DrawPrimitiveType::Nine`: the
-    /// M3 Max, macOS 27.0.1, 7 hangs).
-    const HANG: std::time::Duration = std::time::Duration::from_micros(32_700);
+    /// draw of primitive type 9: 28.3 ms, of 33 hangs on the M3 Max, macOS 27.0.1, queues warmed
+    /// and not, which failed 28.3 to 46.2 ms after their commits (the runtime's measurement,
+    /// `command_buffer/hang.rs`).
+    const HANG: std::time::Duration = std::time::Duration::from_micros(28_300);
 
     /// A command buffer Metal's GPU would fail in two ways, a draw of primitive type 9 in a
     /// render encoder made under protection options, dies at its commit, as nothing measured it
