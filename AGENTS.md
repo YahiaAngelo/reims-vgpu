@@ -343,6 +343,10 @@ watchdog corrupts concurrent work.
   (a target directory, a build kept for reuse) go under `~/.cache/<name>`,
   and so does what must outlive a reboot, which empties `/tmp`: a worktree,
   the state a long run resumes from.
+- Instruments' recordings are scratch. `xctrace record` writes its raw trace
+  to `$TMPDIR/instruments*.ktrace`, gigabytes a run, and can leave it behind:
+  189 left there by two days of profiling held 254 GiB. A profiling run
+  removes its `.trace` and the `.ktrace` files it made when it is done.
 - The code's conventions are [docs/conventions.md](docs/conventions.md).
 
 ## Recording what was learned
