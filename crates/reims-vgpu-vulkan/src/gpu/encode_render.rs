@@ -415,9 +415,11 @@ struct RoundedTextures {
 }
 
 impl RoundedTextures {
-    /// `textures` bound to the fragment stage from slot `first`.
+    /// `textures` bound to the fragment stage from slot `first`, to the last slot a `u64` names: a
+    /// slot past `u32`, which the runtime cannot hold, dies at the command's selector after it
+    /// ([`small`]).
     fn bind(&mut self, first: u64, textures: &[Option<&VulkanTexture>]) {
-        for (slot, t) in (first..).zip(textures) {
+        for (slot, t) in (first..=u64::MAX).zip(textures) {
             self.formats.remove(&slot);
             let format = t
                 .map(|t| t.raw.pixel_format())
@@ -1797,9 +1799,10 @@ fn unsendable(m: &Bound) -> bool {
 
 impl Reach {
     /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
-    /// slots from `first`.
+    /// slots from `first`, to the last slot a `u64` names: a slot past `u32`, which the runtime
+    /// cannot hold, dies at the command's selector after it ([`small`]).
     fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Bound>) {
-        for (slot, m) in (first..).zip(memory) {
+        for (slot, m) in (first..=u64::MAX).zip(memory) {
             self.bind_one(stage, buffers, slot, m);
         }
     }
@@ -6211,6 +6214,45 @@ pub(crate) mod tests {
         assert_ne!(a.unique_identifier(), 0);
         assert_eq!(again.unique_identifier(), a.unique_identifier());
         assert_ne!(b.unique_identifier(), a.unique_identifier());
+    }
+
+    /// A bind at the last slot a `u64` names, or of a range from it, dies at its selector as one
+    /// past `u32`, which the runtime cannot hold: the slots are taken up to that last one, none
+    /// past it
+    #[test]
+    fn binds_at_the_last_slot_die_at_their_selector() {
+        use reims_vgpu_core::raise::death::DeathKind;
+
+        let (p, d) = (platform(), dev());
+        let b = crate::gpu::resource::tests::shared(64);
+        let cases: [RenderCmd<'_, VulkanPlatform>; 4] = [
+            RenderCmd::SetFragmentTexture {
+                texture: None,
+                index: u64::MAX,
+            },
+            RenderCmd::SetFragmentTextures {
+                textures: &[None, None],
+                range: NsRange::new(u64::MAX, 2),
+            },
+            RenderCmd::SetVertexTextures {
+                textures: &[None],
+                range: NsRange::new(u64::MAX, 1),
+            },
+            RenderCmd::SetFragmentBuffers {
+                buffers: &[Some(&b), Some(&b)],
+                offsets: &[0, 0],
+                range: NsRange::new(u64::MAX - 1, 2),
+            },
+        ];
+        for cmd in cases {
+            let sel = cmd.selector();
+            let (_target, pass) = pass_of(&p, &d, (4, 4));
+            let q = d.new_command_queue().unwrap();
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+            let site = catch_death(|| e.encode(OnFault::Die, cmd)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+        }
     }
 
     /// A pass of no attachment and no target size has no encoder, as Metal answers nil
