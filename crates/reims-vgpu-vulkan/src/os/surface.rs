@@ -72,10 +72,15 @@ pub(crate) fn ycbcr_facts(surface: &OsSurface, plane: u64) -> Option<rt::IoSurfa
 /// 0x1000 and 0x4000).
 pub(crate) fn surface_memory(surface: &OsSurface) -> Vec<std::ops::Range<u64>> {
     let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
-    let made = made_over(surface);
-    let first = base.saturating_sub(made.offset);
-    let own = std::iter::once(first..first.saturating_add(surface.alloc_size()));
-    own.chain(made.pages).collect()
+    let own = |offset: u64| {
+        let first = base.saturating_sub(offset);
+        first..first.saturating_add(surface.alloc_size())
+    };
+    recorded(surface, |made| {
+        let pages = made.pages.iter().cloned();
+        std::iter::once(own(made.offset)).chain(pages).collect()
+    })
+    .unwrap_or_else(|| vec![own(0)])
 }
 
 /// The host memory of `surface`'s bytes at `offsets`, each a first byte and an end counted from
@@ -89,15 +94,15 @@ pub(crate) fn surface_bytes_memory(
     let own = offsets
         .iter()
         .map(|o| base.saturating_add(o.start)..base.saturating_add(o.end));
-    let made = made_over(surface);
-    let at = |o: &std::ops::Range<u64>| {
-        made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
-    };
-    let paged: Vec<_> = offsets
-        .iter()
-        .flat_map(|o| in_runs(&made.pages, &at(o)))
-        .collect();
-    own.chain(paged).collect()
+    let paged = recorded(surface, |made| {
+        let at = |o: &std::ops::Range<u64>| {
+            made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
+        };
+        (offsets.iter())
+            .flat_map(|o| in_runs(&made.pages, &at(o)))
+            .collect::<Vec<_>>()
+    });
+    own.chain(paged.into_iter().flatten()).collect()
 }
 
 /// The host ranges that hold the bytes `offsets` of memory laid out over `runs` in their order
@@ -144,18 +149,12 @@ pub(crate) fn runs_meet(runs: &[std::ops::Range<u64>], offsets: &std::ops::Range
 /// page-aligned mapping of `IOSurfaceGetAllocSize` bytes (measured on the M3 Max at 0x40, 0x1000
 /// and 0x4000, over the guest's pages); 0 for a surface made otherwise.
 pub(crate) fn surface_offset(surface: &OsSurface) -> u64 {
-    made_over(surface).offset
+    recorded(surface, |made| made.offset).unwrap_or(0)
 }
 
 /// Whether `surface` was made over the guest's pages (`OsSurfaces::create`).
 pub(crate) fn over_guest_pages(surface: &OsSurface) -> bool {
     recorded(surface, |made| !made.pages.is_empty()).unwrap_or(false)
-}
-
-/// What `surface` was made over, as its OS records it: no pages and offset 0 for a surface
-/// made over neither the guest's pages nor an offset into its allocation.
-fn made_over(surface: &OsSurface) -> MadeOver {
-    recorded(surface, |made| made.clone()).unwrap_or_default()
 }
 
 /// The `kIOSurfaceClientDirection` of a surface core makes over the guest's pages read-only for
@@ -275,11 +274,15 @@ pub(crate) fn memory_kind(surface: &OsSurface) -> &'static str {
 /// reaches (`replaceRegion:`, measured: `tests/client_direction.rs`). False, writing nothing,
 /// for a surface not made over the guest's pages, and for bytes past them.
 pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]) -> bool {
-    let Some((pages, start)) = recorded(surface, |made| (made.pages.clone(), made.offset)) else {
+    let Some(held) = recorded(surface, |made| {
+        let first = made.offset.saturating_add(offset);
+        in_runs(
+            &made.pages,
+            &(first..first.saturating_add(bytes.len().to_u64())),
+        )
+    }) else {
         return false;
     };
-    let first = start.saturating_add(offset);
-    let held = in_runs(&pages, &(first..first.saturating_add(bytes.len().to_u64())));
     let total: u64 = held.iter().map(|r| r.end - r.start).sum();
     if total != bytes.len().to_u64() {
         return false;
