@@ -142,7 +142,7 @@
 //!   filled from its bytes) reads the guest's bytes here, where Metal reads memory core has
 //!   freed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -531,6 +531,7 @@ static DETACHED: Mutex<Detached> = Mutex::new(Detached {
     next: 0,
     detached: BTreeSet::new(),
     released: BTreeMap::new(),
+    releases: VecDeque::new(),
     open: BTreeMap::new(),
 });
 
@@ -540,7 +541,8 @@ static DETACHED: Mutex<Detached> = Mutex::new(Detached {
 /// which no other object ever takes, as the runtime lists a command's uses
 /// ([`rt::UsedResources`]): a buffer not placed in a heap, or a heap. `released` holds an object
 /// at most once, so it grows at most to the objects released while the oldest open command buffer
-/// stays open.
+/// stays open; whether a command buffer can fail by one is read from the latest alone, in
+/// constant time, as each submission asks it.
 #[derive(Debug)]
 struct Detached {
     /// The next number of the sequence.
@@ -550,6 +552,8 @@ struct Detached {
     /// The objects released detached: the number of the release. A command buffer made before
     /// it may hold a use of the object.
     released: BTreeMap<rt::ObjectId, u64>,
+    /// The releases of `released`, in the order of their numbers, the oldest first.
+    releases: VecDeque<(u64, rt::ObjectId)>,
     /// The numbers of the open command buffers ([`Opened`]), each with the isolated task that
     /// made it, if one did, until it commits. An ended task's never commits, and one of a task
     /// that died is never released ([`TaskLife`]), so it holds nothing; a committed one closes
@@ -584,6 +588,7 @@ impl Detached {
         let number = self.number();
         if !self.open.is_empty() {
             self.released.insert(id, number);
+            self.releases.push_back((number, id));
         }
     }
 
@@ -593,9 +598,10 @@ impl Detached {
         self.detached.contains(&id) || self.released.get(&id).is_some_and(|&at| at > made)
     }
 
-    /// Whether a command buffer made at `made` can fail by any object.
+    /// Whether a command buffer made at `made` can fail by any object: one is detached, or the
+    /// latest release, the largest number `released` holds, came after it.
     fn any(&self, made: u64) -> bool {
-        !self.detached.is_empty() || self.released.values().any(|&at| at > made)
+        !self.detached.is_empty() || self.releases.back().is_some_and(|&(at, _)| at > made)
     }
 
     /// Command buffer `made` closed, and those of ended tasks dropped: the releases no open
@@ -606,9 +612,12 @@ impl Detached {
             task.as_ref()
                 .is_none_or(|task| task.upgrade().is_some_and(|task| !task.has_ended()))
         });
-        match self.open.keys().next() {
-            Some(&oldest) => self.released.retain(|_, &mut at| at > oldest),
-            None => self.released.clear(),
+        let oldest = self.open.keys().next().copied().unwrap_or(u64::MAX);
+        while let Some(&(at, id)) = self.releases.front()
+            && at <= oldest
+        {
+            self.releases.pop_front();
+            self.released.remove(&id);
         }
     }
 }
@@ -1432,6 +1441,7 @@ mod tests {
             next: 0,
             detached: BTreeSet::new(),
             released: BTreeMap::new(),
+            releases: VecDeque::new(),
             open: BTreeMap::new(),
         }
     }
@@ -1658,6 +1668,39 @@ mod tests {
         d.detached(buffer);
         d.released(buffer);
         assert!(d.detached.is_empty() && d.released.is_empty());
+    }
+
+    /// Releases made while an old command buffer stays open fail the command buffers made before
+    /// each, and none made after the last; as the oldest open command buffers close, the releases
+    /// none of those still open was made before are forgotten, in order, the later ones kept
+    #[test]
+    fn releases_are_forgotten_in_order_as_the_oldest_command_buffers_close() {
+        let mut d = registry();
+        let objects: [rt::ObjectId; 6] = ids();
+        let old = made(&mut d, None);
+        let [first, second, third, rest @ ..] = objects;
+        for id in [first, second] {
+            d.detached(id);
+            d.released(id);
+        }
+        let middle = made(&mut d, None);
+        for id in std::iter::once(third).chain(rest) {
+            d.detached(id);
+            d.released(id);
+        }
+        let new = made(&mut d, None);
+        assert!(d.any(old) && d.any(middle) && !d.any(new));
+        assert!(d.fails(first, old) && !d.fails(first, middle) && d.fails(third, middle));
+        d.closed(old);
+        assert!(
+            !d.fails(first, old) && !d.fails(second, old),
+            "made before the oldest open"
+        );
+        assert_eq!(d.released.len(), 4);
+        assert!(d.fails(third, middle) && d.any(middle));
+        d.closed(middle);
+        assert!(d.released.is_empty() && d.releases.is_empty() && !d.any(new));
+        d.closed(new);
     }
 
     /// A command buffer committed while a buffer it fills is detached fails with code 8 as it is
