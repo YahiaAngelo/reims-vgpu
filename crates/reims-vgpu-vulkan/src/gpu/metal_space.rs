@@ -1342,8 +1342,40 @@ pub fn process() -> MutexGuard<'static, MetalSpace> {
 }
 
 /// The process's device used so ([`FirstUse`]): Metal's own allocations for it, the first time.
+/// Each blit command, encoder and tiler submission is one, so a use the process's space made
+/// already ([`FIRST_USES`]) is answered without its lock: it changes nothing of the space, and
+/// the lock's other work, the sampler mempool's growth ([`process`]), is placed by the next
+/// lock that changes it, before that change, where this one would have placed it.
 pub fn first_use(first: FirstUse) {
-    process().first_use(first);
+    let bit = first.bit();
+    if FIRST_USES.load(std::sync::atomic::Ordering::Acquire) & bit != 0 {
+        return;
+    }
+    let mut space = process();
+    space.first_use(first);
+    FIRST_USES.fetch_or(bit, std::sync::atomic::Ordering::Release);
+}
+
+/// The first uses the process's space made through [`first_use`], a bit each
+/// ([`FirstUse::bit`]): each made once, with every allocation it takes held for good, so a later
+/// one of the same kind is no change.
+static FIRST_USES: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+impl FirstUse {
+    /// Its bit in [`FIRST_USES`].
+    const fn bit(self) -> u16 {
+        1 << match self {
+            FirstUse::Queue => 0,
+            FirstUse::Texture => 1,
+            FirstUse::ComputeEncoder => 2,
+            FirstUse::BlitCommand => 3,
+            FirstUse::RenderEncoder => 4,
+            FirstUse::TilerBlit => 5,
+            FirstUse::TilerSubmission => 6,
+            FirstUse::SmallShared => 7,
+            FirstUse::SmallPrivate => 8,
+        }
+    }
 }
 
 /// A resource's hold on the process's space: its ranges, given back when it goes.
