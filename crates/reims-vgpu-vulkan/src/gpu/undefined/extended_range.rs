@@ -48,8 +48,6 @@ use super::{
     Aspect, CLEAR, Colour, Draw, IN_TILE_1_1, LOAD, Pass, READ, SHARED, STORE, Shape, Step, TARGET,
     WRITE, buffer, heard, metal, near, once, positions, random_bytes, replace, run, state,
 };
-use reims_vgpu_core::raise::death::DeathKind;
-use reims_vgpu_core::testkit::capture::catch_death;
 
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -246,8 +244,8 @@ fn cleared<P: Platform>((p, d): (&P, &P::Device), format: u64, colour: ClearColo
 /// read back by a blit, and clears to values inside and past the formats' ranges: Metal's bytes
 /// are one value on this host in every run (a blit out of a compressed `BGRA10_XR` texture reads
 /// canonical codes; `BGR10_XR` keeps every bit). This platform's are Metal's, or the runtime
-/// announced `unreached-tiles-rewritten` or `extended-range-bits-kept`; a clear to a NaN dies at
-/// the encoder, named, where Metal stores a code (0, or 384 in an `_sRGB` twin)
+/// announced `unreached-tiles-rewritten` or `extended-range-bits-kept`; a clear to a NaN among
+/// them, where Metal stores a code (0, or 384 in an `_sRGB` twin), as the runtime does
 #[test]
 fn extended_range_cpu_uploads_and_clears_are_metals() {
     let metal = metal();
@@ -308,20 +306,6 @@ fn extended_range_cpu_uploads_and_clears_are_metals() {
             let m = once(&format!("{format} {colour:?}"), || {
                 cleared((mp, md), format, colour)
             });
-            if colour.blue.is_nan() {
-                // This platform dies at the encoder, naming the NaN its clear is not measured to
-                // store as Metal does.
-                *crate::answer::LAST_LINE.lock() = None;
-                let died = catch_death(|| cleared((&p, &d), format, colour)).unwrap_err();
-                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-                assert_eq!(
-                    (died.kind, died.file),
-                    (DeathKind::Abort, "renderCommandEncoderWithDescriptor:"),
-                    "{line}"
-                );
-                assert!(line.contains("is a NaN"), "{format}: {line}");
-                continue;
-            }
             let o = cleared((&p, &d), format, colour);
             if against(&format!("{format} {colour:?}"), &[o], &[m]) {
                 differ.push(format!("{format} {colour:?}"));
