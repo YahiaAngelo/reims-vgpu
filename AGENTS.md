@@ -194,6 +194,13 @@ The suite's inputs:
 - **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
   can run another tree's `xtask` from a shared one
   ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
+  - Seed it before its first build with `scripts/seed-target.sh`. The seed
+    is an APFS clone of the host's warm build of the dependencies, which
+    writes nothing until a file changes, so the first build compiles only
+    the workspace's crates.
+  - Build there with `CARGO_INCREMENTAL=0`, as the check does.
+  - Whoever merges saves the merge worktree's build as the seed once its
+    check passes (`scripts/seed-target.sh save`).
 - **Two full checks at once can exceed RAM** (one test maps 32 GiB), and
   full suites compete for the GPU: run one at a time on the host.
 - **Set work aside with a WIP commit or a patch**, never `git stash`, whose

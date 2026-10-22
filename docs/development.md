@@ -22,6 +22,8 @@ scripts/
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
   run_vmapple.sh            boots a macOS VM on make qemu's QEMU
+  seed-target.sh            a new worktree's target directory as a clone of
+                            the host's warm build of the dependencies
   vm_drive.py, vm_ocr.swift drive a VM through a fixed tour
   walk_window_macos.sh      the manual walk of a display's window on macOS
 docs/
