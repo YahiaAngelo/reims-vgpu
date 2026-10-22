@@ -66,6 +66,116 @@ fn a_compute_states_resource_index_is_metals() {
     }
 }
 
+/// Every metallib the tests hold: the suite's shader fixtures but `fc`, whose kernel's function
+/// constants Metal asserts at unspecialized, and this crate's own test and product libraries,
+/// each with its name.
+fn every_metallib() -> Vec<(String, Vec<u8>)> {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/suite/fixtures/shaders");
+    let mut libs: Vec<(String, Vec<u8>)> = std::fs::read_dir(fixtures)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "metallib"))
+        // Its kernel's function constants are unspecialized: Metal asserts at a state of it.
+        .filter(|p| p.file_stem().is_some_and(|s| s != "fc"))
+        .map(|p| (p.display().to_string(), std::fs::read(&p).unwrap()))
+        .collect();
+    libs.sort();
+    let out = env!("OUT_DIR");
+    for name in [
+        "shaders",
+        "predication",
+        "rgbx",
+        "spin",
+        "icb_encode",
+        "reach",
+        "rounding",
+        "rounding_safe",
+        "simd_stages",
+        "ycbcr_probe",
+        "slice_write_repro",
+        "numbered_samplers",
+        "five_samplers",
+    ] {
+        let path = format!("{out}/{name}.metallib");
+        libs.push((name.to_owned(), std::fs::read(&path).unwrap()));
+    }
+    libs
+}
+
+/// What `d` answers of a compute state of each function of `data` made from the function
+/// alone, by function name: `Ok` of `maxTotalThreadsPerThreadgroup`, `threadExecutionWidth`,
+/// `staticThreadgroupMemoryLength` and `supportIndirectCommandBuffers`; `Err` of the error, nil
+/// or death where it makes none.
+type ComputeAnswer = Result<(u64, u64, u64, bool), String>;
+
+/// [`ComputeAnswer`]s of every function of `data` on `d`, sorted by name; one `Err` where it
+/// makes no library of `data` (a truncated metallib).
+fn compute_answers<P: Platform>(d: &P::Device, data: &[u8]) -> Vec<(String, ComputeAnswer)> {
+    use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
+    let Ok(Ok(Some(library))) = d.new_library(data) else {
+        return vec![("the library".to_owned(), Err("no library".to_owned()))];
+    };
+    let mut names = library.function_names();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let f = library.new_function(OnFault::Return, &name).unwrap();
+            let made = catch_death(|| d.new_compute_pipeline_state_for_function(f.as_ref()));
+            let answer = match made {
+                Ok(Ok(Some(state))) => Ok((
+                    state.max_total_threads_per_threadgroup(),
+                    state.thread_execution_width(),
+                    state.static_threadgroup_memory_length(),
+                    state.support_indirect_command_buffers(),
+                )),
+                Ok(Ok(None)) => Err("nil".to_owned()),
+                Ok(Err(e)) => Err(format!("error {}", e.code)),
+                Err(site) => Err(format!(
+                    "died at {}: {}",
+                    site.file,
+                    crate::answer::LAST_LINE.lock().take().unwrap_or_default()
+                )),
+            };
+            (name, answer)
+        })
+        .collect()
+}
+
+/// A compute state made from each kernel of every metallib the tests hold (102 kernels of 50
+/// libraries on this host, kernels of threadgroup memory, imageblocks, SIMD-group functions,
+/// argument buffers and indirect commands among them) answers `maxTotalThreadsPerThreadgroup`,
+/// `threadExecutionWidth`, `staticThreadgroupMemoryLength` and `supportIndirectCommandBuffers`
+/// as Metal's does; a function Metal makes no compute state of (a vertex, fragment or tile
+/// function, a kernel of stage-in attributes without their descriptor) makes none here either,
+/// though with another error or a death (core makes compute states of functions alone only of
+/// its own XR10 kernels). One kernel Metal makes a state of dies: `ycbcr_probe`'s
+/// `sample_held_sampler_float`, which samples a texture an argument buffer holds, the runtime's
+/// gap (`ArgumentBufferTextures`), where its tests pin the death
+#[test]
+fn compute_state_answers_are_metals_for_every_kernel_here() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let (mut differ, mut died, mut compared) = (Vec::new(), Vec::new(), 0);
+    for (lib, data) in every_metallib() {
+        let theirs = compute_answers::<MetalPlatform>(&md, &data);
+        let ours = compute_answers::<VulkanPlatform>(&d, &data);
+        for ((name, m), (_, o)) in theirs.iter().zip(&ours) {
+            match (m, o) {
+                (Ok(m), Ok(o)) if m == o => compared += 1,
+                (Ok(_), Err(o)) if o.starts_with("died") => died.push(name.clone()),
+                (Err(_), Err(_)) => {}
+                _ => differ.push(format!("{lib} {name}: ours {o:?}, Metal's {m:?}")),
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
+    assert_eq!(died, ["sample_held_sampler_float"]);
+    assert!(compared > 100, "{compared} kernels");
+}
+
 /// newBufferWithIOSurface: makes a Shared buffer over the surface's memory that holds one
 /// reference of the surface while it lives, whose contents are NULL, as Metal's; iosurface
 /// answers it, +1
