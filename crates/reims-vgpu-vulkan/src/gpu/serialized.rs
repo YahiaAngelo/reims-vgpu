@@ -2585,7 +2585,10 @@ pub(crate) mod tests {
             ("render_objects_malformed_truncated", basic[..5].to_vec()),
             ("colour index 8", color(8)),
             ("no vertex function", hex("01 02 04 22000000")),
-            ("sampleCoverage 0.5", hex("02 1b 04 0000003f 01 04 21000000")),
+            (
+                "sampleCoverage 0.5",
+                hex("02 1b 04 0000003f 01 04 21000000"),
+            ),
             ("alphaTestEnabled", hex("02 2d 04 01000000 01 04 21000000")),
             (
                 "a value of 8 bytes",
