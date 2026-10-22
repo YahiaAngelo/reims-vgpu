@@ -1758,26 +1758,12 @@ fn swizzled_extended_range_textures_are_made() {
     }
 }
 
-/// A swizzle other than the identity over memory whose GPU writes never reach it (a surface
-/// of `kIOSurfaceClientDirection` 2 over a guest's page, and a buffer made on it) is refused
-/// under `ShaderWrite` or `RenderTarget` usage as over any other memory, Metal's answers on
-/// the M3 Max under macOS 26.7, one case a process: without `writeSwizzleEnabled` Metal's
-/// validation asserts ("Texture Descriptor Validation"), where the runtime's validation stops
-/// it (`SwizzleWithWrites`); with it Metal makes the texture, of the usage asked, and writes
-/// through the swizzle, which the runtime does not build, so this platform dies naming the
-/// gap (`RuntimeGap::WriteSwizzle`). Read alone (`ShaderRead`, and with `PixelFormatView`),
-/// both make it, answering the usage asked.
-#[test]
-fn written_swizzles_over_read_only_memory_are_refused() {
-    use crate::os::OsSurface;
+/// A `BGRA` surface of 64 by 16, rows 256 bytes apart, of `kIOSurfaceClientDirection` 2 over the
+/// guest's page `guest` of `page` bytes, whose GPU writes never reach its memory.
+fn read_only_surface(guest: reims_vgpu_core::host::HostPtr, page: u64) -> OsSurface {
     use reims_vgpu_core::host::PhysicalMemoryRange;
     use reims_vgpu_core::num::ToU64 as _;
     use reims_vgpu_core::platform::os::surface::IoSurfaces as _;
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
-    use reims_vgpu_core::platform::types::Swizzle;
-    let vm = crate::os::OsVm::new();
-    let page = vm.page_size();
-    let guest = vm.allocate_anywhere(page).unwrap();
     let spec = SurfaceSpec {
         pixel_format: u32::from_be_bytes(*b"BGRA"),
         alloc_size: page,
@@ -1796,6 +1782,27 @@ fn written_swizzles_over_read_only_memory_are_refused() {
     };
     let surface = crate::os::OsSurfaces::new().create(&spec).unwrap();
     assert!(crate::os::gpu_read_only(&surface));
+    surface
+}
+
+/// A swizzle other than the identity over memory whose GPU writes never reach it (a surface
+/// of `kIOSurfaceClientDirection` 2 over a guest's page, and a buffer made on it) is refused
+/// under `ShaderWrite` or `RenderTarget` usage as over any other memory, Metal's answers on
+/// the M3 Max under macOS 26.7, one case a process: without `writeSwizzleEnabled` Metal's
+/// validation asserts ("Texture Descriptor Validation"), where the runtime's validation stops
+/// it (`SwizzleWithWrites`); with it Metal makes the texture, of the usage asked, and writes
+/// through the swizzle, which the runtime does not build, so this platform dies naming the
+/// gap (`RuntimeGap::WriteSwizzle`). Read alone (`ShaderRead`, and with `PixelFormatView`),
+/// both make it, answering the usage asked.
+#[test]
+fn written_swizzles_over_read_only_memory_are_refused() {
+    use crate::os::OsSurface;
+    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    use reims_vgpu_core::platform::types::Swizzle;
+    let vm = crate::os::OsVm::new();
+    let page = vm.page_size();
+    let guest = vm.allocate_anywhere(page).unwrap();
+    let surface = read_only_surface(guest, page);
     let desc = |usage, wse: bool| TextureDesc {
         pixel_format: 80,
         width: 64,
@@ -1867,6 +1874,80 @@ fn written_swizzles_over_read_only_memory_are_refused() {
         }
     }
     drop((buffer, surface));
+    assert!(vm.deallocate(guest, page).is_success());
+}
+
+/// A texture over memory whose GPU writes never reach it (a surface of
+/// `kIOSurfaceClientDirection` 2 over a guest's page, and a buffer made on it), whose usage this
+/// platform answers itself ([`read_only_usage`]), answers the usage bits Metal's public headers
+/// name none of as any other texture does (`usage_bits_metal_takes_are_answered_as_metals`): all
+/// but 0x8, which Metal's texture drops; and so do its views and its swizzled views, which a
+/// texture of `RenderTarget | 0x8` has too, Metal's answers on the M3 Max
+#[test]
+fn usage_bits_over_read_only_surfaces_are_answered_as_metals() {
+    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    let vm = crate::os::OsVm::new();
+    let page = vm.page_size();
+    let guest = vm.allocate_anywhere(page).unwrap();
+    let surface = read_only_surface(guest, page);
+    let desc = |usage| TextureDesc {
+        pixel_format: 80,
+        width: 64,
+        height: 16,
+        usage,
+        resource_options: Some(0),
+        ..TextureDesc::default()
+    };
+    // `MTLTextureSwizzleBlue`, `Green`, `Red`, `Alpha`.
+    let swapped = Swizzle {
+        red: 4,
+        green: 3,
+        blue: 2,
+        alpha: 5,
+    };
+    // The usage of each creator's texture of `desc` on `d` (the IOSurface creator's and a
+    // buffer's on the surface), of its view, and of its view of `swizzle`.
+    fn on<P: Platform<Surface = OsSurface>>(
+        d: &P::Device,
+        surface: &OsSurface,
+        desc: &P::TextureDescriptor,
+        swizzle: Swizzle,
+    ) -> [(u64, u64, u64); 2] {
+        let buffer = d.new_buffer_on_surface(Some(surface)).unwrap().unwrap();
+        let textures = [
+            d.new_texture_on_surface(desc, Some(surface), 0),
+            buffer.new_texture(OnFault::Return, desc, 0, 256),
+        ];
+        let one = NsRange::new(0, 1);
+        textures.map(|t| {
+            let t = t.unwrap().unwrap();
+            let view = t.new_texture_view(80).unwrap().unwrap().usage();
+            let swizzled = (t.new_swizzled_texture_subview(80, 2, one, one, swizzle))
+                .unwrap()
+                .unwrap()
+                .usage();
+            (t.usage(), view, swizzled)
+        })
+    }
+    let d = dev();
+    let p = platform();
+    let md = MetalPlatform::system_default_device();
+    for usage in [0x9, 0xc, 0xd, 0x1_0005, 0x1_c01d] {
+        let ours = on::<VulkanPlatform>(&d, &surface, &p.texture_descriptor(&desc(usage)), swapped);
+        let answered = usage & !0x8;
+        let swizzled = answered & 0x1_4011;
+        assert_eq!(
+            ours,
+            [(answered, answered, swizzled); 2],
+            "usage {usage:#x}"
+        );
+        if let Some(md) = &md {
+            let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc(usage));
+            let theirs = on::<MetalPlatform>(md, &surface, &metal, swapped);
+            assert_eq!(theirs, ours, "Metal: usage {usage:#x}");
+        }
+    }
+    drop(surface);
     assert!(vm.deallocate(guest, page).is_success());
 }
 
