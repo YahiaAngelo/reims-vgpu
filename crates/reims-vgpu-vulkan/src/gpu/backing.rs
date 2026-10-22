@@ -151,7 +151,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
@@ -520,7 +520,7 @@ impl Backing {
             ),
         }
         self.detached.store(true, Ordering::Release);
-        DETACHED.lock().detached(id);
+        DETACHED.detached(id);
         self.pages.zero();
     }
 
@@ -642,7 +642,7 @@ impl Backing {
         }
         self.detached.store(false, Ordering::Release);
         if let Some(id) = self.id {
-            DETACHED.lock().attached(id);
+            DETACHED.attached(id);
         }
         Ok(true)
     }
@@ -657,7 +657,7 @@ impl Drop for Backing {
         if self.is_detached()
             && let Some(id) = self.id
         {
-            DETACHED.lock().released(id);
+            DETACHED.released(id);
         }
         let own = self.alias.lock().own.take();
         if let Some(own) = own {
@@ -672,15 +672,8 @@ impl Drop for Backing {
 /// [`crate::gpu::command`]).
 pub(crate) const DETACHED_USE: u64 = 8;
 
-/// The detached objects, the command buffers they may fail, and those submitted.
-static DETACHED: Mutex<Detached> = Mutex::new(Detached {
-    next: 0,
-    detached: BTreeSet::new(),
-    released: BTreeMap::new(),
-    releases: VecDeque::new(),
-    open: BTreeMap::new(),
-    submitted: BTreeMap::new(),
-});
+/// The detached objects, the command buffers they may fail, and those open.
+static DETACHED: Registry = Registry::new();
 
 /// How many buffers and heaps a detach may detach were made ([`Backing::new`],
 /// [`Backing::heap`]): each takes the count before it as its number, and a submission notes the
@@ -688,15 +681,31 @@ static DETACHED: Mutex<Detached> = Mutex::new(Detached {
 /// was made, so a submission noted with a count of at most an object's number never took it.
 static MADE: AtomicU64 = AtomicU64::new(0);
 
+/// [`Detached`], under its lock, and what a submission reads of it without the lock, each
+/// written under the lock as it changes: whether an object is detached, and the latest release
+/// kept, so a command buffer no object can fail takes no lock of the process's; and the most of
+/// [`MADE`] a submission noted, so a detach of an object made since takes none either.
+#[derive(Debug)]
+struct Registry {
+    /// How many objects are detached now: the length of [`Detached::detached`].
+    detached: AtomicUsize,
+    /// The number of the latest release [`Detached::releases`] keeps, plus one; 0 for none.
+    latest: AtomicU64,
+    /// The most of [`MADE`] a submission noted ([`Submitted::made`]), taken before the note is
+    /// written, under its command buffer's lock: a detach of an object made as the count reached
+    /// it, or after, finds no command buffer that took it ([`in_flight`]).
+    noted: AtomicU64,
+    state: Mutex<Detached>,
+}
+
 /// The objects detached now and those released detached since the oldest open command buffer
-/// was made, and the open command buffers, numbered in one sequence of makes and releases, those
-/// submitted with what they submitted. An
+/// was made, and the open command buffers, numbered in one sequence of makes and releases. An
 /// object is named by its runtime identity ([`rt::Buffer::object_id`], [`rt::Heap::object_id`]),
 /// which no other object ever takes, as the runtime lists a command's uses
 /// ([`rt::UsedResources`]): a buffer not placed in a heap, or a heap. `released` holds an object
 /// at most once, so it grows at most to the objects released while the oldest open command buffer
 /// stays open; whether a command buffer can fail by one is read from the latest alone, in
-/// constant time, as each submission asks it.
+/// constant time, as each submission asks it ([`Registry::any`]).
 #[derive(Debug)]
 struct Detached {
     /// The next number of the sequence.
@@ -708,14 +717,39 @@ struct Detached {
     released: BTreeMap<rt::ObjectId, u64>,
     /// The releases of `released`, in the order of their numbers, the oldest first.
     releases: VecDeque<(u64, rt::ObjectId)>,
-    /// The numbers of the open command buffers ([`Opened`]), each with the isolated task that
-    /// made it, if one did, until it commits. An ended task's never commits, and one of a task
-    /// that died is never released ([`TaskLife`]), so it holds nothing; a committed one closes
-    /// once it completed, whatever its task does.
-    open: BTreeMap<u64, Option<Weak<TaskLife>>>,
-    /// The open command buffers a submission of which the runtime submitted, by number: what
-    /// [`in_flight`] asks what they took.
-    submitted: BTreeMap<u64, Submitted>,
+    /// The open command buffers, by number, until they close ([`Opened`]). One made by an isolated
+    /// task that ended and never committed holds nothing ([`Open::holds_nothing`]): an ended
+    /// task's never commits, and one of a task that died is never released ([`TaskLife`]). Such
+    /// ones go as they reach the front, the oldest open, at a close, and all of them once the
+    /// open ones grew to twice `fewest`, at a close: in O(1) a close, over the closes.
+    open: BTreeMap<u64, Arc<Open>>,
+    /// The fewest open command buffers since those that hold nothing were last let go of.
+    fewest: usize,
+}
+
+/// An open command buffer ([`Opened`]): its number, the isolated task that made it, if one did,
+/// until it commits, and what the runtime submitted of it.
+#[derive(Debug)]
+struct Open {
+    /// Its number in the sequence of [`Detached`].
+    number: u64,
+    /// The isolated task that made it, if one did.
+    task: Option<Weak<TaskLife>>,
+    /// Whether it committed: open until it completed, whatever its task does.
+    committed: AtomicBool,
+    /// Its submissions the runtime submitted, until it closes: each decided and noted under this
+    /// lock ([`Opened::submit`]), which a detach reads them under ([`in_flight`]). It holds the
+    /// command buffer, which holds its check, which holds this: the close takes it.
+    submitted: Mutex<Option<Submitted>>,
+}
+
+impl Open {
+    /// Whether it holds nothing: made by an isolated task that ended, and never committed.
+    fn holds_nothing(&self) -> bool {
+        !self.committed.load(Ordering::Acquire)
+            && (self.task.as_ref())
+                .is_some_and(|task| task.upgrade().is_none_or(|task| task.has_ended()))
+    }
 }
 
 /// A command buffer whose submissions the runtime submitted, until it closes ([`Opened`]): it,
@@ -737,71 +771,138 @@ impl Detached {
         number
     }
 
-    /// Object `id` detached.
-    fn detached(&mut self, id: rt::ObjectId) {
-        self.detached.insert(id);
-    }
-
-    /// Object `id`, detached, replaced: attached again. A command buffer committed before the
-    /// replace that names it fails in the runtime, which resolved the use as it was encoded
-    /// (module docs).
-    fn attached(&mut self, id: rt::ObjectId) {
-        self.detached.remove(&id);
-    }
-
-    /// Object `id` released detached: kept while a command buffer is open, which may have been
-    /// made before it.
-    fn released(&mut self, id: rt::ObjectId) {
-        self.detached.remove(&id);
-        let number = self.number();
-        if !self.open.is_empty() {
-            self.released.insert(id, number);
-            self.releases.push_back((number, id));
-        }
-    }
-
     /// Whether a command buffer made at `made` fails where it uses object `id`: the object is
     /// detached, or was released detached after the command buffer was made.
     fn fails(&self, id: rt::ObjectId, made: u64) -> bool {
         self.detached.contains(&id) || self.released.get(&id).is_some_and(|&at| at > made)
     }
 
+    /// The open command buffers that hold nothing let go of ([`Detached::open`]).
+    fn prune(&mut self) {
+        while let Some(oldest) = self.open.first_entry()
+            && oldest.get().holds_nothing()
+        {
+            oldest.remove();
+        }
+        self.fewest = self.fewest.min(self.open.len());
+        if self.open.len() >= 2 * self.fewest.max(16) {
+            self.open.retain(|_, open| !open.holds_nothing());
+            self.fewest = self.open.len();
+        }
+    }
+}
+
+impl Registry {
+    /// None detached, released or open.
+    const fn new() -> Registry {
+        Registry {
+            detached: AtomicUsize::new(0),
+            latest: AtomicU64::new(0),
+            noted: AtomicU64::new(0),
+            state: Mutex::new(Detached {
+                next: 0,
+                detached: BTreeSet::new(),
+                released: BTreeMap::new(),
+                releases: VecDeque::new(),
+                open: BTreeMap::new(),
+                fewest: 0,
+            }),
+        }
+    }
+
+    /// A command buffer made now by `task`, or by none: its place, open until it closes.
+    fn open(&self, task: Option<Weak<TaskLife>>) -> Arc<Open> {
+        let mut state = self.state.lock();
+        let open = Arc::new(Open {
+            number: state.number(),
+            task,
+            committed: AtomicBool::new(false),
+            submitted: Mutex::new(None),
+        });
+        state.open.insert(open.number, Arc::clone(&open));
+        open
+    }
+
+    /// Object `id` detached.
+    fn detached(&self, id: rt::ObjectId) {
+        let mut state = self.state.lock();
+        state.detached.insert(id);
+        self.detached.store(state.detached.len(), Ordering::SeqCst);
+    }
+
+    /// Object `id`, detached, replaced: attached again. A command buffer committed before the
+    /// replace that names it fails in the runtime, which resolved the use as it was encoded
+    /// (module docs).
+    fn attached(&self, id: rt::ObjectId) {
+        let mut state = self.state.lock();
+        state.detached.remove(&id);
+        self.detached.store(state.detached.len(), Ordering::SeqCst);
+    }
+
+    /// Object `id` released detached: kept while a command buffer is open, which may have been
+    /// made before it.
+    fn released(&self, id: rt::ObjectId) {
+        let mut state = self.state.lock();
+        state.detached.remove(&id);
+        self.detached.store(state.detached.len(), Ordering::SeqCst);
+        let number = state.number();
+        if !state.open.is_empty() {
+            state.released.insert(id, number);
+            state.releases.push_back((number, id));
+            self.latest.store(number + 1, Ordering::SeqCst);
+        }
+    }
+
     /// Whether a command buffer made at `made` can fail by any object: one is detached, or the
-    /// latest release, the largest number `released` holds, came after it.
+    /// latest release kept came after it. Read without the lock.
     fn any(&self, made: u64) -> bool {
-        !self.detached.is_empty() || self.releases.back().is_some_and(|&(at, _)| at > made)
+        self.detached.load(Ordering::SeqCst) > 0
+            || self.latest.load(Ordering::SeqCst) > made.saturating_add(1)
     }
 
-    /// Command buffer `made` submitted `submission`, which no detached object fails, as `objects`
-    /// buffers and heaps were made ([`MADE`]): a detach of what it uses answers NO until it closes
-    /// ([`in_flight`]).
-    fn submitted(&mut self, made: u64, submission: &rt::Submission<'_>, objects: u64) {
-        let noted = self.submitted.entry(made).or_insert_with(|| Submitted {
-            cb: submission.command_buffer().clone(),
-            encoders: Vec::new(),
-            made: objects,
-        });
-        noted.encoders.push(submission.encoders());
-        noted.made = noted.made.max(objects);
+    /// Whether a command buffer made at `made` fails where it uses any of `ids`
+    /// ([`Detached::fails`]).
+    fn fails(&self, ids: &[rt::ObjectId], made: u64) -> bool {
+        let state = self.state.lock();
+        ids.iter().any(|&id| state.fails(id, made))
     }
 
-    /// Command buffer `made` closed, and those of ended tasks dropped: the releases no open
-    /// command buffer was made before are forgotten. What it submitted is answered, to be let go
-    /// of without the lock: it holds the command buffer.
-    fn closed(&mut self, made: u64) -> Option<Submitted> {
-        self.open.remove(&made);
-        self.open.retain(|_, task| {
-            task.as_ref()
-                .is_none_or(|task| task.upgrade().is_some_and(|task| !task.has_ended()))
-        });
-        let oldest = self.open.keys().next().copied().unwrap_or(u64::MAX);
-        while let Some(&(at, id)) = self.releases.front()
+    /// Command buffer `number` closed, and those that hold nothing let go of: the releases no
+    /// open command buffer was made before are forgotten. Its place is answered, to be let go of
+    /// without the lock.
+    fn closed(&self, number: u64) -> Option<Arc<Open>> {
+        let mut state = self.state.lock();
+        let open = state.open.remove(&number);
+        state.prune();
+        let oldest = state.open.keys().next().copied().unwrap_or(u64::MAX);
+        while let Some(&(at, id)) = state.releases.front()
             && at <= oldest
         {
-            self.releases.pop_front();
-            self.released.remove(&id);
+            state.releases.pop_front();
+            state.released.remove(&id);
         }
-        self.submitted.remove(&made)
+        if state.releases.is_empty() {
+            self.latest.store(0, Ordering::SeqCst);
+        }
+        open
+    }
+
+    /// The open command buffers with a submission noted when `made` buffers and heaps had been
+    /// made, or more ([`Submitted::made`]): each, and the encoders of its submissions.
+    fn noted_since(&self, made: u64) -> Vec<(rt::CommandBuffer, Vec<std::ops::Range<usize>>)> {
+        if self.noted.load(Ordering::SeqCst) <= made {
+            return Vec::new();
+        }
+        let open: Vec<Arc<Open>> = self.state.lock().open.values().cloned().collect();
+        // Read under each command buffer's lock, without the registry's.
+        open.iter()
+            .filter_map(|open| {
+                let submitted = open.submitted.lock();
+                (submitted.as_ref())
+                    .filter(|s| s.made > made)
+                    .map(|s| (s.cb.clone(), s.encoders.clone()))
+            })
+            .collect()
     }
 }
 
@@ -809,57 +910,67 @@ impl Detached {
 /// drops: when the command buffer is released uncommitted, when it commits with no check, or
 /// when it completes, as the runtime then drops its check ([`submission_check`]).
 #[derive(Debug)]
-pub(crate) struct Opened(u64);
+pub(crate) struct Opened(Arc<Open>);
 
 impl Opened {
     /// The place of a command buffer made now, by the isolated task whose code runs, if one is.
     pub(crate) fn new() -> Opened {
         let task = TaskLife::current().map(|task| Arc::downgrade(&task));
-        let mut detached = DETACHED.lock();
-        let made = detached.number();
-        detached.open.insert(made, task);
-        Opened(made)
+        Opened(DETACHED.open(task))
     }
 
     /// The command buffer commits now: open until it completed, whatever its task does.
     pub(crate) fn commit(self) -> Opened {
-        if let Some(task) = DETACHED.lock().open.get_mut(&self.0) {
-            *task = None;
-        }
+        self.0.committed.store(true, Ordering::Release);
         self
     }
-}
 
-impl Opened {
     /// The submission check of `submission` of the command buffer ([`submission_check`]): it
     /// fails with [`DETACHED_USE`] where it uses a buffer or heap detached now, or one released
-    /// detached since the command buffer was made ([`Detached::fails`]); else it is submitted
-    /// ([`Detached::submitted`]), decided and noted at once, so a detach either fails it or
-    /// sees it. What it uses is asked only where an object could fail it.
+    /// detached since the command buffer was made ([`Detached::fails`]); else it is noted
+    /// submitted, with its encoders, until the command buffer closes. It is decided and noted at
+    /// once, under the command buffer's lock, which a detach reads the notes under
+    /// ([`in_flight`]), so a detach either fails it or sees it. What it uses is asked only where
+    /// an object could fail it, and let go of under no lock: it may hold a resource's last handle.
     fn submit(&self, submission: &rt::Submission<'_>) -> Option<NonZeroU64> {
         let objects = MADE.load(Ordering::SeqCst);
-        {
-            let mut detached = DETACHED.lock();
-            if !detached.any(self.0) {
-                detached.submitted(self.0, submission, objects);
-                return None;
+        let number = self.0.number;
+        let mut used = None;
+        loop {
+            if used.is_none() && DETACHED.any(number) {
+                used = Some(ids(submission.used_resources()));
             }
+            let mut submitted = self.0.submitted.lock();
+            if DETACHED.any(number) {
+                // An object detached or released since it was first asked: what it uses, asked
+                // anew with the lock let go of.
+                let Some(used) = &used else {
+                    continue;
+                };
+                if DETACHED.fails(used, number) {
+                    return NonZeroU64::new(DETACHED_USE);
+                }
+            }
+            DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
+            let noted = submitted.get_or_insert_with(|| Submitted {
+                cb: submission.command_buffer().clone(),
+                encoders: Vec::new(),
+                made: objects,
+            });
+            noted.encoders.push(submission.encoders());
+            noted.made = noted.made.max(objects);
+            return None;
         }
-        let ids = ids(submission.used_resources());
-        let mut detached = DETACHED.lock();
-        if ids.into_iter().any(|id| detached.fails(id, self.0)) {
-            return NonZeroU64::new(DETACHED_USE);
-        }
-        detached.submitted(self.0, submission, objects);
-        None
     }
 }
 
 impl Drop for Opened {
     fn drop(&mut self) {
-        let submitted = DETACHED.lock().closed(self.0);
-        // Released without the lock: it may hold the command buffer's last handle.
-        drop(submitted);
+        let open = DETACHED.closed(self.0.number);
+        // Let go of without the registry's lock: it holds the command buffer, whose last handle
+        // it may be.
+        let submitted = self.0.submitted.lock().take();
+        drop((submitted, open));
     }
 }
 
@@ -867,16 +978,12 @@ impl Drop for Opened {
 /// detached now, or one released detached since it was made ([`Detached::fails`]). `used` is
 /// asked only where an object could fail it.
 pub(crate) fn uses_detached(used: impl FnOnce() -> rt::UsedResources, cb: &Opened) -> bool {
-    if !DETACHED.lock().any(cb.0) {
-        return false;
-    }
-    let ids = ids(used());
-    let detached = DETACHED.lock();
-    ids.into_iter().any(|id| detached.fails(id, cb.0))
+    let number = cb.0.number;
+    DETACHED.any(number) && DETACHED.fails(&ids(used()), number)
 }
 
 /// The identities of what `used` lists, a buffer not placed in a heap or a heap, as
-/// [`Detached`] names them. `used` is released here, without the lock: what it holds may be a
+/// [`Detached`] names them. `used` is released here, without a lock: what it holds may be a
 /// resource's last handle.
 fn ids(used: rt::UsedResources) -> Vec<rt::ObjectId> {
     used.buffers
@@ -906,18 +1013,13 @@ pub(crate) fn submission_check(cb: Opened) -> rt::SubmissionCheck {
 /// it resident, as the runtime lists what each of its ended encoders uses until it lets go of
 /// those uses, after the completed handlers ran ([`rt::CommandBuffer::ended_encoders`]). Only the
 /// command buffers with a submission noted since the object was made are asked: none noted
-/// before it took it. A submission noted after they were read is decided by the runtime's own
-/// detach, which makes the object's uses in submissions after it fail as Metal's do, and
-/// answers NO where one submitted before it took the object ([`Backing::detach`]).
+/// before it took it, and none is asked where no submission was noted since
+/// ([`Registry::noted_since`]). A submission noted after they were read is decided by the
+/// runtime's own detach, which makes the object's uses in submissions after it fail as Metal's
+/// do, and answers NO where one submitted before it took the object ([`Backing::detach`]).
 fn in_flight(id: rt::ObjectId, made: u64) -> Vec<rt::CommandBuffer> {
-    let asked: Vec<(rt::CommandBuffer, Vec<std::ops::Range<usize>>)> = (DETACHED.lock().submitted)
-        .values()
-        .filter(|s| s.made > made)
-        .map(|s| (s.cb.clone(), s.encoders.clone()))
-        .collect();
-    // The command buffers not taken are let go of here, without the lock.
-    asked
-        .into_iter()
+    // The command buffers not taken are let go of here, under no lock.
+    (DETACHED.noted_since(made).into_iter())
         .filter(|(cb, encoders)| took(cb, encoders, id))
         .map(|(cb, _)| cb)
         .collect()
@@ -1772,28 +1874,26 @@ mod tests {
     }
 
     /// A registry of its own, empty.
-    fn registry() -> Detached {
-        Detached {
-            next: 0,
-            detached: BTreeSet::new(),
-            released: BTreeMap::new(),
-            releases: VecDeque::new(),
-            open: BTreeMap::new(),
-            submitted: BTreeMap::new(),
-        }
+    fn registry() -> Registry {
+        Registry::new()
     }
 
-    /// A command buffer made now in `d` by `task`, or by none: its number.
-    fn made(d: &mut Detached, task: Option<&Arc<TaskLife>>) -> u64 {
-        let made = d.number();
-        d.open.insert(made, task.map(Arc::downgrade));
-        made
+    /// A command buffer made now in `d` by `task`, or by none: its number. Its place stays in
+    /// `d` until it closes there.
+    fn made(d: &Registry, task: Option<&Arc<TaskLife>>) -> u64 {
+        d.open(task.map(Arc::downgrade)).number
     }
 
     /// Command buffer `made` committed now in `d`.
-    fn committed(d: &mut Detached, made: u64) -> u64 {
-        d.open.insert(made, None);
+    fn committed(d: &Registry, made: u64) -> u64 {
+        let open = Arc::clone(&d.state.lock().open[&made]);
+        open.committed.store(true, Ordering::Release);
         made
+    }
+
+    /// The numbers of the command buffers open in `d`.
+    fn open(d: &Registry) -> Vec<u64> {
+        d.state.lock().open.keys().copied().collect()
     }
 
     /// A replace answers NO for an attached object and for ranges of another total, and YES once
@@ -1975,36 +2075,44 @@ mod tests {
     /// while no command buffer is open
     #[test]
     fn detached_objects_fail_their_command_buffers() {
-        let mut d = registry();
+        let d = registry();
         let [buffer, heap] = ids();
-        let first = made(&mut d, None);
+        let first = made(&d, None);
         assert!(!d.any(first));
         d.detached(buffer);
-        assert!(d.any(first) && d.fails(buffer, first) && !d.fails(heap, first));
+        assert!(d.any(first) && d.fails(&[buffer], first) && !d.fails(&[heap], first));
         d.attached(buffer);
-        assert!(!d.any(first) && !d.fails(buffer, first), "replaced");
-        let first = committed(&mut d, first);
+        assert!(!d.any(first) && !d.fails(&[buffer], first), "replaced");
+        let first = committed(&d, first);
         d.detached(buffer);
         d.released(buffer);
-        let second = made(&mut d, None);
-        assert!(d.detached.is_empty());
-        assert!(d.fails(buffer, first), "made before the release");
-        assert!(!d.fails(buffer, second) && !d.any(second), "made after it");
+        let second = made(&d, None);
+        assert!(d.state.lock().detached.is_empty());
+        assert!(d.fails(&[buffer], first), "made before the release");
+        assert!(
+            !d.fails(&[buffer], second) && !d.any(second),
+            "made after it"
+        );
         d.detached(heap);
-        let second = committed(&mut d, second);
-        assert!(d.fails(heap, second) && d.fails(heap, first), "detached");
+        let second = committed(&d, second);
+        assert!(
+            d.fails(&[heap], second) && d.fails(&[heap], first),
+            "detached"
+        );
+        assert!(d.fails(&[buffer, heap], second) && !d.fails(&[], second));
         d.attached(heap);
-        assert!(!d.fails(heap, second), "committed before the replace");
+        assert!(!d.fails(&[heap], second), "committed before the replace");
         d.closed(first);
         assert!(
-            d.released.is_empty(),
+            d.state.lock().released.is_empty(),
             "no open command buffer made before it"
         );
         d.closed(second);
-        assert!(d.open.is_empty());
+        assert!(open(&d).is_empty());
         d.detached(buffer);
         d.released(buffer);
-        assert!(d.detached.is_empty() && d.released.is_empty());
+        let state = d.state.lock();
+        assert!(state.detached.is_empty() && state.released.is_empty());
     }
 
     /// Releases made while an old command buffer stays open fail the command buffers made before
@@ -2012,31 +2120,34 @@ mod tests {
     /// none of those still open was made before are forgotten, in order, the later ones kept
     #[test]
     fn releases_are_forgotten_in_order_as_the_oldest_command_buffers_close() {
-        let mut d = registry();
+        let d = registry();
         let objects: [rt::ObjectId; 6] = ids();
-        let old = made(&mut d, None);
+        let old = made(&d, None);
         let [first, second, third, rest @ ..] = objects;
         for id in [first, second] {
             d.detached(id);
             d.released(id);
         }
-        let middle = made(&mut d, None);
+        let middle = made(&d, None);
         for id in std::iter::once(third).chain(rest) {
             d.detached(id);
             d.released(id);
         }
-        let new = made(&mut d, None);
+        let new = made(&d, None);
         assert!(d.any(old) && d.any(middle) && !d.any(new));
-        assert!(d.fails(first, old) && !d.fails(first, middle) && d.fails(third, middle));
+        assert!(d.fails(&[first], old) && !d.fails(&[first], middle) && d.fails(&[third], middle));
         d.closed(old);
         assert!(
-            !d.fails(first, old) && !d.fails(second, old),
+            !d.fails(&[first], old) && !d.fails(&[second], old),
             "made before the oldest open"
         );
-        assert_eq!(d.released.len(), 4);
-        assert!(d.fails(third, middle) && d.any(middle));
+        assert_eq!(d.state.lock().released.len(), 4);
+        assert!(d.fails(&[third], middle) && d.any(middle));
         d.closed(middle);
-        assert!(d.released.is_empty() && d.releases.is_empty() && !d.any(new));
+        let state = d.state.lock();
+        assert!(state.released.is_empty() && state.releases.is_empty());
+        drop(state);
+        assert!(!d.any(new) && !d.any(0), "no release kept");
         d.closed(new);
     }
 
@@ -2111,25 +2222,55 @@ mod tests {
     /// is never released, and never commits. One that committed holds it until it completed
     #[test]
     fn an_ended_tasks_command_buffer_holds_no_release() {
-        let mut d = registry();
+        let d = registry();
         let task = TaskLife::new();
-        let leaked = made(&mut d, Some(&task));
-        let sent = made(&mut d, Some(&task));
-        let sent = committed(&mut d, sent);
-        let host = made(&mut d, None);
+        let leaked = made(&d, Some(&task));
+        let sent = made(&d, Some(&task));
+        let sent = committed(&d, sent);
+        let host = made(&d, None);
         let [buffer] = ids();
         d.detached(buffer);
         d.released(buffer);
-        assert!(d.fails(buffer, leaked) && d.fails(buffer, sent));
+        assert!(d.fails(&[buffer], leaked) && d.fails(&[buffer], sent));
         d.closed(host);
-        assert!(d.fails(buffer, leaked), "the task is running");
-        let other = made(&mut d, None);
+        assert!(d.fails(&[buffer], leaked), "the task is running");
+        let other = made(&d, None);
         assert!(task.exit());
         d.closed(other);
-        assert_eq!(d.open.keys().copied().collect::<Vec<_>>(), [sent]);
-        assert!(d.fails(buffer, sent), "committed");
+        assert_eq!(open(&d), [sent]);
+        assert!(d.fails(&[buffer], sent), "committed");
         d.closed(sent);
-        assert!(d.open.is_empty() && d.released.is_empty());
+        assert!(open(&d).is_empty() && d.state.lock().released.is_empty());
+    }
+
+    /// The command buffers of an ended task that lie behind an older open one go as the open ones
+    /// double since the last such sweep, at a close, and not one a close before: each close costs
+    /// O(1) over the closes, where a walk of every open one at each close cost O(open)
+    #[test]
+    fn an_ended_tasks_command_buffers_behind_an_open_one_go_as_the_open_ones_double() {
+        let d = registry();
+        let task = TaskLife::new();
+        let oldest = made(&d, None);
+        let leaked: Vec<u64> = (0..20).map(|_| made(&d, Some(&task))).collect();
+        assert!(task.exit());
+        let mut host: Vec<u64> = (0..11).map(|_| made(&d, None)).collect();
+        d.closed(host.remove(0));
+        assert_eq!(open(&d).len(), 31, "under twice 16 open after the close");
+        assert!(open(&d).contains(&leaked[0]));
+        host.extend([made(&d, None), made(&d, None)]);
+        d.closed(host.pop().unwrap());
+        assert_eq!(
+            open(&d).len(),
+            12,
+            "swept at twice 16: the oldest and eleven of the host's"
+        );
+        assert!(leaked.iter().all(|n| !open(&d).contains(n)));
+        assert_eq!(d.state.lock().fewest, 12);
+        d.closed(oldest);
+        for n in host {
+            d.closed(n);
+        }
+        assert!(open(&d).is_empty());
     }
 
     /// The length of a run of pages in [`Pages`]' tests.
