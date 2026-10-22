@@ -15,7 +15,7 @@ use std::fmt;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostBlocks;
@@ -111,6 +111,13 @@ impl<T: Send + Sync + 'static> Handle for Obj<T> {
         ObjId(Arc::as_ptr(&self.0).cast::<u8>().addr().to_u64())
     }
 }
+
+/// The runtime listener every listener of the platform is a handle of. The runtime starts a thread
+/// for each listener it makes (`SharedEventListener::new`, read from code), which ends once its
+/// last handle goes. Core makes one listener for each task and posts nothing to it: one thread of
+/// the process's life replaces an idle thread for each task's. Each handle is still an object of
+/// its own (`id`).
+static LISTENER: OnceLock<rt::SharedEventListener> = OnceLock::new();
 
 /// The process's platform: the runtime's GPU objects, and the OS's IOSurface, VM (reporting the
 /// pages it changes, [`crate::remap`]), clocks and threads ([`crate::os`]), with the task
@@ -561,9 +568,13 @@ impl Platform for VulkanPlatform {
         Obj::new(plain(RenderPassDescriptorObject::new))
     }
 
-    /// A listener with a thread of its own, which core never posts to.
+    /// A handle of the process's one runtime listener ([`LISTENER`]), made at the first call.
     fn new_shared_event_listener(&self) -> VulkanSharedEventListener {
-        Obj::new(get("new", rt::SharedEventListener::new))
+        Obj::new(
+            LISTENER
+                .get_or_init(|| get("new", rt::SharedEventListener::new))
+                .clone(),
+        )
     }
 
     /// A descriptor of Metal's defaults, as `+new` makes.
@@ -730,6 +741,32 @@ pub(crate) mod tests {
 
     pub(crate) fn platform() -> VulkanPlatform {
         VulkanPlatform::new(Box::new(NoLauncher))
+    }
+
+    /// Each listener the platform makes is an object of its own, and every one runs what is posted
+    /// to it on the one thread of the process's runtime listener, where the runtime would start a
+    /// thread for each
+    #[test]
+    fn every_listener_runs_its_notifications_on_the_one_thread_of_the_process() {
+        let p = platform();
+        let listeners: Vec<_> = (0..4).map(|_| p.new_shared_event_listener()).collect();
+        let mut ids: Vec<u64> = listeners.iter().map(|l| l.id().0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), listeners.len());
+        let event = dev().raw.new_shared_event().unwrap();
+        let (ran, threads) = std::sync::mpsc::channel();
+        for listener in &listeners {
+            let ran = ran.clone();
+            event.notify_listener(
+                listener,
+                0,
+                Box::new(move |_, _| ran.send(std::thread::current().id()).unwrap()),
+            );
+        }
+        let threads: Vec<_> = threads.iter().take(listeners.len()).collect();
+        assert!(threads.iter().all(|&t| t == threads[0]), "{threads:?}");
+        assert_ne!(threads[0], std::thread::current().id());
     }
 
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
