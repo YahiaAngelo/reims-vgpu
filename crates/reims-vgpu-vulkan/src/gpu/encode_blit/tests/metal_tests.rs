@@ -1853,7 +1853,7 @@ fn xr_srgb_edges<P: reims_vgpu_core::platform::Platform>(
 
 /// A colour fill packed in a bfloat format (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`), an
 /// extended-range `_sRGB` twin (`BGRA10_XR_sRGB`, `BGR10_XR_sRGB`) or an RGBX format (each of
-/// the 11), which the runtime's colour fill packs ([`fill::RUNTIME_PACKED`]), writes Metal's
+/// the 11), which the runtime's colour fill packs ([`fill::OWN_FORMAT_PACKED`]), writes Metal's
 /// bytes on this host, each colour into a texel of a texture of its format ([`packed_on`]),
 /// each value in each component ([`rotations`]): for bfloat, [`bfloat_values`]; for the
 /// twins, the least `f32` of each code and the one below it, as Metal stores them here

@@ -14,12 +14,13 @@
 //! - **`fillBuffer:range:pattern4:`** is the runtime's `fill_buffer_pattern4`, which writes the
 //!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_the_metal_platforms`,
 //!   over more than the runtime stages at once).
-//! - **The private texture fills** (the two `fillTexture:...`) are copies from a staging buffer
-//!   of the bytes Metal writes ([`crate::gpu::fill`]), at most [`STAGING_BYTES`] of them, copied
-//!   again for the rest; a fill that writes nothing encodes nothing. A texture fill of a format
-//!   whose fill [`crate::gpu::fill`] does not measure
-//!   ([`crate::gpu::fill::texel_bytes`]) is the runtime's `fill_texture` of the pattern, or of the
-//!   colour packed as [`crate::gpu::fill`] packs it, at the level and slice and in the region
+//! - **The private bytes fill** (`fillTexture:level:slice:region:bytes:length:`) is copies from a
+//!   staging buffer of the bytes Metal writes ([`crate::gpu::fill`]), at most [`STAGING_BYTES`]
+//!   of them, copied again for the rest; a fill that writes nothing encodes nothing. A fill of a
+//!   texture of a format whose fill [`crate::gpu::fill`] does not measure
+//!   ([`crate::gpu::fill::texel_bytes`]) is the runtime's `fill_texture` of the pattern, and a
+//!   colour fill of a texture of any format the runtime's colour fill, which fills the texel it
+//!   packs as its `fill_texture` fills a pattern, at the level and slice and in the region
 //!   [`crate::gpu::fill::place`] gives, as Metal's fill writes it on this host:
 //!   - a compressed format's blocks, each the pattern cut at its bytes or repeated to them, the
 //!     region counting blocks, which the runtime cuts at the level's blocks (the cut `place`
@@ -50,13 +51,15 @@
 //!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
 //!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart. It refuses a multisample texture's fill
 //!   alone, which `place` dies at first.
-//! - **A colour fill in a bfloat format, an extended-range `_sRGB` twin or an RGBX format**
-//!   ([`crate::gpu::fill::RUNTIME_PACKED`]) is the runtime's colour fill, which packs the colour
-//!   by its own measured rules, at the level and slice and in the region `place` gives
-//!   (`colours_the_runtime_packs_are_the_metal_platforms`), into a texture of the colour's own
-//!   format. Into a texture of another format it dies: a twin's bytes there follow no rule
-//!   measured on Metal, and a bfloat or RGBX colour's were not compared, where the runtime
-//!   repeats the packed texel.
+//! - **A colour fill** is the runtime's colour fill, which packs the colour in the call's pixel
+//!   format as Metal does ([`crate::gpu::fill`]) and fills that texel as its `fill_texture` fills
+//!   a pattern (above), at the level and slice and in the region `place` gives. A colour in a
+//!   format of [`crate::gpu::fill::OWN_FORMAT_PACKED`] (a bfloat format, an extended-range
+//!   `_sRGB` twin, an RGBX format) into a texture of another format is filled, relayed, and dies
+//!   in strict mode (`colours_the_runtime_packs_are_the_metal_platforms`): a twin's bytes there
+//!   follow no rule measured on Metal, and a bfloat or RGBX colour's were not compared, where the
+//!   runtime repeats the packed texel. A colour in a format Metal packs none in dies
+//!   ([`crate::gpu::fill::colour_format`]).
 //! - **The indirect command buffer blits** copy and reset the commands' records as the command
 //!   buffer runs, and what Metal answers of the commands beside their records
 //!   ([`crate::gpu::icb`]) once it completed; a range past a buffer's size, which Metal runs as
@@ -387,15 +390,15 @@ impl VulkanBlitEncoder {
 
 impl VulkanBlitEncoder {
     /// A colour fill of `region` of `texture` at `level` and `slice` with `color` packed in
-    /// `format`, one of [`fill::RUNTIME_PACKED`], for `sel`: the runtime's colour fill, which
-    /// packs it, where [`fill::place`] says. A colour into a texture of another format is
-    /// filled, the runtime repeating the packed texel, relayed, and dies in strict mode
-    /// ([`crate::answer::Inexact::FillFormat`]): an extended-range `_sRGB` twin's bytes there
-    /// follow no rule measured on Metal (into an `RGBA32Uint` texel, a colour filled alone
-    /// repeats; colours filled one after another in one encoder each left their packed bytes,
-    /// then `01` and zeroes), and a bfloat or RGBX colour's were not compared with Metal's here,
-    /// until a comparison across formats holds them.
-    fn fill_texture_packed(
+    /// `format`, one of [`fill::colour_format`]'s, for `sel`: the runtime's colour fill, which
+    /// packs it, where [`fill::place`] says. A colour in a format of [`fill::OWN_FORMAT_PACKED`]
+    /// into a texture of another format is filled, the runtime repeating the packed texel,
+    /// relayed, and dies in strict mode ([`crate::answer::Inexact::FillFormat`]): an
+    /// extended-range `_sRGB` twin's bytes there follow no rule measured on Metal (into an
+    /// `RGBA32Uint` texel, a colour filled alone repeats; colours filled one after another in one
+    /// encoder each left their packed bytes, then `01` and zeroes), and a bfloat or RGBX colour's
+    /// were not compared with Metal's here, until a comparison across formats holds them.
+    fn fill_texture_color(
         &self,
         sel: &'static str,
         texture: &VulkanTexture,
@@ -413,7 +416,7 @@ impl VulkanBlitEncoder {
             };
             (raw.pixel_format(), shape)
         });
-        if own != format {
+        if own != format && fill::OWN_FORMAT_PACKED.contains(&format) {
             let twin = matches!(format, PixelFormat::BGRA10XRSRGB | PixelFormat::BGR10XRSRGB);
             let why = match twin {
                 true => "follow no rule measured",
@@ -1005,12 +1008,9 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 color,
                 pixel_format,
             } => {
-                if let Some(format) = fill::runtime_packed(pixel_format) {
-                    let place = (level, slice, region);
-                    return self.fill_texture_packed(sel, texture, place, color, format);
-                }
-                let pattern = fill::color_bytes(sel, color, pixel_format);
-                self.fill_texture(sel, texture, level, slice, region, &pattern)
+                let format = fill::colour_format(sel, pixel_format);
+                let place = (level, slice, region);
+                self.fill_texture_color(sel, texture, place, color, format)
             }
             BlitCmd::EndEncoding => self.end(sel, rt::BlitCommandEncoder::end_encoding),
             BlitCmd::FillBuffer {

@@ -1765,7 +1765,7 @@ const BFLOAT_CLEARS: [[f64; 4]; 13] = [
 /// `ShaderWrite` usage too, which it keeps uncompressed, through `half`; a pass that loads it,
 /// holding random codes, draws nothing and stores it, which keeps every code; and a colour fill
 /// in the format of each of [`BFLOAT_COLOURS`] (`fillTexture:level:slice:region:color:
-/// pixelFormat:`), which the runtime's colour fill packs ([`crate::gpu::fill::RUNTIME_PACKED`]).
+/// pixelFormat:`), which the runtime's colour fill packs ([`crate::gpu::fill::OWN_FORMAT_PACKED`]).
 /// Each stores Metal's bytes, bit for bit. Of a Private 16 by 16 `RGBA16Float` texture of 4
 /// samples, a pass's clear to each of [`FLOAT_CLEARS`], and its store, stores Metal's bytes, bit
 /// for bit, the resolve's and each sample's ([`Gpu::multisample_cleared`])
@@ -2413,7 +2413,7 @@ fn stores_into_rgbx_textures_are_metals() {
 /// or without (`Format`); the mipmaps of one of two levels (`MipmapGeneration`); a kernel's read
 /// of a texture buffer of the format (`Format`); a kernel's write into such a texture an
 /// argument buffer holds (`ArgumentBufferTextures`). A colour fill in the format, which the
-/// runtime's colour fill packs ([`crate::gpu::fill::RUNTIME_PACKED`]), is compared with Metal's
+/// runtime's colour fill packs ([`crate::gpu::fill::OWN_FORMAT_PACKED`]), is compared with Metal's
 /// by `encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`
 #[test]
 fn what_the_runtime_refuses_of_rgbx_textures_dies() {

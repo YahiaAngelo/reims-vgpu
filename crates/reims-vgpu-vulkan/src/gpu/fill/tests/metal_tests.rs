@@ -5,6 +5,7 @@ use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::Buffer;
+use reims_vgpu_core::platform::types::ClearColor;
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::MetalPlatform;
@@ -95,13 +96,33 @@ fn values() -> Vec<f64> {
     v
 }
 
-/// Every colour format this platform packs.
+/// Every pixel format of [`PACKED`].
 fn packed_formats() -> Vec<u64> {
-    PixelFormat::ALL
-        .iter()
-        .filter(|f| pack(**f, ClearColor::default()).is_some())
-        .map(|f| u64::from(f.as_raw()))
-        .collect()
+    PACKED.iter().map(|f| u64::from(f.as_raw())).collect()
+}
+
+/// The least value of each of the 8-bit sRGB codes 1 to 255 that Metal stores it for, measured
+/// (the runtime's `fill_value.rs`): halfway from the code below's decoded value to the code's,
+/// each an `f32` of Metal's table of them, for codes 0 to 10 `code` times `1 / 3294.6`, both
+/// `f32`s, in `f32` arithmetic, for the rest the `f32` nearest the curve's
+/// `((code / 255 + 0.055) / 1.055)^2.4`.
+fn srgb_edges() -> [f64; 255] {
+    let decoded = |code: u16| -> f64 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the step is an f32 operation of Metal's, from the f64 constant"
+        )]
+        let value = if code <= 10 {
+            f32::from(code) * (1.0 / 3294.6f64) as f32
+        } else {
+            ((f64::from(code) / 255.0 + 0.055) / 1.055).powf(2.4) as f32
+        };
+        f64::from(value)
+    };
+    std::array::from_fn(|k| {
+        let k = u16::try_from(k).unwrap_or(u16::MAX);
+        f64::midpoint(decoded(k), decoded(k + 1))
+    })
 }
 
 /// Colours of `v`, each value in each component.
@@ -143,7 +164,7 @@ fn beside(edge: f64) -> [f64; 6] {
 #[test]
 fn srgb_and_extended_range_edges_are_the_metal_platforms_here() {
     let mut v = vec![-1e-30, 1e-30, 0.999_999_9, 1.000_000_1, 1.5, -0.8];
-    for &edge in srgb_edges() {
+    for edge in srgb_edges() {
         v.extend(beside(edge));
     }
     for code in 0..=1024 {
@@ -296,16 +317,18 @@ fn nan_payloads_and_integer_edges_are_the_metal_platforms_here() {
     assert_metals(&integers, &colors_of(&v));
 }
 
-/// Asserts that each of `colors`, in each pixel format of `formats`, is the bytes Metal
-/// writes here, where there is a Metal device: the colours fill an RGBA32Uint texel each, of
-/// a texture 4096 wide.
-fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
-    let Some(d) = MetalPlatform::system_default_device() else {
-        return;
-    };
+/// Each of `colors` packed in the pixel format `format`, filled into an RGBA32Uint texel each of
+/// a `Private` texture 4096 wide on platform `P` (`desc` its descriptor), in one blit encoder,
+/// read back: 16 bytes a colour.
+fn fills_of<P: Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    format: u64,
+    colors: &[ClearColor],
+) -> Vec<u8> {
     let width = 4096u64;
     let height = (colors.len() as u64).div_ceil(width);
-    let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
+    let desc = desc(&TextureDesc {
         pixel_format: 123,
         width,
         height,
@@ -314,50 +337,63 @@ fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
         ..TextureDesc::default()
     });
     let t = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+    let length = width * height * 16;
     let out = d
-        .new_buffer_of_length(OnFault::Return, width * height * 16, 0)
+        .new_buffer_of_length(OnFault::Return, length, 0)
         .unwrap()
         .unwrap();
     let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    for (i, color) in (0u64..).zip(colors) {
+        let fill = BlitCmd::<P>::FillTextureColor {
+            texture: &t,
+            level: 0,
+            slice: 0,
+            region: MtlRegion::new(
+                MtlOrigin::new(i % width, i / width, 0),
+                MtlSize::new(1, 1, 1),
+            ),
+            color: *color,
+            pixel_format: format,
+        };
+        e.encode(OnFault::Return, fill).unwrap();
+    }
+    let down = BlitCmd::<P>::CopyTextureToBufferOptions {
+        source_texture: Some(&t),
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(width, height, 1),
+        destination_buffer: Some(&out),
+        destination_offset: 0,
+        destination_bytes_per_row: width * 16,
+        destination_bytes_per_image: length,
+        options: 0,
+    };
+    e.encode(OnFault::Return, down).unwrap();
+    e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    let length = usize::try_from(length).unwrap();
+    // SAFETY: a live Shared buffer of `length` bytes, read after the GPU's writes.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length) }.to_vec()
+}
+
+/// Asserts that each of `colors`, in each pixel format of `formats`, fills the bytes Metal
+/// fills here, where there is a Metal device: an RGBA32Uint texel each ([`fills_of`]).
+fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
+    let Some(metal) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = crate::gpu::device::tests::dev();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let mut wrong = Vec::new();
     for &format in formats {
-        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        for (i, color) in (0u64..).zip(colors) {
-            let fill = BlitCmd::<MetalPlatform>::FillTextureColor {
-                texture: &t,
-                level: 0,
-                slice: 0,
-                region: MtlRegion::new(
-                    MtlOrigin::new(i % width, i / width, 0),
-                    MtlSize::new(1, 1, 1),
-                ),
-                color: *color,
-                pixel_format: format,
-            };
-            e.encode(OnFault::Return, fill).unwrap();
-        }
-        let down = BlitCmd::<MetalPlatform>::CopyTextureToBufferOptions {
-            source_texture: Some(&t),
-            source_slice: 0,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: MtlSize::new(width, height, 1),
-            destination_buffer: Some(&out),
-            destination_offset: 0,
-            destination_bytes_per_row: width * 16,
-            destination_bytes_per_image: width * height * 16,
-            options: 0,
-        };
-        e.encode(OnFault::Return, down).unwrap();
-        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        let length = usize::try_from(width * height * 16).unwrap();
-        // SAFETY: a live Shared buffer of `length` bytes, read after the GPU's writes.
-        let metal = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length) };
-        for (color, metal) in colors.iter().zip(metal.chunks(16)) {
-            let ours = texel(&color_bytes("test", *color, format), 16);
+        let theirs = fills_of::<MetalPlatform>(&metal, &metal_desc, format, colors);
+        let ours = fills_of::<VulkanPlatform>(&d, &vulkan_desc, format, colors);
+        for ((color, metal), ours) in colors.iter().zip(theirs.chunks(16)).zip(ours.chunks(16)) {
             if ours != metal {
                 wrong.push(format!(
                     "{format} {color:?}: ours {ours:02x?} Metal {metal:02x?}"
@@ -381,7 +417,7 @@ fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
 fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
     for format in LEFTOVER_FORMATS {
         let raw = u64::from(format.as_raw());
-        let site = catch_death(|| color_bytes("s", ClearColor::default(), raw)).unwrap_err();
+        let site = catch_death(|| colour_format("s", raw)).unwrap_err();
         assert_eq!(
             (site.kind, site.file),
             (DeathKind::Abort, "s"),
