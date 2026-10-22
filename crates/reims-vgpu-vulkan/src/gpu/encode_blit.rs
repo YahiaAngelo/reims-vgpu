@@ -176,15 +176,16 @@ impl<E> EncoderObject<E> {
         }
     }
 
-    /// Fails its command buffer from this encoder on with `code`, its event signals firing where
-    /// `signals` says, as Metal's GPU fails it ([`Failing`]); nothing once core let go of the
-    /// command buffer, which it can then commit no more.
-    pub(crate) fn fail(&self, code: u64, signals: bool) {
+    /// Tells its command buffer that a draw of primitive type 9 in it fails it with `code`, as
+    /// the runtime does, its event signals firing
+    /// ([`CommandBufferObject::fails_at_type_9`]); nothing once core let go of the command
+    /// buffer, which it can then commit no more.
+    pub(crate) fn fails_at_type_9(&self, code: u64) {
         if let Some(cb) = Obj::upgrade(&self.command_buffer) {
-            cb.fail(Failing {
+            cb.fails_at_type_9(Failing {
                 code,
                 from: self.at,
-                signals,
+                signals: true,
             });
         }
     }

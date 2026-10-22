@@ -91,9 +91,8 @@
 //!   `defaultRasterSampleCount` Metal fails, a detached buffer's use, an encoder made under
 //!   protection options (`ProtectedEncoder`, code 16 or 1), a unit of the runtime's command
 //!   predication left with a block open (`PredicationOpenAtUnitEnd`, code 1), and the driver's
-//!   relay of one of Metal's codes. No draw of type 9, no protection option and no record of
-//!   predication reaches the runtime here (below), so of those five none fails a command buffer
-//!   yet.
+//!   relay of one of Metal's codes. No protection option and no record of predication reaches
+//!   the runtime here (below), so neither of those two fails a command buffer yet.
 //! - **A failure of the GPU's work that the driver relayed** (`CommandBufferError::Execution`, and
 //!   `PageFault` and `DeviceLost` of the same kind): MoltenVK runs the runtime's batches as Metal
 //!   command buffers, and the runtime gives a failed one's Metal code to the command buffer whose
@@ -111,41 +110,26 @@
 //! - **How Metal's GPU fails a command buffer for what its encoders did** is injected at its
 //!   commit ([`rt::CommandBuffer::commit_failed`]): Metal's code, the first encoder that runs
 //!   nothing, every one after it running nothing too, and whether its event signals fire
-//!   ([`Failing`]). Two different ways at once, which nothing measured, die at the commit.
-//!   Measured on the M3 Max (macOS 26.7):
-//!   - a render encoder's draw of primitive type 9 hangs Metal's GPU, which fails the command
-//!     buffer with `MTLCommandBufferErrorTimeout` from that encoder, its signals firing
-//!     ([`crate::gpu::encode_render`]);
-//!   - `setProtectionOptions:` is kept here, as the runtime has no protected content
-//!     ([`CommandBufferObject::made_encoder`]). An encoder made under options other than 0 runs
-//!     nothing, nor does any after it, and fails the command buffer with code 16 ("Protection
-//!     Violation") below 0x10 and `MTLCommandBufferErrorInternal` ("Invalid Input") from 0x10
-//!     up, none of its signals firing; options from 0x10 up fail it so with no encoder made
-//!     under them too, every encoder running. An encoder made before the options runs. Under
-//!     1, 3 and 7 a compute or render encoder's creation, and a blit encoder's first command,
-//!     die, as Metal ends the process there.
+//!   ([`Failing`]). Measured on the M3 Max (macOS 26.7), `setProtectionOptions:` is kept here,
+//!   as the runtime has no protected content ([`CommandBufferObject::made_encoder`]). An encoder
+//!   made under options other than 0 runs nothing, nor does any after it, and fails the command
+//!   buffer with code 16 ("Protection Violation") below 0x10 and `MTLCommandBufferErrorInternal`
+//!   ("Invalid Input") from 0x10 up, none of its signals firing; options from 0x10 up fail it so
+//!   with no encoder made under them too, every encoder running. An encoder made before the
+//!   options runs. Under 1, 3 and 7 a compute or render encoder's creation, and a blit encoder's
+//!   first command, die, as Metal ends the process there. A protection failure reaches no later
+//!   command buffer: one committed on its queue while it is in flight runs, on Metal (measured
+//!   alike) as here.
 //!
-//!   A hang reaches the queue's later command buffers too ([`Hangs`]). Measured on the M3 Max
-//!   (macOS 26.7, `metal_runs_after_a_type_9_hang_here`, 11 hangs): Metal fails the hang's
-//!   command buffer 30 to 37 ms after its commit, and runs nothing of a command buffer of the
-//!   same queue submitted meanwhile, committed at once or up to 10 ms on, completing it without
-//!   an error (status `Completed`), its event signals firing and its completed handlers seeing
-//!   that. One of another queue runs, and so does one of the same queue whose event wait held it
-//!   until the hang completed, and one committed after it. Under macOS 27.0.1 (26A434, the same
-//!   host, `later_command_buffers_of_a_hang_run_as_metals`) Metal still runs nothing of one
-//!   committed at once, while the hang's command buffer reads committed, and completes it so;
-//!   one committed once it reads scheduled (about 1 ms on) it mostly runs, and in 1 of 10 runs
-//!   nothing of it: Metal races there. A command buffer committed on a queue while a hang of
-//!   that queue is in flight here is committed failed with the runtime's code 0, which
-//!   completes it as Metal completes one committed at once, and as one of Metal's answers
-//!   later ([`CommandBufferObject::behind_hang`]); one that encoded an event wait dies at its
-//!   commit, as whether its wait holds it past the hang is decided as it is submitted, where the
-//!   runtime's check answers no code 0. The hang stays in flight here as long as Metal's: its
-//!   command buffer holds what comes after its hanging encoder (its later signals, its
-//!   completion) until [`HANG_TIME`] after the GPU reached it
-//!   ([`CommandBufferObject::hold_after_hang`]). A protection failure reaches no later command
-//!   buffer: one committed on its queue while it is in flight runs, on Metal (measured alike)
-//!   as here.
+//!   A render encoder's draw of primitive type 9, at which Metal's GPU hangs or faults, the
+//!   runtime fails the command buffer at as Metal's GPU does (`crate::gpu::encode_render`), and
+//!   a command buffer of the hang's queue committed while it is in flight runs nothing and
+//!   completes without an error, as Metal's (`rt::DrawPrimitiveType::Nine`; measured on the M3
+//!   Max under macOS 26.7 and 27.0.1, `metal_runs_after_a_type_9_hang_here`,
+//!   `later_command_buffers_of_a_hang_run_as_metals`). Such a draw is told to the command
+//!   buffer ([`CommandBufferObject::fails_at_type_9`]): one that fails another way too, by its
+//!   own encoders, its protection options or a use of a detached object at its commit, dies at
+//!   the commit, as do two different ways at once of any kind, which nothing measured.
 //! - **A submission that uses a detached buffer or heap** fails with
 //!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
 //!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides
@@ -235,40 +219,14 @@ pub struct QueueObject {
     pub raw: rt::CommandQueue,
     /// The device that made it.
     pub device: VulkanDevice,
-    /// Its command buffers Metal's GPU hangs at that are in flight ([`Hangs`]).
-    hangs: Arc<Hangs>,
 }
 
 impl QueueObject {
     /// The queue of `raw`, made by `device`.
     pub(crate) fn new(raw: rt::CommandQueue, device: VulkanDevice) -> QueueObject {
-        QueueObject {
-            raw,
-            device,
-            hangs: Arc::default(),
-        }
+        QueueObject { raw, device }
     }
 }
-
-/// How many of a queue's command buffers that Metal's GPU hangs at (a draw of primitive type 9,
-/// [`HANG`]) are in flight: from the commit until [`HANG_TIME`] after the GPU reached the hang
-/// ([`CommandBufferObject::hold_after_hang`]). Metal runs nothing of a command buffer of the
-/// queue submitted meanwhile, and completes it without an error (the module docs), as the
-/// runtime's code-0 commit failure does ([`CommandBufferObject::behind_hang`]).
-#[derive(Debug, Default)]
-struct Hangs(AtomicUsize);
-
-impl Hangs {
-    /// Whether one of the queue's hangs is in flight.
-    fn in_flight(&self) -> bool {
-        self.0.load(Ordering::SeqCst) != 0
-    }
-}
-
-/// How long a command buffer that Metal's GPU hangs at stays in flight once the GPU reached the
-/// hang: Metal fails it 30 to 37 ms after its commit on the M3 Max (11 hangs, the module docs),
-/// so every command buffer of its queue Metal runs nothing of is committed within it.
-pub(crate) const HANG_TIME: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// `id<MTLCommandQueue>`.
 pub type VulkanCommandQueue = Obj<QueueObject>;
@@ -290,9 +248,6 @@ pub struct CommandBufferObject {
     /// Its place among the releases of detached objects until it commits, which its submission
     /// check then holds ([`backing::submission_check`]).
     opened: Mutex<Option<Opened>>,
-    /// Whether `encodeWaitForEvent:value:` encoded a wait in it, which may hold it past a hang
-    /// of its queue in flight at its commit ([`CommandBufferObject::behind_hang`]).
-    waited: AtomicBool,
     /// How many runtime encoders it has made: each encoder of Metal's, or a part of one where
     /// [`predication`] ends a compute encoder's runtime encoder and makes another. As no two are
     /// open at once, each one's count before it is its place among the encoders the runtime
@@ -301,17 +256,15 @@ pub struct CommandBufferObject {
     /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
     /// it with ([`CommandBufferObject::failure`]).
     failing: Mutex<Vec<Failing>>,
+    /// How Metal's GPU fails it at its draws of primitive type 9, which the runtime fails it
+    /// with itself ([`CommandBufferObject::fails_at_type_9`]).
+    type_9: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
     /// Whether it carries the submission handler that takes Metal's allocation for its work for
     /// the tiler ([`tiler_handler`]), added at its first such work while the process has not
     /// taken it ([`CommandBufferObject::tiler_work`]).
     tiler: AtomicBool,
-    /// Its queue's hangs in flight ([`Hangs`]).
-    hangs: Arc<Hangs>,
-    /// The event that holds what comes after the first encoder Metal's GPU hangs at, where one
-    /// did ([`CommandBufferObject::hold_after_hang`]).
-    hold: Mutex<Option<rt::SharedEvent>>,
     /// The executions of indirect command buffers whose commands its commit reads, each with its
     /// encoder's place ([`CommandBufferObject::checked_at_commit`]).
     executions: Mutex<Vec<(usize, executions::Execution)>>,
@@ -340,27 +293,9 @@ fn tiler_handler() -> rt::Handler {
     Box::new(|_| metal_space::first_use(FirstUse::TilerSubmission))
 }
 
-/// The end of a hang held by `hold` ([`CommandBufferObject::hold_after_hang`]), committed by
-/// `sel`: once the GPU reached the hang (`hold` at 1), [`HANG_TIME`] on, on a listener's thread
-/// of its own, the queue's hang is no longer in flight (`hangs`), then the hold lets what comes
-/// after the hang go (`hold` to 2), as Metal's GPU fails the command buffer then.
-fn hang_ends(sel: &'static str, hold: rt::SharedEvent, hangs: Arc<Hangs>) {
-    let listener = plain_at(sel, rt::SharedEventListener::new);
-    let end: rt::SharedEventNotification = Box::new(move |hold, _| {
-        std::thread::sleep(HANG_TIME);
-        hangs.0.fetch_sub(1, Ordering::SeqCst);
-        hold.set_signaled_value(2);
-    });
-    hold.notify_listener(&listener, 1, end);
-}
-
 /// `MTLCommandBufferErrorInternal`, which Metal's GPU fails a command buffer with under
 /// protection options with a bit from 0x10 up ("Invalid Input").
 pub(crate) const INVALID_INPUT: u64 = 1;
-
-/// `MTLCommandBufferErrorTimeout`, which Metal's GPU fails a command buffer with where a render
-/// encoder drew primitive type 9 ("Caused GPU Hang Error").
-pub(crate) const HANG: u64 = 2;
 
 /// The error code Metal's GPU fails a command buffer with where an encoder was made under
 /// protection options below 0x10 ("Protection Violation"), which no public
@@ -476,6 +411,13 @@ impl CommandBufferObject {
         self.failing.lock().push(failing);
     }
 
+    /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
+    /// which the runtime fails it with itself (`crate::gpu::encode_render`'s `nine`): its
+    /// commit dies where it fails another way too ([`CommandBufferObject::failure`]).
+    pub(crate) fn fails_at_type_9(&self, failing: Failing) {
+        plain(|| self.type_9.lock().push(failing));
+    }
+
     /// `execution`, a command of the encoder it made last, is checked at its commit, where its
     /// commands' records stand as the runtime runs them ([`executions`]).
     pub(crate) fn checked_at_commit(&self, execution: executions::Execution) {
@@ -505,68 +447,14 @@ impl CommandBufferObject {
         }
     }
 
-    /// After `sel`, the end of an encoder Metal's GPU hangs at (a draw of primitive type 9),
-    /// what comes after it waits as on Metal, whose GPU fails the command buffer [`HANG_TIME`]
-    /// after it reaches the hang: a signal of an event of its own to 1, which fires once the work
-    /// before the hang ran, then a wait for 2, which its commit sets [`HANG_TIME`] after the
-    /// signal ([`hang_ends`]). So its later event signals and its completion come then, and its
-    /// queue's hang is in flight until then ([`Hangs`]). The first such encoder alone holds it,
-    /// as nothing after it runs.
-    pub(crate) fn hold_after_hang(&self, sel: &'static str) {
-        let mut hold = plain(|| self.hold.lock());
-        if hold.is_some() {
-            return;
-        }
-        let event = get(sel, || self.device.raw.new_shared_event());
-        let at = || rt::EventRef::Shared(&event);
-        get(sel, || self.raw.encode_signal_event(at(), 1));
-        get(sel, || self.raw.encode_wait_for_event(at(), 2));
-        *hold = Some(event);
-    }
-
-    /// How it fails, committed by `sel` on a queue while a hang of that queue is in flight
-    /// ([`Hangs`]): as Metal runs nothing of it and completes it without an error, its event
-    /// signals firing (the module docs), by the runtime's commit failure of code 0. It dies
-    /// where Metal's answer is not decided at the commit or not measured: an event wait it
-    /// encoded may hold it until the hang ended, after which Metal runs it, and the runtime's
-    /// submission check, which decides it as Metal does when its waits are met, answers no code
-    /// 0; Metal's GPU would fail it for what its encoders did too ([`Failing`]); or it uses a
-    /// detached object (`detached`), which fails a submission Metal runs.
-    fn behind_hang(&self, sel: &'static str, detached: impl FnOnce() -> bool) -> rt::CommitFailure {
-        let unmeasured = if self.waited.load(Ordering::SeqCst) {
-            Some(
-                "an event wait, which Metal runs past where it held it until the hang ended, \
-                 and decides as it submits it, where the runtime's submission check answers no \
-                 failure of code 0",
-            )
-        } else if !plain(|| self.failing.lock().is_empty())
-            || protection_code(plain(|| self.protection.lock().options)) == INVALID_INPUT
-        {
-            Some("a failure of Metal's GPU of its own, which nothing measured beside a hang")
-        } else if detached() {
-            Some("a use of a detached object, which nothing measured beside a hang")
-        } else {
-            None
-        };
-        if let Some(what) = unmeasured {
-            unrepresentable(
-                sel,
-                &format!(
-                    "a command buffer committed on a queue while a command buffer of that queue \
-                     that Metal's GPU hangs at (a draw of primitive type 9) is in flight, with \
-                     {what}"
-                ),
-            );
-        }
-        rt::CommitFailure::new(0)
-    }
-
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
     /// and protection options with a bit from 0x10 up, which fail it with [`INVALID_INPUT`]
-    /// though no encoder was made under them (measured), all of its encoders running. Where it
-    /// fails so, a use of a detached object at the commit (`detached`, asked only then) is
-    /// another way. Two different ways at once, which nothing measured, die. A use of a
-    /// detached object alone fails only its submissions ([`backing::submission_check`]).
+    /// though no encoder was made under them (measured), all of its encoders running; `None`
+    /// where nothing does, or only its draws of primitive type 9, which the runtime fails it at
+    /// ([`CommandBufferObject::fails_at_type_9`]). Where either fails it, a use of a detached
+    /// object at the commit (`detached`, asked only then) is another way. Two different ways at
+    /// once, which nothing measured, die. A use of a detached object alone fails only its
+    /// submissions ([`backing::submission_check`]).
     fn failure(
         &self,
         sel: &'static str,
@@ -581,6 +469,8 @@ impl CommandBufferObject {
                 signals: false,
             });
         }
+        let own = ways.len();
+        ways.extend(plain(|| self.type_9.lock().clone()));
         let first = *ways.first()?;
         if detached() {
             ways.push(Failing {
@@ -598,6 +488,8 @@ impl CommandBufferObject {
                 &format!("a command buffer Metal's GPU fails in more than one way: {ways:?}"),
             );
         }
+        ways.truncate(own);
+        let first = *ways.first()?;
         let mut failure = rt::CommitFailure::new(first.code);
         let from = ways.iter().map(|w| w.from).min().unwrap_or(first.from);
         failure.encoders = rt::FailedEncoders::From(from);
@@ -976,13 +868,11 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             progress: Mutex::new(None),
             predication,
             opened: Mutex::new(Some(Opened::new())),
-            waited: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
+            type_9: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
-            hangs: Arc::clone(&self.hangs),
-            hold: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
         })))
     }
@@ -1406,14 +1296,12 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// which fails a submission that uses a detached buffer or heap (module docs). A slow commit
     /// and a late completion are debug lines ([`timing::commit`]). One that holds work for
     /// Metal's tiler takes Metal's allocation for it as the runtime submits it
-    /// ([`tiler_handler`]). One committed while a hang of its queue is in flight runs nothing
-    /// and completes without an error, as on Metal ([`CommandBufferObject::behind_hang`]); one
-    /// that hangs Metal's GPU is in flight until [`HANG_TIME`] after the GPU reached its hang
-    /// ([`hang_ends`]).
+    /// ([`tiler_handler`]). One committed while a command buffer of its queue that Metal's GPU
+    /// hangs at is in flight runs nothing and completes without an error, as on Metal, as the
+    /// runtime commits it (the module docs).
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
         let progress = self.progress.lock().clone();
-        let hold = plain(|| self.hold.lock().take());
-        let committed = encoding("commit", Policy::Dies, || {
+        encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
             let opened = self.opened.lock().take();
             let detached = || {
@@ -1421,10 +1309,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     backing::uses_detached(|| self.raw.used_resources(), opened)
                 })
             };
-            let failure = match self.hangs.in_flight() {
-                true => Some(self.behind_hang("commit", detached)),
-                false => self.failure("commit", detached),
-            };
+            let failure = self.failure("commit", detached);
             self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
             let check = match (&failure, opened) {
                 (None, Some(opened)) => Some(backing::submission_check(opened.commit())),
@@ -1435,12 +1320,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             }
             committing(|| {
                 timing::commit(&self.raw, || match (failure, check) {
-                    (Some(failure), _) => {
-                        if hold.is_some() {
-                            self.hangs.0.fetch_add(1, Ordering::SeqCst);
-                        }
-                        self.raw.commit_failed(failure)
-                    }
+                    (Some(failure), _) => self.raw.commit_failed(failure),
                     (None, Some(check)) => self
                         .raw
                         .set_submission_check(check)
@@ -1448,11 +1328,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     (None, None) => self.raw.commit(),
                 })
             })
-        });
-        if let (Ok(()), Some(hold)) = (&committed, hold) {
-            hang_ends("commit", hold, Arc::clone(&self.hangs));
-        }
-        committed
+        })
     }
 
     /// A serial encoder, refused as `blitCommandEncoder` is; under protection options 1, 3 and 7
@@ -1522,9 +1398,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         encoding(sel, Policy::Dies, || {
             let event = self::event(sel, event);
             predication::boundary(&self.predication, sel);
-            self.raw.encode_wait_for_event(event, value)?;
-            self.waited.store(true, Ordering::SeqCst);
-            Ok(())
+            self.raw.encode_wait_for_event(event, value)
         })
     }
 
@@ -2544,8 +2418,10 @@ mod tests {
     }
 
     /// A command buffer Metal's GPU fails in one way fails so at its commit, from the first
-    /// encoder that fails, and one that only uses a detached object is left to its submissions;
-    /// one it would fail in two, a use of a detached object and a hang, dies at its commit, as
+    /// encoder that fails; one that only uses a detached object is left to its submissions, and
+    /// one only its draws of primitive type 9 fail, of one kind, to the runtime. One it would
+    /// fail in two, a use of a detached object and a failure of its own or a draw of type 9's,
+    /// or a draw of type 9's and another of its own or of another kind, dies at its commit, as
     /// nothing measured it
     #[test]
     fn a_command_buffer_failing_two_ways_dies_at_its_commit() {
@@ -2557,17 +2433,38 @@ mod tests {
         );
         for from in [3, 1] {
             cb.fail(Failing {
-                code: HANG,
+                code: PROTECTION_VIOLATION,
                 from,
-                signals: true,
+                signals: false,
             });
         }
         let failure = cb.failure("commit", || false).unwrap();
         assert_eq!(
             (failure.code, failure.encoders, failure.signals),
-            (HANG, rt::FailedEncoders::From(1), true)
+            (PROTECTION_VIOLATION, rt::FailedEncoders::From(1), false)
         );
         let site = catch_death(|| cb.failure("commit", || true)).unwrap_err();
+        assert_eq!(site.file, "commit");
+        let hang = Failing {
+            code: rt::CommandBufferError::GpuHang.metal_code(),
+            from: 2,
+            signals: true,
+        };
+        cb.fails_at_type_9(hang);
+        let site = catch_death(|| cb.failure("commit", || false)).unwrap_err();
+        assert_eq!(site.file, "commit");
+        let cb = buffer(&q);
+        for from in [2, 4] {
+            cb.fails_at_type_9(Failing { from, ..hang });
+        }
+        assert!(cb.failure("commit", || false).is_none(), "type 9 alone");
+        let site = catch_death(|| cb.failure("commit", || true)).unwrap_err();
+        assert_eq!(site.file, "commit");
+        cb.fails_at_type_9(Failing {
+            code: rt::CommandBufferError::PageFault.metal_code(),
+            ..hang
+        });
+        let site = catch_death(|| cb.failure("commit", || false)).unwrap_err();
         assert_eq!(site.file, "commit");
     }
 

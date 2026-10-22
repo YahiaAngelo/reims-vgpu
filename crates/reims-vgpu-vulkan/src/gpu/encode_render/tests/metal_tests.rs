@@ -7621,9 +7621,9 @@ fn a_display_pipeline_answers_metals_values() {
 /// by a mutable map's reset, that only loads or clears its target and stores it stores what
 /// Metal's does, in a process that has released no map of layers and after one was made,
 /// drawn with and released, which makes Metal's draws in such a pass draw (its fresh side
-/// first); a draw in such a pass, of a public or a private type, dies at its selector, naming
-/// the map, and a draw of primitive type 9 of no vertices and a tile dispatch there die by
-/// their own lines
+/// first); a draw in such a pass, of a public or a private type, and one of primitive type 9
+/// that fails the command buffer, dies at its selector, naming the map, and a tile dispatch
+/// there dies by its own line
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     use reims_vgpu_core::platform::rate_map::{
@@ -7793,14 +7793,14 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
     let q = d.new_command_queue().unwrap();
-    // A draw, of a public type and over indices of the platform's own (a triangle fan and
-    // quads), named by the map; a draw of primitive type 9 of no vertices, by its own count; and
-    // a tile dispatch, by its own line.
+    // A draw, of a public type, over indices of the platform's own (a triangle fan and quads)
+    // and of primitive type 9 that hangs the GPU, named by the map; and a tile dispatch, by its
+    // own line.
     let deaths = [
         (3, 3, "rate map of no layers"),
         (6, 4, "rate map of no layers"),
         (7, 4, "rate map of no layers"),
-        (9, 0, "primitive type 9 of 0 vertices"),
+        (9, 3, "rate map of no layers"),
         (
             0,
             0,
@@ -8687,5 +8687,149 @@ fn metal_runs_after_a_type_9_hang_here() {
                 println!("{line}");
             }
         }
+    }
+}
+
+/// What a command buffer shows on `p`'s device `d` whose render pass, over a 4 by 4 target filled
+/// with 0x11, draws primitive type 9 directly, `count` vertices of `instances` instances, a blit
+/// before it filling a buffer with 0x5a and one after it another with 0x6b, then an event signal:
+/// its status and error, the first byte of each buffer, whether the signal fired, and the
+/// target's first texel, black where the pass's clear ran.
+fn type_9_pass<P: Platform>(p: &P, d: &P::Device, (count, instances): (u64, u64)) -> String {
+    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    let (dst, pass) = pass_of(p, d, (4, 4));
+    let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+    dst.replace_region(region, 0, 0, HostRange::of_slice(&[0x11; 64]), 16, 0)
+        .unwrap();
+    let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+    let (before, after) = (
+        buffer::<P>(d, 16, 0, &[0; 16]),
+        buffer::<P>(d, 16, 0, &[0; 16]),
+    );
+    let event = d.new_shared_event().unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let fill = |b: &P::Buffer, value| {
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let range = NsRange::new(0, 16);
+        let fill = BlitCmd::FillBuffer {
+            buffer: b,
+            range,
+            value,
+        };
+        blit.encode(OnFault::Die, fill).unwrap();
+        blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    };
+    fill(&before, 0x5a);
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    for cmd in [
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        RenderCmd::DrawPrimitivesInstances {
+            primitive_type: 9,
+            vertex_start: 0,
+            vertex_count: count,
+            instance_count: instances,
+        },
+        RenderCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    fill(&after, 0x6b);
+    cb.encode_signal(Some(EventRef::Shared(&event)), 5).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    let out = buffer::<P>(d, 4, 0, &[]);
+    let read = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let blit = read.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &dst,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(1, 1, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 4,
+            destination_bytes_per_image: 4,
+        },
+        BlitCmd::EndEncoding,
+    ] {
+        blit.encode(OnFault::Die, cmd).unwrap();
+    }
+    read.commit(OnFault::Die).unwrap();
+    read.wait_until_completed(OnFault::Die).unwrap();
+    // SAFETY: Shared buffers' bytes, read after their command buffers completed.
+    let first = |b: &P::Buffer| unsafe { *b.contents().as_ptr::<u8>() };
+    // SAFETY: as above, the 4 bytes of `out`.
+    let texel = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 4) };
+    format!(
+        "status {} error {:?} before {:#x} after {:#x} signal {} texel {texel:x?}",
+        cb.status().0,
+        cb.error().map(|e| e.code),
+        first(&before),
+        first(&after),
+        event.wait_until_signaled_value(5, 1),
+    )
+}
+
+/// [`type_9_pass`]'s lines on Metal, each of its draw's vertices and instances: of 3 vertices
+/// or more and an instance it hangs the GPU, failing the command buffer with
+/// `MTLCommandBufferErrorTimeout` (status 5, code 2), the blit before the pass run and neither
+/// the pass's clear nor the blit after it, the signal firing; of fewer, or of no instance, it
+/// fails nothing (measured on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`).
+const METALS_TYPE_9: [((u64, u64), &str); 6] = [
+    (
+        (0, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        (1, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        (2, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        (3, 0),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        (3, 1),
+        "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        (6, 2),
+        "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+];
+
+/// A direct draw of primitive type 9 fails its command buffer as Metal's GPU does
+/// ([`METALS_TYPE_9`]): it hangs at 3 vertices or more and an instance, and fails nothing at
+/// fewer or no instance
+#[test]
+fn type_9_draws_fail_their_command_buffers_as_metals() {
+    let (p, d) = (platform(), dev());
+    for (draw, metals) in METALS_TYPE_9 {
+        assert_eq!(type_9_pass(&p, &d, draw), metals, "{draw:?}");
+    }
+}
+
+/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`], and this platform's are Metal's
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs Metal's GPU"]
+fn type_9_draws_fail_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for (draw, metals) in METALS_TYPE_9 {
+        let theirs = type_9_pass(&mp, &md, draw);
+        assert_eq!(theirs, metals, "{draw:?}");
+        assert_eq!(type_9_pass(&p, &d, draw), theirs, "{draw:?}");
     }
 }
