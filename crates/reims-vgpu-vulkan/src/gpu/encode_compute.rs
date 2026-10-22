@@ -781,6 +781,98 @@ mod tests {
         assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 
+    /// Prints how long 512 one-thread dispatches take to encode after one `useResources` of 0,
+    /// 1, 256 and 4096 Shared buffers, and of one buffer 4096 times: through this platform's
+    /// compute encoder, and through the runtime's alone, on the same device and pipeline, the
+    /// best of 3 runs each.
+    ///
+    /// Measured on the M3 Max (MoltenVK, a dev build), platform against runtime alone, in ms:
+    /// 6.6 against 5.7 with none resident, 15.8 against 15.1 with one, 99.5 against 97.3 with
+    /// 256, 1542 against 1498 with 4096, and 22.3 against 15.8 with one buffer 4096 times. The
+    /// runtime takes its dispatch memo only in an encoder that made nothing resident, so each
+    /// dispatch after a `useResources` settles its bind state again (about 18 us more), and
+    /// that settling copies, shapes and hashes every resident resource (about 0.7 us more for
+    /// each).
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the times"]
+    fn dispatches_after_a_large_residency() {
+        use reims_vgpu_core::platform::os::Clock as _;
+        let now = || crate::os::OsClock::new().now_mono();
+        let add = pipeline(ADD, "add_one");
+        let (input, out) = (shared(1024), shared(1024));
+        let resident: Vec<VulkanBuffer> = (0..4096).map(|_| shared(256)).collect();
+        let d = dev();
+        let raw_q = d.raw.new_command_queue().unwrap();
+        let one = vec![&resident[0]; 4096];
+        let all: Vec<_> = resident.iter().collect();
+        for (name, list) in [
+            ("0 buffers", &all[..0]),
+            ("1 buffer", &all[..1]),
+            ("256 buffers", &all[..256]),
+            ("4096 buffers", &all[..]),
+            ("one buffer 4096 times", &one[..]),
+        ] {
+            let refs: Vec<_> = (list.iter())
+                .map(|b| Some(ResourceRef::Buffer(*b)))
+                .collect();
+            let raw_refs: Vec<_> = (list.iter())
+                .map(|b| rt::ResourceRef::Buffer(&b.raw))
+                .collect();
+            let (mut ours, mut runtime) = (u128::MAX, u128::MAX);
+            for _ in 0..3 {
+                let cb = command_buffer();
+                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+                let setup = [
+                    ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                    ComputeCmd::SetBuffers {
+                        buffers: &[Some(&out), Some(&input)],
+                        offsets: &[0, 0],
+                        range: NsRange::new(0, 2),
+                    },
+                    ComputeCmd::UseResources {
+                        resources: &refs,
+                        usage: 1,
+                    },
+                ];
+                for cmd in setup {
+                    e.encode(OnFault::Return, cmd).unwrap();
+                }
+                let start = now();
+                for _ in 0..512 {
+                    let dispatch = ComputeCmd::DispatchThreads {
+                        threads_per_grid: MtlSize::new(1, 1, 1),
+                        threads_per_threadgroup: MtlSize::new(1, 1, 1),
+                    };
+                    e.encode(OnFault::Return, dispatch).unwrap();
+                }
+                ours = ours.min(now().saturating_duration_since(start).as_micros());
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+
+                let cb = raw_q.command_buffer().unwrap();
+                let mut e = cb.compute_command_encoder().unwrap();
+                e.set_compute_pipeline_state(&add.raw).unwrap();
+                e.set_buffers(&[Some(&out.raw), Some(&input.raw)], &[0, 0], 0)
+                    .unwrap();
+                e.use_resources(&raw_refs, ResourceUsage::READ).unwrap();
+                let start = now();
+                for _ in 0..512 {
+                    let one = rt::Size::new(1, 1, 1);
+                    e.dispatch_threads(one, one).unwrap();
+                }
+                runtime = runtime.min(now().saturating_duration_since(start).as_micros());
+                e.end_encoding().unwrap();
+                cb.commit().unwrap();
+                cb.wait_until_completed().unwrap();
+            }
+            println!(
+                "{name} resident: 512 dispatches through the platform {ours} us, through the \
+                 runtime alone {runtime} us"
+            );
+        }
+    }
+
     /// Dispatches run their kernels: threads over bound buffers, threadgroups after a buffer
     /// offset, threadgroups from an indirect buffer, threadgroup memory of the length set; with
     /// a barrier, a use and the reinterpretation flush between them
