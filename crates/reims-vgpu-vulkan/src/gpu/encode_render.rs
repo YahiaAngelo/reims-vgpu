@@ -56,13 +56,15 @@
 //!   a fan's first once a triangle; measured at every type, 6 to 1000 vertices, 1 to 3
 //!   instances, at either provoking vertex). Quads and quad strips give a fragment function's
 //!   `[[primitive_id]]` as Metal counts them, once a quad (`quads_give_metals_primitive_ids`).
-//!   Where its list cannot draw as Metal's draws (a vertex start past `i32::MAX`, which the list's
-//!   base vertex cannot hold, or, on a device whose fragment stage cannot declare
-//!   `[[primitive_id]]`, such as MoltenVK's, a vertex function that computes it into its varying),
-//!   the runtime refuses it (`PrivatePrimitives`), which dies. One over indices or indirect
-//!   arguments under a vertex function that writes memory dies too
-//!   ([`VulkanRenderEncoder::listed_runs`]): the runtime does not run the function as often at each
-//!   vertex as Metal on every device.
+//!   Where the list drawn over indices would not run as Metal's draws, the runtime draws the
+//!   list's positions without indices, each once, its vertex function reading the list's index
+//!   and Metal's base vertex at the list's device address: under a vertex function that writes
+//!   memory, which then runs as often at each vertex as Metal's over indices and from indirect
+//!   arguments too (`private_types_run_the_vertex_function_as_often_as_metals_at_every_draw`);
+//!   under one that computes `[[primitive_id]]` into its varying (on a device whose fragment stage
+//!   cannot declare it); and in a direct draw whose last vertex passes `i32::MAX`, which the
+//!   list's base vertex cannot hold. On a device without device addresses the runtime refuses
+//!   such a draw (`PrivatePrimitives`), which dies.
 //! - **Work of a pipeline state that can encode indirect commands** (the runtime's
 //!   `can_encode_indirect_commands`) dies in an encoder that made resident for writing an indirect
 //!   command buffer whose ID is not the runtime's, as a compute encoder's does
@@ -469,10 +471,6 @@ struct Marks {
     line_fill: bool,
     /// A pipeline state was set.
     pipeline: bool,
-    /// The pipeline state set's vertex function writes memory (the runtime's
-    /// `vertex_writes_memory`): a private type's draw over indices or indirect arguments dies
-    /// ([`VulkanRenderEncoder::listed_runs`]).
-    vertex_writes: bool,
     /// The pipeline state set sizes its points as Metal does: its vertex function writes
     /// `[[point_size]]`, or its input primitive topology is the point class (the module docs).
     points_sized: bool,
@@ -2181,27 +2179,6 @@ impl VulkanRenderEncoder {
         self.run(sel, call)
     }
 
-    /// Dies at `sel`, a draw of `t` over indices or indirect arguments, where `t` is one of
-    /// Metal's private types and the pipeline state set's vertex function writes memory
-    /// ([`Marks::vertex_writes`]): the runtime draws it over a list the GPU writes, whose
-    /// vertices it does not run the function at as often as Metal's draw does on every device, so
-    /// its writes may not be Metal's. Elsewhere such a draw died before the runtime drew private
-    /// types, and a direct one draws.
-    fn listed_runs(&self, sel: &'static str, t: rt::DrawPrimitiveType) {
-        let private = !matches!(t, rt::DrawPrimitiveType::Public(_));
-        if private && plain(|| self.marks.lock().vertex_writes) {
-            unrepresentable(
-                sel,
-                &format!(
-                    "primitive type {} over indices or indirect arguments under a vertex function \
-                     that writes memory, which the runtime does not run as often at each vertex \
-                     as Metal's draw does on every device",
-                    t.raw()
-                ),
-            );
-        }
-    }
-
     /// An indirect command buffer's execution `sel`, of `icb`'s commands `range` (`None`: a range
     /// a buffer holds): it draws, so it dies as a draw does where the private setters leave it no
     /// exact form ([`Self::marked`]), unless it is `empty`, of no command, and after a nil
@@ -2508,9 +2485,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
-                if let Some((t, _)) = kinds {
-                    self.listed_runs(sel, t);
-                }
                 let call = |e: &mut rt::RenderCommandEncoder, (t, i)| {
                     e.draw_indexed_primitives_indirect(
                         t,
@@ -2579,7 +2553,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 if t == rt::DrawPrimitiveType::Nine {
                     unmeasured_type_9(sel);
                 }
-                self.listed_runs(sel, t);
                 self.draw(sel, (Some((Shape::Primitives(t), t)), false), |e, t| {
                     e.draw_primitives_indirect(t, &indirect_buffer.raw, indirect_buffer_offset)
                 })
@@ -2927,7 +2900,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         let mut m = self.marks.lock();
                         m.pipeline = true;
                         m.points_sized = f.points_sized;
-                        m.vertex_writes = f.writes[VERTEX];
                         m.half_apart = f.half_apart;
                     });
                     Ok(())
@@ -3507,9 +3479,6 @@ impl VulkanRenderEncoder {
         (buffer, offset): (&VulkanBuffer, u64),
     ) -> RaiseResult<()> {
         let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
-        if let Some((t, _)) = kinds {
-            self.listed_runs(sel, t);
-        }
         let (count, instances) = (small(sel, count), small(sel, instances));
         let base_vertex = i32::try_from(base_vertex).unwrap_or_else(|_| {
             unrepresentable(sel, &format!("base vertex {base_vertex} as an i32"))
@@ -4194,50 +4163,6 @@ pub(crate) mod tests {
             dies_at(&e, three(9, None)),
             "drawPrimitives:vertexStart:vertexCount:"
         );
-    }
-
-    /// A draw of one of Metal's private types over indices or indirect arguments under a state
-    /// whose vertex function writes memory dies, naming that, as the runtime does not run the
-    /// function as often at each vertex as Metal on every device
-    #[test]
-    fn private_types_over_indices_under_a_writing_vertex_function_die() {
-        let (e, indices) = drawing_encoder("vertex_ids:counting_vertex", SIZED.1);
-        let indirect = RenderCmd::DrawPrimitivesIndirect {
-            primitive_type: 8,
-            indirect_buffer: &indices,
-            indirect_buffer_offset: 0,
-        };
-        let indexed_indirect = RenderCmd::DrawIndexedPrimitivesIndirect {
-            primitive_type: 5,
-            index_type: U16,
-            index_buffer: &indices,
-            index_buffer_offset: 0,
-            indirect_buffer: &indices,
-            indirect_buffer_offset: 0,
-        };
-        for (draw, sel) in [
-            (
-                three(7, Some(&indices)),
-                "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
-            ),
-            (
-                indirect,
-                "drawPrimitives:indirectBuffer:indirectBufferOffset:",
-            ),
-            (
-                indexed_indirect,
-                "drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:\
-                 indirectBufferOffset:",
-            ),
-        ] {
-            *crate::answer::LAST_LINE.lock() = None;
-            assert_eq!(dies_at(&e, draw), sel);
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert!(
-                line.contains("a vertex function that writes memory"),
-                "{line}"
-            );
-        }
     }
 
     /// The sweep library, `rounding.metal`, compiled with fast math, the compiler's default.

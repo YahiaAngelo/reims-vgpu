@@ -912,23 +912,7 @@ fn provoked<P: Platform>(
     let entries: &[&str] = if executed { &["19 04 01000000"] } else { &[] };
     let state = blob_state::<P>(d, functions, entries);
     let (pos, colours) = flat_vertices::<P>(d, 64);
-    let (indices, arguments) = match draw {
-        Provoked::Indices {
-            index_type,
-            indices,
-            ..
-        } => (index_bytes(index_type, indices), Vec::new()),
-        Provoked::Indirect(_, arguments) => (Vec::new(), u32s(&arguments)),
-        Provoked::IndexedIndirect {
-            index_type,
-            indices,
-            arguments,
-            ..
-        } => (index_bytes(index_type, indices), u32s(&arguments)),
-        _ => (Vec::new(), Vec::new()),
-    };
-    let index_buffer = buffer::<P>(d, 256, 0, &indices);
-    let indirect_buffer = buffer::<P>(d, 64, 0, &arguments);
+    let (index_buffer, indirect_buffer) = provoked_buffers::<P>(d, draw);
     let icb = match draw {
         Provoked::Executed {
             inherits,
@@ -1008,49 +992,9 @@ fn provoked<P: Platform>(
         cmds.push(RenderCmd::SetPrimitiveRestartEnabled { enabled, index });
     }
     cmds.push(RenderCmd::SetProvokingVertexMode { mode });
-    match draw {
-        Provoked::Vertices(primitive_type, start, count, instances) => {
-            cmds.push(RenderCmd::DrawPrimitivesInstances {
-                primitive_type,
-                vertex_start: start,
-                vertex_count: count,
-                instance_count: instances,
-            });
-        }
-        Provoked::Indices {
-            primitive_type,
-            index_type,
-            indices,
-            base_vertex,
-            instances,
-        } => cmds.push(RenderCmd::DrawIndexedPrimitivesBase {
-            primitive_type,
-            index_count: u64::try_from(indices.len()).unwrap(),
-            index_type,
-            index_buffer: &index_buffer,
-            index_buffer_offset: 0,
-            instance_count: instances,
-            base_vertex,
-            base_instance: 0,
-        }),
-        Provoked::Indirect(primitive_type, _) => cmds.push(RenderCmd::DrawPrimitivesIndirect {
-            primitive_type,
-            indirect_buffer: &indirect_buffer,
-            indirect_buffer_offset: 0,
-        }),
-        Provoked::IndexedIndirect {
-            primitive_type,
-            index_type,
-            ..
-        } => cmds.push(RenderCmd::DrawIndexedPrimitivesIndirect {
-            primitive_type,
-            index_type,
-            index_buffer: &index_buffer,
-            index_buffer_offset: 0,
-            indirect_buffer: &indirect_buffer,
-            indirect_buffer_offset: 0,
-        }),
-        Provoked::Executed { .. } => {
+    match provoked_draw(draw, (&index_buffer, &indirect_buffer)) {
+        Some(drawn) => cmds.push(drawn),
+        None => {
             let (icb, used) = (icb.as_ref().unwrap(), used.as_ref().unwrap());
             cmds.extend([
                 RenderCmd::UseResources {
@@ -1065,6 +1009,82 @@ fn provoked<P: Platform>(
         }
     }
     pass_pixels(p, d, cmds)
+}
+
+/// The index and indirect buffers of `draw`, a draw of [`provoked`]'s, on `d`: its indices and its
+/// arguments, each empty where it has none.
+fn provoked_buffers<P: Platform>(d: &P::Device, draw: Provoked<'_>) -> (P::Buffer, P::Buffer) {
+    let (indices, arguments) = match draw {
+        Provoked::Indices {
+            index_type,
+            indices,
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
+        Provoked::Indirect(_, arguments) => (Vec::new(), u32s(&arguments)),
+        Provoked::IndexedIndirect {
+            index_type,
+            indices,
+            arguments,
+            ..
+        } => (index_bytes(index_type, indices), u32s(&arguments)),
+        _ => (Vec::new(), Vec::new()),
+    };
+    (
+        buffer::<P>(d, 256, 0, &indices),
+        buffer::<P>(d, 64, 0, &arguments),
+    )
+}
+
+/// The command of `draw`, a draw of [`provoked`]'s, over `index_buffer` and `indirect_buffer`
+/// ([`provoked_buffers`]); `None` for an execution, which [`provoked`] encodes itself.
+fn provoked_draw<'a, P: Platform>(
+    draw: Provoked<'_>,
+    (index_buffer, indirect_buffer): (&'a P::Buffer, &'a P::Buffer),
+) -> Option<RenderCmd<'a, P>> {
+    Some(match draw {
+        Provoked::Vertices(primitive_type, start, count, instances) => {
+            RenderCmd::DrawPrimitivesInstances {
+                primitive_type,
+                vertex_start: start,
+                vertex_count: count,
+                instance_count: instances,
+            }
+        }
+        Provoked::Indices {
+            primitive_type,
+            index_type,
+            indices,
+            base_vertex,
+            instances,
+        } => RenderCmd::DrawIndexedPrimitivesBase {
+            primitive_type,
+            index_count: u64::try_from(indices.len()).unwrap(),
+            index_type,
+            index_buffer,
+            index_buffer_offset: 0,
+            instance_count: instances,
+            base_vertex,
+            base_instance: 0,
+        },
+        Provoked::Indirect(primitive_type, _) => RenderCmd::DrawPrimitivesIndirect {
+            primitive_type,
+            indirect_buffer,
+            indirect_buffer_offset: 0,
+        },
+        Provoked::IndexedIndirect {
+            primitive_type,
+            index_type,
+            ..
+        } => RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type,
+            index_type,
+            index_buffer,
+            index_buffer_offset: 0,
+            indirect_buffer,
+            indirect_buffer_offset: 0,
+        },
+        Provoked::Executed { .. } => return None,
+    })
 }
 
 /// A draw of `indices` of `index_type` as `primitive_type`, from `base_vertex`, of `instances`.
@@ -1903,35 +1923,45 @@ fn vertex_runs<P: Platform>(
     mode: u64,
     (primitive_type, start, count, instances): (u64, u64, u64, u64),
 ) -> Vec<u32> {
+    let draw = Provoked::Vertices(primitive_type, start, count, instances);
+    provoked_runs(p, d, (mode, None), draw)
+}
+
+/// The runs of `counting_vertex` at each of the first [`RUNS`] vertex IDs after `draw`, a draw
+/// of [`provoked`]'s but an execution, under a state of `counting_vertex` and `ids_fragment`
+/// over [`flat_vertices`] in buffer 0 and the runs in buffer 1, at `setProvokingVertexMode:` of
+/// `mode`, after `restart`'s `setPrimitiveRestartEnabled:index:` where it has one.
+fn provoked_runs<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    (mode, restart): (u64, Option<(bool, u64)>),
+    draw: Provoked<'_>,
+) -> Vec<u32> {
     let state = fixture_state::<P>(d, "vertex_ids:counting_vertex", SIZED.1);
     let (pos, _) = flat_vertices::<P>(d, RUNS);
     let runs = buffer::<P>(d, 4 * RUNS as u64, 0, &[0; 4 * RUNS]);
-    pass_pixels(
-        p,
-        d,
-        vec![
-            RenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(&state),
-            },
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&pos),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&runs),
-                offset: 0,
-                index: 1,
-            },
-            RenderCmd::SetProvokingVertexMode { mode },
-            RenderCmd::DrawPrimitivesInstances {
-                primitive_type,
-                vertex_start: start,
-                vertex_count: count,
-                instance_count: instances,
-            },
-        ],
-    );
+    let (index_buffer, indirect_buffer) = provoked_buffers::<P>(d, draw);
+    let mut cmds = vec![
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&pos),
+            offset: 0,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&runs),
+            offset: 0,
+            index: 1,
+        },
+    ];
+    if let Some((enabled, index)) = restart {
+        cmds.push(RenderCmd::SetPrimitiveRestartEnabled { enabled, index });
+    }
+    cmds.push(RenderCmd::SetProvokingVertexMode { mode });
+    cmds.extend(provoked_draw(draw, (&index_buffer, &indirect_buffer)));
+    pass_pixels(p, d, cmds);
     // SAFETY: a Shared buffer of `4 * RUNS` bytes, read after the pass completed.
     let bytes = unsafe { std::slice::from_raw_parts(runs.contents().as_ptr::<u8>(), 4 * RUNS) };
     bytes
@@ -1987,6 +2017,51 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
         assert!(ours.iter().any(|&n| n > 1), "{mode} {draw:?}");
         if let Some((mp, md)) = &metal {
             assert_eq!(ours, vertex_runs(mp, md, mode, draw), "{mode} {draw:?}");
+        }
+    }
+}
+
+/// Metal's private types run a vertex function that writes memory as many times at each vertex
+/// as Metal's draws, once for each vertex of the list Metal draws them as, over 16- and 32-bit
+/// indices, from a base vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad
+/// strip restarting at its index type's all-ones index, and from indirect arguments, over indices
+/// too, at `setProvokingVertexMode:` 0 and 1 (the line loop's lines at 1 relayed,
+/// `provoking-vertex-lines`, where the device lacks the last vertex). Each draw runs some vertex
+/// more than once
+#[test]
+fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    for t in 5..=8 {
+        let mut cases = vec![
+            (over((t, U16), SCRAMBLED, (1, 2)), None),
+            (over((t, U32), SCRAMBLED, (0, 1)), None),
+            (over((t, U16), SCRAMBLED_AT_3, (0, 1)), Some((true, 3))),
+            (Provoked::Indirect(t, [10, 1, 2, 0]), None),
+            (Provoked::Indirect(t, [9, 2, 0, 0]), None),
+            (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
+            (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+        ];
+        if t == 8 {
+            cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
+            cases.push((over((t, U32), QUADS_RESTARTED_WIDE, (0, 1)), None));
+        }
+        for (draw, restart) in cases {
+            for mode in [0, 1] {
+                let ours = crate::answer::relaxed(|| provoked_runs(&p, &d, (mode, restart), draw));
+                assert!(ours.iter().any(|&n| n > 1), "{draw:?} at mode {mode}");
+                if let Some((mp, md)) = &metal {
+                    let theirs = provoked_runs(mp, md, (mode, restart), draw);
+                    assert_eq!(ours, theirs, "{draw:?} at mode {mode}");
+                }
+            }
         }
     }
 }
