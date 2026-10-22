@@ -1892,8 +1892,9 @@ fn indexed_kinds(
 /// included, of any instances) and as a victim of its recovery from indirect arguments (any),
 /// its event signals firing; it runs a render pass after it, and a later command buffer of its
 /// queue, but a blit encoder right after it in some runs and not in others (measured on the M3
-/// Max, macOS 27.0.1: after a process's first such failure over indices in 7 runs of 7, after
-/// later ones in 1 of 35), where the runtime runs every encoder after it.
+/// Max, macOS 27.0.1, each such command buffer the first of a queue of its own: the blit ran in
+/// 7 runs of 7 where the command buffer was the process's first to fail, over indices, and in 1
+/// of 35 where another had failed before it), where the runtime runs every encoder after it.
 fn unmeasured_type_9(sel: &'static str) -> ! {
     unrepresentable(
         sel,
