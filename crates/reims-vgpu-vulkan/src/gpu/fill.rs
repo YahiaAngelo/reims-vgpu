@@ -104,6 +104,12 @@ use crate::answer::unrepresentable;
 /// The most texels a fill region may span before the cut: Metal took 23 ms for this many.
 const MEASURED_TEXELS: u64 = 1 << 32;
 
+/// The most bytes of its pattern a fill of a texture with bytes reads: a block of the largest
+/// format Metal describes at any level the runtime measured (`RGBA32Float` and the 16-byte
+/// compressed blocks), as a texel is the pattern cut at its format's block ([`texel`], and the
+/// runtime's fill likewise), the bytes past it unread.
+pub const MOST_PATTERN_BYTES: usize = 16;
+
 /// A texel of `bytes` bytes: `pattern` repeated from its start and cut at `bytes`. An empty
 /// pattern (none reaches here) is a texel of zeroes.
 pub fn texel(pattern: &[u8], bytes: usize) -> Vec<u8> {
@@ -831,6 +837,20 @@ mod tests {
         for format in [0, 553, 555, 252, 260, 9999] {
             let site = catch_death(|| color_bytes("s", red, format)).unwrap_err();
             assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"));
+        }
+    }
+
+    /// No format any Metal level the runtime measured describes holds a block of more bytes
+    /// than a fill's copy of its pattern keeps ([`MOST_PATTERN_BYTES`]), so every texel a fill
+    /// writes is cut from bytes it copied
+    #[test]
+    fn no_block_is_longer_than_a_fills_pattern() {
+        let most = u64::try_from(MOST_PATTERN_BYTES).unwrap();
+        for level in metal2vulkan_runtime::MetalLevel::ALL {
+            for raw in 0..2048 {
+                let [bytes, ..] = level.pixel_format_info(raw).words;
+                assert!(bytes <= most, "{level:?} format {raw}: {bytes} bytes");
+            }
         }
     }
 
