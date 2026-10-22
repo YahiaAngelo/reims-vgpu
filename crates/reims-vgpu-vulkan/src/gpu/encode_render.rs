@@ -38,11 +38,11 @@
 //!   state set before: a draw, direct or indirect, a tile dispatch, and an execution of an
 //!   indirect command buffer whose commands inherit the pipeline state. **A nil depth-stencil
 //!   state** is Metal's default state, with no depth or stencil test, as the runtime's nil is.
-//! - **A draw of an index type no `MTLIndexType` is, or of no instances,** encodes nothing, as
-//!   Metal draws nothing (`render_draw_indexed`: index type 2). The runtime would check an empty
-//!   draw's state as any draw's before it records nothing, and refuse what it cannot bind, where
-//!   Metal draws nothing. A patch draw of no instances, plain or indexed, goes to the runtime,
-//!   which checks it so and records nothing.
+//! - **A draw of an index type no `MTLIndexType` is** encodes nothing, as Metal draws nothing
+//!   (`render_draw_indexed`: index type 2). **A draw of no instances**, a patch draw's too, goes
+//!   to the runtime, which records nothing and checks it only as plain Metal does: a pipeline
+//!   state set, of the draw's kind. A non-indexed draw of one of Metal's private types and no
+//!   instances encodes nothing.
 //! - **Metal's private primitive types** 5 to 8 draw a line loop, a triangle fan, quads and a
 //!   quad strip, measured against Metal pixel for pixel at every count from 0 to 10, with flat
 //!   attributes, blending and instances: a non-indexed draw of one is an indexed draw of the
@@ -4034,17 +4034,17 @@ impl VulkanRenderEncoder {
     }
 
     /// A non-indexed draw of a raw primitive type: `(start, count, instances, base instance)`; one
-    /// of no instances encodes nothing, as Metal draws nothing, before the runtime's checks of its
-    /// state (the module docs). A private type draws as its public one over the indices of its
-    /// vertices ([`Private::indices`]), and a list or strip of triangles the provoking vertex
-    /// rotates ([`Self::rotates`]) as a list over its triangles' vertices last first
-    /// ([`last_first`]), each in a buffer the encoder keeps for its later draws of the kind
-    /// ([`OwnIndices`]) and the command buffer until it completes, and each asks what any draw
-    /// asks ([`Self::drawn`]); one of too few vertices draws nothing, as on Metal. The indices are
+    /// of no instances is an empty draw, which the runtime records nothing of (the module docs),
+    /// and one of a private type encodes nothing. A private type draws as its public one over the
+    /// indices of its vertices ([`Private::indices`]), and a list or strip of triangles the
+    /// provoking vertex rotates ([`Self::rotates`]) as a list over its triangles' vertices last
+    /// first ([`last_first`]), each in a buffer the encoder keeps for its later draws of the kind
+    /// ([`OwnIndices`]) and the command buffer until it completes, and each asks what any draw asks
+    /// ([`Self::drawn`]); one of too few vertices draws nothing, as on Metal. The indices are
     /// relative to `start`, the indexed draw's base vertex, so `[[base_vertex]]` reads `start` and
-    /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module
-    /// docs); a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal
-    /// draws from, dies. Such a draw restarts at the all-ones index alone after
+    /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module docs);
+    /// a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal draws from,
+    /// dies. Such a draw restarts at the all-ones index alone after
     /// `setPrimitiveRestartEnabled:index:` too, as a line loop's line strip has no index where
     /// Metal's loop restarts.
     fn primitives(
@@ -4059,7 +4059,7 @@ impl VulkanRenderEncoder {
             return self.hangs(sel, count, instances);
         }
         let topology = topology(sel, primitive_type);
-        if instances == 0 {
+        if instances == 0 && matches!(topology, Topology::Private(_)) {
             return self.draw(sel, (None::<(Shape, ())>, true), |_, ()| Ok(()));
         }
         let shape = Shape::Primitives {
@@ -4070,7 +4070,7 @@ impl VulkanRenderEncoder {
         let listed = match topology {
             Topology::Public(p) => {
                 self.pipelined(sel);
-                let empty = draws_none(p, count);
+                let empty = instances == 0 || draws_none(p, count);
                 if empty || !self.rotation(sel, shape, crate::answer::strict()) {
                     return self.draw(sel, (Some((shape, p)), empty), |e, p| {
                         e.draw_primitives(p, start, count, instances, base)
@@ -4118,8 +4118,8 @@ impl VulkanRenderEncoder {
     }
 
     /// An indexed draw of a raw primitive and index type: `(count, instances, base vertex, base
-    /// instance)` from the index buffer at its offset; one of no instances encodes nothing, as
-    /// Metal draws nothing, before the runtime's checks of its state (the module docs).
+    /// instance)` from the index buffer at its offset; one of no instances is an empty draw,
+    /// which the runtime records nothing of (the module docs).
     fn indexed(
         &self,
         sel: &'static str,
@@ -4129,12 +4129,11 @@ impl VulkanRenderEncoder {
     ) -> RaiseResult<()> {
         let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
         let (count, instances) = (small(sel, count), small(sel, instances));
-        let kinds = kinds.filter(|_| instances != 0);
         let base_vertex = i32::try_from(base_vertex).unwrap_or_else(|_| {
             unrepresentable(sel, &format!("base vertex {base_vertex} as an i32"))
         });
         let base_instance = small(sel, base_instance);
-        let empty = kinds.is_some_and(|(p, _)| draws_none(p, count));
+        let empty = instances == 0 || kinds.is_some_and(|(p, _)| draws_none(p, count));
         let drawn = kinds.map(|(p, i)| (Shape::public(p, true, false), (p, i)));
         self.draw(sel, (drawn, empty), |e, (p, i)| {
             e.draw_indexed_primitives(
@@ -5694,6 +5693,47 @@ pub(crate) mod tests {
         assert_eq!(dies_at(&e, drawn(1, 2)), draw);
         assert_eq!(dies_at(&e, drawn(3, 3)), draw);
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    }
+
+    /// A draw of no instances draws nothing whatever the private setters left, plain and
+    /// indexed, as on Metal, and the encoder goes on; one with no pipeline state set dies, where
+    /// plain Metal stops the process (the runtime's probe `zero_instances`, an M4)
+    #[test]
+    fn draws_of_no_instances_draw_nothing_as_plain_metal_does() {
+        let (e, indices) = drawing_encoder(FLAT.0, FLAT.1);
+        send_all(
+            &e,
+            vec![
+                RenderCmd::SetLineWidth { line_width: 2.0 },
+                RenderCmd::SetTriangleFillMode { fill_mode: 1 },
+                RenderCmd::SetProvokingVertexMode { mode: 1 },
+            ],
+        );
+        let plain = |primitive_type| RenderCmd::DrawPrimitivesInstances {
+            primitive_type,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 0,
+        };
+        let indexed = |primitive_type| RenderCmd::DrawIndexedPrimitivesInstances {
+            primitive_type,
+            index_count: 3,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            instance_count: 0,
+        };
+        let mut empty = Vec::new();
+        for primitive_type in [0, 1, 2, 3, STRIP] {
+            empty.extend([plain(primitive_type), indexed(primitive_type)]);
+        }
+        send_all(&e, empty);
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let (e, _dst) = open_encoder();
+        assert_eq!(
+            dies_at(&e, plain(3)),
+            "drawPrimitives:vertexStart:vertexCount:instanceCount:"
+        );
     }
 
     /// `setVertexAmplificationMode:value:` encodes nothing; draws go on where it leaves the
