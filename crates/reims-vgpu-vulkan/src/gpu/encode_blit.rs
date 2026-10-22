@@ -318,7 +318,11 @@ impl VulkanBlitEncoder {
         };
         let ([x, y, z], [w, h, d]) = (place.origin, place.size);
         let region = rt::Region::new_3d(x, y, z, w, h, d);
-        let pattern = if pattern.is_empty() { &[0][..] } else { pattern };
+        let pattern = if pattern.is_empty() {
+            &[0][..]
+        } else {
+            pattern
+        };
         send(sel, Policy::Dies, || {
             self.with(sel, |e| {
                 e.fill_texture(raw, place.level, place.slice, region, pattern)
