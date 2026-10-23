@@ -727,9 +727,10 @@ struct Detached {
     /// The releases of `released`, in the order of their numbers, the oldest first.
     releases: VecDeque<(u64, rt::ObjectId)>,
     /// The open command buffers, by number, until they close ([`Opened`]). One made by an isolated
-    /// task that ended and never committed holds nothing ([`Open::let_go`]): an ended
-    /// task's never commits, and one of a task that died is never released ([`TaskLife`]). Such
-    /// ones go as they reach the front, the oldest open, at a close, and all of them once the
+    /// task that ended and never committed holds nothing ([`Open::let_go`]): an ended task's
+    /// commits no more, but for a commit already past its check of the task's end, which puts it
+    /// back ([`Registry::commit`]), and one of a task that died is never released ([`TaskLife`]).
+    /// Such ones go as they reach the front, the oldest open, at a close, and all of them once the
     /// open ones grew to twice `fewest`, at a close: in O(1) a close, over the closes.
     open: BTreeMap<u64, Arc<Open>>,
     /// The fewest open command buffers since those that hold nothing were last let go of.
