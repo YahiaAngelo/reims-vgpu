@@ -1231,7 +1231,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
         let raw = encoding("blitCommandEncoder", Policy::Dies, || {
             predication::boundary(&self.predication, "blitCommandEncoder");
-            self.raw.blit_command_encoder()
+            self.raw.blit_command_encoder().map(Box::new)
         })?;
         Ok(Some(Obj::new(EncoderObject::new(raw, self))))
     }

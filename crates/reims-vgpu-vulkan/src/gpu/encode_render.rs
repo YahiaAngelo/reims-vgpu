@@ -376,9 +376,9 @@ fn half_output_apart(sel: &'static str, (index, format): (usize, PixelFormat)) {
 /// for.
 #[derive(Debug)]
 pub struct RenderEncoderObject {
-    /// The runtime's encoder, until it ends, boxed: it is 11 KiB, which each move between its
-    /// making and its end would copy.
-    pub encoder: EncoderObject<Box<rt::RenderCommandEncoder>>,
+    /// The runtime's encoder, until it ends: a handle of at most 128 bytes, its lowering boxed by
+    /// the runtime, held in place.
+    pub encoder: EncoderObject<rt::RenderCommandEncoder>,
     /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
     nil_pipeline: Mutex<bool>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
@@ -1605,9 +1605,7 @@ fn make(
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let d = without_unused_resolves(d);
-    match plain_at(sel, || {
-        command_buffer.raw.render_command_encoder(&d).map(Box::new)
-    }) {
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), taken).map(Some)
@@ -1678,7 +1676,7 @@ fn make(
 /// abandon the command buffer. What Metal aborts at in the pass dies then.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
-    raw: Box<rt::RenderCommandEncoder>,
+    raw: rt::RenderCommandEncoder,
     (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
     taken: Taken,
 ) -> RaiseResult<VulkanRenderEncoder> {
@@ -6545,7 +6543,7 @@ pub(crate) mod tests {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let made = without_unused_resolves(pass.descriptor());
-        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
+        let raw = cb.raw.render_command_encoder(&made).unwrap();
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
