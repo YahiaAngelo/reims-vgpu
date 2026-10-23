@@ -298,8 +298,9 @@ impl VulkanBlitEncoder {
     /// `sel`: the runtime's fill, where [`fill_place`] says, which cuts the pattern at its unit
     /// or repeats it to it, or runs it across a texture buffer's bytes (the module's docs), of the
     /// pattern's bytes it reads ([`crate::gpu::resource::fill_bytes`]); a texture buffer's of a
-    /// pattern past the bytes measured dies ([`fill::streamed_pattern`]). An empty pattern (a
-    /// length of 0 at a readable address, which nothing measured on Metal) fills zeroes.
+    /// pattern past the bytes Metal fills dies, as Metal's process ends there
+    /// ([`fill::streamed_pattern`]). An empty pattern (a length of 0 at a readable address, which
+    /// nothing measured on Metal) fills zeroes.
     fn fill_texture(
         &self,
         sel: &'static str,

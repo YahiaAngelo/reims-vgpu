@@ -60,8 +60,9 @@
 //!   row, height and depth, the pattern running across the region's bytes, not started again at
 //!   each texel, past the width too and cut at the buffer's end, as the runtime's fill writes it
 //!   (`texture_buffer_fills_are_the_metal_platforms`,
-//!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 256 bytes, the most
-//!   measured; a longer one dies ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
+//!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 32752 bytes; a
+//!   longer one ends Metal's process in the call, whatever the region, and dies there, naming the
+//!   runtime's refusal of it ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
 //!   bytes past the pattern's whole copies, which are its stack's, the runtime's reads zeros and
 //!   announces `TextureBufferFillLeftover`, one of Metal's answers, relayed.
 //! - **A multisample texture's** fill writes every sample of the region's texels and no other,
@@ -71,6 +72,7 @@
 //!   where the device cannot run its sample copies, which dies naming the refusal.
 
 use metal2vulkan::metal::{PixelFormat, TextureType};
+use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::types::MtlRegion;
 
 use crate::answer::unrepresentable;
@@ -84,11 +86,12 @@ const MEASURED_TEXELS: u64 = 1 << 32;
 /// the pattern at its format's block, the bytes past it unread.
 pub const MOST_PATTERN_BYTES: usize = 16;
 
-/// The most bytes of its pattern a fill of a texture buffer with bytes was measured to read on
-/// Metal, which runs the whole pattern across the buffer's bytes, its length deciding which of
-/// its bytes lands where (the module's docs): the runtime's probe of Metal's fills of texture
-/// buffers took patterns of 1 to 256 bytes ([`streamed_pattern`]).
-pub const MOST_STREAMED_PATTERN_BYTES: usize = 256;
+/// The most bytes of its pattern a fill of a texture buffer with bytes reads on Metal, which runs
+/// the whole pattern across the buffer's bytes, its length deciding which of its bytes lands
+/// where (the module's docs), as the runtime's fill streams it, byte for byte up to this length
+/// (its probes on the M3 Max under macOS 27.0.1: `R8Uint`, `R32Uint` and `RGBA32Uint` texture
+/// buffers): a longer pattern ends Metal's process in the call ([`streamed_pattern`]).
+pub const MOST_STREAMED_PATTERN_BYTES: usize = 32752;
 
 /// The formats Metal packs no colour in, for which a colour fill writes bytes Metal holds from
 /// earlier work (the module's docs).
@@ -254,19 +257,16 @@ pub fn texture_buffer_writes(sel: &'static str, region: MtlRegion) -> bool {
 }
 
 /// Dies for `sel` at a fill of a texture buffer with a pattern of `length` bytes, past
-/// [`MOST_STREAMED_PATTERN_BYTES`]: Metal reads the whole pattern there, and nothing measured
-/// what it writes of a longer one.
+/// [`MOST_STREAMED_PATTERN_BYTES`], where Metal's process ends in the call whatever the region (of
+/// no texels and past the buffer too), naming the runtime's refusal of it
+/// (`LongTextureBufferFillPattern`), before the region is read: the runtime refuses it only for a
+/// region it is given, and this platform gives none of no texels across.
 pub fn streamed_pattern(sel: &'static str, length: u64) {
     use reims_vgpu_core::num::ToU64 as _;
     if length > MOST_STREAMED_PATTERN_BYTES.to_u64() {
-        unrepresentable(
-            sel,
-            &format!(
-                "a fill of a texture buffer with a pattern of {length} bytes, past the \
-                 {MOST_STREAMED_PATTERN_BYTES} measured on Metal, which runs a pattern across \
-                 the buffer's bytes"
-            ),
-        );
+        let problem = rt::Problem::LongTextureBufferFillPattern { length };
+        let e = rt::Error::Invalid(rt::Invalid::new("fill_texture", problem));
+        crate::answer::refused(sel, &e);
     }
 }
 
@@ -383,7 +383,8 @@ mod tests {
     /// region is cut at the level; 1D and 2D ignore the slice and every type but 3D the region's
     /// depth; arrays write their slices, a multisample array too; a cube writes face `slice %
     /// 6`. A texture buffer's fill
-    /// writes but for a region of no texels across, and dies at a pattern past the bytes measured
+    /// writes but for a region of no texels across, and dies at a pattern past the bytes Metal
+    /// fills, naming the runtime's refusal
     #[test]
     fn places_are_metals() {
         let shape = |texture_type, extent, levels, array_length| Shape {
@@ -472,9 +473,15 @@ mod tests {
         assert!(!writes(r([9, 0, 0], [0, 1, 1])));
         let site = catch_death(|| writes(r([0, 0, 0], [1 << 16, (1 << 16) + 1, 1]))).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"));
-        streamed_pattern("s", 256);
-        let site = catch_death(|| streamed_pattern("s", 257)).unwrap_err();
+        streamed_pattern("s", 32752);
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| streamed_pattern("s", 32753)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "s"));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert!(
+            line.contains("LongTextureBufferFillPattern { length: 32753 }"),
+            "{line}"
+        );
         assert_eq!(
             place_of(&flat, 0, 0, r([0, 0, 0], [1 << 16, 1 << 16, 1])),
             at(0, 0, [0, 0, 0], [4, 4, 1])
