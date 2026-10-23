@@ -684,11 +684,11 @@ A panic is a bug, never control flow, and it ends the process as a death does: o
 panic of the library's reaches the host's frames. The API's singleton
 (`reims-vgpu/src/singleton.rs`) installs a chained panic hook that does this when the panicking
 thread is running the library's code (the FIFO thread, a worker running one of core's blocks, a
-Metal completion handler, a public entry point, or a C export, each marked by `rt::enter_ours`),
-and leaves any other panic, the host's own, to the host's hook (D9). Every C export is
-`extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which installs the
-hook and marks the thread first: the `extern "C"` frame would end the process too, but only after
-the frames below it had run their drops. `panic = "unwind"` stays because objc2's
+Metal completion handler or buffer deallocator, a public entry point, or a C export, each marked
+by `rt::enter_ours`), and leaves any other panic, the host's own, to the host's hook (D9). Every C
+export is `extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which
+installs the hook and marks the thread first: the `extern "C"` frame would end the process too,
+but only after the frames below it had run their drops. `panic = "unwind"` stays because objc2's
 `exception::catch` needs it.
 
 ### 6.6 Values kept for good

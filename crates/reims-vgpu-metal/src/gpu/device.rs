@@ -298,6 +298,10 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
         let block = slot.clone().map(|slot| {
             RcBlock::new(move |_pointer: *mut c_void, _length: u64| {
+                // A foreign callout: Metal runs it on whichever thread lets the buffer go last,
+                // its completion thread among them. Marked ours, so a panic in it aborts before
+                // it unwinds into Metal (6.5); the thread's own mark comes back after.
+                let _ours = reims_vgpu_core::rt::enter_ours();
                 let d = slot.lock().take();
                 if let Some(d) = d {
                     d();
@@ -1215,6 +1219,36 @@ pub(crate) mod tests {
         drop(b);
         // SAFETY: the buffer is gone; allocated above with `layout`.
         unsafe { std::alloc::dealloc(mem, layout) };
+    }
+
+    /// Metal runs a no-copy buffer's deallocator on the thread that lets the buffer go, which
+    /// need not be the library's: the deallocator runs marked as ours there (a panic in it aborts
+    /// before it unwinds into Metal), and the thread's own mark comes back after it
+    #[test]
+    fn a_no_copy_deallocator_runs_marked_as_ours() {
+        use reims_vgpu_core::rt::is_our_thread;
+        let d = dev();
+        let layout = std::alloc::Layout::from_size_align(16384, 16384).unwrap();
+        // SAFETY: a non-zero layout.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        let mem_addr = mem.expose_provenance();
+        let ours = Arc::new(Mutex::new(None));
+        let o = ours.clone();
+        let deallocator: NoCopyDeallocator = Box::new(move || {
+            *o.lock() = Some(is_our_thread());
+            // SAFETY: allocated above with `layout`, freed once, here.
+            unsafe { std::alloc::dealloc(std::ptr::with_exposed_provenance_mut(mem_addr), layout) };
+        });
+        // SAFETY: the memory stays allocated until the deallocator runs.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(mem), 16384) };
+        let b = d
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, Some(deallocator))
+            .unwrap()
+            .unwrap();
+        assert!(!is_our_thread());
+        drop(b);
+        assert_eq!(*ours.lock(), Some(true));
+        assert!(!is_our_thread());
     }
 
     /// A refused no-copy buffer keeps its deallocator's captures for good, and with them the

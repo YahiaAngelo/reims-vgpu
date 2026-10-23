@@ -301,10 +301,13 @@ fn buffer_resource_options(d: &MetalBufferDescriptor, resource_options: u64) {
 }
 
 /// `setDeallocator:` of a block that runs `deallocator` at most once. Metal copies the block and
-/// calls it once, with the buffer's contents and length, when the buffer it made is released.
+/// calls it once, with the buffer's contents and length, after the buffer it made is released,
+/// on a thread of its own: the block runs marked as ours there, so a panic in `deallocator`
+/// aborts before it unwinds into Metal (6.5).
 fn set_buffer_deallocator(d: &MetalBufferDescriptor, deallocator: BufferDeallocator) {
     let once = Mutex::new(Some(deallocator));
     let block = RcBlock::new(move |pointer: *mut c_void, length: u64| {
+        let _ours = reims_vgpu_core::rt::enter_ours();
         if let Some(d) = once.lock().take() {
             d(HostPtr::from_ptr(pointer), length);
         }
@@ -1308,6 +1311,46 @@ mod tests {
             *seen.lock(),
             vec![(HostPtr::from_ptr(aligned), page.to_u64())]
         );
+        drop(mem);
+    }
+
+    /// Metal calls a descriptor's deallocator after the buffer's release, on a thread of its own:
+    /// the deallocator runs marked as ours there, so a panic in it aborts before it unwinds into
+    /// Metal's frames
+    #[test]
+    fn a_descriptor_deallocator_runs_marked_as_ours() {
+        use reims_vgpu_core::rt::is_our_thread;
+        let k = kit();
+        let page = 16384usize;
+        let mut mem = vec![0u8; page * 2];
+        let base = mem.as_mut_ptr();
+        let aligned = base.wrapping_add(base.align_offset(page));
+        // SAFETY: `aligned..aligned+page` lies in `mem`, which outlives the buffer (its
+        // deallocator has run before `mem` is dropped).
+        let contents = unsafe { HostRange::new(HostPtr::from_ptr(aligned), page.to_u64()) };
+        let ours = Arc::new(Mutex::new(None));
+        let o = ours.clone();
+        let b = k
+            .device
+            .new_buffer(BufferDesc {
+                length: page.to_u64(),
+                options: vec![],
+                pinned_gpu_address: None,
+                contents: Some(contents),
+                no_copy: true,
+                deallocator: Some(Box::new(move |_, _| *o.lock() = Some(is_our_thread()))),
+            })
+            .unwrap()
+            .unwrap();
+        drop(b);
+        for _ in 0..500 {
+            if ours.lock().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(*ours.lock(), Some(true));
+        assert!(!is_our_thread());
         drop(mem);
     }
 
