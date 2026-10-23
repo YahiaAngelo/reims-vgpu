@@ -96,10 +96,14 @@ Unset or unparsable values give the defaults below.
 ## Matching the host's screen
 
 - By default the guest runs 1920×1080 at 1×, offered first with the standard
-  sizes within it, at the screen's highest refresh rate; the window scales
-  it on the GPU. A 4K HiDPI guest runs much slower.
+  sizes within it, at the screen's refresh rate; the window scales it on the
+  GPU. A 4K HiDPI guest runs much slower. The screen's rate is the one it is
+  set to (its current mode's): a ProMotion screen set to 60 Hz gives the
+  guest 60, not the 120 it offers; where the current mode gives no rate, the
+  highest of the screen's modes of its size, else 60 Hz.
   `test: policy::a_chosen_mode_comes_first_with_the_sizes_within_it`,
-  `test: policy::a_chosen_mode_is_1x`
+  `test: policy::a_chosen_mode_is_1x`,
+  `test: screens::a_screen_runs_at_its_current_mode_s_rate`
 - With `resolution=<w>x<h>@<ppi>`, the chosen mode is told that density in
   place of 1×. Where the guest reads it as 146.67 ppi or more (its width in
   whole millimetres to nearest, then in whole centimetres rounded up:
@@ -117,7 +121,7 @@ Unset or unparsable values give the defaults below.
 - With `resolution=host`, the guest is offered modes that fill the
   window's screen: the largest 16:10, 16:9 and 4:3 sizes within its pixels,
   16:10 first, then smaller standard sizes of each ratio, at the screen's
-  highest refresh rate. Their density follows the screen's scale: a Retina
+  refresh rate. Their density follows the screen's scale: a Retina
   screen gets a HiDPI (2×) guest desktop, a 1× screen a 1× one.
   `test: policy::offered_modes_for_a_built_in_retina_screen`,
   `test: policy::offered_modes_for_a_5k_screen`,
@@ -309,8 +313,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
 - Wayland lets no client place a windowed window: the compositor does.
   Borderless windows fill the screen named, over its panels. `manual`
 - The host's screens are SDL's: the primary first, then top to bottom and
-  left to right, each at its scale (fractional ones included) and highest
-  refresh rate; a change of screens lays every window out again. `manual`
+  left to right, each at its scale (fractional ones included) and the
+  refresh rate it is set to (its current mode's, as above); a change of
+  screens lays every window out again. `manual`
 - The picture: one GPU pass from the guest's frame into the swapchain's
   image, no copy, with the display's gamma and colour matrix, in sRGB.
   `manual`

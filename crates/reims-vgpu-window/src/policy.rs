@@ -15,8 +15,8 @@
 //! and gets a HiDPI guest desktop, and a 1× screen is told 110 ppi and gets a 1× one
 //! ([`density`]).
 //!
-//! Either way the modes run at the screen's highest refresh rate, or at
-//! `REIMS_VGPU_WINDOW_REFRESH`'s, and the size in millimetres is the first mode's pixels at the
+//! Either way the modes run at the screen's refresh rate (its current mode's, the rate the
+//! person set it to, `crate::screens`), or at `REIMS_VGPU_WINDOW_REFRESH`'s, and the size in millimetres is the first mode's pixels at the
 //! density. The scale factor is 2 above 143 ppi for the screen's own modes, and for a chosen
 //! density the scale the guest runs the mode at ([`guest_scale`]).
 //!
@@ -165,19 +165,19 @@ fn largest(pixels: (u64, u64), ratio: (u64, u64)) -> Option<(u16, u16)> {
     Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?))
 }
 
-/// The rate the modes run at: `refresh_hz` where given, else the screen's highest, else
+/// The rate the modes run at: `refresh_hz` where given, else the screen's, else
 /// [`DEFAULT_REFRESH_HZ`].
 fn refresh(screen: Option<&HostScreen>, refresh_hz: Option<f64>) -> f64 {
     let valid = |hz: f64| hz.is_finite() && hz > 0.0;
     match (refresh_hz, screen) {
         (Some(hz), _) if valid(hz) => hz,
-        (_, Some(screen)) if valid(screen.max_refresh_hz) => screen.max_refresh_hz,
+        (_, Some(screen)) if valid(screen.refresh_hz) => screen.refresh_hz,
         _ => DEFAULT_REFRESH_HZ,
     }
 }
 
 /// The modes offered for `screen`, the first the preferred one. `refresh_hz` overrides the
-/// screen's highest rate. Empty for a screen with no pixels.
+/// screen's rate. Empty for a screen with no pixels.
 ///
 /// First the largest 16:10, 16:9 and 4:3 rectangles within the screen's pixels, each side
 /// rounded down to a multiple of 8; then, for each ratio in that order, its standard sizes
@@ -217,7 +217,7 @@ pub fn offered_modes(screen: &HostScreen, refresh_hz: Option<f64>) -> Vec<Offere
 
 /// The modes offered for a chosen mode `mode` (width, height) on `screen`: `mode` first, then,
 /// for each ratio in order, its standard sizes within `mode` (neither side larger). No mode is
-/// listed twice. `refresh_hz` overrides the screen's highest rate, as for [`offered_modes`].
+/// listed twice. `refresh_hz` overrides the screen's rate, as for [`offered_modes`].
 /// Empty for a mode with an empty side. With no `screen`, the rate is `refresh_hz`, or else
 /// [`DEFAULT_REFRESH_HZ`].
 pub fn modes_up_to(
@@ -335,12 +335,12 @@ pub fn guest_scale(mode: (u16, u16), size_in_millimeters: (f64, f64)) -> u8 {
 mod tests {
     use super::*;
 
-    fn screen(pixels: (u32, u32), scale: f64, max_refresh_hz: f64) -> HostScreen {
+    fn screen(pixels: (u32, u32), scale: f64, refresh_hz: f64) -> HostScreen {
         HostScreen {
             id: 1,
             pixels,
             scale,
-            max_refresh_hz,
+            refresh_hz,
         }
     }
 
@@ -459,7 +459,7 @@ mod tests {
         assert_eq!((huge[0].width, huge[0].height), (65528, 40952));
     }
 
-    /// The refresh rate: the override, else the screen's highest, else 60 Hz
+    /// The refresh rate: the override, else the screen's, else 60 Hz
     #[test]
     fn the_refresh_rate_can_be_overridden() {
         let s = screen((3456, 2234), 2.0, 120.0);

@@ -309,8 +309,8 @@ fn list_screens() -> Vec<HostScreen> {
     screens.into_iter().map(|(_, _, s)| s).collect()
 }
 
-/// Screen `id`'s size in pixels, scale and highest refresh rate, or `None` where SDL gives no
-/// current mode.
+/// Screen `id`'s size in pixels, scale and refresh rate (its current mode's,
+/// `crate::screens::screen_refresh`), or `None` where SDL gives no current mode.
 fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
     // SAFETY: SDL's video runs on this thread; the mode is SDL's, valid until the display
     // changes, and read at once.
@@ -342,7 +342,7 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
         id: id.0,
         pixels,
         scale,
-        max_refresh_hz: crate::screens::highest_refresh(
+        refresh_hz: crate::screens::screen_refresh(
             pixels,
             f64::from(mode.refresh_rate),
             fullscreen,

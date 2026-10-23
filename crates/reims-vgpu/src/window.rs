@@ -103,7 +103,7 @@ pub(crate) fn window_sink<P: Platform>(
 /// a 1× density; without one, the policy's modes for the screen, the first the preferred, at the
 /// screen's density. The density is that of the first mode. `None` when the policy offers no
 /// mode: the display then offers what its config says. The modes run at `refresh_hz`
-/// (`REIMS_VGPU_WINDOW_REFRESH`) where given, else at the screen's highest rate.
+/// (`REIMS_VGPU_WINDOW_REFRESH`) where given, else at the screen's rate (its current mode's).
 ///
 /// With no `screen`, the chosen mode as with one, or else `policy::UNMATCHED_MODE` at 1×, at
 /// `refresh_hz` or else 60 Hz: offering none would leave the guest no mode to set (`policy`).

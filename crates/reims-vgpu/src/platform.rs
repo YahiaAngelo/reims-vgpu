@@ -161,12 +161,12 @@ mod fake {
     }
 
     /// The host screen of the testkit's platform, whatever the port: a Retina screen of 3024 by
-    /// 1964 pixels at 2 pixels a point, at up to 120 Hz.
+    /// 1964 pixels at 2 pixels a point, at 120 Hz.
     pub const FAKE_HOST_SCREEN: reims_vgpu_window::HostScreen = reims_vgpu_window::HostScreen {
         id: 1,
         pixels: (3024, 1964),
         scale: 2.0,
-        max_refresh_hz: 120.0,
+        refresh_hz: 120.0,
     };
 
     /// The testkit's platform: a process per test thread, its one device (registry ID

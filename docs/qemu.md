@@ -396,7 +396,7 @@ library can run AppKit (`reims-vgpu-window`'s `native/macos/main_thread.rs`).
   headless`. Any other display type, or `REIMS_VGPU_WINDOW=0`, keeps
   `apple-gfx` headless.
 - **Modes.** Each display is offered 1920x1080 at 1x, then the standard
-  sizes within it, at the host screen's highest refresh rate
+  sizes within it, at the rate the host screen is set to
   (`RVG_WINDOW_MATCH_HOST_SCREEN` with a mode), and the window scales the
   guest's frames to its size on the GPU. The `resolution` property picks
   another mode; `<w>x<h>@<ppi>` also tells the guest that density, and the

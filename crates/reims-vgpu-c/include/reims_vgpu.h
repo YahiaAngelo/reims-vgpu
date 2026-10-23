@@ -636,13 +636,13 @@ typedef struct {
   // NULL is a table with every callback absent.
   const RvgWindowCallbacks *callbacks;
   // With RVG_WINDOW_MATCH_HOST_SCREEN, the mode the display offers first, in place of the
-  // host screen's own: it and the standard sizes within it, at the screen's highest refresh
-  // rate, with a size in millimetres at 110 pixels per inch and a scale factor of 1, so the
-  // guest runs a 1× desktop at that mode (measured up to 3811 pixels wide; 5832 ran HiDPI)
-  // and the window scales it to its size on the GPU; `mode_pixels_per_inch` tells another
-  // density. 0 in either is none: the screen's own modes, at its density. Ignored without
-  // the flag. With no screen to match, the mode is offered at 60 Hz, and none is 1920 × 1080
-  // at 1×.
+  // host screen's own: it and the standard sizes within it, at the screen's refresh rate (the
+  // rate it is set to), with a size in millimetres at 110 pixels per inch and a scale factor
+  // of 1, so the guest runs a 1× desktop at that mode (measured up to 3811 pixels wide; 5832
+  // ran HiDPI) and the window scales it to its size on the GPU; `mode_pixels_per_inch` tells
+  // another density. 0 in either is none: the screen's own modes, at its density. Ignored
+  // without the flag. With no screen to match, the mode is offered at 60 Hz, and none is
+  // 1920 × 1080 at 1×.
   uint16_t mode_width;
   // As `mode_width`.
   uint16_t mode_height;

@@ -3,15 +3,20 @@
 //! screen's `NSScreen` by its display ID (`deviceDescription["NSScreenNumber"]`).
 //!
 //! A screen's size is its current mode's pixels (`CGDisplayModeGetPixelWidth`), and its scale
-//! those pixels over the mode's points (`CGDisplayModeGetWidth`). Its highest refresh rate is
-//! the highest `CGDisplayModeGetRefreshRate` among its current mode and every mode of the same
-//! pixel size (`screens::highest_refresh`); a rate of 0 is unknown, and a screen whose rates are
-//! all unknown runs at 60 Hz.
+//! those pixels over the mode's points (`CGDisplayModeGetWidth`). Its refresh rate is its current
+//! mode's `CGDisplayModeGetRefreshRate`; where that is 0, unknown, the highest among the modes of
+//! the same pixel size stands in, and a screen whose rates are all unknown runs at 60 Hz
+//! (`screens::screen_refresh`).
 //!
 //! Measured on the M3 Max's built-in ProMotion screen (3456×2234 pixels, 1728×1117 points,
-//! refresh set to ProMotion), macOS 26.7:
+//! refresh set to ProMotion), macOS 26.7, and again on macOS 27.0.1 (26A434) with the displays
+//! asleep and the session locked:
 //! - the current mode reports 120 Hz, not 0, and the modes of its pixel size are listed at
-//!   120, 60, 59.94, 50, 48 and 47.95 Hz, so the screen's highest is 120;
+//!   120, 60, 59.94, 50, 48 and 47.95 Hz, each a mode of its own (I/O Kit mode IDs 54 to 59 at
+//!   1728×1117 points), so a rate the person sets below ProMotion's is another current mode, at
+//!   that rate (read from the list; the setting was not changed to see it). `NSScreen`'s
+//!   `maximumFramesPerSecond` is 120 (`minimumRefreshInterval` 1/120 s, `maximumRefreshInterval`
+//!   1/24 s), and CoreVideo's display link's nominal rate 120 Hz;
 //! - `CGDisplayCopyAllDisplayModes` lists the current, scaled mode (1728×1117 points) only when
 //!   asked for `kCGDisplayShowDuplicateLowResolutionModes`; without it only the 1:1 modes of
 //!   that pixel size appear, at the same rates. The modes are asked for with it;
@@ -28,7 +33,7 @@ use objc2_core_graphics::{
     kCGNullDirectDisplay,
 };
 
-use crate::screens::{HostScreen, highest_refresh};
+use crate::screens::{HostScreen, screen_refresh};
 
 /// The most displays asked for.
 const MAX_DISPLAYS: usize = 32;
@@ -99,7 +104,7 @@ fn screen(display: CGDirectDisplayID) -> Option<HostScreen> {
         id: display,
         pixels,
         scale,
-        max_refresh_hz: highest_refresh(pixels, CGDisplayMode::refresh_rate(mode), modes),
+        refresh_hz: screen_refresh(pixels, CGDisplayMode::refresh_rate(mode), modes),
     })
 }
 
@@ -132,10 +137,7 @@ mod tests {
         for s in &screens {
             assert!(s.pixels.0 > 0 && s.pixels.1 > 0, "{s:?}");
             assert!(s.scale.is_finite() && s.scale > 0.0, "{s:?}");
-            assert!(
-                s.max_refresh_hz.is_finite() && s.max_refresh_hz > 0.0,
-                "{s:?}"
-            );
+            assert!(s.refresh_hz.is_finite() && s.refresh_hz > 0.0, "{s:?}");
         }
         assert_eq!(screen_for_port(0).is_some(), !screens.is_empty());
     }
