@@ -8471,10 +8471,12 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
 /// after the pass ended and before its command buffer's commit, or after the commit while the
 /// command buffer waits for an event signalled after the reset, to the identity over the map's
 /// screen, it draws by the map as reset, as Metal's does, and a map of the identity made over a
-/// screen smaller than the target draws its corner, as Metal's. A reset to a map of another
-/// screen size dies while the pass may run: Metal's GPU draws the pass over the screen the map
-/// had at the encoder's creation (all of a 16-pixel target from a 16-pixel screen reset to 8,
-/// the corner from 8 reset to 16), where the runtime's draws over the screen as reset
+/// screen smaller than the target draws its corner, as Metal's. Reset so to the identity of
+/// another screen size, it draws over the screen the map had at the encoder's creation, to the
+/// 32-pixel tiles of the new screen where that spans one tile fewer, as Metal's GPU does: all of
+/// a 16-pixel target from a 16-pixel screen reset to 8, the corner from 8 reset to 16, the 32 by
+/// 32 corner of a 64-pixel target from a 64-pixel screen reset to 32 or to 24, and all of it
+/// reset to 48
 #[test]
 fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
     use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
@@ -8486,6 +8488,8 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
 
     const SIDE: u64 = 16;
     const HALF: u64 = SIDE / 2;
+    /// The side of the target and screen whose resets cross a 32-pixel tile.
+    const WIDE: u64 = 64;
 
     /// How the pass's map is made, and when it is reset, if at all.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8523,7 +8527,7 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
         desc
     }
 
-    /// The `SIDE` by `SIDE` target's bytes after a full-screen triangle in a pass, which a
+    /// The `target` by `target` texture's bytes after a full-screen triangle in a pass, which a
     /// command buffer waiting for an event runs, over a map of the identity over a `from` by
     /// `from` screen: mutable and not yet reset, reset `when` to an immutable descriptor of the
     /// identity over a `to` by `to` screen; or, `Made`, an immutable map of `to`. The event is
@@ -8532,14 +8536,14 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
     fn drawn<P: Platform>(
         p: &P,
         d: &P::Device,
-        (when, from, to): (Reset, u64, u64),
+        (when, target, from, to): (Reset, u64, u64, u64),
     ) -> Result<Vec<u8>, DeathSite> {
         let map = match when {
             Reset::Made => d.new_rate_map(&identity(p, to, None)),
             _ => d.new_rate_map(&identity(p, from, Some(1))),
         };
         let map = map.unwrap().unwrap();
-        let (dst, pass) = pass_of(p, d, (SIDE, SIDE));
+        let (dst, pass) = pass_of(p, d, (target, target));
         pass.set_pass(&PassSet {
             rasterization_rate_map: Some(Some(&map)),
             ..Default::default()
@@ -8563,7 +8567,7 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
         ] {
             e.encode(OnFault::Die, cmd).unwrap();
         }
-        let out = buffer::<P>(d, SIDE * SIDE * 4, 0, &[]);
+        let out = buffer::<P>(d, target * target * 4, 0, &[]);
         let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
         for cmd in [
             BlitCmd::CopyTextureToBuffer {
@@ -8571,11 +8575,11 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
                 source_slice: 0,
                 source_level: 0,
                 source_origin: MtlOrigin::new(0, 0, 0),
-                source_size: MtlSize::new(SIDE, SIDE, 1),
+                source_size: MtlSize::new(target, target, 1),
                 destination_buffer: &out,
                 destination_offset: 0,
-                destination_bytes_per_row: SIDE * 4,
-                destination_bytes_per_image: SIDE * SIDE * 4,
+                destination_bytes_per_row: target * 4,
+                destination_bytes_per_image: target * target * 4,
             },
             BlitCmd::EndEncoding,
         ] {
@@ -8595,52 +8599,123 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{:?}", cb.error());
         after?;
-        let n = usize::try_from(SIDE * SIDE * 4).unwrap();
+        let n = usize::try_from(target * target * 4).unwrap();
         // SAFETY: a Shared buffer's bytes, read after the blit completed.
         Ok(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
     }
 
-    /// The target as cleared, with the top left `side` by `side` texels of the fragment
-    /// function's colour, (1, 0.5, 0.25, 1) as BGRA8.
-    fn shaded(side: u64) -> Vec<u8> {
-        (0..SIDE * SIDE)
-            .flat_map(|i| match (i % SIDE < side, i / SIDE < side) {
+    /// A `target` by `target` texture as cleared, with the top left `side` by `side` texels of
+    /// the fragment function's colour, (1, 0.5, 0.25, 1) as BGRA8.
+    fn shaded(target: u64, side: u64) -> Vec<u8> {
+        (0..target * target)
+            .flat_map(|i| match (i % target < side, i / target < side) {
                 (true, true) => [64, 128, 255, 255],
                 _ => [0, 0, 0, 255],
             })
             .collect()
     }
 
-    let same = [
-        ((Reset::Never, SIDE, SIDE), 0),
-        ((Reset::BeforeCommit, SIDE, SIDE), SIDE),
-        ((Reset::AfterCommit, SIDE, SIDE), SIDE),
-        ((Reset::Never, HALF, HALF), 0),
-        ((Reset::BeforeCommit, HALF, HALF), HALF),
-        ((Reset::AfterCommit, HALF, HALF), HALF),
-        ((Reset::Made, 0, HALF), HALF),
-    ];
-    let resized = [
-        ((Reset::BeforeCommit, SIDE, HALF), SIDE),
-        ((Reset::AfterCommit, SIDE, HALF), SIDE),
-        ((Reset::BeforeCommit, HALF, SIDE), HALF),
-        ((Reset::AfterCommit, HALF, SIDE), HALF),
+    let cases = [
+        ((Reset::Never, SIDE, SIDE, SIDE), 0),
+        ((Reset::BeforeCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::Never, SIDE, HALF, HALF), 0),
+        ((Reset::BeforeCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::Made, SIDE, 0, HALF), HALF),
+        ((Reset::BeforeCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::BeforeCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::BeforeCommit, WIDE, WIDE, 32), 32),
+        ((Reset::AfterCommit, WIDE, WIDE, 24), 32),
+        ((Reset::BeforeCommit, WIDE, WIDE, 48), WIDE),
     ];
     let p = platform();
     let d = dev();
-    for (case, side) in same {
-        assert!(drawn(&p, &d, case) == Ok(shaded(side)), "{case:?}");
-    }
-    for (case, _) in resized {
-        let site = drawn(&p, &d, case).unwrap_err();
-        assert_eq!(site.file, "resetUsingDescriptor:", "{case:?}");
+    for (case, side) in cases {
+        assert!(drawn(&p, &d, case) == Ok(shaded(case.1, side)), "{case:?}");
     }
     if let Some(md) = MetalPlatform::system_default_device() {
         let mp = MetalPlatform::new(Box::new(NoLauncher));
-        for (case, side) in same.into_iter().chain(resized) {
-            assert!(drawn(&mp, &md, case) == Ok(shaded(side)), "{case:?}");
+        for (case, side) in cases {
+            assert!(
+                drawn(&mp, &md, case) == Ok(shaded(case.1, side)),
+                "{case:?}"
+            );
         }
     }
+}
+
+/// A reset of a mutable rasterization rate map whose rates vary to one of another screen size,
+/// after a pass took it and before the pass ran, dies at the reset: no measurement says what
+/// Metal's GPU draws then ([`crate::gpu::rate_map`])
+#[test]
+fn a_reset_of_a_varying_map_to_another_screen_dies_while_its_pass_may_run() {
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+
+    /// An immutable descriptor of a `side` by `side` screen of one layer of one sample of 0.5
+    /// on each axis.
+    fn half(p: &VulkanPlatform, side: u64) -> <VulkanPlatform as Platform>::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 0.5 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    let (p, d) = (platform(), dev());
+    let made = p.rate_map_descriptor(&RateMapDesc {
+        screen_size: MtlSize::new(128, 128, 1),
+        mutability: Some(1),
+        ..RateMapDesc::default()
+    });
+    let map = d.new_rate_map(&made).unwrap().unwrap();
+    map.reset(&half(&p, 128));
+    let (_dst, pass) = pass_of(&p, &d, (128, 128));
+    pass.set_pass(&PassSet {
+        rasterization_rate_map: Some(Some(&map)),
+        ..Default::default()
+    });
+    let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    crate::answer::relaxed(|| {
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+    });
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| map.reset(&half(&p, 64))).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(site.file, "resetUsingDescriptor:", "{line}");
+    assert!(line.contains("of a 64 by 64 screen"), "{line}");
 }
 
 /// The tile size of a one-sample pass is Metal's

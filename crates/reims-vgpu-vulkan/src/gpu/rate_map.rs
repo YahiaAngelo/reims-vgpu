@@ -76,14 +76,19 @@
 //!   outlives core's handle, with the class and the screen size each took. A reset while one of
 //!   them may still run on the GPU (not committed, or committed and not complete) dies where the
 //!   map as reset is of a class the one it took does not hold over ([`Class::holds_over`]), as
-//!   the encoder's decisions would no longer be Metal's, and where it is of another screen size:
-//!   Metal's GPU draws the pass over the screen the map had at the encoder's creation, where the
-//!   runtime's draws it over the screen as reset (measured: a full-screen triangle in a pass of a
-//!   16-pixel target over a mutable map of a 16-pixel screen reset, before or after the commit, to
-//!   the identity over 8 pixels shaded all 256 pixels, where the runtime's shaded the 8 by 8
-//!   corner, and over a map of 8 reset to 16 the 8 by 8 corner, where the runtime's shaded all of
-//!   them; a map of 8 made and drawn over shaded the corner on both). One that goes uncommitted
-//!   runs nothing, and no longer counts. What an encoder takes and the
+//!   the encoder's decisions would no longer be Metal's. A reset to the identity of another
+//!   screen size draws as Metal's: Metal's GPU draws the pass over the screen the map had at the
+//!   encoder's creation, to the 32-pixel tiles of the new screen where the new screen spans one
+//!   such tile fewer, and so does the runtime's
+//!   (`rt::RasterizationRateMap::reset_using_descriptor`; measured: a full-screen triangle in a
+//!   pass of a 16-pixel target over a mutable map of a 16-pixel screen reset, before or after the
+//!   commit, to the identity over 8 pixels shades all 256 pixels, over a map of 8 reset to 16 the
+//!   8 by 8 corner, and in a pass of a 64-pixel target over a map of 64 reset to 32 or to 24 the
+//!   32 by 32 corner and to 48 all of it, on both,
+//!   `a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs`). A reset to a map
+//!   other than the identity of another screen size dies there, where no measurement says what
+//!   Metal's GPU draws ([`RateMapObject`]'s `reset`). One that goes uncommitted runs nothing, and
+//!   no longer counts. What an encoder takes and the
 //!   registration of its command buffer, once the encoder exists, are under the map's lock, which
 //!   a reset's compile and check hold too.
 
@@ -580,9 +585,11 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     /// mutability, and encodes again each pass that took the map whose command buffer is not yet
     /// submitted (the module docs); a refusal dies. So does a reset while a pass that took the
     /// map may still run, where what its encoder decided by the class it took does not hold over
-    /// the map as reset ([`Class::holds_over`]), or where the map's screen size changes, which
-    /// Metal's GPU draws the pass over as it was at the encoder's creation and the runtime's as
-    /// reset. The reset holds the map's lock, which a pass's creation holds too.
+    /// the map as reset ([`Class::holds_over`]), or where the map's screen size changes to one of
+    /// a map other than the identity: Metal's GPU draws the pass over the screen as it was at the
+    /// encoder's creation, as the runtime's does over the identity, and over another map by the
+    /// map as reset within it, which no measurement compared with Metal's. The reset holds the
+    /// map's lock, which a pass's creation holds too.
     fn reset(&self, descriptor: &VulkanRateMapDescriptor) {
         let sel = "resetUsingDescriptor:";
         let mut inner = plain(|| self.inner.lock());
@@ -602,15 +609,16 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
                 ),
             );
         }
-        if let Some(took) = inner.passes.iter().find(|t| t.screen != (width, height)) {
+        let resized = inner.passes.iter().find(|t| t.screen != (width, height));
+        if let Some(took) = resized.filter(|_| class != Class::Identity) {
             let (w, h) = took.screen;
             unrepresentable(
                 sel,
                 &format!(
-                    "a reset to a map of a {width} by {height} screen before a pass that took the \
-                     map of a {w} by {h} screen has run: Metal's GPU draws the pass over the \
-                     screen the map had at the encoder's creation, where the runtime's draws it \
-                     over the screen of the map as reset"
+                    "a reset to a map of class {class:?} of a {width} by {height} screen before a \
+                     pass that took the map of a {w} by {h} screen has run: Metal's GPU draws the \
+                     pass over the screen the map had at the encoder's creation, and the runtime's \
+                     by the map as reset within it, which no measurement compared with Metal's"
                 ),
             );
         }
