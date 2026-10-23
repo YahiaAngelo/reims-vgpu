@@ -200,15 +200,19 @@ impl Form {
         matches!(self.field(key).map(|f| &f.value), Some(Value::Toggle(true)))
     }
 
-    /// Replaces a choice's options, keeping its selection where it remains.
-    pub fn set_options(&mut self, key: &str, new: Vec<(String, String)>) {
+    /// Replaces a choice's options, keeping its selection: one the new options lack stays, after
+    /// them, as a VM's GPU the host's list lacks does in its edit form.
+    pub fn set_options(&mut self, key: &str, mut new: Vec<(String, String)>) {
         if let Some(f) = self.fields.iter_mut().find(|f| f.key == key)
             && let Value::Choice { options, index } = &mut f.value
         {
-            let cur = options.get(*index).map(|o| o.0.clone());
-            *index = cur
-                .and_then(|c| new.iter().position(|o| o.0 == c))
-                .unwrap_or(0);
+            *index = match options.get(*index) {
+                Some(cur) => new.iter().position(|o| o.0 == cur.0).unwrap_or_else(|| {
+                    new.push(cur.clone());
+                    new.len() - 1
+                }),
+                None => 0,
+            };
             *options = new;
         }
     }
@@ -603,6 +607,35 @@ mod tests {
         assert_eq!(f.text("size"), "");
         f.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(f.focused_key(), "path");
+    }
+
+    /// The edit form's GPU, when the host's GPUs are listed after it opened: a VM's GPU the list
+    /// lacks (its driver moved, say) stays the VM's, rather than turning into Automatic, which
+    /// the form would then save.
+    #[test]
+    fn new_options_keep_a_selection_they_lack() {
+        let mut f = Form::new(
+            "t",
+            "save",
+            vec![Field::choice(
+                "gpu",
+                "GPU",
+                opts(&[("auto", "Automatic"), ("/icd/a.json", "A")]),
+                "/icd/a.json",
+                "",
+            )],
+        );
+        f.set_options("gpu", opts(&[("auto", "Automatic"), ("/icd/b.json", "B")]));
+        assert_eq!(f.choice("gpu"), "/icd/a.json");
+        f.set_options(
+            "gpu",
+            opts(&[("auto", "Automatic"), ("/icd/a.json", "A, listed")]),
+        );
+        assert_eq!(f.choice("gpu"), "/icd/a.json");
+        match &f.fields[0].value {
+            Value::Choice { options, .. } => assert_eq!(options.len(), 2),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
