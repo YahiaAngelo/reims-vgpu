@@ -39,7 +39,8 @@
 //! decides whether it may be resized while captured ([`os::hold_size`]), asked at each change of
 //! capture and as the window leaves full screen.
 //!
-//! **The end.** At the display's end the window lets its input go and hides; SDL's window is
+//! **The end.** At the display's end the window lets its input go, and the keyboard's grab, the
+//! pointer's hold and the size's hold with it ([`ended`]), and hides; SDL's window is
 //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
 //! swapchain and Vulkan surface go too ([`released`]), whichever of the two comes last.
 
@@ -181,12 +182,11 @@ pub(crate) fn open(window: &Arc<Window>) {
     );
 }
 
-/// Window `id`'s display ended: its input lets go and it hides; SDL's window goes once its OS
-/// lets it go ([`os::close`]).
+/// Window `id`'s display ended: its input lets go ([`ended`]) and it hides; SDL's window goes
+/// once its OS lets it go ([`os::close`]).
 pub(crate) fn close(id: u64) {
     let gone = with_shell(id, |shell| {
-        shell.input.closing();
-        shell.flush();
+        ended(shell);
         shell.closed = true;
         os::close(shell) || shell.released
     });
@@ -394,15 +394,20 @@ impl Shell {
         self.input.flush(&self.window);
     }
 
-    /// The input was captured or released: the OS grabs the keyboard or lets it go, SDL holds
-    /// the pointer over the image or frees it, the OS holds the window's size or lets it go, and
-    /// the title and the cursor follow.
+    /// The input was captured or released: the holds follow ([`Shell::holds_follow_capture`]),
+    /// and the title and the cursor too.
     pub(crate) fn capture_changed(&mut self) {
+        self.holds_follow_capture();
+        self.refresh_title();
+        self.refresh_cursor();
+    }
+
+    /// The holds follow the capture: the OS grabs the keyboard or lets it go, SDL holds the
+    /// pointer over the image or frees it, and the OS holds the window's size or lets it go.
+    fn holds_follow_capture(&mut self) {
         os::grab_keyboard(self, self.input.is_captured());
         self.confine_pointer();
         os::hold_size(self);
-        self.refresh_title();
-        self.refresh_cursor();
     }
 
     /// Holds the pointer over the image while captured, and frees it when not (the module doc):
@@ -543,16 +548,22 @@ fn shows(kind: u32) -> Option<bool> {
     }
 }
 
-/// The steps of a close the person asks for ([`close_asked`]).
+/// The steps of a close the person asks for ([`close_asked`]) and of the display's end
+/// ([`ended`]).
 trait Closing {
     /// Whether the keyboard is captured.
     fn is_captured(&self) -> bool;
-    /// The input lets go: every key and button held goes up, and capture ends.
+    /// The person closed the window: the input lets go, every key and button held goes up, and
+    /// capture ends.
     fn let_go(&mut self);
+    /// The display ended: the input lets go as for [`Closing::let_go`].
+    fn let_go_at_the_end(&mut self);
     /// What the input queued goes to the host.
     fn flush(&mut self);
-    /// The grab, the title and the cursor follow capture.
+    /// The grab, the pointer's hold, the size's hold, the title and the cursor follow capture.
     fn capture_changed(&mut self);
+    /// The grab, the pointer's hold and the size's hold follow capture.
+    fn holds_follow_capture(&mut self);
     /// The host is told of the close.
     fn tell_host(&mut self);
 }
@@ -566,12 +577,20 @@ impl Closing for Shell {
         self.input.close_requested();
     }
 
+    fn let_go_at_the_end(&mut self) {
+        self.input.closing();
+    }
+
     fn flush(&mut self) {
         Shell::flush(self);
     }
 
     fn capture_changed(&mut self) {
         Shell::capture_changed(self);
+    }
+
+    fn holds_follow_capture(&mut self) {
+        Shell::holds_follow_capture(self);
     }
 
     fn tell_host(&mut self) {
@@ -593,6 +612,20 @@ fn close_asked(c: &mut impl Closing) {
         c.capture_changed();
     }
     c.tell_host();
+}
+
+/// The display's end, in order, as AppKit's window closes (`DisplayView::window_closing`): the
+/// input lets go, what it queued goes to the host, and where that ended capture, the keyboard's
+/// grab, the pointer's hold and the size's hold go with it, so none stays on the window as it
+/// hides. The title and the cursor are left: the window no longer shows, and SDL's cursor is the
+/// process's, which another window sets as the pointer enters it.
+fn ended(c: &mut impl Closing) {
+    let captured = c.is_captured();
+    c.let_go_at_the_end();
+    c.flush();
+    if c.is_captured() != captured {
+        c.holds_follow_capture();
+    }
 }
 
 #[cfg(test)]
@@ -639,12 +672,23 @@ mod tests {
             }
         }
 
+        fn let_go_at_the_end(&mut self) {
+            self.steps.push("let go at the end");
+            if self.releases {
+                self.captured = false;
+            }
+        }
+
         fn flush(&mut self) {
             self.steps.push("flush");
         }
 
         fn capture_changed(&mut self) {
             self.steps.push("capture changed");
+        }
+
+        fn holds_follow_capture(&mut self) {
+            self.steps.push("holds follow");
         }
 
         fn tell_host(&mut self) {
@@ -675,6 +719,31 @@ mod tests {
         };
         close_asked(&mut free);
         assert_eq!(free.steps, ["let go", "flush", "tell host"]);
+    }
+
+    /// The display's end lets the input go and sends what it queued, then lets go of the
+    /// keyboard's grab, the pointer's hold and the size's hold where capture ended; with no
+    /// capture to end, nothing follows it
+    #[test]
+    fn the_end_lets_go_of_the_grab_and_the_holds() {
+        let mut captured = Recorded {
+            captured: true,
+            releases: true,
+            steps: Vec::new(),
+        };
+        ended(&mut captured);
+        assert_eq!(
+            captured.steps,
+            ["let go at the end", "flush", "holds follow"]
+        );
+        assert!(!captured.captured);
+        let mut free = Recorded {
+            captured: false,
+            releases: true,
+            steps: Vec::new(),
+        };
+        ended(&mut free);
+        assert_eq!(free.steps, ["let go at the end", "flush"]);
     }
 
     /// A window hidden, minimized or covered (a Wayland compositor's suspended one) stops

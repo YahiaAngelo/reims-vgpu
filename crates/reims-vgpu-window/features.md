@@ -368,10 +368,13 @@ runtime's own device. The switches above apply, and `resolution=` too.
   X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
   whole window); the window stays resizable, its resize edges being the
   compositor's, outside its surface and beyond the hold; Ctrl+Alt+Super
-  releases both; losing the keyboard releases; the title says whether input
-  is captured, as on macOS, with Ctrl+Alt+Super to release.
+  releases both; losing the keyboard releases; the window's end releases
+  both, and the grab and the hold go with the capture before it hides; the
+  title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
+  release.
   `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`,
+  `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
 - Scrolling: the wheel's notches, or, where the host takes smooth
