@@ -1145,8 +1145,13 @@ impl App {
     }
 
     fn toggle_logs(&mut self) {
-        let Some(mut vm) = self.selected_vm() else {
+        let Some(vm) = self.selected_vm() else {
             return;
+        };
+        // As saved now, not as the list last read it: the toggle saves the whole of it.
+        let mut vm = match Vm::load(&vm.dir) {
+            Ok(vm) => vm,
+            Err(e) => return self.say(&format!("{e:#}"), Level::Error),
         };
         vm.config.logs.enabled = !vm.config.logs.enabled;
         match vm.save() {
@@ -2891,6 +2896,38 @@ mod tests {
         assert_eq!(at(Position::new(35, 10)), Rect::new(18, 5, 22, 5));
         // Up where the cell is below the screen, as when the terminal shrinks.
         assert_eq!(at(Position::new(35, 20)), Rect::new(18, 7, 22, 5));
+    }
+
+    /// The logs toggle saves the VM's settings as they are saved now, not as the list last read
+    /// them (it reads them every 5 seconds): a reims-ctl set from a shell just before stays.
+    #[test]
+    fn toggling_logs_keeps_what_was_saved_since_the_list_was_read() {
+        let env = crate::testenv::Env::new("tui-logs");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+        let mut app = App::with(Host::current());
+        app.reload().unwrap();
+        let mut vm = Vm::load(&dir).unwrap();
+        vm.config.memory_mib = 8192;
+        vm.save().unwrap();
+        press(&mut app, [KeyCode::Char('l')]);
+        let saved = Vm::load(&dir).unwrap().config;
+        assert!(saved.logs.enabled);
+        assert_eq!(saved.memory_mib, 8192);
     }
 
     #[test]
