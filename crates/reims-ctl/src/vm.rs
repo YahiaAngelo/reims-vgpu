@@ -24,7 +24,8 @@ pub struct VmConfig {
     pub disk: PathBuf,
     #[serde(default)]
     pub disk_format: ImageFormat,
-    /// How long `stop` waits for the guest to shut down before it powers the VM off.
+    /// How long `stop` waits for the guest to shut down before it powers the VM off; 0 for no
+    /// limit ([`VmConfig::stop_timeout`]).
     #[serde(default = "default_stop_timeout")]
     pub stop_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -50,8 +51,11 @@ pub struct VmConfig {
 }
 
 fn default_stop_timeout() -> u64 {
-    90
+    DEFAULT_STOP_TIMEOUT.as_secs()
 }
+
+/// How long `stop` waits for the guest by default.
+pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -403,6 +407,14 @@ impl VmConfig {
         }
     }
 
+    /// How long `stop` waits for the guest to shut down before it powers the VM off: `None`
+    /// for a timeout of 0, no limit, as an SSH port of 0 is no forward. A stop then waits until
+    /// the guest shuts down, which may ask about unsaved documents for as long as they stay
+    /// open; only a forced stop powers the VM off.
+    pub fn stop_timeout(&self) -> Option<std::time::Duration> {
+        stop_timeout(self.stop_timeout_secs)
+    }
+
     /// The displays the guest has: VMware SVGA's one, or apple-gfx's.
     pub fn display_count(&self) -> u32 {
         match self.graphics {
@@ -431,6 +443,11 @@ impl VmConfig {
         }
         w
     }
+}
+
+/// A stop timeout of `secs` seconds: `None` for 0, no limit ([`VmConfig::stop_timeout`]).
+pub fn stop_timeout(secs: u64) -> Option<std::time::Duration> {
+    (secs != 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 pub fn check_name(name: &str) -> Result<()> {

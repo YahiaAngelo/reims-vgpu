@@ -12,7 +12,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::{Graphics, Vm};
+use crate::vm::{DEFAULT_STOP_TIMEOUT, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -528,12 +528,20 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
 /// Stops the VM: macOS's Control-Option-Command-Power on the USB keyboard ("quit all apps,
 /// then shut down", which asks about unsaved documents), then, a third of `timeout` in, the
 /// machine's power button (ACPI's on q35, a GPIO on vmapple), and at `timeout` a power-off; with
-/// `force`, the power-off at once. `progress` hears each step.
+/// `force`, the power-off at once. With no `timeout` it waits until the guest shuts down, the
+/// button a third of [`DEFAULT_STOP_TIMEOUT`] in, and never powers the VM off: where neither the
+/// keys nor the button reach the guest, it ends with an error instead. `progress` hears each
+/// step.
 ///
 /// The keys come first because the power button alone does not shut a guest down: a macOS 26
 /// vmapple guest did nothing with vmapple's in 90 s, where the keys shut it down in under 6 s
 /// (2026-10-11, M3 Max).
-pub fn stop(vm: &Vm, force: bool, timeout: Duration, mut progress: impl FnMut(&str)) -> Result<()> {
+pub fn stop(
+    vm: &Vm,
+    force: bool,
+    timeout: Option<Duration>,
+    mut progress: impl FnMut(&str),
+) -> Result<()> {
     let Some(p) = pid(vm) else {
         progress("not running");
         return Ok(());
@@ -556,16 +564,23 @@ pub fn stop(vm: &Vm, force: bool, timeout: Duration, mut progress: impl FnMut(&s
             }
         };
         let start = Instant::now();
+        let button_at = timeout.unwrap_or(DEFAULT_STOP_TIMEOUT) / 3;
         let mut button = false;
-        while start.elapsed() < timeout {
+        while timeout.is_none_or(|t| start.elapsed() < t) {
             if !alive(p) {
                 progress("shut down");
                 return Ok(());
             }
-            if !button && (!asked || start.elapsed() >= timeout / 3) {
+            if !button && (!asked || start.elapsed() >= button_at) {
                 button = true;
-                if qmp::run(&sock, "system_powerdown", None).is_ok() {
-                    progress("still running: pressed its power button");
+                match qmp::run(&sock, "system_powerdown", None) {
+                    Ok(_) => progress("still running: pressed its power button"),
+                    Err(e) if !asked && timeout.is_none() => bail!(
+                        "{e:#}: neither the keys nor the power button reach {}, which runs on; \
+                         a forced stop powers it off",
+                        vm.name()
+                    ),
+                    Err(_) => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(300));
@@ -735,6 +750,97 @@ mod tests {
         assert!(vm.logs_dir().is_dir());
         let _ = std::fs::remove_file(&sock);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A QMP server at `sock` that greets, answers every command, and records each command but
+    /// qmp_capabilities.
+    fn fake_qmp(sock: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::io::BufRead;
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().map_while(Result::ok) {
+                let _ = conn.write_all(b"{\"QMP\": {}}\n");
+                let reader = std::io::BufReader::new(conn.try_clone().unwrap());
+                for line in reader.lines().map_while(Result::ok) {
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let command = v["execute"].as_str().unwrap_or_default().to_string();
+                    if command != "qmp_capabilities" {
+                        record.lock().unwrap().push(command);
+                    }
+                    let _ = conn.write_all(b"{\"return\": {}}\n");
+                }
+            }
+        });
+        seen
+    }
+
+    /// A stop timeout of 0 is no limit, as an SSH port of 0 is no forward: stop asks the guest
+    /// to shut down, waits for it and powers nothing off. Where nothing reaches the guest, it
+    /// ends with an error rather than wait for good.
+    #[test]
+    fn a_stop_timeout_of_0_waits_for_the_guest() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            stop_timeout_secs = 0
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        let vm = Vm {
+            dir: d.clone(),
+            config: toml::from_str(config).unwrap(),
+        };
+        // QEMU: a process whose command line names its pid file, as QEMU's does.
+        let qemu = || {
+            let q = std::process::Command::new("sh")
+                .args(["-c", "sleep 10; :"])
+                .arg(vm.pidfile())
+                .spawn()
+                .unwrap();
+            std::fs::write(vm.pidfile(), format!("{}\n", q.id())).unwrap();
+            q
+        };
+        let mut running = qemu();
+        let asked = fake_qmp(&vm.qmp_socket());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stopping = {
+            let vm = vm.clone();
+            std::thread::spawn(move || {
+                stop(&vm, false, vm.config.stop_timeout(), |s| {
+                    let _ = tx.send(s.to_string());
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_secs(1));
+        let commands = asked.lock().unwrap().clone();
+        let waited = alive(running.id() as i32);
+        // The guest shuts down.
+        let _ = running.kill();
+        let _ = running.wait();
+        let stopped = stopping.join().unwrap();
+        let steps: Vec<String> = rx.try_iter().collect();
+
+        std::fs::remove_file(vm.qmp_socket()).unwrap();
+        let mut running = qemu();
+        let unreached = stop(&vm, false, vm.config.stop_timeout(), |_| {});
+        let _ = running.kill();
+        let _ = running.wait();
+        std::fs::remove_dir_all(&d).unwrap();
+
+        assert_eq!(commands, ["send-key"]);
+        assert!(waited);
+        stopped.unwrap();
+        assert_eq!(steps.last().map(String::as_str), Some("shut down"), "{steps:?}");
+        let e = format!("{:#}", unreached.unwrap_err());
+        assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
 
     #[test]

@@ -8,7 +8,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -55,7 +54,8 @@ pub enum Cmd {
         /// Power off at once
         #[arg(long)]
         force: bool,
-        /// Seconds to wait for the guest (the VM's own setting by default)
+        /// Seconds to wait for the guest before powering it off; 0 for no limit, waiting until
+        /// the guest shuts down (the VM's own setting by default)
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -349,7 +349,8 @@ pub struct SetArgs {
     pub ssh_port: Option<u16>,
     #[arg(long)]
     pub mac: Option<String>,
-    /// Seconds stop waits for the guest before it powers the VM off
+    /// Seconds stop waits for the guest to shut down before it powers the VM off; 0 for no
+    /// limit: stop waits until the guest shuts down, and only stop --force powers it off
     #[arg(long)]
     pub stop_timeout: Option<u64>,
     /// More QEMU arguments, as one shell-quoted string; empty for none
@@ -388,7 +389,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             timeout,
         } => {
             let vm = Registry::load()?.open(&name)?;
-            let t = Duration::from_secs(timeout.unwrap_or(vm.config.stop_timeout_secs));
+            let t = timeout.map_or(vm.config.stop_timeout(), vm::stop_timeout);
             runtime::stop(&vm, force, t, |s| println!("{name}: {s}"))?;
         }
         Cmd::Show { name } => show(&Registry::load()?.open(&name)?, host),
@@ -875,7 +876,13 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             "off".into()
         },
     );
-    add("stop timeout", format!("{} s", c.stop_timeout_secs));
+    add(
+        "stop timeout",
+        match c.stop_timeout() {
+            Some(t) => format!("{} s", t.as_secs()),
+            None => "none: stop waits until the guest shuts down".into(),
+        },
+    );
     if !c.extra_args.is_empty() {
         add(
             "extra args",

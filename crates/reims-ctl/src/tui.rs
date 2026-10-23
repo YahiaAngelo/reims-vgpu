@@ -944,7 +944,7 @@ impl App {
                 };
                 self.activity.remove(&name);
                 self.spawn(&name, "powering off", move |p| {
-                    runtime::stop(&vm, true, Duration::ZERO, |s| p(s))?;
+                    runtime::stop(&vm, true, None, |s| p(s))?;
                     Ok(format!("{}: powered off", vm.name()))
                 });
             }
@@ -976,7 +976,7 @@ impl App {
             self.say(&format!("{} is not running", vm.name()), Level::Info);
             return;
         }
-        let timeout = Duration::from_secs(vm.config.stop_timeout_secs);
+        let timeout = vm.config.stop_timeout();
         let first = if force {
             "powering off"
         } else {
@@ -1530,7 +1530,9 @@ impl App {
                 "stop_timeout",
                 "Shutdown timeout",
                 &c.stop_timeout_secs.to_string(),
-                "Seconds stop (x) waits for the guest to shut down before it powers the VM off.",
+                "Seconds stop (x) waits for the guest to shut down before it powers the VM off; \
+                 0 for no limit: stop waits until the guest shuts down, and only power off \
+                 (K) pulls the plug.",
             ),
         ]);
         if c.q35.is_some() {
