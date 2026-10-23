@@ -283,6 +283,31 @@ fi
 
 # ------------------------------------------------------------------ the library and QEMU
 
+# The files running processes execute, their links resolved, a line each: on
+# Linux every process's /proc/PID/exe; on macOS the txt files lsof lists of
+# those whose name starts with qemu (QEMU, qemu-img). A QEMU's executable names
+# the build it started from, where its command line, and ps, show only
+# qemu/current, through which reims-ctl runs QEMU, and which a new build moves.
+qemu_executables() {
+  if [[ -d /proc/self ]]; then
+    readlink /proc/[0-9]*/exe 2>/dev/null || true
+  else
+    lsof -nP -a -c qemu -d txt -Fn 2>/dev/null | sed -n 's/^n//p' || true
+  fi
+}
+
+# prune_qemu DIR: removes the QEMU builds in DIR but the three newest and those
+# a running process executes a file of.
+prune_qemu() {
+  local real in_use old
+  real="$(cd "$1" && pwd -P)"
+  in_use="$(qemu_executables)"
+  ls -1d "$1/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
+    old="${old%/}"
+    grep -qF "$real/${old##*/}/" <<<"$in_use" || rm -rf "$old"
+  done
+}
+
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
@@ -333,11 +358,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
   rm -rf "$STAGE"
   ln -sfn "$ID" "$DATA/qemu/current"
-  # Keep the three newest builds, and any build a running VM uses.
-  in_use="$(ps -axo command= 2>/dev/null | grep -o "$DATA/qemu/[^/ ]*/" | sort -u || true)"
-  ls -1d "$DATA/qemu/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
-    grep -qF "$old" <<<"$in_use" || rm -rf "$old"
-  done
+  prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
 else
   QEMU_DIR="$(cd "$DATA/qemu/current" 2>/dev/null && pwd -P || true)"

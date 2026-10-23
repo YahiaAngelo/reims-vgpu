@@ -160,6 +160,70 @@ pub fn qemu_version(qemu: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The shell function `name` of scripts/install-ctl.sh, as the script defines it.
+    fn script_function(script: &str, name: &str) -> String {
+        let start = script.find(&format!("\n{name}() {{")).expect(name) + 1;
+        let len = script[start..].find("\n}\n").expect(name) + 3;
+        script[start..start + len].to_string()
+    }
+
+    /// What the prune test runs as a QEMU: this test binary, copied into a build, idling here.
+    #[test]
+    fn idle_as_a_qemu() {
+        if std::env::var_os("REIMS_CTL_TEST_IDLE").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// The installer's prune keeps a build older than the newest three while a QEMU runs from
+    /// it, started as reims-ctl starts it, through `qemu/current`, which a newer build then
+    /// took; and removes the old builds nothing runs.
+    #[test]
+    fn the_installers_prune_keeps_a_build_a_running_qemu_executes() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install-ctl.sh");
+        let text = std::fs::read_to_string(&script).unwrap();
+        let functions: String = ["qemu_executables", "prune_qemu"]
+            .iter()
+            .map(|f| script_function(&text, f))
+            .collect();
+        let root = std::env::temp_dir().join(format!("reims-ctl-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let qemu = root.join("qemu");
+        let builds = ["20260101-000000-a", "20260102-000000-b", "20260103-000000-c"]
+            .into_iter()
+            .chain(["20260104-000000-d", "20260105-000000-e"])
+            .collect::<Vec<_>>();
+        for b in &builds {
+            std::fs::create_dir_all(qemu.join(b).join("bin")).unwrap();
+        }
+        let bin = "bin/qemu-system-test";
+        std::fs::copy(std::env::current_exe().unwrap(), qemu.join(builds[0]).join(bin)).unwrap();
+        let link = |b: &str| {
+            let _ = std::fs::remove_file(qemu.join("current"));
+            std::os::unix::fs::symlink(b, qemu.join("current")).unwrap();
+        };
+        link(builds[0]);
+        let mut running = std::process::Command::new(qemu.join("current").join(bin))
+            .args(["--exact", "install::tests::idle_as_a_qemu"])
+            .env("REIMS_CTL_TEST_IDLE", "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        link(builds[4]);
+        let pruned = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -euo pipefail\n{functions}prune_qemu \"$1\""))
+            .arg("prune")
+            .arg(&qemu)
+            .status();
+        let _ = running.kill();
+        let _ = running.wait();
+        assert!(pruned.unwrap().success());
+        let left: Vec<_> = builds.iter().filter(|b| qemu.join(b).exists()).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(left, [&builds[0], &builds[2], &builds[3], &builds[4]]);
+    }
+
     #[test]
     fn audio_backend_prefers_the_native_one() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
