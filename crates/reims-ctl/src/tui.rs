@@ -1522,7 +1522,7 @@ impl App {
                     .ssh_port
                     .map(|p| p.to_string())
                     .unwrap_or_default(),
-                "A port on 127.0.0.1 forwarded to the guest's SSH; empty for none.",
+                "A port on 127.0.0.1 forwarded to the guest's SSH; empty or 0 for none.",
             )
             .placeholder("none")
             .show_if("network", &["yes"]),
@@ -1737,12 +1737,7 @@ impl App {
         s.display.hidpi = f.toggle("hidpi");
         s.display.check()?;
         s.logs = f.toggle("logs");
-        let ssh = f.text("ssh_port");
-        s.ssh_port = if ssh.is_empty() {
-            None
-        } else {
-            Some(ssh.parse().context("SSH port: a number")?)
-        };
+        s.ssh_port = ssh_port_field(f)?;
         Ok(s)
     }
 
@@ -2250,12 +2245,7 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     }
     c.network.enabled = f.toggle("network");
     if f.is_shown("ssh_port") {
-        let p = f.text("ssh_port");
-        c.network.ssh_port = if p.is_empty() {
-            None
-        } else {
-            Some(p.parse().context("SSH port: a number")?)
-        };
+        c.network.ssh_port = ssh_port_field(f)?;
     }
     c.stop_timeout_secs = f
         .text("stop_timeout")
@@ -2271,6 +2261,15 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         c.extra_env.insert(k.into(), v.into());
     }
     c.check()
+}
+
+/// The SSH port field's forward: none where it is empty or 0, as `set --ssh-port 0` has it.
+fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
+    let p = f.text("ssh_port");
+    if p.is_empty() {
+        return Ok(None);
+    }
+    Ok(crate::vm::ssh_port(p.parse().context("SSH port: a number")?))
 }
 
 /// Runs less on `files`, each at its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach

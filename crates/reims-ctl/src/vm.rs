@@ -298,9 +298,24 @@ impl Default for Audio {
 pub struct Network {
     pub enabled: bool,
     pub mac: String,
-    /// A host port on 127.0.0.1 forwarded to the guest's SSH port.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A host port on 127.0.0.1 forwarded to the guest's SSH port ([`ssh_port`]).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "saved_ssh_port"
+    )]
     pub ssh_port: Option<u16>,
+}
+
+/// The SSH forward from host port `p`: none for 0, wherever a port is given, as QEMU's
+/// `hostfwd` on port 0 forwards a port nobody is told.
+pub fn ssh_port(p: u16) -> Option<u16> {
+    (p != 0).then_some(p)
+}
+
+/// A saved SSH port: 0, which create saved for `--ssh-port 0` before it meant none there too,
+/// is none.
+fn saved_ssh_port<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u16>, D::Error> {
+    Ok(Option::<u16>::deserialize(d)?.and_then(ssh_port))
 }
 
 impl Default for Network {
@@ -855,6 +870,20 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`
+    /// gives.
+    #[test]
+    fn a_saved_ssh_port_of_0_is_no_forward() {
+        let mut c = x86_64_config();
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("ssh_port = 2222"), "{text}");
+        let zero = text.replace("ssh_port = 2222", "ssh_port = 0");
+        assert_eq!(toml::from_str::<VmConfig>(&zero).unwrap().network.ssh_port, None);
+        c.network.ssh_port = None;
+        let none = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<VmConfig>(&none).unwrap(), c);
     }
 
     #[test]

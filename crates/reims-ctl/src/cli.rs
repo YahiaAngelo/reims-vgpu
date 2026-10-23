@@ -297,7 +297,7 @@ pub struct CreateArgs {
     /// controller OpenCore's boot chime plays on)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
-    /// Forward this port on 127.0.0.1 to the guest's SSH port
+    /// Forward this port on 127.0.0.1 to the guest's SSH port; 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
     /// Start it once made
@@ -1023,7 +1023,7 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         c.network.enabled = b;
     }
     if let Some(p) = a.ssh_port {
-        c.network.ssh_port = (p != 0).then_some(p);
+        c.network.ssh_port = vm::ssh_port(p);
     }
     if let Some(m) = &a.mac {
         c.network.mac = m.clone();

@@ -297,7 +297,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         network: Network {
             enabled: true,
             mac: spec.mac.clone().unwrap_or_else(random_mac),
-            ssh_port: spec.ssh_port,
+            ssh_port: spec.ssh_port.and_then(ssh_port),
         },
         logs: Logs {
             enabled: spec.logs,
@@ -778,6 +778,20 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `create --ssh-port 0`, and 0 in the interface's field, mean no forward, as `set
+    /// --ssh-port 0` does; QEMU's hostfwd on port 0 would forward a port nobody is told.
+    #[test]
+    fn a_new_vms_ssh_port_of_0_is_no_forward() {
+        let mut spec = Spec::new("t");
+        let config = |spec: &Spec| {
+            base_config(spec, Profile::VmappleArm64, "disk.img".into(), ImageFormat::Raw)
+        };
+        spec.ssh_port = Some(0);
+        assert_eq!(config(&spec).network.ssh_port, None);
+        spec.ssh_port = Some(2222);
+        assert_eq!(config(&spec).network.ssh_port, Some(2222));
+    }
 
     #[test]
     fn a_dmg_is_known_by_its_udif_trailer() {
