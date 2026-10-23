@@ -6579,7 +6579,7 @@ pub(crate) mod tests {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let made = without_unused_resolves(pass.descriptor());
-        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
+        let raw = cb.raw.render_command_encoder(&made).unwrap();
         let taken = Taken {
             class: Some(Class::Unset),
             mutable: true,
