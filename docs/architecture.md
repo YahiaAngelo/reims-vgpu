@@ -656,7 +656,10 @@ resolver's callback through Metal. What the resolver's lookups hold deep goes to
 the hold the pipeline creation is passed (4.2), and the resolver answers `RaiseResult`: its raise
 comes back as `Err` (the handler Metal's call forces), goes back through Metal as an
 `NSException`, and once Metal has unwound, the caller raises it again. Every caller is a pipeline
-creation, reached only under a handler, so it is `Err`.
+creation, reached only under a handler, so it is `Err`. A death or a stop inside the resolver of
+an isolated task's code is a Rust unwind (5.5), which never crosses Metal's frames: the context
+catches it in the callback, raises through Metal in its place, and the deserialization goes on
+with the unwind once Metal has returned.
 
 ### 6.4 Deaths
 

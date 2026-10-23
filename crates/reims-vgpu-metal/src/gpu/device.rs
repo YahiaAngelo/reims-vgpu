@@ -236,6 +236,11 @@ unsafe fn made_or_error<T: Message>(
 /// through Metal to the caller unchanged, and thrown again once Metal has unwound), otherwise
 /// Metal's.
 ///
+/// A death or a stop inside the resolver, in an isolated task's code, is a Rust unwind to the
+/// task's run, which never crosses Metal's frames: the context keeps it and raises through Metal
+/// in its place, and once Metal has returned the unwind goes on from here, so the task ends at
+/// the same op as it would with no Metal frame between.
+///
 /// Every caller is a pipeline creation, which runs only under a handler (its creator's own sends
 /// are `Caught`): either raise is `Err`, the caller's to catch.
 fn deserialize<T: Message>(
@@ -252,6 +257,9 @@ fn deserialize<T: Message>(
     let made = context.with_resolver(hold, resolver, || {
         msg::catch(sel, || call(device, data, any))
     });
+    if let Some(unwound) = context.take_unwound() {
+        std::panic::resume_unwind(unwound)
+    }
     match made {
         Ok(made) => Ok(created(made)),
         Err(caught) => match context.take_thrown() {
@@ -1612,6 +1620,57 @@ pub(crate) mod tests {
         assert_eq!(
             (site.kind, site.file, site.line),
             (DeathKind::UnhandledRaise, "resolver", 0)
+        );
+    }
+
+    /// A death in an isolated task's resolver while Metal deserializes, and a stop there once the
+    /// task has ended, each end the task once Metal has returned: nothing after the
+    /// deserialization runs, the resolver is called once, and Metal deserializes again after
+    #[test]
+    fn a_death_or_stop_in_the_resolver_ends_the_task_after_metal() {
+        use reims_vgpu_core::raise::death::DeathSite;
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+        use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
+
+        let d = dev();
+        let lib = library(&d);
+        let v = function(&lib, "displayPresentVertex");
+        let rd = render_descriptor(&lib);
+        let bytes = serialize(
+            &d,
+            objc2::sel!(serializeRenderPipelineDescriptor:),
+            rd.get(),
+        );
+        for stop in [false, true] {
+            let life = TaskLife::new();
+            let mut calls = 0u32;
+            let mut ended = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
+                calls += 1;
+                if stop {
+                    assert!(TaskLife::current().unwrap().exit());
+                    stop_if_task_ended();
+                } else {
+                    reims_vgpu_core::fatal!(DeathSite {
+                        kind: DeathKind::Abort,
+                        file: "resolver.test",
+                        line: 0,
+                    });
+                }
+                Ok(None)
+            };
+            let mut after = false;
+            let r = life.run(|| {
+                let _ = d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut ended);
+                after = true;
+            });
+            assert_eq!((r, after, calls), (None, false, 1), "stop: {stop}");
+            assert_eq!(life.death().is_some(), !stop);
+        }
+        let mut resolver = |_: Hold<'_>, _r: u64| Ok(Some(v.clone_ref()));
+        assert!(
+            d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
+                .unwrap()
+                .is_some()
         );
     }
 

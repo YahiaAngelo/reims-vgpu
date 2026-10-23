@@ -2,8 +2,10 @@
 //! the ICB argument classes) with typed declarations of the methods it sends them, the
 //! deserialization context that answers a pipeline descriptor's function references.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 
 use objc2::exception::Exception;
@@ -195,7 +197,8 @@ mod protocol {
 pub use protocol::MTLDeserializationContext;
 
 /// The resolver a pipeline-descriptor send borrows for its duration. `Err` is a throw inside the
-/// lookup, which leaves `functionWithFunctionRef:` as an Objective-C exception.
+/// lookup, which leaves `functionWithFunctionRef:` as an Objective-C exception; so does a Rust
+/// unwind out of it, which the context keeps ([`DeserializationContext::take_unwound`]).
 pub(crate) type Resolver<'a> = dyn FnMut(Hold<'_>, u64) -> RaiseResult<Option<MetalFunction>> + 'a;
 
 /// A send's resolver, borrowed for the send, and the hold of the send's caller, which
@@ -207,12 +210,13 @@ struct Installed {
 }
 
 /// The context's state: the borrowed resolver and its caller's hold while a send runs,
-/// `None` otherwise, and the throw the resolver last raised through Metal, for the send to hand
-/// on.
+/// `None` otherwise; the throw the resolver last raised through Metal, for the send to hand on;
+/// and a Rust unwind out of the resolver, for the send to go on with once Metal has returned.
 #[derive(Debug, Default)]
 pub struct DeserializationContextIvars {
     installed: Cell<Option<Installed>>,
     thrown: RefCell<Option<Raise>>,
+    unwound: RefCell<Option<Box<dyn Any + Send>>>,
 }
 
 define_class!(
@@ -238,7 +242,8 @@ define_class!(
         /// this frame, which owns nothing then (D34): Metal's own behaviour decides whether it
         /// reaches the send. Whichever foreign handler catches it unwinds this frame first, since
         /// objc2 0.6.4 makes every `define_class!` method `extern "C-unwind"` (measured on
-        /// macOS 26.7).
+        /// macOS 26.7). A Rust unwind out of the lookup never leaves this frame: it is kept, and
+        /// the method raises in its place (`resolve`).
         #[unsafe(method(functionWithFunctionRef:))]
         fn function_with_function_ref(&self, function_ref: u64) -> *mut ProtocolObject<dyn MTLFunction> {
             match self.resolve(function_ref) {
@@ -249,6 +254,20 @@ define_class!(
         }
     }
 );
+
+/// The reason of the exception raised through Metal in place of a Rust unwind (a diagnostic).
+const UNWOUND: &str = "the function resolver's thread unwound";
+
+/// `+[NSException exceptionWithName:reason:userInfo:]` of `NSGenericException`, `reason` and no
+/// userInfo.
+fn generic_exception(reason: &str) -> Retained<Exception> {
+    let name = NSString::from_str("NSGenericException");
+    let reason = NSString::from_str(reason);
+    // SAFETY: a name and a reason, no userInfo.
+    let exception =
+        unsafe { NSException::exceptionWithName_reason_userInfo(&name, Some(&reason), None) };
+    NSException::into_exception(exception)
+}
 
 impl DeserializationContext {
     /// A context with no resolver yet.
@@ -295,7 +314,21 @@ impl DeserializationContext {
     /// dies inside Metal's send. The raise is kept for [`Self::take_thrown`] and comes back as the
     /// `NSException` to raise through Metal: `+exceptionWithName:reason:userInfo:` of a generic
     /// exception and the raise's detail.
+    ///
+    /// A Rust unwind out of the resolver (a death or a stop in an isolated task's code, which
+    /// unwinds to the task's run, or a test's captured death) is caught here, before any of
+    /// Metal's frames, and kept for [`Self::take_unwound`]. Metal gets a generic exception in its
+    /// place, which unwinds Metal's frames as a raise's does, and the send goes on with the
+    /// unwind once Metal has returned. While one is kept, a later call answers the same
+    /// exception and runs nothing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "no Rust unwind crosses Metal's frames: the resolver's is carried across (6.3)"
+    )]
     fn resolve(&self, function_ref: u64) -> Result<Option<MetalFunction>, Retained<Exception>> {
+        if self.ivars().unwound.borrow().is_some() {
+            return Err(generic_exception(UNWOUND));
+        }
         let Some(Installed {
             hold,
             resolver: mut ptr,
@@ -307,17 +340,16 @@ impl DeserializationContext {
         // borrow of the resolver for as long as it is installed; Metal calls back synchronously
         // on the same thread (never re-entrantly into the same resolver).
         let resolver = unsafe { ptr.as_mut() };
-        match resolver(hold, function_ref) {
-            Ok(f) => Ok(f),
-            Err(t) => {
-                let name = NSString::from_str("NSGenericException");
-                let reason = NSString::from_str(t.detail().unwrap_or_default());
-                // SAFETY: a name and a reason, no userInfo.
-                let exception = unsafe {
-                    NSException::exceptionWithName_reason_userInfo(&name, Some(&reason), None)
-                };
+        match std::panic::catch_unwind(AssertUnwindSafe(|| resolver(hold, function_ref))) {
+            Ok(Ok(f)) => Ok(f),
+            Ok(Err(t)) => {
+                let exception = generic_exception(t.detail().unwrap_or_default());
                 *self.ivars().thrown.borrow_mut() = Some(t);
-                Err(NSException::into_exception(exception))
+                Err(exception)
+            }
+            Err(unwound) => {
+                *self.ivars().unwound.borrow_mut() = Some(unwound);
+                Err(generic_exception(UNWOUND))
             }
         }
     }
@@ -326,6 +358,12 @@ impl DeserializationContext {
     /// reaches the caller unchanged.
     pub fn take_thrown(&self) -> Option<Raise> {
         self.ivars().thrown.borrow_mut().take()
+    }
+
+    /// The Rust unwind out of the resolver during the last send, if one came: the send's caller
+    /// goes on with it (`std::panic::resume_unwind`) once Metal has returned.
+    pub fn take_unwound(&self) -> Option<Box<dyn Any + Send>> {
+        self.ivars().unwound.borrow_mut().take()
     }
 
     /// The context as the `id` the SPI takes.
@@ -392,6 +430,48 @@ mod tests {
         assert!(ns.userInfo().is_none());
         let t = ctx.take_thrown().expect("the resolver's Raise");
         assert_eq!(t.detail(), Some("Invalid function reference"));
+    }
+
+    /// A death in the resolver of an isolated task's code never unwinds through the send's frames:
+    /// the method raises through them as for a throw and keeps the unwind, a later send raises
+    /// the same without the resolver, and the task's death goes on once the sender takes the
+    /// unwind back
+    #[test]
+    fn a_death_in_the_resolver_is_carried_across_the_send() {
+        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+
+        let ctx = DeserializationContext::new();
+        let life = TaskLife::new();
+        let mut calls = 0u32;
+        let mut resolver = |_: Hold<'_>, _: u64| -> RaiseResult<Option<MetalFunction>> {
+            calls += 1;
+            reims_vgpu_core::fatal!(DeathSite {
+                kind: DeathKind::Abort,
+                file: "resolver.test",
+                line: 0,
+            })
+        };
+        let mut steps = Vec::new();
+        let r: Option<()> = life.run(|| {
+            for _ in 0..2 {
+                let sent = ctx.with_resolver(Hold::NONE, &mut resolver, || {
+                    objc2::exception::catch(std::panic::AssertUnwindSafe(|| send_ref(&ctx, 3)))
+                });
+                let exc = sent.expect_err("raised through the send");
+                let (_, reason) = crate::msg::name_and_reason(exc.as_deref());
+                steps.push(reason);
+            }
+            assert!(ctx.take_thrown().is_none());
+            if let Some(unwound) = ctx.take_unwound() {
+                std::panic::resume_unwind(unwound)
+            }
+            steps.push("never".to_owned());
+        });
+        assert_eq!(r, None);
+        assert!(life.death().is_some());
+        assert_eq!(calls, 1);
+        assert_eq!(steps, vec![UNWOUND, UNWOUND]);
     }
 
     /// The private classes resolve to the runtime's classes
