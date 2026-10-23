@@ -72,8 +72,9 @@ Unset or unparsable values give the defaults below.
 - Each guest frame is drawn as it arrives, up to the screen's refresh rate
   (120 Hz on ProMotion). `manual`
 - Colours are sRGB, not stretched over a P3 screen's gamut. `manual`
-- The window resizes freely. The image keeps the guest mode's aspect ratio,
-  centred on whole pixels between black bars.
+- The window resizes freely while input is not captured (Capture). The
+  image keeps the guest mode's aspect ratio, centred on whole pixels between
+  black bars.
   `test: geometry::keeps_the_guest_ratio`,
   `test: geometry::centres_the_image`,
   `test: geometry::the_image_is_on_whole_pixels`
@@ -195,11 +196,16 @@ Unset or unparsable values give the defaults below.
   `mouseConfinementRect`), so every click is the guest's: it cannot leave
   for the bars, the title bar or the host's other windows, menu bar or Dock,
   and the guest's own edges and corners (its menu bar, its Dock, its hot
-  corners) are in reach. Released, it goes where the person moves it. In
-  native full screen an image that reaches the screen's top or bottom edge
-  takes the pointer there, where macOS slides its own menu bar or Dock in.
+  corners) are in reach. Nor can the window be resized while captured, so a
+  click or a drag where the image meets the window's edges is the guest's
+  too, never a resize of the window. Released, the pointer goes where the
+  person moves it, and the window resizes again. In native full screen an
+  image that reaches the screen's top or bottom edge takes the pointer there,
+  where macOS slides its own menu bar or Dock in.
   `test: capture::captured_input_holds_the_pointer_over_the_image`,
-  `manual` (the hold)
+  `test: capture::a_captured_window_cannot_be_resized`,
+  `test: native::macos::shell::a_windowed_window_is_not_resizable_while_captured`,
+  `manual` (the hold, and edge clicks)
 - Pressing ⌃⌥⌘ together releases capture, of the keyboard and the pointer.
   `test: capture::control_option_command_releases`,
   `test: native::macos::input::the_release_chord_lifts_every_key_and_releases`
@@ -356,9 +362,10 @@ runtime's own device. The switches above apply, and `resolution=` too.
   on macOS: SDL's mouse rect, in whole points rounded out, which the
   compositor's pointer constraints keep on Wayland and XFixes barriers on
   X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
-  whole window); Ctrl+Alt+Super releases both; losing the keyboard releases;
-  the title says whether input is captured, as on macOS, with
-  Ctrl+Alt+Super to release.
+  whole window); the window stays resizable, its resize edges being the
+  compositor's, outside its surface and beyond the hold; Ctrl+Alt+Super
+  releases both; losing the keyboard releases; the title says whether input
+  is captured, as on macOS, with Ctrl+Alt+Super to release.
   `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
@@ -391,9 +398,10 @@ Metal view, opens and follows the guest's mode in the frames AppKit's window
 takes, is borderless as AppKit's window is (the camera housing's room
 included), and gives AppKit's events to AppKit's window's input, so keys,
 capture, the system's hot keys and scrolling's phases and momentum are the
-same. The cursor is SDL's, with an image at the screen's scale, and the
+same. The cursor is SDL's, with an image at the screen's scale, the
 pointer's hold while captured is SDL's mouse rect, which SDL keeps with the
-same `mouseConfinementRect`. `manual`
+same `mouseConfinementRect`, and the window is held from resizing while
+captured through SDL's resizable flag. `manual`
 
 ## Not provided
 
