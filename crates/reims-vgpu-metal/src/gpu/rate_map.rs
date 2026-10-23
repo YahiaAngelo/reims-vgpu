@@ -66,14 +66,17 @@
 //!   every pass would have to match.
 //!
 //! So the platform's draw comes only where the pass would hang without it: [`mark_pass`] marks
-//! the encoder, a `drawPrimitives` of triangles or a triangle strip the guest encodes on it,
-//! which Metal takes, removes the mark ([`drew`]), and [`end_pass`] makes the no-draw pipeline,
-//! once per device, for a pass still marked. From the first such pass on, the ICB-capable
+//! the encoder, a `drawPrimitives` the guest encodes on it of the shape measured to keep a pass
+//! from hanging, which Metal takes, removes the mark ([`drew`]), and [`end_pass`] makes the
+//! no-draw pipeline, once per device, for a pass still marked. That shape is at least one whole
+//! triangle of a triangle list or strip (3 vertices or more), once or more: the measured draw is 3
+//! vertices of a triangle list, one instance. From the first such pass on, the ICB-capable
 //! pipelines made later have identifiers other than Metal's own; a run whose passes over mutable
 //! maps all draw sees Metal's identifiers. A pass of the guest's that draws over a mutable map
 //! completes with no draw of the platform's (measured, the same test). Other draws keep the mark
-//! (indexed, indirect and mesh draws, patches, ICB executions, and points and lines): nothing
-//! measured shows that they keep the pass from hanging.
+//! (indexed, indirect and mesh draws, patches, ICB executions, points and lines, and draws of no
+//! vertices, fewer than three, or no instances): nothing measured shows that a guest's draw of
+//! those keeps the pass from hanging, and some may give the GPU no draw.
 
 use std::cell::Cell;
 use std::ptr;
@@ -340,12 +343,17 @@ pub(crate) fn mark_pass(encoder: &MetalRenderEncoder, descriptor: &MTLRenderPass
     MARKED_HERE.set(ptr::from_ref(e).addr());
 }
 
-/// After a guest's draw of `primitive` on `encoder`, answered `drawn`: a draw of triangles or a
-/// triangle strip that Metal took takes the encoder's mark when [`mark_pass`] set it on this
-/// thread, as the pass no longer needs the platform's draw.
+/// After a guest's draw of `vertices` vertices of `primitive`, `instances` times, on `encoder`,
+/// answered `drawn`: a draw of the shape measured to keep a pass from hanging, which Metal took,
+/// takes the encoder's mark when [`mark_pass`] set it on this thread, as the pass no longer needs
+/// the platform's draw. That shape is a draw of triangles or a triangle strip of at least one
+/// whole triangle (3 vertices or more), once or more; a draw of no vertices, of fewer than three,
+/// or of no instances keeps the mark, as it may give the GPU no draw at all.
 pub(crate) fn drew(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     primitive: MTLPrimitiveType,
+    vertices: usize,
+    instances: usize,
     drawn: &RaiseResult<()>,
 ) {
     let at = ptr::from_ref(encoder).addr();
@@ -355,6 +363,8 @@ pub(crate) fn drew(
             primitive,
             MTLPrimitiveType::Triangle | MTLPrimitiveType::TriangleStrip
         )
+        || vertices < 3
+        || instances == 0
     {
         return;
     }
@@ -851,9 +861,10 @@ mod tests {
         completes(0, None, Target::Multisample, false);
     }
 
-    /// A draw of triangles or a triangle strip that Metal took, on the encoder marked on this
-    /// thread, takes its mark; one of points or lines, or one Metal refused, keeps it, as does a
-    /// draw on another encoder than the one marked last here
+    /// A draw of at least one whole triangle of a list or a strip, once or more, that Metal took,
+    /// on the encoder marked on this thread, takes its mark; one of points or lines, of fewer
+    /// than three vertices, of no instances, or one Metal refused, keeps it, as does a draw on
+    /// another encoder than the one marked last here
     #[test]
     fn a_triangle_draw_the_guest_encodes_takes_the_mark() {
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -886,6 +897,7 @@ mod tests {
                 "refused",
             ))
         };
+        let (triangles, strip) = (MTLPrimitiveType::Triangle, MTLPrimitiveType::TriangleStrip);
         let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
         assert!(marked(&e));
         for primitive in [
@@ -893,34 +905,54 @@ mod tests {
             MTLPrimitiveType::Line,
             MTLPrimitiveType::LineStrip,
         ] {
-            drew(e.get(), primitive, &Ok(()));
+            drew(e.get(), primitive, 3, 1, &Ok(()));
         }
-        drew(e.get(), MTLPrimitiveType::Triangle, &refused());
+        drew(e.get(), triangles, 3, 1, &refused());
+        for (primitive, vertices, instances) in [
+            (triangles, 0, 1),
+            (triangles, 2, 1),
+            (strip, 2, 1),
+            (triangles, 3, 0),
+            (strip, 4, 0),
+        ] {
+            drew(e.get(), primitive, vertices, instances, &Ok(()));
+        }
         assert!(marked(&e), "kept");
-        drew(e.get(), MTLPrimitiveType::TriangleStrip, &Ok(()));
-        assert!(!marked(&e), "taken by a strip");
+        drew(e.get(), strip, 3, 1, &Ok(()));
+        assert!(!marked(&e), "taken by a strip of one triangle");
         e.get().endEncoding();
-        // Through the platform's encode, with a pipeline set.
+        // Through the platform's encode, with a pipeline set: no vertices, then no instances,
+        // keep the mark, and a triangle takes it.
         let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
         let set = RenderCmd::SetRenderPipelineState {
             pipeline_state: Some(&k.render_pipeline),
         };
         e.encode(OnFault::Return, set).unwrap();
-        let draw = RenderCmd::DrawPrimitives {
-            primitive_type: MTLPrimitiveType::Triangle.0.to_u64(),
+        let draw = |vertex_count| RenderCmd::DrawPrimitives {
+            primitive_type: triangles.0.to_u64(),
             vertex_start: 0,
-            vertex_count: 0,
+            vertex_count,
         };
-        e.encode(OnFault::Return, draw).unwrap();
-        assert!(!marked(&e), "taken by a draw of triangles");
+        e.encode(OnFault::Return, draw(0)).unwrap();
+        assert!(marked(&e), "kept by a draw of no vertices");
+        let no_instances = RenderCmd::DrawPrimitivesInstances {
+            primitive_type: triangles.0.to_u64(),
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 0,
+        };
+        e.encode(OnFault::Return, no_instances).unwrap();
+        assert!(marked(&e), "kept by a draw of no instances");
+        e.encode(OnFault::Return, draw(3)).unwrap();
+        assert!(!marked(&e), "taken by a draw of a triangle");
         e.get().endEncoding();
         // A second marked encoder on this thread: a draw on the first keeps the first's mark.
         let first = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
         first.get().endEncoding();
         let second = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
-        drew(first.get(), MTLPrimitiveType::Triangle, &Ok(()));
+        drew(first.get(), triangles, 3, 1, &Ok(()));
         assert!(marked(&first) && marked(&second));
-        drew(second.get(), MTLPrimitiveType::Triangle, &Ok(()));
+        drew(second.get(), triangles, 3, 1, &Ok(()));
         assert!(marked(&first) && !marked(&second));
         second.get().endEncoding();
     }

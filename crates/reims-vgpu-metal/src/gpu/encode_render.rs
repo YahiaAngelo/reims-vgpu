@@ -312,7 +312,7 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                     Policy::On(on),
                     || unsafe { e.drawPrimitives_vertexStart_vertexCount(primitive, start, count) },
                 );
-                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                crate::gpu::rate_map::drew(e, primitive, count, 1, &drawn);
                 drawn
             }
             RenderCmd::DrawPrimitivesInstances {
@@ -333,7 +333,7 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                         )
                     },
                 );
-                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                crate::gpu::rate_map::drew(e, primitive, count, instances, &drawn);
                 drawn
             }
             RenderCmd::DrawPrimitivesBase {
@@ -355,7 +355,7 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                         )
                     },
                 );
-                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                crate::gpu::rate_map::drew(e, primitive, count, instances, &drawn);
                 drawn
             }
             // A pass over a map that is not immutable, in which the guest drew no triangles, draws
