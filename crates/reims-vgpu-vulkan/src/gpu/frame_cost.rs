@@ -13,6 +13,11 @@
 //! that made [`RESIDENT`] buffers resident. The platform's device announces what the product's
 //! does ([`product_device`]), and its calls run outside strict mode, as the product's.
 //!
+//! Beside each step's cost a call, each path prints what a frame costs as a whole: the CPU time
+//! of the encoding thread and of the whole process (the runtime's threads and the driver's
+//! included), and wall time, each run's mean a frame, as their median, lowest and highest over the
+//! runs. A frame's work is waited for inside it, so the process's CPU is that frame's.
+//!
 //! The environment picks what runs: `FRAME_COST_RUNS` the runs (5), `FRAME_COST_SHAPE` one shape
 //! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform`, `runtime` or
 //! `metal`), and `FRAME_COST_OPTIONS` other device options ([`product_device`]).
@@ -121,6 +126,51 @@ impl Tally {
         self.0
             .map(|(total, count)| total as f64 / (count.max(1) as f64))
     }
+}
+
+/// CPU time in nanoseconds: this thread's, the process's, and the monotonic clock's (wall).
+fn cpu_now() -> [u64; 3] {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, at: *mut Timespec) -> i32;
+    }
+    // `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_MONOTONIC`.
+    #[cfg(target_os = "macos")]
+    const CLOCKS: [i32; 3] = [16, 12, 6];
+    #[cfg(target_os = "linux")]
+    const CLOCKS: [i32; 3] = [3, 2, 1];
+    CLOCKS.map(|clock| {
+        let mut at = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: `at` is a timespec, which `clock_gettime` writes.
+        assert_eq!(unsafe { clock_gettime(clock, &mut at) }, 0);
+        u64::try_from(at.sec).unwrap() * 1_000_000_000 + u64::try_from(at.nsec).unwrap()
+    })
+}
+
+/// Runs `call`, adding the CPU it took ([`cpu_now`]) to `into`.
+fn cpu_of<T>(into: &mut [u64; 3], call: impl FnOnce() -> T) -> T {
+    let before = cpu_now();
+    let out = call();
+    for ((total, after), before) in into.iter_mut().zip(cpu_now()).zip(before) {
+        *total += after - before;
+    }
+    out
+}
+
+/// The median, lowest and highest of `values`.
+fn spread(values: &mut [f64]) -> [f64; 3] {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    let median = if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    };
+    [median, values[0], values[n - 1]]
 }
 
 /// Per-step means of `frames`: the lowest of each over runs of [`FRAMES`] frames, so a run a
@@ -520,24 +570,37 @@ fn frame_cost() {
         .filter(|(name, _)| shape.as_deref().is_none_or(|s| s == *name))
     {
         let mut seen: [Vec<[f64; STEPS.len()]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // Each run's CPU a frame, by path: the encoding thread's, the process's, and wall time.
+        let mut cpu_runs: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         let mut counts = Tally::default();
         for _ in 0..runs {
             let mut tallies = [Tally::default(); 3];
+            let mut cpu = [[0u64; 3]; 3];
             for frame in 0..WARM + FRAMES {
                 let mut t = [Tally::default(); 3];
+                let mut c = [[0u64; 3]; 3];
                 if only.is_none_or(|o| o == "platform") {
-                    crate::answer::relaxed(|| ours.frame(shape, &mut t[0]));
+                    cpu_of(&mut c[0], || {
+                        crate::answer::relaxed(|| ours.frame(shape, &mut t[0]));
+                    });
                 }
                 if only.is_none_or(|o| o == "runtime") {
-                    runtime_frame(&ours, &raw_queue, shape, &mut t[1]);
+                    cpu_of(&mut c[1], || {
+                        runtime_frame(&ours, &raw_queue, shape, &mut t[1]);
+                    });
                 }
                 #[cfg(target_os = "macos")]
                 if let Some((_, _, objects)) = &metal
                     && only.is_none_or(|o| o == "metal")
                 {
-                    objects.frame(shape, &mut t[2]);
+                    cpu_of(&mut c[2], || objects.frame(shape, &mut t[2]));
                 }
                 if frame >= WARM {
+                    for (cpu, c) in cpu.iter_mut().zip(c) {
+                        for (s, v) in cpu.iter_mut().zip(c) {
+                            *s += v;
+                        }
+                    }
                     for (tally, t) in tallies.iter_mut().zip(t) {
                         for (s, (total, count)) in tally.0.iter_mut().zip(t.0) {
                             s.0 += total;
@@ -552,6 +615,11 @@ fn frame_cost() {
             }
             for (seen, tally) in seen.iter_mut().zip(tallies) {
                 seen.push(tally.means());
+            }
+            #[expect(clippy::as_conversions, reason = "a mean, printed")]
+            let us_a_frame = |ns: u64| ns as f64 / (FRAMES as f64) / 1000.0;
+            for (runs, cpu) in cpu_runs.iter_mut().zip(cpu) {
+                runs.push(cpu.map(us_a_frame));
             }
         }
         let [platform, runtime, metal_platform] = seen.map(|runs| best(&runs));
@@ -578,5 +646,26 @@ fn frame_cost() {
             frame(&runtime) / 1000.0,
             frame(&metal_platform) / 1000.0
         );
+        let paths = ["platform", "runtime alone", "Metal platform"];
+        for (path, runs) in paths.iter().zip(&cpu_runs) {
+            if runs.is_empty() || runs.iter().all(|r| r[2] == 0.0) {
+                continue;
+            }
+            let [thread, process, wall] = [0, 1, 2].map(|i| {
+                let mut values: Vec<f64> = runs.iter().map(|r| r[i]).collect();
+                spread(&mut values)
+            });
+            let show = |[median, lowest, highest]: [f64; 3]| {
+                format!("{median:.0} [{lowest:.0}, {highest:.0}]")
+            };
+            println!(
+                "  {path:>14} us a frame, median [lowest, highest] of {n}: encoding thread CPU \
+                 {}, process CPU {}, wall {}",
+                show(thread),
+                show(process),
+                show(wall),
+                n = runs.len(),
+            );
+        }
     }
 }
