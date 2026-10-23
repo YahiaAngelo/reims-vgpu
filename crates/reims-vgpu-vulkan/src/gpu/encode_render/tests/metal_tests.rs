@@ -8262,8 +8262,15 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
             *crate::answer::LAST_LINE.lock() = None;
             let site = catch_death(|| stored(p, d, reset, load)).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, "endEncoding"), "{line}");
-            assert!(line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN), "{line}");
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::Abort, "endEncoding"),
+                "{line}"
+            );
+            assert!(
+                line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
+                "{line}"
+            );
         }
         stored(p, d, false, load)
     }
@@ -8364,7 +8371,11 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
 
     /// A descriptor of a `SIDE` by `SIDE` screen of `mutability`, with one layer of one sample
     /// of `rate` on each axis where `rate` is some, else no layers.
-    fn map_desc<P: Platform>(p: &P, mutability: Option<u64>, rate: Option<f32>) -> P::RateMapDescriptor {
+    fn map_desc<P: Platform>(
+        p: &P,
+        mutability: Option<u64>,
+        rate: Option<f32>,
+    ) -> P::RateMapDescriptor {
         let desc = p.rate_map_descriptor(&RateMapDesc {
             screen_size: MtlSize::new(SIDE, SIDE, 1),
             mutability,
@@ -8395,7 +8406,10 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
         d: &P::Device,
         (made, reset, state): (Option<f32>, Option<Option<f32>>, bool),
     ) -> (u64, Option<i64>) {
-        let map = d.new_rate_map(&map_desc(p, Some(MUTABLE), made)).unwrap().unwrap();
+        let map = d
+            .new_rate_map(&map_desc(p, Some(MUTABLE), made))
+            .unwrap()
+            .unwrap();
         if let Some(rate) = reset {
             map.reset(&map_desc(p, None, rate));
         }
@@ -8433,8 +8447,15 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
         *crate::answer::LAST_LINE.lock() = None;
         let site = catch_death(|| drawless(&p, &d, case)).unwrap_err();
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "endEncoding"), "{case:?}: {line}");
-        assert!(line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN), "{line}");
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, "endEncoding"),
+            "{case:?}: {line}"
+        );
+        assert!(
+            line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
+            "{line}"
+        );
     }
     let Some(md) = MetalPlatform::system_default_device() else {
         return;

@@ -1236,7 +1236,10 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
     };
     let (metal, [a, b]) = reads::<MetalPlatform>(&md);
     assert_eq!(metal, vulkan);
-    let tail_on_metal = [length::<MetalPlatform>(&b, 1, 40), length::<MetalPlatform>(&b, 1, 41)];
+    let tail_on_metal = [
+        length::<MetalPlatform>(&b, 1, 40),
+        length::<MetalPlatform>(&b, 1, 41),
+    ];
     assert_eq!(tail_on_metal, tail);
     a.compute_command(1)
         .unwrap()

@@ -294,13 +294,21 @@ fn reads_as_metals_do(
     if rows_overlap(format, shape, plane, size) {
         let site = made.map(drop).unwrap_err();
         let sel = "newTextureWithDescriptor:iosurface:plane:";
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}: {line}");
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, sel),
+            "{what}: {line}"
+        );
         assert!(line.contains("OverlappingSurfaceRows"), "{what}: {line}");
         return;
     }
     let t = made.unwrap_or_else(|site| panic!("{what}: {site:?}: {line}"));
     let t = t.unwrap().unwrap_or_else(|| panic!("nil: {what}"));
-    assert_eq!((t.pixel_format(), t.width(), t.height()), (format, size.0, size.1), "{what}");
+    assert_eq!(
+        (t.pixel_format(), t.width(), t.height()),
+        (format, size.0, size.1),
+        "{what}"
+    );
     type V = crate::platform::VulkanPlatform;
     let read = || probed::<V>(&d, "read_texels", &t, size, None, None);
     if half_relayed {
@@ -314,7 +322,10 @@ fn reads_as_metals_do(
     let theirs = probed::<MetalPlatform>(&md, "read_texels", &mt, size, None, None);
     assert!(ours == theirs, "read: {what}");
     let theirs = measure::read_floats::<MetalPlatform>(&md, &mt, size);
-    assert!(float_bits(&ours_floats) == float_bits(&theirs), "read into floats: {what}");
+    assert!(
+        float_bits(&ours_floats) == float_bits(&theirs),
+        "read into floats: {what}"
+    );
 }
 
 /// A texture of each format of the family over plane 0 of a surface of each two-plane OSType
@@ -346,7 +357,10 @@ fn textures_over_other_ostypes_read_as_metals() {
             let s = shape.surface(size);
             set_value(&s, MATRIX_KEY, matrix);
             shape.fill_noise(&s, size, 10);
-            let what = format!("{format} over {} {matrix}", String::from_utf8_lossy(&own[0][..]));
+            let what = format!(
+                "{format} over {} {matrix}",
+                String::from_utf8_lossy(&own[0][..])
+            );
             if !twin(format) {
                 let half_relayed = converted_10_bit(format);
                 reads_as_metals_do(format, (&shape, &s), 0, size, half_relayed, &what);
@@ -377,7 +391,10 @@ fn textures_over_plane_1_read_as_metals() {
             let shape = Shape::of(ostype);
             let s = shape.surface(size);
             shape.fill_noise(&s, size, 11);
-            let what = format!("{format} over plane 1 of {}", String::from_utf8_lossy(&ostype[..]));
+            let what = format!(
+                "{format} over plane 1 of {}",
+                String::from_utf8_lossy(&ostype[..])
+            );
             reads_as_metals_do(format, (&shape, &s), 1, size, false, &what);
         }
     }
@@ -2584,7 +2601,8 @@ fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
             let s = Shape::of(ostypes[0]).surface(size);
             let mut desc = measure::desc(format, size);
             desc.usage = 0x5;
-            let ours = dev().new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0);
+            let ours =
+                dev().new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0);
             let what = format!("{format} of {size:?}");
             assert_eq!(ours.unwrap().is_some(), !subsampled, "{what}");
             if let Some(md) = &md {
