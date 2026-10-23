@@ -10,7 +10,9 @@
 //!
 //! **Windowed**: decorated and resizable, centred on its screen where the window system lets it
 //! be placed, its content shrunk to fit the screen's usable area less [`TITLE_ROOM`] for the title
-//! bar and a panel, which Wayland does not tell a client.
+//! bar and a panel, which Wayland does not tell a client. Its size and its smallest are asked for
+//! in SDL's sizes (`crate::sdl::units`): points on Wayland, and on X11 pixels, the desktop's
+//! content scale of them to the point.
 //!
 //! **Borderless**: through the compositor's own full screen on its screen, over its panels.
 //!
@@ -37,11 +39,12 @@ use sdl3_sys::everything::*;
 use super::input::{self, At, Wheel};
 use super::keymap;
 use super::render::Target;
-use crate::geometry::{self, Insets, Rect};
+use crate::geometry::{Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
 use crate::sdl::c_string;
-use crate::sdl::shell::{self, DEFAULT_MODE, MIN_CONTENT, Opened, Shell};
+use crate::sdl::shell::{self, DEFAULT_MODE, Opened, Shell};
+use crate::sdl::units::{self, Units};
 
 /// Points of a screen's height kept for a window's title bar and a panel: Wayland gives a client
 /// no work area, nor the size of the compositor's decorations.
@@ -110,8 +113,18 @@ impl Input {
     }
 }
 
-/// The content size in points of a windowed window for a guest mode `mode` at `guest_scale`, on
-/// screen `display` (the module doc): at least [`MIN_CONTENT`].
+/// SDL's sizes on screen `display` (`crate::sdl::units`).
+fn units_of(display: SDL_DisplayID) -> Units {
+    // SAFETY: SDL's video runs on this thread; the mode is SDL's, read at once.
+    let density =
+        unsafe { SDL_GetCurrentDisplayMode(display).as_ref() }.map_or(1.0, |m| m.pixel_density);
+    // SAFETY: as above.
+    let content = unsafe { SDL_GetDisplayContentScale(display) };
+    Units::new(density, content)
+}
+
+/// The content size, in SDL's sizes, of a windowed window for a guest mode `mode` at
+/// `guest_scale`, on screen `display` (the module doc): at least `shell::MIN_CONTENT` points.
 fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (i32, i32) {
     let mut usable = SDL_Rect {
         x: 0,
@@ -121,20 +134,8 @@ fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (
     };
     // SAFETY: SDL's video runs on this thread.
     let known = unsafe { SDL_GetDisplayUsableBounds(display, &mut usable) };
-    let room = if known {
-        (f64::from(usable.w), f64::from(usable.h) - TITLE_ROOM)
-    } else {
-        (0.0, 0.0)
-    };
-    // SAFETY: as above.
-    let mode_info = unsafe { SDL_GetCurrentDisplayMode(display).as_ref() };
-    let density = mode_info.map_or(1.0, |m| f64::from(m.pixel_density).max(1.0));
-    let (width, height) = geometry::initial_content_size(mode, f64::from(guest_scale.max(1)), room);
-    let whole = |points: f64| ((points * density).floor() / density).round() as i32;
-    (
-        whole(width).max(MIN_CONTENT.0),
-        whole(height).max(MIN_CONTENT.1),
-    )
+    let usable = known.then_some((usable.w, usable.h));
+    units::windowed_size(mode, guest_scale, usable, TITLE_ROOM, units_of(display))
 }
 
 /// Makes and shows `window`'s SDL window (the module doc), and hands its render thread SDL's
@@ -147,6 +148,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
     );
     let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
     let size = windowed_size(display, mode, window.guest_scale(mode));
+    let min = units_of(display).min_content();
     let title = c_string(window.title());
     let flags = SDL_WINDOW_VULKAN
         | SDL_WINDOW_HIGH_PIXEL_DENSITY
@@ -161,7 +163,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
     let centered = SDL_WINDOWPOS_CENTERED_DISPLAY(display);
     // SAFETY: `sdl` is the window just made, on this thread.
     unsafe {
-        SDL_SetWindowMinimumSize(sdl, MIN_CONTENT.0, MIN_CONTENT.1);
+        SDL_SetWindowMinimumSize(sdl, min.0, min.1);
         SDL_SetWindowPosition(sdl, centered, centered);
         if borderless {
             SDL_SetWindowFullscreen(sdl, true);

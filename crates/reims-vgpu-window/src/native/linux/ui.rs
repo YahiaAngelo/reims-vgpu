@@ -318,14 +318,7 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
     // SAFETY: as above.
     let content = unsafe { SDL_GetDisplayContentScale(id) };
     let density = f64::from(mode.pixel_density);
-    // SDL's points are pixels on X11, where the desktop's scale is the content scale alone.
-    let scale = if density > 1.0 {
-        density
-    } else if content.is_finite() && content > 0.0 {
-        f64::from(content)
-    } else {
-        1.0
-    };
+    let scale = crate::sdl::units::pixels_per_point(mode.pixel_density, content);
     let pixels = (mode_pixels(mode.w, density), mode_pixels(mode.h, density));
     let mut fullscreen = Vec::new();
     let mut count = 0;

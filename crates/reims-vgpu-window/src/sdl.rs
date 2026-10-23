@@ -22,10 +22,12 @@
 //!   room, the menu and the end.
 //!
 //! Modules shared by both: [`shell`] (the windows open, each one's opening, size, title, layout,
-//! events and end) and [`cursor`] (the guest's cursor as SDL's).
+//! events and end), [`cursor`] (the guest's cursor as SDL's) and [`units`] (SDL's sizes, points
+//! or pixels, and a window's first size in them).
 
 pub(crate) mod cursor;
 pub(crate) mod shell;
+pub(crate) mod units;
 
 /// What the window does its own way on each OS: the window's making and placing, its surface,
 /// its input and its end.

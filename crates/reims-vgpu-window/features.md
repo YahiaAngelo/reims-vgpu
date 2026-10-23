@@ -297,10 +297,15 @@ runtime's own device. The switches above apply, and `resolution=` too.
   the reason is logged once. `manual`
 - The title, the first size (a guest point per host point, shrunk to fit
   the screen less 48 points for the title bar and a panel, on whole pixels)
-  and the screen a display opens on are as above.
+  and the screen a display opens on are as above. The size is asked for in
+  SDL's sizes: points on Wayland, and on X11 pixels, the desktop's content
+  scale of them to the point, so an X11 desktop at 200% does not open the
+  window at half its size.
   `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`,
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
-  `test: screens::display_i_opens_on_screen_i`, `manual`
+  `test: sdl::units::a_window_opens_a_guest_point_per_host_point_in_sdl_s_sizes`,
+  `test: screens::display_i_opens_on_screen_i`, `manual` (X11 at a content
+  scale above 1 among them)
 - Wayland lets no client place a windowed window: the compositor does.
   Borderless windows fill the screen named, over its panels. `manual`
 - The host's screens are SDL's: the primary first, then top to bottom and
