@@ -744,9 +744,19 @@ mod tests {
         let outside = env.root.join("other/oc.img");
         let dir = renewed("a", "../other/oc.img", &outside);
         assert!(dir.join("opencore.qcow2").is_file());
-        assert!(outside.is_file(), "a file outside the VM's directory was deleted");
-        let dir = renewed("b", "sub/../opencore.qcow2", &env.root.join("b/opencore.qcow2"));
-        assert!(dir.join("opencore.qcow2").is_file(), "the new image was deleted");
+        assert!(
+            outside.is_file(),
+            "a file outside the VM's directory was deleted"
+        );
+        let dir = renewed(
+            "b",
+            "sub/../opencore.qcow2",
+            &env.root.join("b/opencore.qcow2"),
+        );
+        assert!(
+            dir.join("opencore.qcow2").is_file(),
+            "the new image was deleted"
+        );
     }
 
     #[test]

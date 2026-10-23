@@ -800,7 +800,12 @@ mod tests {
     fn a_new_vms_ssh_port_of_0_is_no_forward() {
         let mut spec = Spec::new("t");
         let config = |spec: &Spec| {
-            base_config(spec, Profile::VmappleArm64, "disk.img".into(), ImageFormat::Raw)
+            base_config(
+                spec,
+                Profile::VmappleArm64,
+                "disk.img".into(),
+                ImageFormat::Raw,
+            )
         };
         spec.ssh_port = Some(0);
         assert_eq!(config(&spec).network.ssh_port, None);

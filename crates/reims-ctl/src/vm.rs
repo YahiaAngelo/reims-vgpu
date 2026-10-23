@@ -314,7 +314,9 @@ pub fn ssh_port(p: u16) -> Option<u16> {
 
 /// A saved SSH port: 0, which create saved for `--ssh-port 0` before it meant none there too,
 /// is none.
-fn saved_ssh_port<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u16>, D::Error> {
+fn saved_ssh_port<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<u16>, D::Error> {
     Ok(Option::<u16>::deserialize(d)?.and_then(ssh_port))
 }
 
@@ -509,7 +511,10 @@ pub fn check_mac(mac: &str) -> Result<()> {
                 && p.get(2).is_none_or(|s| matches!(s, b':' | b'-'))
         });
     if !ok {
-        bail!("a MAC is six pairs of hex digits joined by ':' or '-', such as 52:54:00:12:34:56, not {mac:?}");
+        bail!(
+            "a MAC is six pairs of hex digits joined by ':' or '-', such as \
+             52:54:00:12:34:56, not {mac:?}"
+        );
     }
     Ok(())
 }
@@ -948,7 +953,10 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("ssh_port = 2222"), "{text}");
         let zero = text.replace("ssh_port = 2222", "ssh_port = 0");
-        assert_eq!(toml::from_str::<VmConfig>(&zero).unwrap().network.ssh_port, None);
+        assert_eq!(
+            toml::from_str::<VmConfig>(&zero).unwrap().network.ssh_port,
+            None
+        );
         c.network.ssh_port = None;
         let none = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&none).unwrap(), c);

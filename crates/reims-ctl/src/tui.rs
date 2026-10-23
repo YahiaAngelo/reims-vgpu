@@ -2270,7 +2270,8 @@ fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
     if p.is_empty() {
         return Ok(None);
     }
-    Ok(crate::vm::ssh_port(p.parse().context("SSH port: a number")?))
+    let p = p.parse().context("SSH port: a number")?;
+    Ok(crate::vm::ssh_port(p))
 }
 
 /// Runs less on `files`, each at its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach

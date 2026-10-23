@@ -189,15 +189,23 @@ mod tests {
         let root = std::env::temp_dir().join(format!("reims-ctl-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let qemu = root.join("qemu");
-        let builds = ["20260101-000000-a", "20260102-000000-b", "20260103-000000-c"]
-            .into_iter()
-            .chain(["20260104-000000-d", "20260105-000000-e"])
-            .collect::<Vec<_>>();
+        let builds = [
+            "20260101-000000-a",
+            "20260102-000000-b",
+            "20260103-000000-c",
+        ]
+        .into_iter()
+        .chain(["20260104-000000-d", "20260105-000000-e"])
+        .collect::<Vec<_>>();
         for b in &builds {
             std::fs::create_dir_all(qemu.join(b).join("bin")).unwrap();
         }
         let bin = "bin/qemu-system-test";
-        std::fs::copy(std::env::current_exe().unwrap(), qemu.join(builds[0]).join(bin)).unwrap();
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            qemu.join(builds[0]).join(bin),
+        )
+        .unwrap();
         let link = |b: &str| {
             let _ = std::fs::remove_file(qemu.join("current"));
             std::os::unix::fs::symlink(b, qemu.join("current")).unwrap();

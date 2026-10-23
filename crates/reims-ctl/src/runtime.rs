@@ -838,7 +838,11 @@ mod tests {
         assert_eq!(commands, ["send-key"]);
         assert!(waited);
         stopped.unwrap();
-        assert_eq!(steps.last().map(String::as_str), Some("shut down"), "{steps:?}");
+        assert_eq!(
+            steps.last().map(String::as_str),
+            Some("shut down"),
+            "{steps:?}"
+        );
         let e = format!("{:#}", unreached.unwrap_err());
         assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
