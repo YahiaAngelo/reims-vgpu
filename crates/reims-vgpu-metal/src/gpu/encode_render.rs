@@ -23,7 +23,7 @@ pub type MetalRenderEncoder = Obj<ProtocolObject<dyn MTLRenderCommandEncoder>>;
 impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRenderEncoder {
     /// One call per command: a raise inside Metal is the caller's to catch. A command only the
     /// decoder encodes, always under a handler, is `Caught`; one only the display's frame
-    /// encodes, with none, is `Uncaught`; one both encode is `On(on)`, as the caller says. A
+    /// encodes, with none, is `Fatal`; one both encode is `On(on)`, as the caller says. A
     /// `…:withRange:` command whose array is shorter than the range dies before the call
     /// ([`check_len`]). Raw guest values go to Metal unvalidated, which is what objc2-metal's
     /// `unsafe` marks: Metal checks them itself, and raises or faults the GPU on what it

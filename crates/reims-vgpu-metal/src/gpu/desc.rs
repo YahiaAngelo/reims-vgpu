@@ -15,10 +15,10 @@
 //!   descriptors Metal makes from serialized data take only their resource index.
 //! - Setters and getters are `Fatal` sends: a raise inside one dies at the call ([`msg::get`]).
 //!   The attachment arrays' subscripts (`On` where the display's frame sets a colour attachment
-//!   with no handler and the decoder under one, `Caught` for the decoder's attachment state,
-//!   `Uncaught` for a display's pipeline) and `setSamplePositions:count:`
-//!   (`Caught`: only the decoder sends it) answer on the thrown channel the traits carry
-//!   ([`msg::send`]).
+//!   with no handler and the decoder under one, `Caught` for the decoder's attachment state)
+//!   and `setSamplePositions:count:` (`Caught`: only the decoder sends it) answer on the thrown
+//!   channel the traits carry ([`msg::send`]); a display's pipeline's subscript is a `Fatal`
+//!   send, as its setters are.
 //! - A raw guest value goes to Metal as it is: an enum or option set is its newtype over the
 //!   same word, whatever Metal makes of it.
 //! - A sub-object (an attachment, a stencil descriptor, an attachment array) comes back `+0`,
