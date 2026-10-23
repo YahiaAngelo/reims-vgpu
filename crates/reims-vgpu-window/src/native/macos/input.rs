@@ -314,7 +314,7 @@ impl InputLogic {
             _ => None,
         };
         if smooth {
-            self.scrolled_smoothly(input, over, cx.image);
+            self.scrolled_smoothly(input, cx.point, over, cx.image);
             return Reaction::default();
         }
         let Some((point, mode)) = over else {
@@ -328,18 +328,19 @@ impl InputLogic {
         Reaction::default()
     }
 
-    /// Smooth scrolling: the event goes where [`Gesture::route`] sends it, after the pointer's
-    /// position where the pointer is over the image (`over`: where, in which mode), with its
-    /// notches. An event of no phase, no distance and no notch is not sent.
+    /// Smooth scrolling: the event goes where [`Gesture::route`] sends it, the pointer at `at`,
+    /// after the pointer's position where the pointer is over the image (`over`: where, in which
+    /// mode), with its notches. An event of no phase, no distance and no notch is not sent.
     fn scrolled_smoothly(
         &mut self,
         input: ScrollInput,
+        at: Option<(f64, f64)>,
         over: Option<((f64, f64), (u16, u16))>,
         image: Rect,
     ) {
         if !self
             .gesture
-            .route(input.phase, input.momentum, over.is_some())
+            .route(input.phase, input.momentum, at, over.is_some())
         {
             return;
         }
@@ -1045,10 +1046,11 @@ mod tests {
                 scroll(0, P::Ended, M::None, 0),
             ]
         );
-        // A gesture begun off the image is not sent; a wheel's lines over it are, at 10 points
-        // each, and one of no distance is not.
+        // A gesture begun off the image is not sent, wherever it goes; a wheel's lines over the
+        // image are, at 10 points each, and one of no distance is not.
         logic.scrolled(swipe(0.0, P::MayBegin, M::None), true, &off);
-        logic.scrolled(swipe(6.0, P::Began, M::None), true, &over);
+        logic.scrolled(swipe(6.0, P::Began, M::None), true, &off);
+        logic.scrolled(swipe(2.0, P::Changed, M::None), true, &over);
         logic.scrolled(swipe(0.0, P::Ended, M::None), true, &over);
         let wheel = ScrollInput {
             delta: (0.0, 1.5),

@@ -239,9 +239,13 @@ pointing device takes it (vmapple's `usb-vmapple-tablet`):
   `test: scroll::smooth_scrolling_is_in_256ths_of_a_point`
 - A gesture that begins over the image scrolls the guest to its end,
   momentum included, wherever the pointer goes meanwhile; one that begins
-  over the bars never does.
+  over the bars never does. It begins where the pointer is as it first
+  scrolls, or where the fingers rested before that while the pointer is
+  still there. An end the window never saw (fingers that lifted, a gesture
+  that ended, out of its sight) carries nothing over to the next gesture.
   `test: scroll::a_gesture_begun_over_the_image_is_sent_to_its_end`,
   `test: scroll::a_gesture_begun_off_the_image_is_not_sent`,
+  `test: scroll::an_end_unseen_leaves_nothing_to_the_next_gesture`,
   `test: scroll::an_event_of_no_phase_goes_where_the_pointer_is`
 - The guest gets the physical direction here too.
   `test: scroll::smooth_scrolling_is_in_256ths_of_a_point`

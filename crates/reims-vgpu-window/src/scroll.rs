@@ -9,7 +9,12 @@
 //! Smoothly ([`smooth`], [`Gesture`]): the guest gets each event's distance in points, with the
 //! phases of its gesture and of the momentum scrolling after it, and scrolls as the host does. A
 //! gesture that begins over the guest's image goes to the guest to its end, momentum included,
-//! wherever the pointer goes meanwhile; one that begins elsewhere does not.
+//! wherever the pointer goes meanwhile; one that begins elsewhere does not. A gesture begins where
+//! the pointer is at its first scroll (`Began`), or, with the pointer still where it was, where
+//! the fingers that began it rested on the device first (`MayBegin`). An end the window never
+//! sees (the fingers' `Cancelled`, the gesture's `Ended`) leaves nothing to the next gesture: a
+//! pointer that has moved since the fingers rested shows they lifted, and a second `Began` is a
+//! gesture of its own.
 //!
 //! The guest gets the device's own direction. With the host's natural scrolling on, macOS
 //! reverses the deltas it reports and says so (`isDirectionInvertedFromDevice`); they are
@@ -135,11 +140,20 @@ pub fn smooth(input: ScrollInput) -> (i32, i32) {
 }
 
 /// Where smooth scrolling is in a gesture: which of its events go to the guest.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Gesture {
     /// In no gesture.
     #[default]
     Idle,
+    /// Fingers rest on the device and may begin a gesture, the pointer at `at` (in the view's
+    /// points, where known), over the image (`over`) or not: their `MayBegin` went to the guest
+    /// where it was over the image, and so does their `Cancelled`.
+    MayBegin {
+        /// Whether the pointer was over the image.
+        over: bool,
+        /// Where the pointer was.
+        at: Option<(f64, f64)>,
+    },
     /// A gesture that began over the image: its events go to the guest.
     Open,
     /// That gesture ended: the momentum that may follow goes to the guest.
@@ -151,20 +165,38 @@ pub enum Gesture {
 }
 
 impl Gesture {
-    /// Whether an event with `phase` and `momentum` goes to the guest, the pointer being over
-    /// the image (`over`) or not. An event of no phase goes where the pointer is over the image;
-    /// an event of a gesture, where the gesture began over it.
-    pub fn route(&mut self, phase: ScrollPhase, momentum: MomentumPhase, over: bool) -> bool {
-        use Gesture::{Elsewhere, Ended, Idle, Momentum, Open};
-        let begin = if over { Open } else { Elsewhere };
+    /// Whether an event with `phase` and `momentum` goes to the guest, the pointer being at `at`
+    /// in the view's points (where known) and over the image (`over`) or not. An event of no
+    /// phase goes where the pointer is over the image; an event of a gesture, where the gesture
+    /// began over it (the module doc).
+    pub fn route(
+        &mut self,
+        phase: ScrollPhase,
+        momentum: MomentumPhase,
+        at: Option<(f64, f64)>,
+        over: bool,
+    ) -> bool {
+        use Gesture::{Elsewhere, Ended, Idle, MayBegin, Momentum, Open};
+        // Fingers that rested with the pointer where it still is begin the gesture where they
+        // rested. A pointer that moved since shows they lifted, their Cancelled unseen: the
+        // gesture begins where the pointer is now, as after any other state, a gesture whose
+        // Ended went unseen included.
+        let begins_over = match *self {
+            MayBegin {
+                over: rested,
+                at: was,
+            } if at.is_some() && at == was => rested,
+            _ => over,
+        };
         let (next, send) = match (phase, momentum, *self) {
-            (ScrollPhase::MayBegin, _, _) => (begin, over),
-            // A gesture that may have begun begins where that was.
-            (ScrollPhase::Began, _, Open | Elsewhere) => (*self, *self == Open),
-            (ScrollPhase::Began, _, _) => (begin, over),
+            (ScrollPhase::MayBegin, _, _) => (MayBegin { over, at }, over),
+            (ScrollPhase::Began, _, _) if begins_over => (Open, true),
+            (ScrollPhase::Began, _, _) => (Elsewhere, false),
+            // Resting fingers held still (Stationary) go where they would begin.
+            (ScrollPhase::Changed, _, MayBegin { .. }) => (*self, begins_over),
             (ScrollPhase::Changed, _, _) => (*self, *self == Open),
             (ScrollPhase::Ended, _, Open) => (Ended, true),
-            (ScrollPhase::Cancelled, _, Open) => (Idle, true),
+            (ScrollPhase::Cancelled, _, Open | MayBegin { over: true, .. }) => (Idle, true),
             (ScrollPhase::Ended | ScrollPhase::Cancelled, _, _) => (Idle, false),
             (ScrollPhase::None, MomentumPhase::Began, Ended) => (Momentum, true),
             (ScrollPhase::None, MomentumPhase::Began, _) => (Idle, false),
@@ -309,21 +341,24 @@ mod tests {
     fn a_gesture_begun_over_the_image_is_sent_to_its_end() {
         use MomentumPhase as M;
         use ScrollPhase as P;
+        let (here, there) = (Some((600.0, 300.0)), Some((20.0, 300.0)));
         let mut g = Gesture::default();
-        assert!(g.route(P::MayBegin, M::None, true));
-        assert!(g.route(P::Began, M::None, false));
-        assert!(g.route(P::Changed, M::None, false));
-        assert!(g.route(P::Ended, M::None, false));
-        assert!(g.route(P::None, M::Began, false));
-        assert!(g.route(P::None, M::Changed, false));
-        assert!(g.route(P::None, M::Ended, false));
+        // Fingers rest over the image, and scroll with the pointer still there, the image gone
+        // from under it.
+        assert!(g.route(P::MayBegin, M::None, here, true));
+        assert!(g.route(P::Began, M::None, here, false));
+        assert!(g.route(P::Changed, M::None, there, false));
+        assert!(g.route(P::Ended, M::None, there, false));
+        assert!(g.route(P::None, M::Began, there, false));
+        assert!(g.route(P::None, M::Changed, there, false));
+        assert!(g.route(P::None, M::Ended, there, false));
         assert_eq!(g, Gesture::Idle);
         // Without MayBegin, and without momentum.
-        assert!(g.route(P::Began, M::None, true));
-        assert!(g.route(P::Ended, M::None, false));
+        assert!(g.route(P::Began, M::None, here, true));
+        assert!(g.route(P::Ended, M::None, there, false));
         // Fingers that may have begun, and lift.
-        assert!(g.route(P::MayBegin, M::None, true));
-        assert!(g.route(P::Cancelled, M::None, true));
+        assert!(g.route(P::MayBegin, M::None, here, true));
+        assert!(g.route(P::Cancelled, M::None, there, false));
         assert_eq!(g, Gesture::Idle);
     }
 
@@ -332,28 +367,70 @@ mod tests {
     fn a_gesture_begun_off_the_image_is_not_sent() {
         use MomentumPhase as M;
         use ScrollPhase as P;
+        let (here, there) = (Some((20.0, 300.0)), Some((600.0, 300.0)));
         let mut g = Gesture::default();
-        assert!(!g.route(P::MayBegin, M::None, false));
-        assert!(!g.route(P::Began, M::None, true));
-        assert!(!g.route(P::Changed, M::None, true));
-        assert!(!g.route(P::Ended, M::None, true));
-        assert!(!g.route(P::None, M::Began, true));
-        assert!(!g.route(P::None, M::Changed, true));
-        assert!(!g.route(P::None, M::Ended, true));
+        assert!(!g.route(P::MayBegin, M::None, here, false));
+        assert!(!g.route(P::Began, M::None, here, true));
+        assert!(!g.route(P::Changed, M::None, there, true));
+        assert!(!g.route(P::Ended, M::None, there, true));
+        assert!(!g.route(P::None, M::Began, there, true));
+        assert!(!g.route(P::None, M::Changed, there, true));
+        assert!(!g.route(P::None, M::Ended, there, true));
         // Momentum after a gesture that ended long ago is not the guest's either.
-        assert!(g.route(P::Began, M::None, true));
-        assert!(g.route(P::Ended, M::None, true));
-        assert!(!g.route(P::Began, M::None, false));
-        assert!(!g.route(P::None, M::Began, true));
+        assert!(g.route(P::Began, M::None, there, true));
+        assert!(g.route(P::Ended, M::None, there, true));
+        assert!(!g.route(P::Began, M::None, here, false));
+        assert!(!g.route(P::None, M::Began, there, true));
         assert_eq!(g, Gesture::Idle);
+    }
+
+    /// An end the window never saw leaves nothing to the next gesture: fingers that rested over
+    /// the image, or off it, and lifted unseen (the pointer has moved since) do not decide where
+    /// the next gesture goes, nor does a gesture whose Ended went unseen
+    #[test]
+    fn an_end_unseen_leaves_nothing_to_the_next_gesture() {
+        use MomentumPhase as M;
+        use ScrollPhase as P;
+        let (over, off) = (Some((600.0, 300.0)), Some((20.0, 300.0)));
+        let mut g = Gesture::default();
+        // Resting fingers held still go where they rested.
+        assert!(g.route(P::MayBegin, M::None, over, true));
+        assert!(g.route(P::Changed, M::None, over, false));
+        // Rested over the image, Cancelled unseen; the next gesture begins off it.
+        assert!(g.route(P::MayBegin, M::None, over, true));
+        assert!(!g.route(P::Began, M::None, off, false));
+        assert!(!g.route(P::Changed, M::None, over, true));
+        assert!(!g.route(P::Ended, M::None, over, true));
+        // Rested off the image, Cancelled unseen; the next gesture begins over it.
+        assert!(!g.route(P::MayBegin, M::None, off, false));
+        assert!(g.route(P::Began, M::None, over, true));
+        assert!(g.route(P::Changed, M::None, off, false));
+        // That gesture's Ended unseen; the next begins off the image, and the next over it.
+        assert!(!g.route(P::Began, M::None, off, false));
+        assert!(!g.route(P::Changed, M::None, over, true));
+        assert!(g.route(P::Began, M::None, over, true));
+        assert!(g.route(P::Ended, M::None, off, false));
+        // Where the pointer is not known, the rest decides nothing either.
+        assert!(g.route(P::MayBegin, M::None, None, true));
+        assert!(!g.route(P::Began, M::None, None, false));
     }
 
     /// An event of no phase (a notched wheel) goes where the pointer is over the image
     #[test]
     fn an_event_of_no_phase_goes_where_the_pointer_is() {
         let mut g = Gesture::default();
-        assert!(g.route(ScrollPhase::None, MomentumPhase::None, true));
-        assert!(!g.route(ScrollPhase::None, MomentumPhase::None, false));
+        assert!(g.route(
+            ScrollPhase::None,
+            MomentumPhase::None,
+            Some((600.0, 300.0)),
+            true
+        ));
+        assert!(!g.route(
+            ScrollPhase::None,
+            MomentumPhase::None,
+            Some((20.0, 300.0)),
+            false
+        ));
         assert_eq!(g, Gesture::Idle);
     }
 }
