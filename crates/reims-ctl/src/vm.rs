@@ -407,6 +407,9 @@ impl VmConfig {
             bail!("memory must be at least 2 GiB, not {} MiB", self.memory_mib);
         }
         self.display.check()?;
+        for k in self.extra_env.keys() {
+            check_env_name(k)?;
+        }
         if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
             bail!(
                 "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
@@ -475,6 +478,20 @@ pub fn check_name(name: &str) -> Result<()> {
     if !ok {
         bail!(
             "a VM's name is 1 to 64 letters, digits, '-', '_' or '.', not starting with '-' or '.': {name:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An environment variable's name for QEMU's environment: letters, digits and '_', not
+/// starting with a digit, as the shell's `export` in a printed command takes it.
+pub fn check_env_name(k: &str) -> Result<()> {
+    let ok = k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        bail!(
+            "an environment variable's name is letters, digits and '_', not starting with a \
+             digit: {k:?}"
         );
     }
     Ok(())

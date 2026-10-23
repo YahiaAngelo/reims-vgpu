@@ -133,6 +133,8 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
         }
     }
     for (k, v) in &c.extra_env {
+        // A name the shell's export takes, so the printed script runs as start does.
+        crate::vm::check_env_name(k)?;
         env.retain(|(ek, _)| ek != k);
         unset.retain(|u| u != k);
         env.push((k.clone(), v.clone()));
@@ -801,6 +803,23 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("memfd")));
         assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
         assert!(!a.iter().any(|x| x.contains("ICH9-LPC")));
+    }
+
+    /// A variable for QEMU's environment is named as the printed script's export takes it: a
+    /// space or a `;` in its name would break the script or run more than QEMU.
+    #[test]
+    fn an_environment_variable_is_named_as_the_shell_takes_it() {
+        let mut vm = q35_vm();
+        let ctx = ctx(linux());
+        for bad in ["A B", "X;touch /tmp/x;Y", "1A", "", "A-B", "A=B"] {
+            vm.config.extra_env = BTreeMap::from([(bad.to_string(), "1".to_string())]);
+            assert!(vm.config.check().is_err(), "{bad:?}");
+            assert!(invocation(&vm, &ctx).is_err(), "{bad:?}");
+        }
+        vm.config.extra_env = BTreeMap::from([("_Ab_9".to_string(), "1 2".to_string())]);
+        assert!(vm.config.check().is_ok());
+        let script = invocation(&vm, &ctx).unwrap().shell_script("");
+        assert!(script.contains("\nexport _Ab_9='1 2'\n"), "{script}");
     }
 
     #[test]

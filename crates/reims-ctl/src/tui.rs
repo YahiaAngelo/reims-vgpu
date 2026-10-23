@@ -1580,7 +1580,8 @@ impl App {
                 "extra_env",
                 "Extra environment",
                 &env,
-                "KEY=VALUE pairs for QEMU's environment, shell-quoted.",
+                "KEY=VALUE pairs for QEMU's environment, shell-quoted; a KEY is letters, digits \
+                 and _, not starting with a digit.",
             )
             .placeholder("none"),
         ]);

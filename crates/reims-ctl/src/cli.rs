@@ -356,7 +356,8 @@ pub struct SetArgs {
     /// More QEMU arguments, as one shell-quoted string; empty for none
     #[arg(long, allow_hyphen_values = true)]
     pub extra_args: Option<String>,
-    /// KEY=VALUE for QEMU's environment; KEY= removes it (repeatable)
+    /// KEY=VALUE for QEMU's environment, KEY letters, digits and _, not starting with a digit;
+    /// KEY= removes it (repeatable)
     #[arg(long = "env")]
     pub env: Vec<String>,
 }
