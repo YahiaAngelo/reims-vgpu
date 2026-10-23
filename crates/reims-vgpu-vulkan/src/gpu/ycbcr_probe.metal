@@ -92,6 +92,41 @@ kernel void sample_texels_float(texture2d<float> t [[texture(0)]],
     out[g.y * p.columns + g.x] = v;
 }
 
+// read_texels_float of slice 0 of a 2D array: a view of a texture as a 2D array.
+kernel void read_slice_texels_float(texture2d_array<float, access::read> t [[texture(0)]],
+                                    device float4 *out [[buffer(0)]],
+                                    uint2 g [[thread_position_in_grid]]) {
+    uint width = t.get_width();
+    if (g.x >= width || g.y >= t.get_height()) {
+        return;
+    }
+    out[g.y * width + g.x] = t.read(g, 0);
+}
+
+// sample_texels_float of slice 0 of a 2D array.
+kernel void sample_slice_texels_float(texture2d_array<float> t [[texture(0)]],
+                                      sampler s [[sampler(0)]],
+                                      device float4 *out [[buffer(0)]],
+                                      constant Probe &p [[buffer(1)]],
+                                      uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= p.columns || g.y >= p.rows) {
+        return;
+    }
+    float2 at = p.origin + float2(g) * p.step;
+    if (p.normalized != 0) {
+        at /= float2(t.get_width(), t.get_height());
+    }
+    float4 v;
+    if (p.read == 1) {
+        v = t.gather(s, at, 0, int2(0), component::x);
+    } else if (p.read == 2) {
+        v = t.gather(s, at, 0, int2(0), component::z);
+    } else {
+        v = t.sample(s, at, 0);
+    }
+    out[g.y * p.columns + g.x] = v;
+}
+
 // sample() at each of the probe's positions, in rows, whatever its read: a reader with no gather,
 // for a texture of a format the runtime gathers none of (the two-plane XR10 formats,
 // gpu/resource.rs's tests), as a function holding a gather it refuses.

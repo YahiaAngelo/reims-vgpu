@@ -1153,26 +1153,6 @@ impl VulkanTexture {
             && no_view(sel, pixel_format)
     }
 
-    /// Relays for `sel`, or dies in strict mode ([`crate::answer::Inexact::YcbcrView`]), a view of
-    /// this texture, of the two-plane YCbCr family, in its own format (`pixel_format`, raw) as
-    /// another type than its own (`kind`): Metal makes it, but reads it otherwise than the
-    /// texture (a 2D array view reads its planes' codes unconverted, measured:
-    /// `own_format_views_are_metals`), where the runtime's view, made, reads as the texture.
-    fn retyped_ycbcr(&self, sel: &'static str, pixel_format: u64, kind: TextureType) {
-        let (source, own) = plain(|| (self.raw.pixel_format(), self.raw.texture_type()));
-        if crate::gpu::ycbcr::runtime_makes(source)
-            && u64::from(source.as_raw()) == pixel_format
-            && kind != own
-        {
-            crate::answer::inexact(sel, crate::answer::Inexact::YcbcrView, || {
-                format!(
-                    "a {kind:?} view of a {source:?} texture, which Metal reads otherwise than \
-                     the texture, and the runtime as the texture"
-                )
-            });
-        }
-    }
-
     /// The view `call` makes of this texture, for `sel`: of the same device, over the same surface
     /// (sharing this texture's reference of it, as a view shares its texels). Metal raises for no
     /// view (measured, without API validation): nil where the runtime answers it, as Metal
@@ -1391,7 +1371,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_view_with_levels_slices(format, kind, levels, slices)
@@ -1413,7 +1392,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_view_with_swizzle(format, kind, levels, slices, swizzle)
@@ -1436,7 +1414,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_subview_with_placement(
@@ -1464,7 +1441,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_subview_with_placement(

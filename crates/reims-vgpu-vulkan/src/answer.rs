@@ -2108,9 +2108,6 @@ pub enum Inexact {
     /// A draw or tile dispatch in a pass of a rasterization rate map whose rates vary, or a tile
     /// dispatch in one of no layers, which the runtime runs by its own regions and tiles.
     RateMap,
-    /// A view of a two-plane YCbCr texture as another type, which the runtime reads as the
-    /// texture where Metal reads the planes' codes unconverted.
-    YcbcrView,
     /// A colour fill packed in a pixel format other than the texture's, whose bytes the runtime
     /// repeats where Metal's follow no rule measured.
     FillFormat,
@@ -2146,7 +2143,7 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
         Self::WriteRounding,
@@ -2154,7 +2151,6 @@ impl Inexact {
         Self::MetalLevel,
         Self::LineWidth,
         Self::RateMap,
-        Self::YcbcrView,
         Self::FillFormat,
         Self::LateResolve,
         Self::ProtectedContent,
@@ -2173,7 +2169,6 @@ impl Inexact {
             Self::MetalLevel => "inexact-metal-level",
             Self::LineWidth => "inexact-line-width",
             Self::RateMap => "inexact-rate-map",
-            Self::YcbcrView => "inexact-ycbcr-view",
             Self::FillFormat => "inexact-fill-format",
             Self::LateResolve => "inexact-late-resolve",
             Self::ProtectedContent => "inexact-protected-content",
@@ -2806,7 +2801,6 @@ mod tests {
                 | Inexact::MetalLevel
                 | Inexact::LineWidth
                 | Inexact::RateMap
-                | Inexact::YcbcrView
                 | Inexact::FillFormat
                 | Inexact::LateResolve
                 | Inexact::ProtectedContent

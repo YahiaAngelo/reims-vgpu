@@ -71,7 +71,9 @@
 //! 505, 506 and 507, the packed 508, 509 and 510, their `_sRGB` twins 520, 522, 523, 525, 526,
 //! 527, 528, 529 and 530, and 540 to 545. It refuses the others, which die there, naming the refusal, where Metal makes them. It makes a
 //! view of each converted format in its twin, where Metal makes them, and refuses the reverse ones
-//! ([`twin_view`]). A packed format's texture writes nothing on `replaceRegion:`, as Metal's
+//! ([`twin_view`]). A view in a texture's own format as a 2D array reads the luma codes alone, as
+//! Metal's does, and a twin's as its converted format's, where Metal's reads no defined value
+//! (`own_format_views_are_metals`). A packed format's texture writes nothing on `replaceRegion:`, as Metal's
 //! leaves both planes; its blits to and from a buffer, which Metal runs at rows that follow no
 //! layout of the texture's, and a texture over plane 1 of a packed surface die, naming the
 //! runtime's refusal (`packed_textures_copy_nothing_and_their_blits_and_plane_1_die`).

@@ -78,7 +78,6 @@ process there instead.
 | A heap texture of unmeasured size or layout takes the runtime's size and layout | heaps |
 | A Metal-level answer for an unmeasured host release, or a format's description off macOS 26.7, comes from that release's description | device answers |
 | A draw or tile dispatch in a varying-rate pass runs on the runtime's own regions | rate maps |
-| A retyped YCbCr view reads as the texture itself | YCbCr views |
 | A blit fill packed in another format repeats the packed texel | blits |
 | A late resolve texture beside a dropped resolve leaves the colour resolve dropped | render passes |
 | A texture of protection options from `newTextureWithDescriptor:` or `newSharedTextureWithDescriptor:` is made unprotected, as Metal's other creators make it, where Metal answers nil without the protected-content entitlement; its contents are not kept from the host | device textures |

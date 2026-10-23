@@ -602,12 +602,20 @@ fn views_in_srgb_twins_read_as_metals() {
 
 /// A view of a texture of each format of the family in its own format and type is made, as
 /// Metal makes it, with the default swizzle and with (B, G, R, A), and reads into floats as
-/// Metal's view does, bit for bit, answering Metal's type and usage. One as a 2D array dies where
-/// it is made, where Metal makes it but reads it otherwise than the texture (its planes' codes
-/// unconverted) and the runtime's reads as the texture. Over the format's first OSType of its
-/// own bits and chroma
+/// Metal's view does, bit for bit, answering Metal's type and usage. So is one as a 2D array,
+/// which Metal reads otherwise than the texture (the luma codes alone): its `read()` of every
+/// texel, and its nearest and linear samples and its gathers of red and of blue under the
+/// runtime's exact filter of the format ([`exact`]), at positions a third of a texel apart from
+/// 0.9 of a texel before the texture to as far past it, are Metal's bit for bit. Of an `_sRGB`
+/// twin, whose such view Metal reads no defined value of (measured here: two reads of one view of
+/// one texture differ), they are those of Metal's view of its converted format's texture over the
+/// same surface, which the runtime reads. A linear sample of a 10-bit format's view takes the
+/// device's filter even so, and announces `ycbcr-filter-not-exact` ([`crate::answer::DIES`]): in
+/// strict mode it dies at the dispatch, and by default it reads Metal's bits on this host. Over
+/// the format's first OSType of its own bits and chroma
 #[test]
 fn own_format_views_are_metals() {
+    use metal2vulkan::metal::format::{YCbCrReads, ycbcr_format};
     use reims_vgpu_core::platform::types::Swizzle;
     const BGRA: Swizzle = Swizzle {
         red: 4,
@@ -637,8 +645,52 @@ fn own_format_views_are_metals() {
         let texels = measure::read_floats::<P>(d, view, size);
         (view.texture_type(), view.usage(), float_bits(&texels))
     }
+    /// What `view`, a 2D array view of a texture of `size`, reads of its slice into floats, as
+    /// their bits: `read()` of every texel (`sample` none), or the sampler's (filter, read) at
+    /// every position of the probe's grid.
+    fn arrayed<P: Platform>(
+        d: &P::Device,
+        view: &P::Texture,
+        size: (u64, u64),
+        sample: Option<(u64, u32)>,
+    ) -> Vec<[u32; 4]> {
+        let bytes = match sample {
+            None => {
+                let kernel = ("read_slice_texels_float", 16);
+                probed_texels::<P>(d, kernel, view, size, None, None)
+            }
+            Some((filter, read)) => {
+                let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
+                let probe = probe((-0.9, -0.9), 1.0 / 3.0, grid, true, read);
+                let s = measure::sampler::<P>(d, (filter, 0, true), 0);
+                let kernel = ("sample_slice_texels_float", 16);
+                probed_texels::<P>(d, kernel, view, grid, Some(&s), Some(&probe))
+            }
+        };
+        float_bits(&measure::float_texels(&bytes))
+    }
+    /// The bits, chroma, packing and reads of `format`, raw.
+    fn of(format: u64) -> metal2vulkan::metal::format::YCbCrFormat {
+        let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
+        ycbcr_format(pf).unwrap()
+    }
+    /// The format whose 2D array view Metal reads as the runtime reads `format`'s: an `_sRGB`
+    /// twin's converted format, or `format`.
+    fn read_as(format: u64) -> u64 {
+        let f = of(format);
+        if f.reads != YCbCrReads::Srgb {
+            return format;
+        }
+        let converted = |c: &u64| {
+            let c = of(*c);
+            (c.bits, c.subsampling, c.packed) == (f.bits, f.subsampling, f.packed)
+                && c.reads == YCbCrReads::Converted
+        };
+        family().into_iter().find(converted).unwrap()
+    }
     let size = (33, 17);
-    let d = dev();
+    let (d, e) = (dev(), exact());
+    let mut differ = Vec::new();
     for format in family() {
         let (_, ostypes) = surfaces_of(format, true);
         let shape = Shape::of(ostypes[0]);
@@ -662,23 +714,50 @@ fn own_format_views_are_metals() {
                 (ours.0, ours.1),
                 (theirs.0, theirs.1)
             );
-            let site = catch_death(|| view::<VulkanPlatform>(&t, format, (3, swizzle)).map(drop))
-                .unwrap_err();
-            let sel = match swizzle {
-                None => "newTextureViewWithPixelFormat:textureType:levels:slices:",
-                Some(_) => "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:",
-            };
+            let array = view::<VulkanPlatform>(&t, format, (3, swizzle)).unwrap();
+            let metal = view::<MetalPlatform>(&mt, format, (3, swizzle)).unwrap();
             assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, sel),
-                "{format} {swizzle:?}"
+                (array.texture_type(), array.usage()),
+                (metal.texture_type(), metal.usage()),
+                "the 2D array view's type and usage: {format} {swizzle:?}"
             );
-            assert!(
-                view::<MetalPlatform>(&mt, format, (3, swizzle)).is_some(),
-                "Metal: {format}"
-            );
+            let filtered = ours_on(&e, format, &s, size);
+            let filtered = view::<VulkanPlatform>(&filtered, format, (3, swizzle)).unwrap();
+            let base = read_as(format);
+            let (rd, read) = metals(base, &s, size).unwrap();
+            let read = view::<MetalPlatform>(&read, base, (3, swizzle)).unwrap();
+            for sample in [None, Some((0, 0)), Some((1, 0)), Some((0, 1)), Some((0, 2))] {
+                let (on, subject) = match sample {
+                    None => (&d, &array),
+                    Some(_) => (&e, &filtered),
+                };
+                let read_ours = || arrayed::<VulkanPlatform>(on, subject, size, sample);
+                let theirs = arrayed::<MetalPlatform>(&rd, &read, size, sample);
+                let what = format!("{format} {swizzle:?} {sample:?}");
+                let ours = if sample == Some((1, 0)) && of(format).bits != 8 {
+                    *crate::answer::LAST_LINE.lock() = None;
+                    let site = catch_death(read_ours).map(drop);
+                    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                    let named = "(metal2vulkan-degrade-ycbcr-filter-not-exact)";
+                    if site.map_err(|s| s.file) != Err("dispatchThreads:threadsPerThreadgroup:")
+                        || !line.contains(named)
+                    {
+                        differ.push(format!("{what}: did not die naming {named}: {line}"));
+                    }
+                    crate::answer::relaxed(read_ours)
+                } else {
+                    read_ours()
+                };
+                if ours != theirs {
+                    let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                    let at = ours.iter().zip(&theirs).position(|(a, b)| a != b);
+                    let first = at.map(|i| (ours[i], theirs[i]));
+                    differ.push(format!("{what}: {n} differ, first at {at:?}: {first:?}"));
+                }
+            }
         }
     }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
 /// A texture of `RGB10_420_2P` (543), which reads its codes, samples as Metal's bit for bit,
