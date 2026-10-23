@@ -76,7 +76,8 @@
 //! completes with no draw of the platform's (measured, the same test). Other draws keep the mark
 //! (indexed, indirect and mesh draws, patches, ICB executions, points and lines, and draws of no
 //! vertices, fewer than three, or no instances): nothing measured shows that a guest's draw of
-//! those keeps the pass from hanging, and some may give the GPU no draw.
+//! those keeps the pass from hanging. The platform's own draw of no vertices was measured to, but
+//! only through its no-draw pipeline, with rasterization off.
 
 use std::cell::Cell;
 use std::ptr;
