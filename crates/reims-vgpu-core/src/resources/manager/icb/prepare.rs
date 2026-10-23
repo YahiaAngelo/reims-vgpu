@@ -517,7 +517,7 @@ pub(super) fn prepare_compute<P: Platform, M: IcbWalkOps<P>>(
         }
         if !flags.inherit_buffers() {
             let mut strides = None;
-            // Sized by the kernel count here (the synchronize sizes it by the vertex count).
+            // One word a kernel bind, as the synchronize writes them.
             if flags.support_dynamic_attribute_stride() {
                 strides = Some(read_or_fail!(
                     command.sub_cursor_at(

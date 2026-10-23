@@ -2867,14 +2867,16 @@ aborts, section 7.4):
 - Once prepared, an ICB ignores its guest memory until it is invalidated (opcode
   52 or `invalidateHost`); DiscardResources (63) does nothing
   (`icb_bind_lookups`, `icb_prepare_invalid_guest`).
-- A compute ICB's write-back sizes its stride cursor with the vertex bind count
-  where prepare uses the kernel's: with 31 vertex binds the ICB prepares and
-  runs, and its write-back stops after the type and pipeline
-  (`icb_sync_errors`). With a vertex bind count of 2, both kernel binds and both
-  strides are written back; with none, the first stride's write fails, only bind
-  0 is written, and the error is dropped (`mutgap_tex_icb_sync_more`, which also
-  locks an indexed-patches command's baseInstance and tessellation factor
-  offset, and a render ICB written back with no strides cursor).
+- A compute ICB's write-back sizes its stride cursor by the kernel bind count,
+  as prepare does, whatever the descriptor's vertex bind count: with 31 vertex
+  binds the ICB prepares, runs and is written back whole (`icb_sync_errors`),
+  and with 2 or none both kernel binds and both strides are written back
+  (`mutgap_tex_icb_sync_more`, which also locks an indexed-patches command's
+  baseInstance and tessellation factor offset, and a render ICB written back
+  with no strides cursor). Apple's GPU task service does the same (**read**,
+  macOS 27.0.1, 26A434: `synchronizeIndirectComputeCommandBuffer` makes the
+  strides sub-cursor at the layout's stride offset with the kernel bind count
+  × 8 bytes, as it makes the kernel binds' with the kernel bind count × 20).
 - Prepare resets a render command whose guest type is 0: a command that drew,
   rewritten to type 0 and invalidated, draws nothing
   (`mutgap_tex_icb_reset_again`).
@@ -3873,7 +3875,7 @@ to fix: changing one is a change of behaviour, made on purpose and reviewed
 | A heap record is read as 16 bytes | **read**; an 11-byte record faults (`resources_heap_records_*`) | type 13 |
 | A serializer texture in an exec's resource list always faults | **measured**, `textures_serializer_records` | resource lists |
 | A legacy heap's synchronize leaves it guest-invalid, so a second 53 copies again | **measured**, `resources_heap_paging` | opcode 53 |
-| A prepared ICB ignores guest writes until invalidated; 63 does nothing; a compute ICB's write-back uses the vertex bind count; write-back errors are dropped | **measured**, `icb_*` (section 6.19) | ICBs in the service |
+| A prepared ICB ignores guest writes until invalidated; 63 does nothing; write-back errors are dropped | **measured**, `icb_*` (section 6.19) | ICBs in the service |
 | 'RGhA' presents below version 22 log and present anyway | **measured**, `display_mapper_formats_v21` | opcode 8 |
 | Restore sets the colour-matrix force-read byte (+0xa71) | **measured**, `suspend_roundtrip` | resume |
 | Resuming in place loses the root FIFO | **measured**, `suspend_in_place` | `rvg_device_will_resume`/`rvg_device_did_resume` on the same device |

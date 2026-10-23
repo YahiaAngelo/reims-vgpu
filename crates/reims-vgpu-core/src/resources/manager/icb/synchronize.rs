@@ -356,12 +356,12 @@ pub(super) fn synchronize_compute<P: Platform, M: IcbWalkOps<P>>(
         }
         if !flags.inherit_buffers() {
             let mut strides = None;
-            // Sized by the vertex bind count.
+            // One word a kernel bind, as the prepare reads them.
             if flags.support_dynamic_attribute_stride() {
                 strides = Some(write_or_fail!(
                     command.writable_sub_cursor_at(
                         u64::from(layout.attribute_stride_offset),
-                        flags.max_vertex_buffer_bind_count.wrapping_mul(WORD_SIZE),
+                        flags.max_kernel_buffer_bind_count.wrapping_mul(WORD_SIZE),
                     ),
                     "attribute strides not writable"
                 ));
@@ -718,33 +718,37 @@ mod tests {
             assert_eq!((x.imageblock_width, x.imageblock_height), (16, 32));
         }
 
+        /// The strides cursor holds a word for each kernel bind, whatever the vertex bind count.
         #[test]
-        fn strides_are_sized_by_the_vertex_count() {
-            // One vertex slot for two kernel binds; the second stride write fails and stops the
-            // loop, its bind already written.
-            let mut o = FakeOps::new();
-            let _b5 = o.resident_buffer(5, 0x100);
-            let _b6 = o.resident_buffer(6, 0x100);
-            let icb = o.icb(1);
-            let mut c = Cmds::new(1);
-            compute_command(&mut c, 0, CONCURRENT_DISPATCH);
-            let mut f = compute_flags(0b111);
-            f.bits = 0b100;
-            prepare_compute(Hold::NONE, &o, &icb, &layout(), &f, c.cursor())
-                .unwrap()
-                .unwrap();
-            f.max_vertex_buffer_bind_count = 1;
-            let (mem, w) = writable(CMD as u64);
-            synchronize_compute(Hold::NONE, &o, &icb, &layout(), &f, w)
-                .unwrap()
-                .unwrap();
-            assert_eq!(read_back::<u64>(&mem, 0x58), 0x30);
-            assert_eq!(read_back::<u64>(&mem, 0x60), 0);
-            assert_eq!(
-                { read_back::<IndirectCommandBufferBind>(&mem, 0x114).buffer_reference },
-                6
-            );
-            assert_eq!(o.log().count("getKernelAttributeStrideAtIndex:"), 2);
+        fn strides_are_sized_by_the_kernel_count() {
+            for vertex in [0, 1, 31] {
+                let mut o = FakeOps::new();
+                let _b5 = o.resident_buffer(5, 0x100);
+                let _b6 = o.resident_buffer(6, 0x100);
+                let icb = o.icb(1);
+                let mut c = Cmds::new(1);
+                compute_command(&mut c, 0, CONCURRENT_DISPATCH);
+                let mut f = compute_flags(0b100);
+                f.max_vertex_buffer_bind_count = vertex;
+                prepare_compute(Hold::NONE, &o, &icb, &layout(), &f, c.cursor())
+                    .unwrap()
+                    .unwrap();
+                let (mem, w) = writable(CMD as u64);
+                synchronize_compute(Hold::NONE, &o, &icb, &layout(), &f, w)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read_back::<u64>(&mem, 0x58), 0x30, "{vertex}");
+                assert_eq!(read_back::<u64>(&mem, 0x60), 0x40, "{vertex}");
+                // The word after the strides is not theirs.
+                assert_eq!(read_back::<u64>(&mem, 0x68), 0, "{vertex}");
+                assert_eq!(
+                    { read_back::<IndirectCommandBufferBind>(&mem, 0x114).buffer_reference },
+                    6
+                );
+                assert_eq!(o.log().count("getKernelAttributeStrideAtIndex:"), 2);
+                // The lengths and arguments after them are written.
+                assert_eq!(read_back::<u64>(&mem, 0x148), 0x200, "{vertex}");
+            }
         }
 
         /// Lengths that run past the command end the walk before any length is asked for or

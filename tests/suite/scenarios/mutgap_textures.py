@@ -622,10 +622,10 @@ def mutgap_tex_icb_sync_more():
     strides nor inherited buffers, whose vertex bind prepare set without a
     stride and which is written back with no strides cursor; a dynamic-stride
     compute ICB of two kernel binds with strides 4 and 8: the stride cursor
-    is sized by the descriptor's vertex bind count, so with 2 both binds and
-    both strides, as prepare set them with their binds, are written back, and
-    with none the first stride's write fails and only bind 0 is written, the
-    error dropped. GPU addresses are the host's: keyed by the host. Isolate
+    is sized by the kernel bind count, so whether the descriptor's vertex bind
+    count is 2 or none, both binds and both strides, as prepare set them with
+    their binds, are written back. GPU addresses are the host's: keyed by the
+    host. Isolate
     only: in-process the write-back aborts (icb_sync_in_process)."""
     from scenarios.icb import ICBTask, sync_refs
     s = Scenario("mutgap_tex_icb_sync_more", setups=("isolate",), host=True, doc=mutgap_tex_icb_sync_more.__doc__)
@@ -641,8 +641,8 @@ def mutgap_tex_icb_sync_more():
     from pgtest.exec_objects import ICB_DISPATCH_THREADS, icb_descriptor, icb_record
     from pgtest.icb_cmds import CMD, layout
     two_va = w.t.reserve(PAGE)
-    # A compute ICB whose descriptor also says 2 vertex binds: the
-    # write-back sizes its stride cursor by that count.
+    # A compute ICB whose descriptor also says 2 vertex binds, which the
+    # write-back's stride cursor does not use.
     two = w.icb([compute_cmd(pso=w.cpso, binds=[(O, 0, 0x30), (w.tb, 0, 0x40)], strides=[4, 8], grid=(4, 1, 1),
                              tg=(4, 1, 1))], va=two_va,
                 record=icb_record(CMD, two_va // PAGE, icb_descriptor(ICB_DISPATCH_THREADS, vbufs=2, kbufs=2,

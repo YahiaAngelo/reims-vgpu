@@ -716,9 +716,9 @@ def icb_sync_errors():
     "Failed to get attribute strides / kernel, vertex or fragment buffers
     cursor"): the error is dropped (synchronizeWithCPU ignores it) and the
     guest copy is marked valid. A compute ICB with dynamic strides sizes its
-    write-back stride cursor by the vertex bind count, where prepare uses the
-    kernel one: 31 vertex binds prepare and execute, and fail the write-back
-    after the binds. Keyed by the host (GPU addresses)."""
+    write-back stride cursor by the kernel bind count, as prepare does: one
+    with 31 vertex binds prepares, executes and is written back whole. Keyed
+    by the host (GPU addresses)."""
     s = Scenario("icb_sync_errors", setups=("isolate",), host=True, doc=icb_sync_errors.__doc__)
     s.bring_up()
     w = ICBTask(s)

@@ -28,8 +28,10 @@
 //!   text read from the draw record, or dies
 //!   (`prepare::tests::render::a_long_string_with_a_size_dies`).
 //! - **Synchronize** writes the type, the pipeline's reference, the binds, the lengths, the
-//!   barrier and the arguments; only a failed cursor, type or pipeline write ends the walk; every
-//!   length lands at one offset; a compute ICB's strides are sized by the vertex count; an empty
+//!   barrier and the arguments; only a failed cursor, type or pipeline write ends the walk; a
+//!   compute command's strides and lengths take one word each, where prepare reads them
+//!   (`synchronize::tests::compute::strides_are_sized_by_the_kernel_count`,
+//!   `synchronize::tests::compute::a_prepared_dispatch_round_trips_every_length`); an empty
 //!   compute slot writes only its type
 //!   (`synchronize::tests::compute::an_empty_slot_writes_only_its_type`).
 //! - **Metal's argument objects** are read whole, each getter once, in order, before the binds
