@@ -307,11 +307,13 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
             } => {
                 let primitive = MTLPrimitiveType(primitive_type.to_usize());
                 let (start, count) = (vertex_start.to_usize(), vertex_count.to_usize());
-                msg::send(
+                let drawn = msg::send(
                     "drawPrimitives:vertexStart:vertexCount:",
                     Policy::On(on),
                     || unsafe { e.drawPrimitives_vertexStart_vertexCount(primitive, start, count) },
-                )
+                );
+                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                drawn
             }
             RenderCmd::DrawPrimitivesInstances {
                 primitive_type,
@@ -322,7 +324,7 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                 let primitive = MTLPrimitiveType(primitive_type.to_usize());
                 let (start, count) = (vertex_start.to_usize(), vertex_count.to_usize());
                 let instances = instance_count.to_usize();
-                msg::send(
+                let drawn = msg::send(
                     "drawPrimitives:vertexStart:vertexCount:instanceCount:",
                     Policy::Caught,
                     || unsafe {
@@ -330,7 +332,9 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                             primitive, start, count, instances,
                         )
                     },
-                )
+                );
+                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                drawn
             }
             RenderCmd::DrawPrimitivesBase {
                 primitive_type,
@@ -342,7 +346,7 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                 let primitive = MTLPrimitiveType(primitive_type.to_usize());
                 let (start, count) = (vertex_start.to_usize(), vertex_count.to_usize());
                 let (instances, base) = (instance_count.to_usize(), base_instance.to_usize());
-                msg::send(
+                let drawn = msg::send(
                     "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
                     Policy::Caught,
                     || unsafe {
@@ -350,10 +354,12 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                             primitive, start, count, instances, base,
                         )
                     },
-                )
+                );
+                crate::gpu::rate_map::drew(e, primitive, &drawn);
+                drawn
             }
-            // A pass over a map that is not immutable draws no vertices first
-            // ([`crate::gpu::rate_map`]).
+            // A pass over a map that is not immutable, in which the guest drew no triangles, draws
+            // no vertices first ([`crate::gpu::rate_map`]).
             RenderCmd::EndEncoding => {
                 crate::gpu::rate_map::end_pass(on, e)?;
                 msg::send("endEncoding", Policy::On(on), || e.endEncoding())

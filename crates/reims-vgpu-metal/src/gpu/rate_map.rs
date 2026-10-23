@@ -4,9 +4,9 @@
 //! Every method is one call through the message layer: a getter's or a descriptor property's raise ends
 //! the process at the call; a raise inside a method with arguments is the caller's to catch.
 //!
-//! A render pass over a map that is not immutable ends with a draw the guest did not encode
-//! ([`mark_pass`], [`end_pass`]), which keeps the host's GPU from hanging. Measured on the M3 Max,
-//! macOS 27.0.1 (26A434), one case a process:
+//! A render pass over a map that is not immutable, which the guest ends having drawn no triangles,
+//! ends with a draw the guest did not encode ([`mark_pass`], [`drew`], [`end_pass`]), which keeps
+//! the host's GPU from hanging. Measured on the M3 Max, macOS 27.0.1 (26A434), one case a process:
 //! - A pass over a mutable map that clears an attachment and draws nothing hangs the GPU: its
 //!   command buffer ends about 29 ms in with `MTLCommandBufferErrorDomain` 2, "Caused GPU Hang
 //!   Error (00000003:kIOGPUCommandBufferCallbackErrorHang)". The map may be made with no layers or
@@ -38,13 +38,46 @@
 //! encodes: a guest draw with no pipeline set dies at the draw, as it does without it, and
 //! `setRenderPipelineState:` of nil dies (both measured). The visibility mode stays the guest's:
 //! `setVisibilityResultMode:offset:` of `Disabled` at offset 0 writes 8 zero bytes at offset 0
-//! (measured). The draw comes whether or not the pass drew, since that is not known until it ends.
-//! A map does not say whether it is mutable through Metal's API; its `mutability` (SPI) answers 1 for
-//! a mutable map and 2 for an immutable one, and every map whose answer is not 2 gets the draw.
+//! (measured). A map does not say whether it is mutable through Metal's API; its `mutability` (SPI)
+//! answers 1 for a mutable map and 2 for an immutable one, and every map whose answer is not 2 is
+//! marked.
+//!
+//! **Only a pass that drew nothing gets the draw**, since making its pipeline moves identifiers the
+//! guest reads. Measured on the same host, one process a case, 3 runs each, every run alike:
+//! - Metal keeps a record for each pipeline that supports indirect command buffers in one region of
+//!   GPU memory, and such a pipeline's `uniqueIdentifier`, which opcode 460 hands the guest, is its
+//!   record's address there (`0x1000000440` for the first in a process). A render pipeline whose
+//!   vertex function's variant is new takes 0x80 bytes of that region too, and a mesh pipeline
+//!   0x2c0, so each moves the records made after it: made between two pairs of ICB-capable render
+//!   and compute pipelines, the no-draw pipeline moves the second pair's identifiers by 0x80,
+//!   whether its function is in a library of its own or a shared one, and whatever its
+//!   amplification count. How far depends on what the region holds and has freed: 0x200 in
+//!   `only_a_drawless_pass_moves_later_pipelines_identifiers` (6 runs alike).
+//! - What takes nothing there: a library or a function, a compute pipeline that does not support
+//!   ICBs, and a render pipeline whose vertex variant is already made (a new fragment function or
+//!   attachment format over the same vertex function). No pipeline moves `gpuResourceID` or
+//!   `resourceIndex` (a counter of ICB-capable pipelines alone), nor the identifiers and addresses
+//!   of later ICBs, textures and buffers. A pipeline made and released before the next ones moves
+//!   nothing: its block is freed with it.
+//! - No pipeline the draw could bind is known to take nothing. With rasterization off, Metal
+//!   requires a vertex function that returns nothing (`AGXMetalG15X_M1` error 3,
+//!   "RasterizationEnabled is false but the vertex shader's return type is not void"), whose
+//!   variant only the draw's own pipeline makes; one that rasterizes names attachment formats
+//!   every pass would have to match.
+//!
+//! So the platform's draw comes only where the pass would hang without it: [`mark_pass`] marks
+//! the encoder, a `drawPrimitives` of triangles or a triangle strip the guest encodes on it,
+//! which Metal takes, removes the mark ([`drew`]), and [`end_pass`] makes the no-draw pipeline,
+//! once per device, for a pass still marked. From the first such pass on, the ICB-capable
+//! pipelines made later have identifiers other than Metal's own; a run whose passes over mutable
+//! maps all draw sees Metal's identifiers. A pass of the guest's that draws over a mutable map
+//! completes with no draw of the platform's (measured, the same test). Other draws keep the mark
+//! (indexed, indirect and mesh draws, patches, ICB executions, and points and lines): nothing
+//! measured shows that they keep the pass from hanging.
 
+use std::cell::Cell;
 use std::ptr;
 
-use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
@@ -260,12 +293,39 @@ const NO_DRAW_SOURCE: &str = "vertex void reims_vgpu_no_draw() {}";
 /// of the process.
 static NO_DRAW: Mutex<Vec<(u64, MetalRenderPipeline)>> = Mutex::new(Vec::new());
 
-/// The key of the association [`mark_pass`] makes: its address.
+/// The key of the association [`mark_pass`] makes, and its value: its address. The association
+/// assigns, so nothing is retained.
 static MARK: u8 = 0;
 
+thread_local! {
+    /// The encoder [`mark_pass`] last marked on this thread, by address, until a draw of the
+    /// guest's or [`end_pass`] takes the mark (0 for none): a draw reads this, not the association.
+    /// A pass carried to another thread, or marked before another on this one, keeps its mark
+    /// through its draws and gets the platform's draw whether or not the guest drew.
+    static MARKED_HERE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Sets `encoder`'s mark (`marked`) or takes it.
+fn set_mark(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, marked: bool) {
+    let value = if marked {
+        (&raw const MARK).cast_mut().cast()
+    } else {
+        ptr::null_mut()
+    };
+    // SAFETY: a live encoder and a static key; the association assigns, so the value, the key's
+    // own address or nil, is never retained or released.
+    unsafe {
+        objc2::ffi::objc_setAssociatedObject(
+            ptr::from_ref(encoder).cast_mut().cast(),
+            (&raw const MARK).cast(),
+            value,
+            objc2::ffi::OBJC_ASSOCIATION_ASSIGN,
+        );
+    }
+}
+
 /// When the pass `descriptor` describes is over a map that is not immutable, marks `encoder`, its
-/// encoder, for [`end_pass`]: associates the device's no-draw pipeline with it, which the encoder
-/// keeps until it goes or [`end_pass`] takes it.
+/// encoder, for [`end_pass`].
 pub(crate) fn mark_pass(encoder: &MetalRenderEncoder, descriptor: &MTLRenderPassDescriptor) {
     let Some(map) = msg::get("rasterizationRateMap", || descriptor.rasterizationRateMap()) else {
         return;
@@ -276,50 +336,55 @@ pub(crate) fn mark_pass(encoder: &MetalRenderEncoder, descriptor: &MTLRenderPass
         return;
     }
     let e = encoder.get();
-    let pipeline = no_draw_pipeline(&msg::get("device", || e.device()));
-    // SAFETY: a live encoder, a static key, and a pipeline (an Objective-C object) the association
-    // retains.
-    unsafe {
-        objc2::ffi::objc_setAssociatedObject(
-            ptr::from_ref(e).cast_mut().cast(),
-            (&raw const MARK).cast(),
-            Retained::as_ptr(pipeline.as_retained()).cast_mut().cast(),
-            objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
-        );
-    }
+    set_mark(e, true);
+    MARKED_HERE.set(ptr::from_ref(e).addr());
 }
 
-/// Before `encoder`'s `endEncoding`: when [`mark_pass`] marked it, takes the mark, so a second
-/// `endEncoding` draws nothing more, then binds its pipeline and draws no vertices. A raise at either
-/// send is as `on` says.
+/// After a guest's draw of `primitive` on `encoder`, answered `drawn`: a draw of triangles or a
+/// triangle strip that Metal took takes the encoder's mark when [`mark_pass`] set it on this
+/// thread, as the pass no longer needs the platform's draw.
+pub(crate) fn drew(
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    primitive: MTLPrimitiveType,
+    drawn: &RaiseResult<()>,
+) {
+    let at = ptr::from_ref(encoder).addr();
+    if MARKED_HERE.get() != at
+        || drawn.is_err()
+        || !matches!(
+            primitive,
+            MTLPrimitiveType::Triangle | MTLPrimitiveType::TriangleStrip
+        )
+    {
+        return;
+    }
+    MARKED_HERE.set(0);
+    set_mark(encoder, false);
+}
+
+/// Before `encoder`'s `endEncoding`: when the encoder is still marked, takes the mark, so a second
+/// `endEncoding` draws nothing more, then binds the device's no-draw pipeline, made on its first
+/// use, and draws no vertices. A raise at either send is as `on` says.
 pub(crate) fn end_pass(
     on: OnFault,
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
 ) -> RaiseResult<()> {
     let object = ptr::from_ref(encoder).cast::<AnyObject>();
-    // SAFETY: a live encoder and the static key; the value is nil or the pipeline `mark_pass`
-    // associated, retained here before the association lets it go.
-    let pipeline = unsafe {
-        let p = objc2::ffi::objc_getAssociatedObject(object, (&raw const MARK).cast());
-        Retained::retain(
-            p.cast_mut()
-                .cast::<ProtocolObject<dyn MTLRenderPipelineState>>(),
-        )
+    // SAFETY: a live encoder and the static key; the value is nil or the key's address.
+    let marked = unsafe {
+        !objc2::ffi::objc_getAssociatedObject(object, (&raw const MARK).cast()).is_null()
     };
-    let Some(pipeline) = pipeline else {
+    if !marked {
         return Ok(());
-    };
-    // SAFETY: as above; nil ends the association.
-    unsafe {
-        objc2::ffi::objc_setAssociatedObject(
-            object.cast_mut(),
-            (&raw const MARK).cast(),
-            ptr::null_mut(),
-            objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
-        );
     }
+    set_mark(encoder, false);
+    if MARKED_HERE.get() == object.addr() {
+        MARKED_HERE.set(0);
+    }
+    let pipeline = no_draw_pipeline(&msg::get("device", || encoder.device()));
+    let pipeline = pipeline.get();
     msg::send("setRenderPipelineState:", Policy::On(on), || {
-        encoder.setRenderPipelineState(&pipeline)
+        encoder.setRenderPipelineState(pipeline)
     })?;
     // SAFETY: a draw of no vertices.
     msg::send(
@@ -415,6 +480,7 @@ fn made_or_die<T: objc2::Message>(
 #[cfg(test)]
 mod tests {
 
+    use objc2::rc::Retained;
     use objc2_metal::MTLRasterizationRateMapDescriptor;
     use reims_vgpu_core::platform::Handle as _;
     use reims_vgpu_core::platform::rate_map::*;
@@ -600,6 +666,19 @@ mod tests {
         target: Target,
         pipeline: Option<&MetalRenderPipeline>,
     ) -> (Option<NsErrorText>, Vec<u8>) {
+        pass_over(k, map, target, pipeline, false)
+    }
+
+    /// [`clear_over`], whose pass, when `draws`, draws through the platform after setting the
+    /// pipeline: a triangle of the kit's vertex function, whose three vertices are one point, so
+    /// it covers no texel.
+    fn pass_over(
+        k: &Kit,
+        map: &MetalRateMap,
+        target: Target,
+        pipeline: Option<&MetalRenderPipeline>,
+        draws: bool,
+    ) -> (Option<NsErrorText>, Vec<u8>) {
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
 
@@ -638,6 +717,14 @@ mod tests {
                 pipeline_state: Some(p),
             };
             e.encode(OnFault::Return, set).unwrap();
+            if draws {
+                let draw = RenderCmd::DrawPrimitives {
+                    primitive_type: MTLPrimitiveType::Triangle.0.to_u64(),
+                    vertex_start: 0,
+                    vertex_count: 3,
+                };
+                e.encode(OnFault::Return, draw).unwrap();
+            }
         }
         e.encode(OnFault::Return, RenderCmd::EndEncoding).unwrap();
         let c = cb.get();
@@ -762,6 +849,124 @@ mod tests {
     #[test]
     fn a_multisampled_clear_over_a_mutable_map_completes() {
         completes(0, None, Target::Multisample, false);
+    }
+
+    /// A draw of triangles or a triangle strip that Metal took, on the encoder marked on this
+    /// thread, takes its mark; one of points or lines, or one Metal refused, keeps it, as does a
+    /// draw on another encoder than the one marked last here
+    #[test]
+    fn a_triangle_draw_the_guest_encodes_takes_the_mark() {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+
+        let k = kit();
+        let map = side_map(&k, 1, true);
+        let texture = side_texture(&k, MTLPixelFormat::BGRA8Unorm, 1, MTLStorageMode::Shared);
+        let pass = MTLRenderPassDescriptor::new();
+        // SAFETY: index 0 of the colour attachments.
+        let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        a.setTexture(Some(&texture));
+        a.setLoadAction(MTLLoadAction::Load);
+        a.setStoreAction(MTLStoreAction::Store);
+        pass.setRasterizationRateMap(Some(map.get()));
+        let pass: crate::gpu::desc::MetalRenderPassDescriptor = Obj::from_retained(pass);
+        // Each encoder is ended without its command buffer committed: nothing runs on the GPU.
+        let cb = k.queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let marked = |e: &MetalRenderEncoder| {
+            let object = ptr::from_ref(e.get()).cast::<AnyObject>();
+            // SAFETY: a live encoder and the static key.
+            unsafe {
+                !objc2::ffi::objc_getAssociatedObject(object, (&raw const MARK).cast()).is_null()
+            }
+        };
+        let refused = || {
+            Err(reims_vgpu_core::testkit::capture::raise(
+                OnFault::Return,
+                "draw",
+                "refused",
+            ))
+        };
+        let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        assert!(marked(&e));
+        for primitive in [
+            MTLPrimitiveType::Point,
+            MTLPrimitiveType::Line,
+            MTLPrimitiveType::LineStrip,
+        ] {
+            drew(e.get(), primitive, &Ok(()));
+        }
+        drew(e.get(), MTLPrimitiveType::Triangle, &refused());
+        assert!(marked(&e), "kept");
+        drew(e.get(), MTLPrimitiveType::TriangleStrip, &Ok(()));
+        assert!(!marked(&e), "taken by a strip");
+        e.get().endEncoding();
+        // Through the platform's encode, with a pipeline set.
+        let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        let set = RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&k.render_pipeline),
+        };
+        e.encode(OnFault::Return, set).unwrap();
+        let draw = RenderCmd::DrawPrimitives {
+            primitive_type: MTLPrimitiveType::Triangle.0.to_u64(),
+            vertex_start: 0,
+            vertex_count: 0,
+        };
+        e.encode(OnFault::Return, draw).unwrap();
+        assert!(!marked(&e), "taken by a draw of triangles");
+        e.get().endEncoding();
+        // A second marked encoder on this thread: a draw on the first keeps the first's mark.
+        let first = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        first.get().endEncoding();
+        let second = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        drew(first.get(), MTLPrimitiveType::Triangle, &Ok(()));
+        assert!(marked(&first) && marked(&second));
+        drew(second.get(), MTLPrimitiveType::Triangle, &Ok(()));
+        assert!(marked(&first) && !marked(&second));
+        second.get().endEncoding();
+    }
+
+    /// An ICB-capable pipeline made after a pass over a mutable map in which the guest drew has
+    /// the identifier Metal gives with no such pass: the pass makes no pipeline. A pass that draws
+    /// nothing makes the no-draw pipeline, which moves that identifier, by 0x200 in this sequence
+    /// (measured on the M3 Max, macOS 27.0.1, 6 runs alike)
+    #[test]
+    fn only_a_drawless_pass_moves_later_pipelines_identifiers() {
+        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+
+        use crate::gpu::resource::testkit::render_pipeline;
+
+        let k = kit();
+        let mutable = side_map(&k, 1, true);
+        let immutable = side_map(&k, 1, false);
+        // Whatever Metal makes for a pass of this shape the first time, made first.
+        let (error, _) = pass_over(
+            &k,
+            &immutable,
+            Target::Color,
+            Some(&k.render_pipeline),
+            true,
+        );
+        assert_eq!(error, None);
+        // The kit's pipeline made again and released: its record goes with it.
+        let identifier = || render_pipeline(&k.device).unique_identifier();
+        let metals = identifier();
+        assert_eq!(
+            identifier(),
+            metals,
+            "a released pipeline's record is freed"
+        );
+        let (error, stored) =
+            pass_over(&k, &mutable, Target::Color, Some(&k.render_pipeline), true);
+        assert_eq!(error, None, "the pass over the mutable map that drew");
+        assert!(
+            stored.chunks(4).all(|t| t == [0xbf, 0x80, 0x40, 0xff]),
+            "{:02x?}",
+            &stored[..8]
+        );
+        assert_eq!(identifier(), metals, "a pass that drew makes nothing");
+        let (error, _) = clear_over(&k, &mutable, Target::Color, None);
+        assert_eq!(error, None, "the drawless pass");
+        assert_eq!(identifier(), metals + 0x200, "the no-draw pipeline's block");
     }
 
     /// A pass over a mutable map is marked, its end draws once, and a second end draws no more; a
