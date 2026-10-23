@@ -404,6 +404,28 @@ pub fn now_stamp(fmt: &str) -> String {
     }
 }
 
+/// Readies the VM's directory for a run of QEMU: its logs rotated, and the QMP socket's
+/// directory made. Returns the socket.
+///
+/// The pid file and the socket an earlier run left stay where they are. QEMU locks its pid file
+/// before it opens anything else, so a second QEMU of a VM that already runs, from a start
+/// racing this one, ends there, before it opens the VM's disks or replaces the first one's
+/// socket; and QEMU replaces a stale socket itself. Deleted here, the second QEMU would lock a
+/// new file and run on the disks the first one writes, which on macOS, where QEMU locks no
+/// image, nothing else stops.
+fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(vm.logs_dir())?;
+    rotate(&vm.qemu_log());
+    if vm.config.logs.enabled {
+        rotate(&vm.serial_log());
+    }
+    let sock = vm.qmp_socket();
+    if let Some(d) = sock.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    Ok(sock)
+}
+
 /// Starts the VM, and returns QEMU's pid once QMP answers.
 pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     if let Some(p) = pid(vm) {
@@ -415,19 +437,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     }
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
-
-    let logs = vm.logs_dir();
-    std::fs::create_dir_all(&logs)?;
-    rotate(&vm.qemu_log());
-    if vm.config.logs.enabled {
-        rotate(&vm.serial_log());
-    }
-    let sock = vm.qmp_socket();
-    if let Some(d) = sock.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(vm.pidfile());
+    let sock = prepare_run(vm)?;
 
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -626,6 +636,39 @@ mod tests {
             "/usr/share/vulkan/icd.d/nvidia_icd.json",
             "NVIDIA GeForce RTX 3090"
         )));
+    }
+
+    /// A start leaves the pid file and the QMP socket where they are, a running QEMU's among
+    /// them: QEMU's lock on its pid file is what ends a second QEMU of the VM, from a start
+    /// racing this one, before it opens the disks the first one writes.
+    #[test]
+    fn a_start_leaves_the_pid_file_and_socket_to_qemu() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        let vm = Vm {
+            dir: d.clone(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let sock = vm.qmp_socket();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        std::fs::write(&sock, "").unwrap();
+        std::fs::write(vm.pidfile(), "1234\n").unwrap();
+        assert_eq!(prepare_run(&vm).unwrap(), sock);
+        assert_eq!(std::fs::read_to_string(vm.pidfile()).unwrap(), "1234\n");
+        assert!(sock.exists());
+        assert!(vm.logs_dir().is_dir());
+        let _ = std::fs::remove_file(&sock);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
