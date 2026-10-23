@@ -255,7 +255,9 @@ fn ask(
     Some(named != Some(false))
 }
 
-/// Whether `draw` is of points, of some vertices or indices and instances.
+/// Whether `draw` is of points, of some vertices or indices and instances: the draw as the record
+/// runs it ([`rt::EncodedRenderCommand::draw`], of the type set), not as the arguments getters
+/// answer it, which read quads and a quad strip as points ([`rt::IndirectRenderCommand::draw`]).
 fn points_drawn(draw: Option<rt::IndirectDraw>) -> bool {
     match draw {
         Some(rt::IndirectDraw::Primitives {

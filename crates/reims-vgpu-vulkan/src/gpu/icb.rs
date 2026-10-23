@@ -59,7 +59,8 @@
 //!   executions draw each as an encoder's draw of the type draws ([`rt::DrawPrimitiveType`];
 //!   compared with Metal's pixel for pixel, inheriting the encoder's state or not,
 //!   `private_types_draw_over_indices_and_arguments_as_metals`); the arguments getters answer
-//!   the type set, but 0 for quads and a quad strip, as Metal's do ([`answered_type`]). A draw of
+//!   the runtime's, the type set but 0 for quads and a quad strip, as Metal's do
+//!   ([`rt::IndirectRenderCommand::draw`]), and `getCommandType` the runtime's too. A draw of
 //!   type 9, at which Metal's GPU fails the command buffer that runs it, dies at its setter, as
 //!   does a type past it ([`primitive`]). A kernel's draw of a type past Metal's five writes
 //!   points, as Metal's encoding does (the runtime's).
@@ -1039,6 +1040,16 @@ impl CommandObject<rt::IndirectRenderCommand> {
             _ => unrepresentable(sel, "a render command the runtime reads as none"),
         }
     }
+
+    /// The command's draw as an arguments getter `sel` answers it: the runtime's, whose primitive
+    /// type is the one set but 0 for quads and a quad strip (7 and 8), as Metal's getters answer
+    /// of a command set with either, direct or over indices, though its execution draws the type
+    /// set (measured: `render_commands_read_back_as_on_metal`,
+    /// `private_types_draw_over_indices_and_arguments_as_metals`).
+    fn draw(&self, sel: &'static str) -> Option<rt::IndirectDraw> {
+        self.icb.intact(sel, self.index);
+        get(sel, || self.raw.draw())
+    }
 }
 
 impl CommandObject<rt::IndirectComputeCommand> {
@@ -1081,19 +1092,6 @@ fn primitive(sel: &'static str, raw: u64) -> rt::DrawPrimitiveType {
         5..=8 => rt::DrawPrimitiveType::from_raw(raw).unwrap_or_else(|e| refused(sel, &e)),
         9 => unrepresentable(sel, TYPE_9),
         _ => rt::DrawPrimitiveType::Public(metal_value(sel, "primitive type", raw)),
-    }
-}
-
-/// The primitive type Metal's arguments getters answer of a command's draw of `t`: its raw value,
-/// but 0 for quads and a quad strip (7 and 8), which Metal's getters answer of a command set
-/// with either, direct or over indices, though its execution draws the type set (measured:
-/// `render_commands_read_back_as_on_metal`,
-/// `private_types_draw_over_indices_and_arguments_as_metals`), where the runtime's record answers
-/// the type set.
-fn answered_type(t: rt::DrawPrimitiveType) -> u64 {
-    match t {
-        rt::DrawPrimitiveType::Quads | rt::DrawPrimitiveType::QuadStrip => 0,
-        t => t.raw(),
     }
 }
 
@@ -1281,20 +1279,11 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
         }
     }
 
-    /// The record's draw kind, as `MTLIndirectCommandType`; 0 for none.
+    /// The record's draw kind, as `MTLIndirectCommandType`; 0 for none: the runtime's.
     fn command_type(&self) -> u64 {
         let sel = "getCommandType";
-        let kind = match self.record(sel).draw {
-            None => IndirectCommandType::empty(),
-            Some(rt::IndirectDraw::Primitives { .. }) => IndirectCommandType::DRAW,
-            Some(rt::IndirectDraw::IndexedPrimitives { .. }) => IndirectCommandType::DRAW_INDEXED,
-            Some(rt::IndirectDraw::Patches { .. }) => IndirectCommandType::DRAW_PATCHES,
-            Some(rt::IndirectDraw::IndexedPatches { .. }) => {
-                IndirectCommandType::DRAW_INDEXED_PATCHES
-            }
-            Some(_) => unrepresentable(sel, "a draw of a kind Metal has no type for"),
-        };
-        u64::from(kind.as_raw())
+        self.icb.intact(sel, self.index);
+        u64::from(get(sel, || self.raw.command_type()).as_raw())
     }
 
     fn fragment_buffer_address(&self, index: u64) -> RaiseResult<u64> {
@@ -1328,7 +1317,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
     fn draw_args(&self) -> Option<DrawArgs> {
         let sel = "drawArguments";
-        match self.record(sel).draw {
+        match self.draw(sel) {
             Some(rt::IndirectDraw::Primitives {
                 primitive_type,
                 vertex_start,
@@ -1336,7 +1325,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
                 instance_count,
                 base_instance,
             }) => Some(DrawArgs {
-                primitive_type: answered_type(primitive_type),
+                primitive_type: primitive_type.raw(),
                 vertex_start,
                 vertex_count,
                 instance_count,
@@ -1350,7 +1339,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     /// 4294967294).
     fn draw_indexed_args(&self) -> Option<DrawIndexedArgs> {
         let sel = "drawIndexedArguments";
-        match self.record(sel).draw {
+        match self.draw(sel) {
             Some(rt::IndirectDraw::IndexedPrimitives {
                 primitive_type,
                 index_count,
@@ -1361,7 +1350,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
                 base_instance,
             }) => Some(DrawIndexedArgs {
                 index_buffer_gpu_virtual_address: index_buffer.0,
-                primitive_type: answered_type(primitive_type),
+                primitive_type: primitive_type.raw(),
                 index_type: u64::from(index_type.as_raw()),
                 index_count,
                 instance_count,
@@ -1374,7 +1363,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
     fn draw_patches_args(&self) -> Option<DrawPatchesArgs> {
         let sel = "drawPatchesArguments";
-        match self.record(sel).draw {
+        match self.draw(sel) {
             Some(rt::IndirectDraw::Patches {
                 control_points,
                 patch_start,
@@ -1397,7 +1386,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
     fn draw_indexed_patches_args(&self) -> Option<DrawIndexedPatchesArgs> {
         let sel = "drawIndexedPatchesArguments";
-        match self.record(sel).draw {
+        match self.draw(sel) {
             Some(rt::IndirectDraw::IndexedPatches {
                 control_points,
                 patch_start,
@@ -1426,7 +1415,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     /// the scale 1, which every patch draw a command's setter encodes holds.
     fn tessellation_factor_args(&self) -> Option<TessellationFactorArgs> {
         let sel = "getTessellationFactorArguments";
-        match self.record(sel).draw {
+        match self.draw(sel) {
             Some(
                 rt::IndirectDraw::Patches {
                     factor_buffer,
