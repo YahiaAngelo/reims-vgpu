@@ -309,6 +309,14 @@ pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
     );
 }
 
+/// Nothing: the window stays resizable while captured. The hold keeps the pointer on the window's
+/// own surface, and the window's resize edges lie outside it, the compositor's (xdg-decoration's
+/// decorations, libdecor's frame, an X11 window manager's frame window), where the pointer held
+/// over the image cannot go. A window SDL made not resizable would also be held on X11 at its
+/// size from before it was maximized or tiled (`X11_SetWindowMinMax`, read from SDL 3.4.18's
+/// code).
+pub(crate) fn hold_size(_shell: &Shell) {}
+
 /// What a change of capture left: whether `captured`, whether the window has the keyboard
 /// (`focused`), whether SDL then holds the keyboard grab (`held`), and the error where SDL refused
 /// it.

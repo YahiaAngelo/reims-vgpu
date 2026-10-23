@@ -39,6 +39,20 @@
 //! it; a pointer warped (`CGWarpMouseCursorPosition`) or moved by events posted at the HID event
 //! tap lands outside the rectangle, so only a person's own mouse shows the hold (the manual walk,
 //! `scripts/walk_window_macos.sh`).
+//!
+//! **The window's size.** While the input is captured, a windowed window cannot be resized
+//! ([`InputState::window_resizable`]): where the image reaches the window's edges, the pointer
+//! held over it is over the window's resize edges too, where a click meant for the guest would
+//! drag the window smaller. The view drops `Resizable` from the window's style as capture starts,
+//! and puts it back as capture ends and as the window closes
+//! ([`super::shell::resizable_change`]). It leaves the style alone in native full screen and on
+//! the way in or out, which the delegate tells it, and sets it again once the window has left; a
+//! borderless window's style has no `Resizable`. Measured on the M3 Max, macOS 27.0.1 (26A434),
+//! on a titled window not on screen: dropping `Resizable` and putting it back keeps the frame,
+//! the content's rectangle and the view's bounds, the first responder, the frame view, the
+//! minimum size, the collection behaviour and the `mouseConfinementRect`, and sends no
+//! `windowDidResize:` (which would end the following of the guest's mode) and no
+//! `viewDidMoveToWindow`.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -51,7 +65,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSEvent, NSEventType, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
-    NSWindowOcclusionState,
+    NSWindowOcclusionState, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
@@ -81,6 +95,9 @@ pub(crate) struct ViewIvars {
     cursors: RefCell<CursorCache>,
     /// The last layout.
     layout: Cell<Layout>,
+    /// Whether the window is in native full screen, or on its way in or out: its style is then
+    /// left alone (module doc).
+    full_screen: Cell<bool>,
 }
 
 define_class!(
@@ -335,6 +352,7 @@ impl DisplayView {
             input: RefCell::new(input),
             cursors: RefCell::new(CursorCache::new()),
             layout: Cell::new(Layout::default()),
+            full_screen: Cell::new(false),
         };
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
         // SAFETY: `initWithFrame:` is NSView's designated initializer, taking an NSRect.
@@ -535,15 +553,60 @@ impl DisplayView {
         self.react(reaction)
     }
 
-    /// Acts on the input's reaction: a changed capture refreshes the title, the cursor and the
-    /// pointer's hold. True when the event goes on to `super`.
+    /// Acts on the input's reaction: a changed capture refreshes the title, the cursor, the
+    /// pointer's hold and whether the window may be resized. True when the event goes on to
+    /// `super`.
     fn react(&self, reaction: Reaction) -> bool {
         if reaction.capture_changed {
             self.refresh_title();
             self.invalidate_cursor();
             self.confine_pointer();
+            self.hold_size();
         }
         reaction.pass_on
+    }
+
+    /// Makes a windowed window not resizable while the input is captured, and resizable again
+    /// when not, but in native full screen and on the way in or out (module doc).
+    fn hold_size(&self) {
+        let Ok(input) = self.ivars().input.try_borrow() else {
+            return;
+        };
+        let resizable = input.window_resizable();
+        drop(input);
+        let Some(window) = msg::get("window", || self.window()) else {
+            return;
+        };
+        let mut style = msg::get("styleMask", || window.styleMask());
+        let ivars = self.ivars();
+        let Some(resizable) = super::shell::resizable_change(
+            style,
+            resizable,
+            ivars.borderless,
+            ivars.full_screen.get(),
+        ) else {
+            return;
+        };
+        style.set(NSWindowStyleMask::Resizable, resizable);
+        msg::get("setStyleMask:", || window.setStyleMask(style));
+        log::debug!(
+            "window {:?}: {}",
+            ivars.window.title(),
+            if resizable {
+                "resizable again"
+            } else {
+                "not resizable while captured"
+            }
+        );
+    }
+
+    /// The window is entering native full screen (`entering`), or has left it or failed to
+    /// enter it: its style is left alone until then, and follows the capture again after.
+    pub(crate) fn full_screen_changed(&self, entering: bool) {
+        self.ivars().full_screen.set(entering);
+        if !entering {
+            self.hold_size();
+        }
     }
 
     /// Holds the host's pointer over the image while the input is captured, and frees it when
@@ -643,13 +706,14 @@ impl DisplayView {
             .is_ok_and(|input| input.is_captured())
     }
 
-    /// The window is closing, or about to: every key held goes up, capture ends, and the pointer
-    /// goes free.
+    /// The window is closing, or about to: every key held goes up, capture ends, the pointer
+    /// goes free, and the window is resizable again.
     pub(crate) fn window_closing(&self) {
         if let Ok(mut input) = self.ivars().input.try_borrow_mut() {
             input.window_closing();
         }
         self.confine_pointer();
+        self.hold_size();
     }
 
     /// The person closed the window or chose Quit: the input lets go, and the host is told,

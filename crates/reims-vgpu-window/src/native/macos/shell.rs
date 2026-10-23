@@ -7,7 +7,8 @@
 //! on.
 //!
 //! **Windowed** (the default): titled, closable, miniaturizable and resizable, and able to go
-//! full screen. Its content is the guest's mode, else the first mode the display offers, else
+//! full screen; while its input is captured it is not resizable, and it is again once released
+//! ([`resizable_change`], which the view applies). Its content is the guest's mode, else the first mode the display offers, else
 //! 1920×1080, at one guest point per host point (a HiDPI guest's pixel is a screen pixel, a 1×
 //! guest's a point, which the draw scales on the GPU), shrunk to fit the screen's visible area
 //! less the title bar ([`geometry::initial_content_size`]), centred there. The guest's scale
@@ -42,7 +43,8 @@
 //! releases the input. Any resize the library did not make is the person's sizing, which ends
 //! the following of the guest's mode: tiling, Stage Manager and window managers set the frame
 //! with no other sign. A live resize's start, a zoom and entering full screen mark it before
-//! their first resize. The window's occlusion tells the render thread whether to draw, and its
+//! their first resize. Entering full screen and leaving it, or failing to enter it, tell the view,
+//! which leaves the window's style alone in between. The window's occlusion tells the render thread whether to draw, and its
 //! backing scale and screen lay the view out again.
 
 use std::cell::{Cell, RefCell};
@@ -208,6 +210,19 @@ define_class!(
         fn window_will_enter_full_screen(&self, _notification: &NSNotification) {
             let _env = BlockEnv::foreign();
             self.person_sized("full screen");
+            self.ivars().view.full_screen_changed(true);
+        }
+
+        #[unsafe(method(windowDidExitFullScreen:))]
+        fn window_did_exit_full_screen(&self, _notification: &NSNotification) {
+            let _env = BlockEnv::foreign();
+            self.ivars().view.full_screen_changed(false);
+        }
+
+        #[unsafe(method(windowDidFailToEnterFullScreen:))]
+        fn window_did_fail_to_enter_full_screen(&self, _window: &NSWindow) {
+            let _env = BlockEnv::foreign();
+            self.ivars().view.full_screen_changed(false);
         }
 
         #[unsafe(method(windowDidResignKey:))]
@@ -373,6 +388,23 @@ fn windowed_style() -> NSWindowStyleMask {
 /// A borderless window's style: titled, so that it takes clicks (module doc).
 pub(crate) fn borderless_style() -> NSWindowStyleMask {
     NSWindowStyleMask::Titled | NSWindowStyleMask::FullSizeContentView
+}
+
+/// Whether a window of `style` is to be made resizable, or not, for `resizable`
+/// ([`crate::capture::Capture::window_resizable`]): `Some(resizable)` for a windowed window
+/// whose style says otherwise. A borderless window's style has no `Resizable`, and stays as it
+/// is. So does that of a window in native full screen or on its way in or out (`full_screen`, or
+/// `FullScreen` in its style): SDL's Cocoa code leaves the style alone there too, as a window
+/// made not resizable in its full screen space can be stuck in it (read from SDL 3.4.18's code).
+/// The window asks again once it has left full screen.
+pub(crate) fn resizable_change(
+    style: NSWindowStyleMask,
+    resizable: bool,
+    borderless: bool,
+    full_screen: bool,
+) -> Option<bool> {
+    let windowed = !borderless && !full_screen && !style.contains(NSWindowStyleMask::FullScreen);
+    (windowed && style.contains(NSWindowStyleMask::Resizable) != resizable).then_some(resizable)
 }
 
 /// How far a window that would open exactly over another moves, right and down, in points.
@@ -925,6 +957,32 @@ mod tests {
             NSPoint::new(origin.0, origin.1),
             NSSize::new(size.0, size.1),
         )
+    }
+
+    /// While captured, a windowed window is made not resizable, and resizable again once
+    /// released; a borderless window, and one in native full screen or on its way in or out, keep
+    /// their style
+    #[test]
+    fn a_windowed_window_is_not_resizable_while_captured() {
+        let windowed = windowed_style();
+        let held = windowed.difference(NSWindowStyleMask::Resizable);
+        assert_eq!(resizable_change(windowed, false, false, false), Some(false));
+        assert_eq!(resizable_change(held, true, false, false), Some(true));
+        // Already as asked: nothing changes.
+        assert_eq!(resizable_change(windowed, true, false, false), None);
+        assert_eq!(resizable_change(held, false, false, false), None);
+        // In full screen, or on its way in or out.
+        let full_screen = windowed | NSWindowStyleMask::FullScreen;
+        assert_eq!(resizable_change(full_screen, false, false, false), None);
+        assert_eq!(resizable_change(windowed, false, false, true), None);
+        assert_eq!(resizable_change(held, true, false, true), None);
+        // Borderless, captured or not.
+        for resizable in [false, true] {
+            assert_eq!(
+                resizable_change(borderless_style(), resizable, true, false),
+                None
+            );
+        }
     }
 
     /// A second window on one screen opens below and right of the first, not over it

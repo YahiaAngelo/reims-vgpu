@@ -4,7 +4,11 @@
 //! goes to the guest, ⌘ shortcuts included (and the host's system keys, which the AppKit side
 //! turns off while captured), and the host's pointer is held over the image
 //! ([`Capture::pointer_confinement`]): it cannot leave for the title bar or the host's other
-//! windows, and every click is the guest's. The keyboard is never captured without the pointer,
+//! windows, and every click is the guest's. Nor can the window be resized while captured
+//! ([`Capture::window_resizable`]): where the image reaches the window's edges, the pointer held
+//! over it is over the window's resize edges too, where a click meant for the guest would drag
+//! the window smaller instead, and never larger, the hold keeping the pointer from going
+//! outward. The keyboard is never captured without the pointer,
 //! nor the pointer without the keyboard. Pressing ⌃⌥⌘ together releases both, and so does the
 //! window losing the keyboard. Uncaptured, a key with ⌘ held drives the host's menu and every
 //! other key goes to the guest, and the pointer goes where the person moves it.
@@ -84,6 +88,12 @@ impl Capture {
     /// person moves it.
     pub fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
         (self.captured && image.width > 0.0 && image.height > 0.0).then_some(image)
+    }
+
+    /// Whether the person may resize the window: not while captured (module doc), and as before
+    /// once released.
+    pub fn window_resizable(&self) -> bool {
+        !self.captured
     }
 
     /// Who a key goes to, `command_held` whether ⌘ is down: the guest while captured; the host
@@ -236,6 +246,22 @@ mod tests {
         capture.click_in_image(true);
         capture.resign_key();
         assert_eq!(capture.pointer_confinement(image), None);
+    }
+
+    /// Captured, the window cannot be resized; released, by the chord or by losing the keyboard,
+    /// it can again
+    #[test]
+    fn a_captured_window_cannot_be_resized() {
+        let mut capture = Capture::new();
+        assert!(capture.window_resizable());
+        capture.click_in_image(false);
+        assert!(!capture.window_resizable());
+        capture.release();
+        assert!(capture.window_resizable());
+        capture.click_in_image(true);
+        assert!(!capture.window_resizable());
+        capture.resign_key();
+        assert!(capture.window_resizable());
     }
 
     /// The title says a click captures while not captured, and how to release while captured

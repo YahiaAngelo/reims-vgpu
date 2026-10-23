@@ -33,8 +33,9 @@
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
-//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), and the host's
-//! pointer over the image ([`InputState::pointer_confinement`], which the view applies).
+//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), the host's
+//! pointer over the image ([`InputState::pointer_confinement`], which the view applies), and its
+//! own size ([`InputState::window_resizable`], which the view applies too).
 
 use std::sync::Arc;
 
@@ -663,6 +664,12 @@ impl InputState {
     /// the image while captured ([`Capture::pointer_confinement`]).
     pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
         self.logic.capture.pointer_confinement(image)
+    }
+
+    /// Whether the person may resize the window: not while captured
+    /// ([`Capture::window_resizable`]).
+    pub(crate) fn window_resizable(&self) -> bool {
+        self.logic.capture.window_resizable()
     }
 
     /// What the window's title ends with in the current capture state.

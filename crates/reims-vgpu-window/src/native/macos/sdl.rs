@@ -20,6 +20,8 @@
 //! - **Input**: AppKit's events, given to AppKit's window's input (`super::input`) by the
 //!   application before it dispatches them (`input`), with the system's hot keys held off while
 //!   captured; SDL's own input events are not taken.
+//! - **The size while captured**: as AppKit's window, a windowed window is not resizable while
+//!   captured, and is again once released ([`hold_size`]).
 //! - **The end**: at the display's end the window lets its input go and hides, and SDL's window
 //!   and Metal view go at once: the render thread holds the layer itself, and lets go of it on
 //!   the main thread.
@@ -300,6 +302,35 @@ pub(crate) fn input_event(_shell: &mut Shell, _kind: u32, _event: &SDL_Event) ->
 /// Capture changed: the input holds the system's hot keys off while captured (`super::hotkeys`),
 /// and nothing more is grabbed.
 pub(crate) fn grab_keyboard(_shell: &Shell, _captured: bool) {}
+
+/// Makes a windowed window not resizable while its input is captured, and resizable again when
+/// not, as AppKit's window does (`super::shell::resizable_change`): SDL's resizable flag, which
+/// SDL's Cocoa code makes the window's style. A borderless window keeps its style, which SDL would
+/// replace with its own windowed one. So does one in native full screen, where SDL's Cocoa code
+/// would still set the window's collection behaviour at once, to no full screen while not
+/// resizable (read from SDL 3.4.18's code); the shell asks again as the window leaves it.
+pub(crate) fn hold_size(shell: &Shell) {
+    // SAFETY: SDL's window, on the main thread.
+    let flags = unsafe { SDL_GetWindowFlags(shell.sdl) };
+    let style = msg::get("styleMask", || shell.os.ns_window.styleMask());
+    let Some(resizable) = appkit::resizable_change(
+        style,
+        shell.input.window_resizable(),
+        shell.os.borderless,
+        (flags & SDL_WINDOW_FULLSCREEN).0 != 0,
+    ) else {
+        return;
+    };
+    // SAFETY: as above.
+    if !unsafe { SDL_SetWindowResizable(shell.sdl, resizable) } {
+        let what = if resizable {
+            "the window stays not resizable"
+        } else {
+            "the window stays resizable while captured"
+        };
+        shell::refused(what, shell.window.title());
+    }
+}
 
 /// The display ended: the window hides, and the surface's reference to the layer goes, on the
 /// main thread. SDL's window may go at once.

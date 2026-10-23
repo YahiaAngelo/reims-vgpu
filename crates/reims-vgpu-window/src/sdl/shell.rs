@@ -35,7 +35,9 @@
 //! SDL keeps the rect on Wayland with the compositor's pointer constraints, on X11 with XFixes
 //! pointer barriers, and on macOS with the window's `mouseConfinementRect`, each only while the
 //! window has the keyboard (read from SDL 3.4.18's code). Where SDL has no mouse rect (an X11
-//! build without XFixes), its mouse grab holds the pointer in the whole window.
+//! build without XFixes), its mouse grab holds the pointer in the whole window. The window's OS
+//! decides whether it may be resized while captured ([`os::hold_size`]), asked at each change of
+//! capture and as the window leaves full screen.
 //!
 //! **The end.** At the display's end the window lets its input go and hides; SDL's window is
 //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
@@ -343,6 +345,10 @@ impl Shell {
                 self.follows_guest = false;
                 false
             }
+            k if k == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN.0 => {
+                os::hold_size(self);
+                false
+            }
             k if shows(k).is_some() => {
                 self.shown = settled(self.shown, k);
                 false
@@ -389,10 +395,12 @@ impl Shell {
     }
 
     /// The input was captured or released: the OS grabs the keyboard or lets it go, SDL holds
-    /// the pointer over the image or frees it, and the title and the cursor follow.
+    /// the pointer over the image or frees it, the OS holds the window's size or lets it go, and
+    /// the title and the cursor follow.
     pub(crate) fn capture_changed(&mut self) {
         os::grab_keyboard(self, self.input.is_captured());
         self.confine_pointer();
+        os::hold_size(self);
         self.refresh_title();
         self.refresh_cursor();
     }

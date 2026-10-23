@@ -72,6 +72,11 @@ impl Input {
         self.0.pointer_confinement(image)
     }
 
+    /// Whether the person may resize the window: not while captured.
+    pub(crate) fn window_resizable(&self) -> bool {
+        self.0.window_resizable()
+    }
+
     /// What the title ends with in the current capture state.
     pub(crate) fn title_suffix(&self) -> &'static str {
         self.0.title_suffix()
