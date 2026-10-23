@@ -21,6 +21,7 @@
 //! function's write through an address it loads (an argument buffer's, a pointer's) into such an
 //! object not made resident for writing names nothing and is not seen: on Linux it reaches the
 //! pages, as the runtime imports no read-only memory there.
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -631,29 +632,28 @@ pub struct Slot {
 
 impl Whether {
     /// What work writes an object through, where it does ([`Whether::holds`]), for a death that
-    /// names it. A buffer's slot is written where its function's argument there is a `device`
-    /// pointer that is not `const`, which Metal's reflection answers read-write whether or not
-    /// the function stores through it.
-    pub(crate) fn through(&self) -> &'static str {
+    /// names it, with why the state's reflection cannot tell where it cannot. A buffer's slot is
+    /// written where its function's argument there is a `device` pointer that is not `const`,
+    /// which Metal's reflection answers read-write whether or not the function stores through it.
+    pub(crate) fn through(&self) -> Cow<'static, str> {
         match self {
-            Whether::Writes => {
-                "a resource made resident for writing, or a buffer bound for indirect commands \
-                 that run pipeline states of their own, which no reflection here tells"
-            }
-            Whether::Slot(reflection, s) => match (reflection.slots().is_ok(), s.texture) {
-                (false, _) => {
+            Whether::Writes => "a resource made resident for writing, or a buffer bound for \
+                                indirect commands that run pipeline states of their own, which \
+                                no reflection here tells"
+                .into(),
+            Whether::Slot(reflection, s) => match (reflection.slots(), s.texture) {
+                (Err(why), _) => format!(
                     "a texture or buffer at a slot the function may write, which the pipeline \
-                     state's reflection cannot tell"
-                }
-                (true, true) => {
-                    "a texture at a slot the function writes (`access::write` or \
-                     `access::read_write`)"
-                }
-                (true, false) => {
-                    "a buffer at a slot whose argument the function declares a `device` pointer \
-                     that is not `const`, read-write by Metal's reflection, whether or not it \
-                     stores through it"
-                }
+                     state's reflection cannot tell ({why})"
+                )
+                .into(),
+                (Ok(_), true) => "a texture at a slot the function writes (`access::write` or \
+                                  `access::read_write`)"
+                    .into(),
+                (Ok(_), false) => "a buffer at a slot whose argument the function declares a \
+                                   `device` pointer that is not `const`, read-write by Metal's \
+                                   reflection, whether or not it stores through it"
+                    .into(),
             },
         }
     }
@@ -686,6 +686,32 @@ mod tests {
 
     use super::*;
     use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};
+
+    /// A death over a slot whose state's reflection cannot tell names why it cannot; one the
+    /// reflection tells names the declaration that writes
+    #[test]
+    fn a_write_the_reflection_cannot_tell_names_why() {
+        let slot = Slot {
+            stage: 0,
+            texture: false,
+            slot: 3,
+            untold: true,
+        };
+        let untold = Whether::Slot(Reflection::new(None), slot);
+        assert!(untold.holds());
+        assert!(
+            untold
+                .through()
+                .ends_with("reflection cannot tell (a state of no guest descriptor's)"),
+            "{}",
+            untold.through()
+        );
+        assert!(
+            Whether::Writes
+                .through()
+                .starts_with("a resource made resident")
+        );
+    }
 
     /// A buffer or heap whose memory the runtime imports through a writable twin of read-only
     /// pages is counted once while it is, set so again or not, and uncounted as it goes, which
