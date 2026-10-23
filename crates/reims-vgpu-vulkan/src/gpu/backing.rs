@@ -115,20 +115,39 @@
 //!   that used the object, 9 of 200 made as its `waitUntilCompleted` returned, none of 200 made
 //!   2 ms later; `tests/detach_backing.rs` waits 20 ms before such a detach); here one made in a
 //!   completed handler answers NO (`tests/detach_backing.rs`'s `in_a_completed_handler`), and one
-//!   made once `waitUntilCompleted` returned YES. The runtime's own detach answers by Metal's
-//!   rule only until the command buffer's GPU work completed, before its completed handlers run
-//!   (the runtime's `detach.rs`), so this platform answers first: each submission the runtime
-//!   submits is noted with its encoders as its check decides it ([`Opened::submit`]), until the
-//!   command buffer closes, after its completed handlers ran; a detach asks the runtime what those
-//!   encoders use ([`in_flight`]), of the command buffers with a submission noted since the
-//!   object was made alone, and a buffer's waits by reading the command buffer's status, which
-//!   the runtime sets before it runs the completed handlers. Where none took it, the runtime's
-//!   detach answers, by its rule over what it holds of each command buffer's work until that work
-//!   completed: a NO of its own, which only a command buffer completing as the detach is made
-//!   could leave, is answered as Metal's NO, the object attached. Core never reads the answer:
-//!   after a NO, its next prepare has the replace answer NO, which raises
-//!   (`BufferBackingRefused`, `HeapBackingRefused`), and a command buffer that uses the object
-//!   before it runs.
+//!   made once `waitUntilCompleted` returned YES. The runtime's own detach answers NO while the
+//!   work of a submission that took the object has not completed, and the command buffer's last
+//!   submissions' until its completed handlers ran, so it lets go of an object only an earlier
+//!   submission took before them (the runtime's `detach.rs`); this platform answers first: each
+//!   submission the runtime submits is noted with its encoders as its check decides it
+//!   ([`Opened::submit`]), until the command buffer closes, after its completed handlers ran; a
+//!   detach asks the runtime what those encoders use ([`in_flight`]), of the command buffers with
+//!   a submission noted since the object was made alone, and a buffer's waits by reading the
+//!   command buffer's status, which the runtime sets before it runs the completed handlers. Where
+//!   none took it, the runtime's detach answers, by its rule over what it holds: a NO of its own
+//!   is answered as Metal's NO, the object attached. Core never reads the answer: after a NO, its
+//!   next prepare has the replace answer NO, which raises (`BufferBackingRefused`,
+//!   `HeapBackingRefused`), and a command buffer that uses the object before it runs.
+//!
+//!   A command buffer that completes with an error, its status `Error`, is let go of before its
+//!   completed handlers run: Metal answers YES to a detach made in its completed handler, whether
+//!   the encoders that took the object ran or ran nothing (measured on the M3 Max, macOS 27.0.1,
+//!   26A434: 2796 of 2800 detaches of a heap's and a buffer's, in command buffers failed with
+//!   code 1 or 16 by protection options and with code 8 by a detached use, where 248 of 800 made
+//!   the same day in the handler of one that completed answered NO; `tests/detach_backing.rs`'s
+//!   `expected_in_a_failed_completed_handler`). A noted command buffer whose status reads
+//!   `Error` took nothing ([`in_flight`]), and one Metal's GPU fails at its commit for what its
+//!   encoders did is noted nowhere, as it is committed with no check (`crate::gpu::command`). The
+//!   GPU's own failures (a hang, a fault, a victim of its recovery), which no test here may run,
+//!   follow the same rule unmeasured. A detach made while a command buffer that fails is in
+//!   flight is unmeasured too, and answers as for any other. The runtime's detach answers then:
+//!   it lets go of what a submission before the command buffer's last took as that work
+//!   completes, and this platform answers YES there, as Metal's (a use of the object, then a
+//!   later submission a detached use fails). It keeps what the last submissions took, failed or
+//!   not, those of encoders its commit failed included, until the completed handlers ran, and
+//!   answers NO, so where the object's submission is the last (the tests' failures by protection
+//!   options, each of one submission) this platform answers NO, where Metal answers YES, until the
+//!   runtime lets go of it (reported to it).
 //!
 //! What Metal answers, measured on the M3 Max (macOS 26.7, 25G229), and this platform with it:
 //! - **A replace** answers NO, and leaves the object detached, for an attached object, an empty
@@ -1052,10 +1071,13 @@ pub(crate) fn submission_check(cb: Opened) -> rt::SubmissionCheck {
 /// before it took it, and none is asked where no submission was noted since
 /// ([`Registry::noted_since`]). A submission noted after they were read is decided by the
 /// runtime's own detach, which makes the object's uses in submissions after it fail as Metal's
-/// do, and answers NO where one submitted before it took the object ([`Backing::detach`]).
+/// do, and answers NO where one submitted before it took the object ([`Backing::detach`]). One
+/// that completed with an error, its status `Error`, took nothing: Metal lets go of what a failed
+/// command buffer used before its completed handlers run (module docs, "In flight").
 fn in_flight(id: rt::ObjectId, made: u64) -> Vec<rt::CommandBuffer> {
     // The command buffers not taken are let go of here, under no lock.
     (DETACHED.noted_since(made).into_iter())
+        .filter(|(cb, _)| !matches!(cb.status(), rt::CommandBufferStatus::Error))
         .filter(|(cb, encoders)| took(cb, encoders, id))
         .map(|(cb, _)| cb)
         .collect()
@@ -2266,6 +2288,85 @@ mod tests {
             .find(|l| l.starts_with("reims-vgpu: fatal: "));
         assert!(out.status.success() && death.is_none(), "{out:?}");
         assert!(stdout.contains("status 5 code 8"), "{stdout}");
+    }
+
+    /// A command buffer that completed with an error took nothing: in its completed handler a
+    /// detach finds none of its noted submissions in flight, its fill of the object having run
+    /// and a later submission having failed with code 8 by a detached use, as Metal lets go of a
+    /// failed command buffer's uses before its completed handlers run ([`in_flight`], module
+    /// docs, "In flight"); in the handler of one that completed it finds the command buffer
+    #[test]
+    fn a_failed_command_buffer_took_nothing_in_its_completed_handler() {
+        use crate::gpu::command::VulkanCommandBuffer;
+        use crate::gpu::resource::VulkanBuffer;
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::device::GpuDevice;
+        use reims_vgpu_core::platform::event::EventRef;
+        use reims_vgpu_core::platform::resource::Buffer;
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+        use reims_vgpu_core::raise::OnFault;
+        fn fill(cb: &VulkanCommandBuffer, buffer: &VulkanBuffer) {
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for command in [
+                BlitCmd::FillBuffer {
+                    buffer,
+                    range: NsRange::new(0, 16),
+                    value: 0x5c,
+                },
+                BlitCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Return, command).unwrap();
+            }
+        }
+        let d = crate::gpu::device::tests::dev();
+        // A no-copy buffer over a page of the test's, which stays mapped for the process.
+        let no_copy = || {
+            // SAFETY: the page stays mapped for the process.
+            let contents = unsafe { reims_vgpu_core::platform::HostRange::new(pages(1, 0), PAGE) };
+            d.new_buffer(BufferDesc {
+                length: PAGE,
+                options: vec![OptionSet::StorageMode(0)],
+                pinned_gpu_address: None,
+                contents: Some(contents),
+                no_copy: true,
+                deallocator: None,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let used = no_copy();
+        let detached = no_copy();
+        detached.detach_backing().unwrap();
+        let (id, made) = (used.backing.id.unwrap(), used.backing.made);
+        let queue = d.new_command_queue().unwrap();
+        let event = d.new_shared_event().unwrap();
+        let mut seen = Vec::new();
+        for fails in [false, true] {
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let (taken, handler) = std::sync::mpsc::channel();
+            cb.add_completed_handler(
+                OnFault::Return,
+                Box::new(move |info| {
+                    let _ = taken.send((info.status.0, in_flight(id, made).len()));
+                }),
+            )
+            .unwrap();
+            fill(&cb, &used);
+            if fails {
+                cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
+                fill(&cb, &detached);
+            }
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            seen.push(handler.recv().unwrap());
+        }
+        assert_eq!(
+            seen,
+            [(4, 1), (5, 0)],
+            "(status, command buffers taking it)"
+        );
     }
 
     /// A command buffer of an isolated task that ended holds no release: one that died mid-encode
