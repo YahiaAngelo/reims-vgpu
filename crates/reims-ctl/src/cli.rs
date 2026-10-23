@@ -257,7 +257,7 @@ pub struct CreateArgs {
     /// it (default: a new one made for the VM, with OVMF and a Mac identity of its own)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
-    /// The network card's MAC
+    /// The network card's MAC, such as 52:54:00:12:34:56 (default: a random one)
     #[arg(long)]
     pub mac: Option<String>,
     /// arm64: install macOS from this IPSW, or `latest` to download the newest this Mac supports
@@ -347,6 +347,7 @@ pub struct SetArgs {
     /// 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
+    /// The network card's MAC, such as 52:54:00:12:34:56
     #[arg(long)]
     pub mac: Option<String>,
     /// Seconds stop waits for the guest to shut down before it powers the VM off; 0 for no

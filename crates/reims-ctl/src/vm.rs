@@ -410,6 +410,7 @@ impl VmConfig {
         for k in self.extra_env.keys() {
             check_env_name(k)?;
         }
+        check_mac(&self.network.mac)?;
         if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
             bail!(
                 "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
@@ -493,6 +494,22 @@ pub fn check_env_name(k: &str) -> Result<()> {
             "an environment variable's name is letters, digits and '_', not starting with a \
              digit: {k:?}"
         );
+    }
+    Ok(())
+}
+
+/// A MAC as QEMU's `mac` property takes it: six pairs of hex digits, each pair after the first
+/// following a ':' or a '-' (hw/core/qdev-properties-system.c, set_mac).
+pub fn check_mac(mac: &str) -> Result<()> {
+    let b = mac.as_bytes();
+    let ok = b.len() == 17
+        && b.chunks(3).all(|p| {
+            p[0].is_ascii_hexdigit()
+                && p[1].is_ascii_hexdigit()
+                && p.get(2).is_none_or(|s| matches!(s, b':' | b'-'))
+        });
+    if !ok {
+        bail!("a MAC is six pairs of hex digits joined by ':' or '-', such as 52:54:00:12:34:56, not {mac:?}");
     }
     Ok(())
 }
@@ -792,6 +809,40 @@ mod tests {
         assert!(parse_size_mib("8Q").is_err());
         assert_eq!(format_mib(8192), "8G");
         assert_eq!(format_mib(1536), "1536M");
+    }
+
+    /// A MAC is what QEMU's mac property takes, and nothing more: a ',' would add options to
+    /// the network card's.
+    #[test]
+    fn macs_are_what_qemu_takes() {
+        for good in [
+            "52:54:00:12:34:56",
+            "52-54-00-12-34-56",
+            "52:54-00:12-34:56",
+            "AA:bb:CC:dd:EE:ff",
+        ] {
+            assert!(check_mac(good).is_ok(), "{good:?}");
+        }
+        for bad in [
+            "",
+            "52:54:00:12:34",
+            "52:54:00:12:34:56:78",
+            "52:54:00:12:34:5g",
+            "52.54.00.12.34.56",
+            "525400123456",
+            "5254.0012.3456",
+            " 52:54:00:12:34:56",
+            "52:54:00:12:34:56 ",
+            "2:54:00:12:34:567",
+            "52:54:00:12:34:56,romfile=/x",
+        ] {
+            assert!(check_mac(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_mac(&random_mac()).is_ok());
+        let mut c = x86_64_config();
+        assert!(c.check().is_ok());
+        c.network.mac = "52:54:00:12:34:56,romfile=/x".into();
+        assert!(c.check().is_err());
     }
 
     #[test]

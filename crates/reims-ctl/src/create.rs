@@ -156,6 +156,9 @@ pub fn default_dir(name: &str) -> PathBuf {
 /// Makes the VM, calling `progress` with each step, and registers it.
 pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
     check_name(&spec.name)?;
+    if let Some(m) = &spec.mac {
+        check_mac(m)?;
+    }
     if Registry::load()?.find(&spec.name).is_some() {
         bail!("a VM named {} already exists", spec.name);
     }
@@ -778,6 +781,18 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A MAC QEMU would refuse stops a create before it makes anything.
+    #[test]
+    fn a_mac_qemu_refuses_stops_a_create_at_once() {
+        let env = crate::testenv::Env::new("create-mac");
+        let mut spec = Spec::new("t");
+        spec.dir = Some(env.root.join("t"));
+        spec.mac = Some("52:54:00:12:34:56,romfile=/x".into());
+        let e = create(spec, Host::current(), &mut |_| {}).unwrap_err();
+        assert!(format!("{e:#}").starts_with("a MAC is six pairs"), "{e:#}");
+        assert!(!env.root.join("t").exists());
+    }
 
     /// `create --ssh-port 0`, and 0 in the interface's field, mean no forward, as `set
     /// --ssh-port 0` does; QEMU's hostfwd on port 0 would forward a port nobody is told.
