@@ -8086,8 +8086,8 @@ fn a_display_pipeline_answers_metals_values() {
 /// only loads or clears its target and stores it stores what Metal's does, in a process that has
 /// released no map of layers and after one was made, drawn with and released, which makes
 /// Metal's draws in such a pass draw (its fresh side first). Over a mutable map reset to no
-/// layers Metal's stores the same, and the pass dies at `endEncoding`, as the runtime fails its
-/// command buffer as a GPU hang there (`MUTABLE_MAP_UNDRAWN`). A draw in such a pass,
+/// layers both store the same, each pass ending with a draw of no vertices
+/// (`crate::gpu::rate_map::no_draw`, the Metal platform's `gpu::rate_map`). A draw in such a pass,
 /// of a public or a private type, and one of primitive type 9 that fails the command buffer,
 /// dies at its selector, naming the map, and a tile dispatch there dies by its own line
 #[test]
@@ -8250,35 +8250,10 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
         Some(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
     }
 
-    /// What `stored` answers here: a mutable map reset to no layers dies at `endEncoding`, and
-    /// answers the immutable one's bytes, which Metal's stores over it too.
-    fn ours_stored(
-        p: &VulkanPlatform,
-        d: &crate::gpu::device::VulkanDevice,
-        reset: bool,
-        load: bool,
-    ) -> Option<Vec<u8>> {
-        if reset {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| stored(p, d, reset, load)).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, "endEncoding"),
-                "{line}"
-            );
-            assert!(
-                line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
-                "{line}"
-            );
-        }
-        stored(p, d, false, load)
-    }
-
     let p = platform();
     let d = dev();
     let shapes = [(false, false), (false, true), (true, false), (true, true)];
-    let ours = shapes.map(|(reset, load)| ours_stored(&p, &d, reset, load));
+    let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
     for (shape, bytes) in shapes.iter().zip(&ours) {
         assert!(bytes.is_some(), "reset, load {shape:?}: no encoder");
     }
@@ -8342,7 +8317,7 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     // After a map of one layer was drawn with and released, each platform's own.
     draw_and_release(&p, &d);
-    let ours = shapes.map(|(reset, load)| ours_stored(&p, &d, reset, load));
+    let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
     if let Some((mp, md)) = &metal {
         draw_and_release(mp, md);
         let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
@@ -8352,22 +8327,29 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
 }
 
-/// A pass of no draw call over a rasterization rate map made of a `Mutable` descriptor dies at
-/// `endEncoding` ([`crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN`]), where Metal's command
-/// buffer completes with no error, its state set or not: over a map of one layer not yet reset,
-/// reset to the identity, reset to half its rate on each axis, and over one made of no layers,
-/// each in a command buffer of its own queue, before any command buffer drew over a mutable map
+/// A pass of no draw call over a rasterization rate map made of a `Mutable` descriptor, whose
+/// `mutability` answers 1, runs and stores its clear, as the Metal platform's does, each ending
+/// with a draw of no vertices (`crate::gpu::rate_map::no_draw`, the Metal platform's
+/// `gpu::rate_map`), without which the runtime fails its command buffer as a GPU hang, as
+/// Metal's GPU does: its state set or not, over a map of one layer not yet reset, reset to the
+/// identity, reset to half its rate on each axis, and over one made of no layers, in a pass of
+/// one BGRA8 target and in one of a 4-sample BGRA8 target resolved into another, each in a
+/// command buffer of its own queue, before any command buffer drew over a mutable map
 #[test]
-fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
+fn drawless_passes_over_mutable_maps_store_as_metals() {
     use reims_vgpu_core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
     use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
 
     const SIDE: u64 = 64;
     /// `MTLMutabilityMutable`.
     const MUTABLE: u64 = 1;
+    /// `MTLTextureType2DMultisample`, `MTLStoreActionMultisampleResolve` and
+    /// `MTLResourceStorageModePrivate`.
+    const MULTISAMPLE: u64 = 4;
+    const RESOLVE: u64 = 2;
+    const PRIVATE: u64 = 0x20;
 
     /// A descriptor of a `SIDE` by `SIDE` screen of `mutability`, with one layer of one sample
     /// of `rate` on each axis where `rate` is some, else no layers.
@@ -8398,22 +8380,66 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
         desc
     }
 
+    /// A `SIDE` by `SIDE` BGRA8 target, a pass that clears it and stores it, or with
+    /// `multisample` clears a 4-sample one and resolves it into it, and the 4-sample one.
+    fn target<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        multisample: bool,
+    ) -> (P::Texture, P::RenderPassDescriptor, Option<P::Texture>) {
+        if !multisample {
+            let (dst, pass) = pass_of(p, d, (SIDE, SIDE));
+            return (dst, pass, None);
+        }
+        let samples = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: MULTISAMPLE,
+                    pixel_format: BGRA8,
+                    width: SIDE,
+                    height: SIDE,
+                    sample_count: 4,
+                    usage: TARGET,
+                    resource_options: Some(PRIVATE),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let dst = texture(p, d, BGRA8, TARGET | READ, (SIDE, SIDE), None);
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&samples)),
+            resolve_texture: Some(Some(&dst)),
+            load_action: Some(CLEAR),
+            store_action: Some(RESOLVE),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        (dst, pass, Some(samples))
+    }
+
     /// A drawless pass over a mutable map made of `made` and reset to `reset` where some, the
-    /// state set where `state`, in a command buffer of a queue of its own, committed and
-    /// completed: its status and error code.
+    /// state set where `state`, into a target of `multisample` ([`target`]), in a command buffer
+    /// of a queue of its own that then copies the target out, committed and completed: the
+    /// map's `mutability`, the command buffer's status and error code, and the target's bytes.
     fn drawless<P: Platform>(
         p: &P,
         d: &P::Device,
         (made, reset, state): (Option<f32>, Option<Option<f32>>, bool),
-    ) -> (u64, Option<i64>) {
+        multisample: bool,
+    ) -> (u64, u64, Option<i64>, Vec<u8>) {
         let map = d
             .new_rate_map(&map_desc(p, Some(MUTABLE), made))
             .unwrap()
             .unwrap();
+        let mutability = map.mutability();
         if let Some(rate) = reset {
             map.reset(&map_desc(p, None, rate));
         }
-        let (_dst, pass) = pass_of(p, d, (SIDE, SIDE));
+        let (dst, pass, _samples) = target(p, d, multisample);
         pass.set_pass(&PassSet {
             rasterization_rate_map: Some(Some(&map)),
             ..Default::default()
@@ -8429,9 +8455,31 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
             e.encode(OnFault::Die, set).unwrap();
         }
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let out = buffer::<P>(d, SIDE * SIDE * 4, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(SIDE, SIDE, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: SIDE * 4,
+                destination_bytes_per_image: SIDE * SIDE * 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
-        (cb.status().0, cb.error().map(|e| e.code))
+        let n = usize::try_from(SIDE * SIDE * 4).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after the command buffer completed.
+        let bytes = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) };
+        let code = cb.error().map(|e| e.code);
+        (mutability, cb.status().0, code, bytes.to_vec())
     }
 
     let cases = [
@@ -8442,27 +8490,28 @@ fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
         (Some(0.5), Some(Some(0.5)), true),
         (None, None, false),
     ];
+    let clear = [0, 0, 0, 0xff].repeat(usize::try_from(SIDE * SIDE).unwrap());
+    let runs: Vec<_> = [false, true]
+        .into_iter()
+        .flat_map(|multisample| cases.map(|case| (case, multisample)))
+        .collect();
     let (p, d) = (platform(), dev());
-    for case in cases {
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| drawless(&p, &d, case)).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "endEncoding"),
-            "{case:?}: {line}"
-        );
-        assert!(
-            line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
-            "{line}"
-        );
+    let ours: Vec<_> = (runs.iter())
+        .map(|&(case, multisample)| drawless(&p, &d, case, multisample))
+        .collect();
+    for (run, answer) in runs.iter().zip(&ours) {
+        assert_eq!(answer, &(MUTABLE, 4, None, clear.clone()), "{run:?}");
     }
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
     let mp = MetalPlatform::new(Box::new(NoLauncher));
-    for case in cases {
-        assert_eq!(drawless(&mp, &md, case), (4, None), "Metal: {case:?}");
+    for (&(case, multisample), answer) in runs.iter().zip(&ours) {
+        let theirs = drawless(&mp, &md, case, multisample);
+        assert!(
+            &theirs == answer,
+            "Metal: {case:?}, multisample {multisample}"
+        );
     }
 }
 

@@ -220,9 +220,10 @@
 //!   it rasterize by regions whose lines are the map's tiles' exact lines, where Metal's are its
 //!   fixed-point ones: a draw and an execution of indirect commands that is not empty relay it
 //!   there, and so does a tile dispatch, each dying in strict mode. A pass over a map made of a
-//!   `Mutable` descriptor, reset or not, in which nothing drew dies at `endEncoding`: the runtime
-//!   fails its command buffer as a GPU hang, where Metal's GPU runs it and stores what it loaded
-//!   or cleared ([`MUTABLE_MAP_UNDRAWN`]).
+//!   `Mutable` descriptor, reset or not, ends with a draw of no vertices the guest did not
+//!   encode, as the Metal platform's does, without which the runtime fails the command buffer of
+//!   one that nothing drew in as a GPU hang, as Metal's GPU does
+//!   ([`crate::gpu::rate_map::no_draw`]).
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
 //!   Metal enumerator is, a slice shorter than its range, a nil resource (but in
 //!   `useResources:count:usage:`), and a command after `endEncoding`. A rotated texture is the
@@ -232,7 +233,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
@@ -409,12 +410,9 @@ pub struct RenderEncoderObject {
     /// Whether the pass's rate map is one whose rates vary, whose regions the runtime's draws
     /// rasterize by its tiles' exact lines, where Metal's are its fixed-point ones (`layered`).
     varying_rates: bool,
-    /// Whether the pass's rate map was made of a `Mutable` descriptor, whose pass of no draws
-    /// the runtime fails as a GPU hang, where Metal's runs ([`MUTABLE_MAP_UNDRAWN`]).
-    mutable_map: bool,
-    /// Whether a draw or an execution of indirect commands that is not empty reached the
-    /// encoder (`layered`).
-    drawn: AtomicBool,
+    /// Where the pass's rate map was made of a `Mutable` descriptor, the pipeline the pass ends
+    /// with a draw of no vertices through ([`crate::gpu::rate_map::no_draw`]).
+    no_draw: Option<rt::RenderPipelineState>,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
@@ -1695,8 +1693,8 @@ fn opened(
         dropped,
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
-        mutable_map: taken.mutable,
-        drawn: AtomicBool::new(false),
+        no_draw: (taken.mutable)
+            .then(|| crate::gpu::rate_map::no_draw(sel, &command_buffer.device)),
         reach: Mutex::new(Reach::default()),
         bfloat_loaded: bfloat_loaded(&d),
         pass: d,
@@ -1776,18 +1774,6 @@ fn viewport(v: MtlViewport) -> rt::Viewport {
 fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
     rt::ScissorRect::new(r.x, r.y, r.width, r.height)
 }
-
-/// The line of the death at `endEncoding` of a pass over a rate map made of a `Mutable`
-/// descriptor, reset or not, of layers or of none, that no draw or execution of indirect commands
-/// drew in: the runtime fails its command buffer as a GPU hang (`GpuHang`, code 2) until a
-/// command buffer of the device with a draw call over a mutable map was committed, where Metal's
-/// GPU here runs the pass and stores what it loaded or cleared (measured on the M3 Max, macOS
-/// 27.0.1: `a_drawless_pass_over_a_map_of_no_layers_is_metals`,
-/// `drawless_passes_over_mutable_maps_die_where_metal_stores`). An empty draw, which the runtime
-/// counts as a draw call, is not counted here, so such a pass dies too.
-const MUTABLE_MAP_UNDRAWN: &str = "a pass of no draws over a mutable rasterization rate map, \
-     whose command buffer the runtime fails as a GPU hang, where Metal's GPU runs it and stores \
-     what the pass loaded or cleared";
 
 /// The line of a draw's death in a pass of a rate map whose rates vary
 /// ([`Class::Varying`]).
@@ -1983,10 +1969,8 @@ impl VulkanRenderEncoder {
     /// Metal's are their fixed-point ones ([`Class::Varying`]), it draws, relayed, and dies in
     /// strict mode ([`crate::answer::Inexact::RateMap`]). The pass's loads, clears and stores are
     /// Metal's, so one that draws nothing runs. A tile dispatch there dies by its own line
-    /// ([`Self::tiled`]). Either way the pass has drawn, so its `endEncoding` over a mutable map
-    /// does not die ([`MUTABLE_MAP_UNDRAWN`]).
+    /// ([`Self::tiled`]).
     fn layered(&self, sel: &'static str) {
-        self.drawn.store(true, Ordering::Relaxed);
         if self.no_layers {
             unrepresentable(
                 sel,
@@ -2540,8 +2524,15 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
-                if self.mutable_map && !self.drawn.load(Ordering::Relaxed) {
-                    unrepresentable(sel, MUTABLE_MAP_UNDRAWN);
+                // A pass over a mutable map ends with a draw of no vertices, which keeps the
+                // runtime from failing it as a GPU hang where nothing drew in it, as the Metal
+                // platform's draw keeps Metal's GPU from hanging (`rate_map::no_draw`). It is the
+                // pass's last command, so its pipeline is bound for nothing the guest encodes.
+                if let Some(no_draw) = &self.no_draw {
+                    self.run(sel, &mut |e| {
+                        e.set_render_pipeline_state(no_draw)?;
+                        e.draw_primitives(PrimitiveType::Triangle, 0, 0, 1, 0)
+                    })?;
                 }
                 self.encoder.end(sel, |e| e.end_encoding())
             }
@@ -6002,9 +5993,7 @@ pub(crate) mod tests {
 
     /// A pass of a mutable rate map not yet reset rasterizes nothing, a scissor rectangle set in
     /// it too: the colour and depth attachments keep their clears and the fragment function's
-    /// write does not land, as on Metal; a tile dispatch in it dies, and so does its
-    /// `endEncoding` where nothing drew in it, whose command buffer the runtime fails as a GPU
-    /// hang, where Metal's runs ([`MUTABLE_MAP_UNDRAWN`]). A reset after such a
+    /// write does not land, as on Metal; a tile dispatch in it dies. A reset after such a
     /// pass ended and before its command buffer's commit draws the pass by the map as reset, as
     /// Metal's GPU reads it; so does one after a pass of the map as reset ended, to the same map.
     /// A reset to a map of no layers before that pass has run dies: its draw would have died
@@ -6181,8 +6170,6 @@ pub(crate) mod tests {
         })
         .unwrap_err();
         assert_eq!(site.file, "dispatchThreadsPerTile:");
-        let site = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding)).unwrap_err();
-        assert_eq!(site.file, "endEncoding");
         for cmd in [
             RenderCmd::SetRenderPipelineState {
                 pipeline_state: Some(&pipeline),
@@ -6298,11 +6285,10 @@ pub(crate) mod tests {
     }
 
     /// A rate map whose rates vary is made and relayed (`rasterization-rate-map`), at an
-    /// immutable map's creation and at a mutable map's reset, and a pass over the immutable one
-    /// that only clears and stores runs, where over the mutable one, whose command buffer the
-    /// runtime fails as a GPU hang, it dies at `endEncoding` ([`MUTABLE_MAP_UNDRAWN`]); a draw and
-    /// a tile dispatch in either die at their selectors,
-    /// naming the kind.
+    /// immutable map's creation and at a mutable map's reset, and a pass over either that only
+    /// clears and stores runs, the mutable one's ending with a draw of no vertices
+    /// ([`crate::gpu::rate_map::no_draw`]); a draw and a tile dispatch in either die at their
+    /// selectors, naming the kind.
     /// A map whose tiles span as many screen pixels as physical ones announces nothing, at its
     /// creation or a reset, and a draw in a pass over it is taken
     #[test]
@@ -6407,15 +6393,7 @@ pub(crate) mod tests {
         reset.reset(&of_rates(&p, IMMUTABLE, VARYING));
         assert_eq!(announced(), before + 2);
         run(&made, Vec::new());
-        let (_dst, pass) = pass_of(&p, &d, (SIDE, SIDE));
-        pass.set_pass(&PassSet {
-            rasterization_rate_map: Some(Some(&reset)),
-            ..Default::default()
-        });
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let site = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding)).unwrap_err();
-        assert_eq!(site.file, "endEncoding");
+        run(&reset, Vec::new());
         for map in [&made, &reset] {
             let (_dst, pass) = pass_of(&p, &d, (SIDE, SIDE));
             pass.set_pass(&PassSet {

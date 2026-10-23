@@ -59,10 +59,12 @@
 //! - **A pass of a mutable map not yet reset** rasterizes nothing, as on Metal (measured: a
 //!   full-screen triangle's vertex function writes its buffer, its fragment function never runs,
 //!   and the colour, depth and stencil attachments keep their clears), as the runtime's pass
-//!   does. A tile dispatch in it, which only draws were measured against, dies, and so does the
-//!   `endEncoding` of a pass over a mutable map, reset or not, that nothing drew in, whose
-//!   command buffer the runtime fails as a GPU hang, where Metal's GPU runs it and stores what
-//!   it loaded or cleared ([`crate::gpu::encode_render`]).
+//!   does. A tile dispatch in it, which only draws were measured against, dies.
+//! - **A pass over a mutable map**, reset or not, that nothing drew in ends with a draw of no
+//!   vertices the guest did not encode ([`no_draw`], [`crate::gpu::encode_render`]), as the
+//!   Metal platform's does. Without a draw call Metal's GPU hangs at it (measured on the M3 Max,
+//!   macOS 27.0.1: its command buffer fails with code 2 and stores nothing), and the runtime
+//!   fails it so too; with the draw, both run it and store what it loaded or cleared.
 //! - **When the map is read.** Metal's pass reads the map as the GPU runs it (measured: a reset
 //!   after the encoder is made, after its draw, after `endEncoding` and just after `commit` each
 //!   shows in the pass, from a map not yet reset and from a compiled one). So does the runtime's:
@@ -454,11 +456,53 @@ impl RateMapObject {
         Ok(opened)
     }
 
-    /// Whether the map was made of a `Mutable` descriptor, whose pass of no draws the runtime
-    /// fails as a GPU hang, where Metal's runs (`crate::gpu::encode_render`).
+    /// Whether the map was made of a `Mutable` descriptor, a pass over which ends with an empty
+    /// draw ([`no_draw`]).
     pub(crate) fn is_mutable(&self) -> bool {
         self.mutability == MUTABLE
     }
+}
+
+/// The metallib `build.rs` compiled `no_draw.metal` into: [`no_draw`]'s vertex function.
+const NO_DRAW_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/no_draw.metallib"));
+
+/// The no-draw pipelines made so far, each with its device's registry ID. Each stays for the life
+/// of the process.
+static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new());
+
+/// The pipeline a pass over a mutable map ends with a draw of no vertices through, as the Metal
+/// platform's does (its `gpu::rate_map`), made on the first call for `device`'s registry ID. The
+/// runtime fails the command buffer of a pass over a mutable map with no draw call as a GPU
+/// hang, as Metal's GPU does, until a command buffer of the device with a draw call over such a
+/// map was committed (`rate_mapped_pass.rs`), and counts a draw of no vertices as a draw call.
+/// Its vertex function returns nothing ([`NO_DRAW_LIBRARY`]), its rasterization is off, it names
+/// no attachment formats, and its largest vertex amplification count is the device's, which is
+/// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
+/// at `sel`, as the Metal platform's ends the process where Metal does not make one.
+pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
+    use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
+    use reims_vgpu_core::platform::device::GpuDevice as _;
+
+    let id = device.registry_id;
+    // Held through the make, so two first asks make one.
+    let mut made = NO_DRAW.lock();
+    if let Some((_, pipeline)) = made.iter().find(|(r, _)| *r == id) {
+        return pipeline.clone();
+    }
+    let library = plain(|| device.raw.new_library_with_data(NO_DRAW_LIBRARY))
+        .unwrap_or_else(|e| refused(sel, &e));
+    let function = plain(|| library.new_function_with_name("reims_vgpu_no_draw"))
+        .unwrap_or_else(|e| refused(sel, &e));
+    let mut desc =
+        RenderPipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
+    desc.rasterization_enabled = false;
+    desc.max_vertex_amplification_count =
+        u32::try_from(device.caps().max_vertex_amplification_count).unwrap_or(u32::MAX);
+    let pipeline =
+        plain(|| (device.raw).new_render_pipeline_state(&desc, &rt::PipelineOptions::default()))
+            .unwrap_or_else(|e| refused(sel, &e));
+    made.push((id, pipeline.clone()));
+    pipeline
 }
 
 /// Core's coordinate as the runtime's.
