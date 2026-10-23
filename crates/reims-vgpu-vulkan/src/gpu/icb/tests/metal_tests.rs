@@ -1138,10 +1138,10 @@ fn lengths_cross_into_later_commands_as_on_metal() {
 /// A blit's copy carries the threadgroup memory lengths a command holds, the record's and the 7
 /// past them, a length of an index of 38 or more among them as the later command's, and a
 /// blit's reset clears them, while a length past the last command's that a copy or a reset of
-/// another command does not reach stays, as on Metal. A copy into the last command, and a reset
-/// of it on the CPU, change some of those lengths on Metal, and the runtime's otherwise
-/// (`Tail`), though those read here answer as Metal's: a getter of one is relayed here, a death
-/// in strict mode, until core sets it again
+/// another command does not reach stays, as on Metal. A copy into the last command writes its
+/// pipeline words past it, which Metal's keeps where the source's are 0 (`Tail`), though those
+/// read here answer as Metal's: a getter of one is relayed here, a death in strict mode, until
+/// core sets it again; a reset of the command on the CPU zeroes them, as Metal's does
 #[test]
 fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
     fn length<P: Platform>(icb: &P::Icb, i: u64, index: u64) -> u64 {
@@ -1221,7 +1221,7 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
         .unwrap()
         .encode(IcbComputeCmd::Reset)
         .unwrap();
-    let reset = unfollowed(&a, 1, 40);
+    let reset = length::<VulkanPlatform>(&a, 1, 40);
     assert_eq!(reset, 0);
     set::<VulkanPlatform>(&b, 1, 7, 41);
     set::<VulkanPlatform>(&a, 1, 5, 40);
@@ -2170,5 +2170,194 @@ fn at(a: u64, base: u64) -> [u64; 2] {
     match a.checked_sub(base) {
         Some(off) if off < 256 => [1, off],
         _ => [0, a],
+    }
+}
+
+/// The threadgroup memory lengths past the last command's of a buffer of 2 commands, each set by
+/// core, read back after each of a pipeline, dispatch or imageblock setter of a command, a reset
+/// of one on the CPU or by a blit, and a copy into one, of a buffer that inherits its pipeline
+/// state or not: each answers as Metal's but the words Metal writes otherwise than the runtime,
+/// which are relayed, a death in strict mode (`Tail`), at the places past the last command's
+/// lengths: 0 to 3 the commands' pipeline words, 4 to 11 and 12 to 19 their dispatch and
+/// imageblock words, 20 a copy's, and the rest up to 24 none of them
+#[test]
+fn lengths_past_the_last_command_follow_metals_words() {
+    use reims_vgpu_core::platform::types::MtlSize;
+    /// The places read, past the last command's lengths at 76.
+    const PLACES: std::ops::Range<u64> = 76..101;
+    /// What each place reads after `scenario` over buffers that inherit their pipeline state or
+    /// not, through command 1's getter: the length, or none where the getter is relayed.
+    fn read<P: Platform>(d: &P::Device, inherit: bool, scenario: u32) -> Vec<Option<u64>> {
+        let desc = IcbDesc {
+            inherit_pipeline_state: inherit,
+            ..compute_desc()
+        };
+        let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
+        let kernel = icb_kernel::<P>(d, &library, "nothing");
+        let (a, b) = (make::<P>(d, &desc, 2), make::<P>(d, &desc, 2));
+        let cmd = |icb: &P::Icb, i: u64, c: IcbComputeCmd<'_, P>| {
+            icb.compute_command(i).unwrap().unwrap().encode(c).unwrap();
+        };
+        for place in PLACES {
+            let (length, index) = (16 * (place - 70), place - 38);
+            cmd(
+                &a,
+                1,
+                IcbComputeCmd::SetThreadgroupMemoryLength { length, index },
+            );
+        }
+        let pipeline = |icb: &P::Icb, i| {
+            if !inherit {
+                let pipeline_state = Some(&kernel);
+                cmd(
+                    icb,
+                    i,
+                    IcbComputeCmd::SetComputePipelineState { pipeline_state },
+                );
+            }
+        };
+        let dispatch = |icb: &P::Icb, i| {
+            let dispatch = IcbComputeCmd::ConcurrentDispatchThreadgroups {
+                threadgroups_per_grid: MtlSize::new(3, 5, 7),
+                threads_per_threadgroup: MtlSize::new(2, 4, 1),
+            };
+            cmd(icb, i, dispatch);
+        };
+        let reset = |icb, at| BlitCmd::ResetCommandsInBuffer {
+            buffer: icb,
+            range: NsRange::new(at, 1),
+        };
+        let copy = |source, from, destination, to| BlitCmd::CopyIndirectCommandBuffer {
+            source,
+            source_range: NsRange::new(from, 1),
+            destination,
+            destination_index: to,
+        };
+        let ran = |cmds| assert_eq!(blits::<P>(d, cmds).status().0, COMPLETED);
+        let mut of = &a;
+        match scenario {
+            0 => {}
+            1 => pipeline(&a, 0),
+            2 => dispatch(&a, 0),
+            3 => cmd(
+                &a,
+                0,
+                IcbComputeCmd::SetImageblockWidth {
+                    width: 8,
+                    height: 16,
+                },
+            ),
+            4 => cmd(&a, 0, IcbComputeCmd::Reset),
+            5 => ran(vec![reset(&a, 0)]),
+            6 => ran(vec![copy(&b, 0, &a, 0)]),
+            7 => {
+                pipeline(&b, 0);
+                dispatch(&b, 0);
+                ran(vec![copy(&b, 0, &a, 0)]);
+            }
+            8 => cmd(&a, 1, IcbComputeCmd::Reset),
+            9 => ran(vec![reset(&a, 1)]),
+            10 => ran(vec![copy(&b, 0, &a, 1)]),
+            11 => {
+                pipeline(&b, 1);
+                dispatch(&b, 1);
+                ran(vec![copy(&b, 1, &a, 1)]);
+            }
+            12 => {
+                pipeline(&a, 0);
+                dispatch(&a, 0);
+                ran(vec![copy(&a, 0, &b, 0)]);
+                of = &b;
+            }
+            13 => {
+                pipeline(&a, 0);
+                dispatch(&a, 0);
+                ran(vec![copy(&a, 0, &a, 1)]);
+            }
+            14 => {
+                pipeline(&a, 0);
+                cmd(&a, 0, IcbComputeCmd::Reset);
+            }
+            _ => {
+                pipeline(&a, 0);
+                dispatch(&a, 0);
+                ran(vec![reset(&a, 0)]);
+            }
+        }
+        let command = of.compute_command(1).unwrap().unwrap();
+        let length = |place: u64| command.threadgroup_memory_length(place - 38).unwrap();
+        let relayed = |place| {
+            *crate::answer::LAST_LINE.lock() = None;
+            catch_death(|| length(place)).is_err_and(|site| {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                let sel = "getThreadgroupMemoryLengthAtIndex:";
+                assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+                let kind = crate::answer::Inexact::IcbLengthPastTheLastCommand;
+                assert!(line.contains(kind.code()), "{line}");
+                true
+            })
+        };
+        let on_vulkan = std::any::TypeId::of::<P>() == std::any::TypeId::of::<VulkanPlatform>();
+        (PLACES.map(|place| (!(on_vulkan && relayed(place))).then(|| length(place)))).collect()
+    }
+    // The places, past the last command's lengths, relayed after each scenario.
+    let all = |end: u64| (0..end).collect::<Vec<u64>>();
+    let relayed: [[Vec<u64>; 16]; 2] = [
+        [
+            vec![],
+            vec![0, 1],
+            (4..10).collect(),
+            vec![10, 11],
+            vec![],
+            vec![],
+            vec![0, 1, 20],
+            [vec![0, 1], (4..10).collect(), vec![20]].concat(),
+            vec![],
+            vec![],
+            vec![2, 3, 20],
+            [vec![2, 3], (12..18).collect(), vec![20]].concat(),
+            [vec![0, 1], (4..10).collect(), vec![20]].concat(),
+            [(0..10).collect(), (12..18).collect(), vec![20]].concat(),
+            vec![],
+            vec![],
+        ],
+        [
+            vec![],
+            vec![],
+            (4..10).collect(),
+            vec![10, 11],
+            vec![],
+            all(20),
+            all(21),
+            all(21),
+            vec![],
+            all(20),
+            all(21),
+            all(21),
+            all(21),
+            all(21),
+            vec![],
+            all(20),
+        ],
+    ];
+    let d = dev();
+    let md = MetalPlatform::system_default_device();
+    for (inherit, relayed) in [false, true].into_iter().zip(relayed) {
+        for (scenario, relayed) in (0..).zip(relayed) {
+            let what = format!("inherit {inherit}, scenario {scenario}");
+            let ours = read::<VulkanPlatform>(&d, inherit, scenario);
+            let none: Vec<u64> = (PLACES.zip(&ours))
+                .filter(|(_, length)| length.is_none())
+                .map(|(place, _)| place - 76)
+                .collect();
+            assert_eq!(none, relayed, "{what}");
+            let Some(md) = &md else { continue };
+            let metal = read::<MetalPlatform>(md, inherit, scenario);
+            for ((place, o), m) in PLACES.zip(ours).zip(metal) {
+                if o.is_some() {
+                    assert_eq!(o, m, "{what}, place {}", place - 76);
+                }
+            }
+        }
     }
 }

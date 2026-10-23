@@ -438,7 +438,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     // A kernel may copy any of their commands.
                     let progress = self.progress(sel);
                     for icb in &icbs {
-                        icb.resident(sel, progress.as_ref());
+                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
                     }
                 }
                 caught(&mut |e| e.use_resources(&some, usage))?;

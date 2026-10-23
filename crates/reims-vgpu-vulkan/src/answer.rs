@@ -2155,9 +2155,11 @@ pub enum Inexact {
     /// ([`crate::gpu::icb`]).
     IcbIdentifierAfterEncoder,
     /// A threadgroup memory length of a compute indirect command buffer past its last command's,
-    /// from the encoding of a copy into the last command or of a reset of it on, until core sets
-    /// it again: Metal's copy and reset change some such lengths, and the runtime's change them
-    /// otherwise, so the getter answers the runtime's ([`crate::gpu::icb`]'s `Tail`).
+    /// a word of a command's pipeline, dispatch or imageblock size or of a copy, that Metal wrote
+    /// otherwise than the runtime, or may have, until core sets it again: after a setter of the
+    /// command that writes it, a copy into the command, a blit's copy or reset over a buffer that
+    /// inherits its pipeline state, and in a buffer made resident for writing, so the getter
+    /// answers the runtime's ([`crate::gpu::icb`]'s `Tail`).
     IcbLengthPastTheLastCommand,
     /// A threadgroup memory length 36 or 37 of a command of a compute indirect command buffer
     /// that does not inherit its pipeline state, from the encoding of a copy into the command

@@ -15,11 +15,12 @@
 //!   (`IndirectComputeCommand::threadgroup_memory_length`), past the 31 a record holds as well,
 //!   which Metal keeps for its getter alone, as the runtime does: 38 a command, an index of 38 or
 //!   more reaching a later command's, as Metal's, which the runtime's blits move with the
-//!   records, and one past the last command's kept beside the buffer, which a copy or a reset of
-//!   another command does not reach; the index's low 32 bits, as Metal's take them. A copy into
-//!   the last command and a reset of it change some of the lengths past it on Metal, which the
-//!   runtime's change otherwise, so once one may have run, a getter of such a length is relayed,
-//!   a death in strict mode, until core sets it again ([`Tail`]). A copy into a command of a
+//!   records, and those past the last command's, where Metal keeps each command's words of its
+//!   pipeline and its dispatch, which the runtime's copies and resets move as Metal's do; the
+//!   index's low 32 bits, as Metal's take them. A length there that Metal's setters, a copy or,
+//!   over a buffer that inherits its pipeline state, a blit wrote otherwise than the runtime's is
+//!   relayed at its getter, a death in strict mode, until core sets it again ([`Tail`]). A copy
+//!   into a command of a
 //!   buffer that does not inherit its pipeline state clears its lengths 36 and 37 in the
 //!   runtime, where Metal's carries them from a command that names no pipeline state: their
 //!   getter is relayed alike, until core sets them or a reset clears them
@@ -342,6 +343,9 @@ struct Sides {
     /// What Metal answers of the threadgroup memory lengths past the last command's that the
     /// runtime's may not.
     tail: Tail,
+    /// An encoder made the buffer resident for writing: its functions may write its records,
+    /// which Metal's GPU may write words past the last command's lengths of ([`Tail`]).
+    kernel_written: bool,
     /// The threadgroup memory lengths 36 and 37 of the commands a copy wrote into, by their
     /// place in the buffer's array of them ([`LENGTHS_A_COMMAND`]), in a buffer that does not
     /// inherit its pipeline state, that core has not set since and no reset has cleared: the
@@ -359,28 +363,95 @@ impl Sides {
     }
 }
 
-/// The threadgroup memory lengths past the last command's ([`LENGTHS_A_COMMAND`]), which Metal
-/// and the runtime read back as set. A copy into the last command and a reset of it reach some on
-/// Metal, and the runtime's reach them otherwise (measured on the M3 Max, macOS 27.0.1, buffers of
-/// 2 compute commands: a blit's copy of the last command into another buffer's last carries the
-/// length 2 past it over a 0 there, but a 0 copied leaves a length set there, where the runtime's
-/// copies the 0, and a blit's or the CPU's reset of the last command zeroes it; neither reaches
-/// the length 102 past it). From the encoding of one on, the runtime's answer of such a length
-/// may not be Metal's, and its getter is relayed, a death in strict mode
+/// The threadgroup memory lengths past the last command's ([`LENGTHS_A_COMMAND`]) of a buffer of
+/// `n` commands, which Metal and the runtime read back as core set them, where Metal keeps each
+/// command `i`'s words: 2 of its pipeline from `2 i` past the last command's lengths
+/// ([`Tail::pipeline`]), 6 of its dispatch from `2 n + 8 i` and 2 of its imageblock size after
+/// them ([`Tail::dispatch`], [`Tail::imageblock`]), and one word at `10 n` that a copy writes
+/// ([`Tail::copied`]); the runtime's copies and resets move the same words as Metal's (measured
+/// on the M3 Max, macOS 27.0.1, buffers of 2 commands, every place up to 24 past the last
+/// command's, compared with Metal's: `lengths_past_the_last_command_follow_metals_words`). The
+/// runtime's answer of a word differs from Metal's
+/// - after a pipeline, dispatch or imageblock setter of the command, whose words Metal's writes
+///   and the runtime's does not;
+/// - after a copy into the command: Metal's keeps the destination's pipeline words where the
+///   source's are 0, where the runtime's copies the 0, and writes the word at `10 n`, which the
+///   runtime's leaves; the dispatch words are the source's, as they were;
+/// - after a blit's copy into a buffer, or reset of one, that inherits its pipeline state,
+///   whose words the runtime keeps without the pipeline words, so that its blits move the
+///   dispatch words at other places than Metal's;
+/// - and in a buffer an encoder made resident for writing ([`Sides::kernel_written`]), whose
+///   functions' encodings Metal's GPU may write words of, unmeasured.
+///
+/// A reset matches Metal's: on the CPU it zeroes the command's pipeline words, and a blit's its
+/// pipeline and dispatch words, in a buffer that does not inherit its pipeline state. A word that
+/// differs, or may, is relayed at its getter, a death in strict mode
 /// ([`Inexact::IcbLengthPastTheLastCommand`]), until core sets it again.
 #[derive(Debug, Default)]
 struct Tail {
-    /// A copy into the last command or a reset of it was encoded, ran or may have.
-    reached: bool,
-    /// The places past the last command's lengths core set since, which answer as set.
-    set: BTreeSet<u64>,
+    /// The places in the buffer's array of lengths whose answer may not be Metal's.
+    unknown: BTreeSet<u64>,
 }
 
 impl Tail {
-    /// A copy into the last command or a reset of it was encoded, ran or may have.
-    fn reach(&mut self) {
-        self.reached = true;
-        self.set.clear();
+    /// Of a buffer of `n` commands, the places of command `i`'s pipeline words.
+    fn pipeline(n: u64, i: u64) -> Range<u64> {
+        let at = n * LENGTHS_A_COMMAND + 2 * i;
+        at..at + 2
+    }
+
+    /// Of a buffer of `n` commands, the places of command `i`'s dispatch words.
+    fn dispatch(n: u64, i: u64) -> Range<u64> {
+        let at = n * LENGTHS_A_COMMAND + 2 * n + 8 * i;
+        at..at + 6
+    }
+
+    /// Of a buffer of `n` commands, the places of command `i`'s imageblock words.
+    fn imageblock(n: u64, i: u64) -> Range<u64> {
+        let at = n * LENGTHS_A_COMMAND + 2 * n + 8 * i + 6;
+        at..at + 2
+    }
+
+    /// Of a buffer of `n` commands, the place of the word a copy writes.
+    fn copied(n: u64) -> u64 {
+        n * LENGTHS_A_COMMAND + 10 * n
+    }
+
+    /// Of a buffer of `n` commands, the places of every command's words.
+    fn commands(n: u64) -> Range<u64> {
+        n * LENGTHS_A_COMMAND..Self::copied(n)
+    }
+
+    /// Of a buffer of `n` commands, the places of every command's words and the copy's.
+    fn words(n: u64) -> std::ops::RangeInclusive<u64> {
+        n * LENGTHS_A_COMMAND..=Self::copied(n)
+    }
+
+    /// The dispatch and imageblock words of a buffer of `n` commands, command `i`'s.
+    fn dispatch_and_imageblock(n: u64, i: u64) -> Range<u64> {
+        Self::dispatch(n, i).start..Self::imageblock(n, i).end
+    }
+
+    /// The places of `range` that may not answer Metal's, as offsets from its start.
+    fn within(&self, range: Range<u64>) -> Vec<u64> {
+        let start = range.start;
+        self.unknown
+            .range(range)
+            .map(|place| place - start)
+            .collect()
+    }
+
+    /// The places of `range` may not answer Metal's.
+    fn mark(&mut self, range: impl IntoIterator<Item = u64>) {
+        self.unknown.extend(range);
+    }
+
+    /// The places of `range` answer Metal's.
+    fn clear(&mut self, range: Range<u64>) {
+        let gone: Vec<u64> = self.unknown.range(range).copied().collect();
+        for place in gone {
+            self.unknown.remove(&place);
+        }
     }
 }
 
@@ -498,31 +569,64 @@ impl IcbObject {
             return;
         };
         let landed = to..to + (from.end - from.start);
-        let tail = destination.reaches_the_last(landed.clone());
         let cleared = !destination.inherits.pipeline;
-        if cleared {
-            let places = Sides::copied_places(landed.clone());
-            plain(|| destination.sides.lock().copied_lengths.extend(places));
-        }
+        let (m, n) = plain(|| (self.raw.size(), destination.raw.size()));
+        // The words a copy may write otherwise than Metal's, until it ran ([`Tail`]): over a
+        // buffer that inherits its pipeline state, every command's; else the landed commands'
+        // pipeline and dispatch words and the copy's word, the dispatch words taking the
+        // source's once it ran.
+        let misplaced = self.inherits.pipeline || destination.inherits.pipeline;
+        let written = plain(|| self.sides.lock().kernel_written);
+        plain(|| {
+            let mut sides = destination.sides.lock();
+            if cleared {
+                sides
+                    .copied_lengths
+                    .extend(Sides::copied_places(landed.clone()));
+            }
+            match misplaced {
+                true => sides.tail.mark(Tail::words(n)),
+                false => {
+                    for i in landed.clone() {
+                        sides.tail.mark(Tail::pipeline(n, i));
+                        sides.tail.mark(Tail::dispatch_and_imageblock(n, i));
+                    }
+                    sides.tail.mark([Tail::copied(n)]);
+                }
+            }
+        });
         type Land = fn(&mut Sides, u64, u64, Vec<(u64, bool)>);
-        let copy = |land: Land| {
+        let copy = |land: Land, ran: bool| {
             let (source, destination) = (Arc::clone(&self.sides), Arc::clone(&destination.sides));
             let (from, landed) = (from.clone(), landed.clone());
             move || {
-                let moved = source.lock().copies(from.clone());
+                let (moved, unknown) = {
+                    let source = source.lock();
+                    let unknown: Vec<Vec<u64>> = (from.clone())
+                        .map(|i| source.tail.within(Tail::dispatch_and_imageblock(m, i)))
+                        .collect();
+                    (source.copies(from.clone()), unknown)
+                };
                 let mut destination = destination.lock();
                 land(&mut destination, from.start, to, moved);
-                if tail {
-                    destination.tail.reach();
-                }
                 if cleared {
-                    let places = Sides::copied_places(landed);
+                    let places = Sides::copied_places(landed.clone());
                     destination.copied_lengths.extend(places);
+                }
+                // The dispatch words landed as the source's were, where the copy ran.
+                if ran && !misplaced && !written {
+                    for (i, unknown) in landed.zip(unknown) {
+                        let words = Tail::dispatch_and_imageblock(n, i);
+                        destination.tail.clear(words.clone());
+                        destination
+                            .tail
+                            .mark(unknown.into_iter().map(|o| words.start + o));
+                    }
                 }
             }
         };
-        progress.at_completion(copy(Sides::take));
-        progress.at_failure(copy(Sides::unsettle));
+        progress.at_completion(copy(Sides::take, true));
+        progress.at_failure(copy(Sides::unsettle, false));
     }
 
     /// A blit of the command buffer of `progress` (none once it went) resets commands `range`:
@@ -531,31 +635,36 @@ impl IcbObject {
         let Some(progress) = &progress else {
             return;
         };
-        let tail = self.reaches_the_last(range.clone());
-        let (sides, failed) = (Arc::clone(&self.sides), Arc::clone(&self.sides));
+        let n = plain(|| self.raw.size());
+        // Over a buffer that inherits its pipeline state, the runtime's reset zeroes other words
+        // than Metal's ([`Tail`]).
+        let misplaced = self.inherits.pipeline;
+        if misplaced {
+            plain(|| self.sides.lock().tail.mark(Tail::commands(n)));
+        }
+        let sides = Arc::clone(&self.sides);
         progress.at_completion(move || {
             let mut sides = sides.lock();
             for place in Sides::copied_places(range.clone()) {
                 sides.copied_lengths.remove(&place);
             }
             for i in range {
-                if let Ok(i) = u32::try_from(i) {
-                    sides.corrupted.remove(&i);
+                if let Ok(at) = u32::try_from(i) {
+                    sides.corrupted.remove(&at);
+                }
+                if !misplaced {
+                    sides.tail.clear(Tail::pipeline(n, i));
+                    sides.tail.clear(Tail::dispatch_and_imageblock(n, i));
                 }
             }
-            if tail {
-                sides.tail.reach();
-            }
         });
-        if tail {
-            progress.at_failure(move || failed.lock().tail.reach());
-        }
     }
 
-    /// Command `index` was reset on the CPU: its whole record is written again, and, of the last
-    /// command, some lengths past it on Metal ([`Tail`]).
+    /// Command `index` was reset on the CPU: its whole record is written again, and, in a buffer
+    /// that does not inherit its pipeline state, its pipeline words are zeroed, as Metal's are
+    /// ([`Tail`]).
     fn rewritten(&self, index: u32) {
-        let last = plain(|| self.raw.size()).checked_sub(1);
+        let n = plain(|| self.raw.size());
         plain(|| {
             let mut sides = self.sides.lock();
             sides.corrupted.remove(&index);
@@ -563,32 +672,23 @@ impl IcbObject {
             for place in Sides::copied_places(at..at + 1) {
                 sides.copied_lengths.remove(&place);
             }
-            if last == Some(u64::from(index)) {
-                sides.tail.reach();
+            if !self.inherits.pipeline {
+                sides.tail.clear(Tail::pipeline(n, at));
             }
         });
     }
 
-    /// Whether a blit that writes commands `range` reaches the last command, which changes some
-    /// lengths past it on Metal ([`Tail`]): where it does, they are taken as changed from now on.
-    fn reaches_the_last(&self, range: Range<u64>) -> bool {
-        let last = plain(|| self.raw.size()).checked_sub(1);
-        let reaches = last.is_some_and(|last| range.contains(&last));
-        if reaches {
-            plain(|| self.sides.lock().tail.reach());
-        }
-        reaches
+    /// A setter of command `index` wrote the words `words` gives of a buffer of its size, as
+    /// Metal's does and the runtime's does not ([`Tail`]).
+    fn words_set(&self, index: u32, words: fn(u64, u64) -> Range<u64>) {
+        let n = plain(|| self.raw.size());
+        plain(|| (self.sides.lock().tail).mark(words(n, u64::from(index))));
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them,
     /// past the last command's ([`Tail`]): it answers as set again.
     fn tail_set(&self, flat: u64) {
-        plain(|| {
-            let mut sides = self.sides.lock();
-            if sides.tail.reached {
-                sides.tail.set.insert(flat);
-            }
-        });
+        plain(|| self.sides.lock().tail.unknown.remove(&flat));
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them, of a
@@ -614,18 +714,21 @@ impl IcbObject {
     }
 
     /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
-    /// past the last command's ([`Tail`]): relayed, a death in strict mode, where a copy into the
-    /// last command or a reset of it may have changed it on Metal since core set it.
+    /// past the last command's ([`Tail`]): relayed, a death in strict mode, where Metal's may
+    /// differ, a word of a command or of a copy that Metal wrote otherwise than the runtime, or
+    /// may have, since core set it.
     fn tail_read(&self, sel: &'static str, flat: u64) {
+        let n = plain(|| self.raw.size());
         let unknown = plain(|| {
             let sides = self.sides.lock();
-            sides.tail.reached && !sides.tail.set.contains(&flat)
+            let written = sides.kernel_written && Tail::words(n).contains(&flat);
+            written || sides.tail.unknown.contains(&flat)
         });
         if unknown {
             inexact(sel, Inexact::IcbLengthPastTheLastCommand, || {
-                "a threadgroup memory length past the last command's, which Metal's copy into \
-                 the last command or reset of it may have changed otherwise than the runtime's: \
-                 it answers the runtime's"
+                "a threadgroup memory length past the last command's, a word of a command's \
+                 pipeline or dispatch or of a copy, which Metal's setters, copies or GPU wrote \
+                 otherwise than the runtime's, or may have: it answers the runtime's"
                     .to_owned()
             });
         }
@@ -727,9 +830,18 @@ impl IcbObject {
     /// buffer's end may have written over one of their records, or may yet before the functions
     /// run ([`IcbObject::overrun`]), as this platform's copy would carry the intact record; else
     /// the residency is kept while the GPU may run it, so such a copy in another command buffer
-    /// dies at the copy.
-    pub(crate) fn resident(&self, sel: &'static str, progress: Option<&Arc<Progress>>) {
+    /// dies at the copy. Where it is for writing (`writes`), the functions may write the records,
+    /// for good ([`Sides::kernel_written`]).
+    pub(crate) fn resident(
+        &self,
+        sel: &'static str,
+        progress: Option<&Arc<Progress>>,
+        writes: bool,
+    ) {
         self.reached(sel, None, progress, RESIDENT_OVERRUN);
+        if writes {
+            plain(|| self.sides.lock().kernel_written = true);
+        }
     }
 
     /// [`IcbObject::executed`] and [`IcbObject::resident`], whose death names `why`.
@@ -1448,21 +1560,29 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             IcbComputeCmd::ConcurrentDispatchThreadgroups {
                 threadgroups_per_grid,
                 threads_per_threadgroup,
-            } => set(sel, || {
-                c.concurrent_dispatch_threadgroups(
-                    crate::gpu::size(threadgroups_per_grid),
-                    crate::gpu::size(threads_per_threadgroup),
-                )
-            }),
+            } => {
+                set(sel, || {
+                    c.concurrent_dispatch_threadgroups(
+                        crate::gpu::size(threadgroups_per_grid),
+                        crate::gpu::size(threads_per_threadgroup),
+                    )
+                })?;
+                self.icb.words_set(self.index, Tail::dispatch);
+                Ok(())
+            }
             IcbComputeCmd::ConcurrentDispatchThreads {
                 threads_per_grid,
                 threads_per_threadgroup,
-            } => set(sel, || {
-                c.concurrent_dispatch_threads(
-                    crate::gpu::size(threads_per_grid),
-                    crate::gpu::size(threads_per_threadgroup),
-                )
-            }),
+            } => {
+                set(sel, || {
+                    c.concurrent_dispatch_threads(
+                        crate::gpu::size(threads_per_grid),
+                        crate::gpu::size(threads_per_threadgroup),
+                    )
+                })?;
+                self.icb.words_set(self.index, Tail::dispatch);
+                Ok(())
+            }
             IcbComputeCmd::Reset => {
                 set(sel, || c.reset())?;
                 self.icb.rewritten(self.index);
@@ -1471,10 +1591,14 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             IcbComputeCmd::SetBarrier => set(sel, || c.set_barrier()),
             IcbComputeCmd::SetComputePipelineState { pipeline_state } => {
                 let state = some(sel, pipeline_state, "pipeline state");
-                set(sel, || c.set_compute_pipeline_state(&state.raw))
+                set(sel, || c.set_compute_pipeline_state(&state.raw))?;
+                self.icb.words_set(self.index, Tail::pipeline);
+                Ok(())
             }
             IcbComputeCmd::SetImageblockWidth { width, height } => {
-                set(sel, || c.set_imageblock_size(width, height))
+                set(sel, || c.set_imageblock_size(width, height))?;
+                self.icb.words_set(self.index, Tail::imageblock);
+                Ok(())
             }
             IcbComputeCmd::SetKernelBuffer {
                 buffer,
@@ -1566,7 +1690,8 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     /// takes them: the command's below 38, a later command's at 38 or more
     /// ([`LENGTHS_A_COMMAND`]), past the last command's too. A command whose record Metal's copy
     /// past the buffer's end may have written over dies ([`IcbObject::overrun`]); one past the
-    /// last command's that a copy into it or a reset of it may have changed is relayed ([`Tail`]).
+    /// last command's that Metal wrote otherwise than the runtime, or may have, is relayed
+    /// ([`Tail`]).
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
         match self.length_place(index) {
@@ -2401,6 +2526,58 @@ mod tests {
                     .map(|a| a.threadgroups_per_grid.width),
             };
             (c.command_type(), width.unwrap_or(u64::MAX))
+        }
+    }
+
+    /// A buffer an encoder made resident for writing, whose functions' encodings Metal's GPU may
+    /// write the words past the last command's lengths of, relays its getter of every such word,
+    /// a death in strict mode, though core set it again since; one made resident for reading
+    /// alone does not, nor does a length past the words (`Tail`)
+    #[test]
+    fn a_buffer_made_resident_for_writing_relays_its_words() {
+        let d = dev();
+        let (read, written) = (
+            make::<VulkanPlatform>(&d, &compute_desc(), 2),
+            make::<VulkanPlatform>(&d, &compute_desc(), 2),
+        );
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for (icb, usage) in [(&read, 1), (&written, 2)] {
+            let resources = [Some(ResourceRef::Icb(icb))];
+            let cmd = ComputeCmd::UseResources {
+                resources: &resources,
+                usage,
+            };
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let command = |icb: &VulkanIcb| icb.compute_command(1).unwrap().unwrap();
+        for icb in [&read, &written] {
+            for index in [38, 58, 62] {
+                let length = IcbComputeCmd::SetThreadgroupMemoryLength { length: 16, index };
+                command(icb).encode(length).unwrap();
+            }
+        }
+        let length = |icb: &VulkanIcb, index| command(icb).threadgroup_memory_length(index);
+        for index in [38, 58, 62] {
+            assert_eq!(length(&read, index).unwrap(), 16, "read {index}");
+        }
+        assert_eq!(length(&written, 62).unwrap(), 16);
+        for index in [38, 58] {
+            *crate::answer::LAST_LINE.lock() = None;
+            let site = catch_death(|| length(&written, index)).unwrap_err();
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            let sel = "getThreadgroupMemoryLengthAtIndex:";
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+            assert!(
+                line.contains(Inexact::IcbLengthPastTheLastCommand.code()),
+                "{line}"
+            );
+            let relayed = crate::answer::relaxed(|| length(&written, index));
+            assert_eq!(relayed.unwrap(), 16, "{index}");
         }
     }
 
