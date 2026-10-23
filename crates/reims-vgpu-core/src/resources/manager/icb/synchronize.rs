@@ -2,9 +2,9 @@
 //! per slot of the ICB's size.
 //!
 //! Each slot writes its command type, the pipeline state's reference (unless inherited), its
-//! buffers as binds (unless inherited), the threadgroup memory lengths (compute), the barrier
-//! and the command's arguments. Only a failed cursor, command type or pipeline write ends the
-//! walk; the other writes' errors are dropped.
+//! buffers as binds (unless inherited), the threadgroup memory lengths (compute: one word each,
+//! where the prepare reads them), the barrier and the command's arguments. Only a failed cursor,
+//! command type or pipeline write ends the walk; the other writes' errors are dropped.
 //!
 //! A command's arguments are read whole ([`DrawArgs`] and its kin), then each address they
 //! hold is looked up for its bind. The `get*AtIndex:` reads, whose index is the guest's, go out
@@ -382,15 +382,26 @@ pub(super) fn synchronize_compute<P: Platform, M: IcbWalkOps<P>>(
                 strides.as_mut(),
             )?;
         }
-        // Every length is written at the same offset.
-        let mut j: u32 = 0;
-        while u64::from(j) < flags.max_kernel_threadgroup_memory_bind_count {
-            let length = match cc {
-                Some(c) => c.threadgroup_memory_length(u64::from(j))?,
-                None => 0,
-            };
-            let _ = command.write_at(u64::from(layout.threadgroup_memory_length_offset), &length);
-            j = j.wrapping_add(1);
+        // One word a length, as the prepare reads them: a cursor over all of them first, whose
+        // failure ends the walk, then each length in turn, a failed write dropped.
+        let lengths_count = flags.max_kernel_threadgroup_memory_bind_count;
+        if lengths_count != 0 {
+            let mut lengths = write_or_fail!(
+                command.writable_sub_cursor_at(
+                    u64::from(layout.threadgroup_memory_length_offset),
+                    lengths_count.wrapping_mul(WORD_SIZE),
+                ),
+                "threadgroup memory lengths not writable"
+            );
+            let mut j: u32 = 0;
+            while u64::from(j) < lengths_count {
+                let length = match cc {
+                    Some(c) => c.threadgroup_memory_length(u64::from(j))?,
+                    None => 0,
+                };
+                let _ = lengths.write(&length);
+                j = j.wrapping_add(1);
+            }
         }
         let barrier = u32::from(cc.is_some_and(|c| c.has_barrier()));
         let _ = command.write_at(u64::from(layout.barrier_offset), &barrier);
@@ -667,7 +678,7 @@ mod tests {
         }
 
         #[test]
-        fn a_prepared_dispatch_round_trips_with_every_length_at_one_offset() {
+        fn a_prepared_dispatch_round_trips_every_length() {
             let mut o = FakeOps::new();
             let b5 = o.resident_buffer(5, 0x100);
             let _b6 = o.resident_buffer(6, 0x100);
@@ -695,9 +706,9 @@ mod tests {
             );
             assert_eq!(read_back::<u64>(&mem, 0x58), 0x30);
             assert_eq!(read_back::<u64>(&mem, 0x60), 0x40);
-            // The last length, at the first slot; the second is 0.
-            assert_eq!(read_back::<u64>(&mem, 0x140), 0x200);
-            assert_eq!(read_back::<u64>(&mem, 0x148), 0);
+            // Each length at its own word, as the prepare read them.
+            assert_eq!(read_back::<u64>(&mem, 0x140), 0x100);
+            assert_eq!(read_back::<u64>(&mem, 0x148), 0x200);
             let d: ConcurrentDispatch = read_back(&mem, 0x90);
             assert_eq!(d.grid, Triple { a: 1, b: 2, c: 3 });
             assert_eq!(d.threads_per_threadgroup, Triple { a: 4, b: 5, c: 6 });
@@ -734,6 +745,54 @@ mod tests {
                 6
             );
             assert_eq!(o.log().count("getKernelAttributeStrideAtIndex:"), 2);
+        }
+
+        /// Lengths that run past the command end the walk before any length is asked for or
+        /// written; what came before them is written.
+        #[test]
+        fn lengths_past_the_command_end_the_walk() {
+            let mut o = FakeOps::new();
+            let _b5 = o.resident_buffer(5, 0x100);
+            let _b6 = o.resident_buffer(6, 0x100);
+            let icb = o.icb(1);
+            let mut c = Cmds::new(1);
+            compute_command(&mut c, 0, CONCURRENT_DISPATCH);
+            let f = compute_flags(0b11);
+            prepare_compute(Hold::NONE, &o, &icb, &layout(), &f, c.cursor())
+                .unwrap()
+                .unwrap();
+            // 0x140 + 13 words runs past the 0x1a0-byte command.
+            let mut far = f;
+            far.max_kernel_threadgroup_memory_bind_count = 13;
+            let mark = o.log().mark();
+            let (mem, w) = writable(CMD as u64);
+            let e = synchronize_compute(Hold::NONE, &o, &icb, &layout(), &far, w)
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                e.starts_with("threadgroup memory lengths not writable: "),
+                "{e}"
+            );
+            assert!(
+                !o.log()
+                    .since(mark)
+                    .iter()
+                    .any(|c| c.sel == "getThreadgroupMemoryLengthAtIndex:")
+            );
+            assert_eq!(read_back::<u32>(&mem, 0), CONCURRENT_DISPATCH);
+            assert_eq!(read_back::<u64>(&mem, 0x140), 0);
+            // The arguments come after the lengths: not written.
+            let d: ConcurrentDispatch = read_back(&mem, 0x90);
+            assert_eq!(d.grid, Triple { a: 0, b: 0, c: 0 });
+            // Twelve fit exactly.
+            let mut fits = f;
+            fits.max_kernel_threadgroup_memory_bind_count = 12;
+            let (mem, w) = writable(CMD as u64);
+            synchronize_compute(Hold::NONE, &o, &icb, &layout(), &fits, w)
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_back::<u64>(&mem, 0x140), 0x100);
+            assert_eq!(read_back::<u64>(&mem, 0x148), 0x200);
         }
 
         #[test]

@@ -2880,6 +2880,21 @@ aborts, section 7.4):
   (`mutgap_tex_icb_reset_again`).
 - A compute slot of command type 0 writes back only its type; a render slot of
   type 0 still writes its pipeline and binds (`icb_sync`).
+- A compute command's write-back writes each threadgroup memory length to its
+  own word from the layout's lengths offset, where prepare reads them: a
+  command prepared with lengths 0x40 and 0x80 reads 0x40 and 0x80 back, and
+  one with none reads 0 in each word (`icb_sync`, `icb_evict`). The write-back
+  takes one cursor over all of a command's lengths first: lengths past the
+  command end it there, leaving that command's barrier and arguments and the
+  later commands unwritten, the error dropped as below
+  (`synchronize::tests::lengths_past_the_command_end_the_walk`). Apple's GPU
+  task service does the same (**read**, macOS 27.0.1, 26A434:
+  `synchronizeIndirectComputeCommandBuffer` makes one writable sub-cursor of
+  the kernel threadgroup memory count × 8 bytes at the lengths offset, ends
+  the walk when that fails, then writes each length with its own 8-byte
+  write), and Metal keeps a length for each index of each command (**measured**
+  with a probe, M3 Max, macOS 27.0.1: lengths 16, 32, 48, 64 and 0, 0, 80, 0
+  set on two commands read back as set in 301 of 301 runs).
 - Write-back errors are dropped: the synchronize completes, and the guest copy
   is marked valid (`icb_sync_errors` locks the completion).
 - A failed prepare only logs: the ICB stays host-invalid, the commands encoded

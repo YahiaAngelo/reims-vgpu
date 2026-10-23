@@ -538,9 +538,10 @@ def icb_sync():
     address and offset, fillBufferBind; an unbound slot reads ~0), strides,
     barrier and arguments; a compute slot of type 0 stops after its type, a
     render one does not; an inheriting ICB writes neither pipeline nor
-    binds; threadgroup memory lengths all land at one offset. An ICB over a
-    read-only page fails "Failed to make cursor for synchronize" and stays
-    as it was. A second 53 finds every guest copy valid and writes nothing.
+    binds; each threadgroup memory length lands in its own word, where
+    prepare reads it. An ICB over a read-only page fails "Failed to make
+    cursor for synchronize" and stays as it was. A second 53 finds every
+    guest copy valid and writes nothing.
     GPU addresses are the host's: keyed by the host."""
     s = Scenario("icb_sync", setups=("isolate",), host=True, doc=icb_sync.__doc__)
     s.bring_up()
