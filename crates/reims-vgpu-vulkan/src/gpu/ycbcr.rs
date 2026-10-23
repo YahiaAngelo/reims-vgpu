@@ -75,8 +75,10 @@
 //! Metal's does, and a twin's as its converted format's, where Metal's reads no defined value
 //! (`own_format_views_are_metals`). A packed format's texture writes nothing on `replaceRegion:`, as Metal's
 //! leaves both planes; its blits to and from a buffer, which Metal runs at rows that follow no
-//! layout of the texture's, and a texture over plane 1 of a packed surface die, naming the
-//! runtime's refusal (`packed_textures_copy_nothing_and_their_blits_and_plane_1_die`).
+//! layout of the texture's, die, naming the runtime's refusal
+//! (`packed_textures_copy_nothing_and_their_blits_die`). A render target of a 4:2:0 or 4:2:2
+//! format of an odd width or height is nil, as Metal's is
+//! (`odd_render_targets_of_subsampled_formats_are_nil_as_metals`).
 //!
 //! The runtime makes no texture of 505 or 543 from a descriptor alone. So the descriptor holds
 //! the format and answers it ([`crate::gpu::desc::TextureFields`]), and every creator but the one
@@ -85,8 +87,15 @@
 //! runtime makes both, as it makes 500's ([`runtime_makes`]): over plane 0 of an 'x420', 'xf20',
 //! 'x422', 'xf22', 'x444' or 'xf44' surface whose `kIOSurfaceYCbCrMatrix` is BT.601, BT.709,
 //! BT.2020, SMPTE 240M or none, read as Metal reads them (the tests compare them with Metal over
-//! each format and OSType). It refuses, typed, any other OSType, plane 1 and a matrix of any
-//! other value, each a death at the creator, where Metal makes the texture.
+//! each format and OSType). So does each format of the family over plane 0 of a two-plane
+//! surface of another OSType (of other bits or packing, or a coarser chroma plane), each code in
+//! the format's own layout and subsampling, over plane 1 of one, its codes the luma and the chroma
+//! codes 0, and, but an `_sRGB` twin, over a surface whose matrix is `DCI_P3` or `P3_D65`, each
+//! code read alone, each read as Metal's (`textures_over_other_ostypes_read_as_metals`,
+//! `textures_over_plane_1_read_as_metals`). What the runtime refuses of them (an `_sRGB` twin
+//! over a P3 surface, a texture whose rows overlap on the surface, such as a 10-bit format's over
+//! rows of 8-bit codes, a lossless compressed OSType, planes off its alignment, a load, write or
+//! pass it has no form for) dies at its selector, naming the refusal, where Metal goes on.
 //!
 //! **Address modes.** Metal addresses a texture of the family by its format: a 4:2:0 or 4:2:2 one
 //! samples repeat, mirrored repeat and mirror-clamp-to-edge as clamp-to-edge, a 4:4:4 one as

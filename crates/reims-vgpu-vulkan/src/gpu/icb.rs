@@ -17,9 +17,13 @@
 //!   more reaching a later command's, as Metal's, which the runtime's blits move with the
 //!   records, and one past the last command's kept beside the buffer, which a copy or a reset of
 //!   another command does not reach; the index's low 32 bits, as Metal's take them. A copy into
-//!   the last command and a reset of it change some of the lengths past it on Metal and none in
-//!   the runtime, so once one may have run, a getter of such a length is relayed, a death in
-//!   strict mode, until core sets it again ([`Tail`]).
+//!   the last command and a reset of it change some of the lengths past it on Metal, which the
+//!   runtime's change otherwise, so once one may have run, a getter of such a length is relayed,
+//!   a death in strict mode, until core sets it again ([`Tail`]). A copy into a command of a
+//!   buffer that does not inherit its pipeline state clears its lengths 36 and 37 in the
+//!   runtime, where Metal's carries them from a command that names no pipeline state: their
+//!   getter is relayed alike, until core sets them or a reset clears them
+//!   ([`Sides::copied_lengths`]).
 //! - **The pipeline state's `uniqueIdentifier`** a command's getter answers is the runtime's
 //!   (`pipeline_unique_identifier`): that of the state its record names by the state's resource
 //!   ID, which a record the GPU wrote (a kernel's, or a blit's copy) names with no setter's, as
@@ -337,18 +341,32 @@ struct Sides {
     /// What Metal answers of the threadgroup memory lengths past the last command's that the
     /// runtime's may not.
     tail: Tail,
+    /// The threadgroup memory lengths 36 and 37 of the commands a copy wrote into, by their
+    /// place in the buffer's array of them ([`LENGTHS_A_COMMAND`]), in a buffer that does not
+    /// inherit its pipeline state, that core has not set since and no reset has cleared: the
+    /// runtime's copy clears them, where Metal's carries them from a command that names no
+    /// pipeline state (measured on the M3 Max, macOS 27.0.1:
+    /// `blits_move_lengths_past_the_record_as_metals`). Their getter is relayed, a death in strict
+    /// mode ([`Inexact::IcbCopiedLength`]).
+    copied_lengths: BTreeSet<u64>,
+}
+
+impl Sides {
+    /// The places of lengths 36 and 37 of each of commands `range` ([`Sides::copied_lengths`]).
+    fn copied_places(range: Range<u64>) -> impl Iterator<Item = u64> {
+        range.flat_map(|i| [36, 37].map(|slot| i * LENGTHS_A_COMMAND + slot))
+    }
 }
 
 /// The threadgroup memory lengths past the last command's ([`LENGTHS_A_COMMAND`]), which Metal
-/// and the runtime keep beside the buffer and read back as set, a copy or a reset of another
-/// command reaching none of them. A copy into the last command and a reset of it reach some on
-/// Metal, and none in the runtime (measured on the M3 Max, macOS 27.0.1, buffers of 2 compute
-/// commands: a blit's copy of the last command into another buffer's last carries the length 2
-/// past it over a 0 there, but a 0 copied leaves a length set there, and a blit's or the CPU's
-/// reset of the last command zeroes it; neither reaches the length 102 past it). From the
-/// encoding of one on, the runtime's answer of such a length may not be Metal's, and its getter
-/// is relayed, a death in strict mode ([`Inexact::IcbLengthPastTheLastCommand`]), until core
-/// sets it again.
+/// and the runtime read back as set. A copy into the last command and a reset of it reach some on
+/// Metal, and the runtime's reach them otherwise (measured on the M3 Max, macOS 27.0.1, buffers of
+/// 2 compute commands: a blit's copy of the last command into another buffer's last carries the
+/// length 2 past it over a 0 there, but a 0 copied leaves a length set there, where the runtime's
+/// copies the 0, and a blit's or the CPU's reset of the last command zeroes it; neither reaches
+/// the length 102 past it). From the encoding of one on, the runtime's answer of such a length
+/// may not be Metal's, and its getter is relayed, a death in strict mode
+/// ([`Inexact::IcbLengthPastTheLastCommand`]), until core sets it again.
 #[derive(Debug, Default)]
 struct Tail {
     /// A copy into the last command or a reset of it was encoded, ran or may have.
@@ -478,17 +496,27 @@ impl IcbObject {
         let Some(progress) = &progress else {
             return;
         };
-        let tail = destination.reaches_the_last(to..to + (from.end - from.start));
+        let landed = to..to + (from.end - from.start);
+        let tail = destination.reaches_the_last(landed.clone());
+        let cleared = !destination.inherits.pipeline;
+        if cleared {
+            let places = Sides::copied_places(landed.clone());
+            plain(|| destination.sides.lock().copied_lengths.extend(places));
+        }
         type Land = fn(&mut Sides, u64, u64, Vec<(u64, bool)>);
         let copy = |land: Land| {
             let (source, destination) = (Arc::clone(&self.sides), Arc::clone(&destination.sides));
-            let from = from.clone();
+            let (from, landed) = (from.clone(), landed.clone());
             move || {
                 let moved = source.lock().copies(from.clone());
                 let mut destination = destination.lock();
                 land(&mut destination, from.start, to, moved);
                 if tail {
                     destination.tail.reach();
+                }
+                if cleared {
+                    let places = Sides::copied_places(landed);
+                    destination.copied_lengths.extend(places);
                 }
             }
         };
@@ -506,6 +534,9 @@ impl IcbObject {
         let (sides, failed) = (Arc::clone(&self.sides), Arc::clone(&self.sides));
         progress.at_completion(move || {
             let mut sides = sides.lock();
+            for place in Sides::copied_places(range.clone()) {
+                sides.copied_lengths.remove(&place);
+            }
             for i in range {
                 if let Ok(i) = u32::try_from(i) {
                     sides.corrupted.remove(&i);
@@ -527,6 +558,10 @@ impl IcbObject {
         plain(|| {
             let mut sides = self.sides.lock();
             sides.corrupted.remove(&index);
+            let at = u64::from(index);
+            for place in Sides::copied_places(at..at + 1) {
+                sides.copied_lengths.remove(&place);
+            }
             if last == Some(u64::from(index)) {
                 sides.tail.reach();
             }
@@ -555,6 +590,28 @@ impl IcbObject {
         });
     }
 
+    /// Core set the threadgroup memory length `flat` places into the buffer's array of them, of a
+    /// command: a length 36 or 37 a copy cleared answers as set again
+    /// ([`Sides::copied_lengths`]).
+    fn record_set(&self, flat: u64) {
+        plain(|| self.sides.lock().copied_lengths.remove(&flat));
+    }
+
+    /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
+    /// of a command: relayed, a death in strict mode, where it is a length 36 or 37 a copy
+    /// cleared, where Metal's carries it from a command that names no pipeline state
+    /// ([`Sides::copied_lengths`]).
+    fn record_read(&self, sel: &'static str, flat: u64) {
+        if plain(|| self.sides.lock().copied_lengths.contains(&flat)) {
+            inexact(sel, Inexact::IcbCopiedLength, || {
+                "a threadgroup memory length 36 or 37 of a command a copy wrote into, which the \
+                 runtime's copy clears and Metal's carries from a command that names no pipeline \
+                 state: it answers the runtime's"
+                    .to_owned()
+            });
+        }
+    }
+
     /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
     /// past the last command's ([`Tail`]): relayed, a death in strict mode, where a copy into the
     /// last command or a reset of it may have changed it on Metal since core set it.
@@ -566,8 +623,8 @@ impl IcbObject {
         if unknown {
             inexact(sel, Inexact::IcbLengthPastTheLastCommand, || {
                 "a threadgroup memory length past the last command's, which Metal's copy into \
-                 the last command or reset of it may have changed, and the runtime's do not: it \
-                 answers the runtime's"
+                 the last command or reset of it may have changed otherwise than the runtime's: \
+                 it answers the runtime's"
                     .to_owned()
             });
         }
@@ -985,11 +1042,17 @@ impl CommandObject<rt::IndirectRenderCommand> {
 }
 
 impl CommandObject<rt::IndirectComputeCommand> {
+    /// The place of the command's threadgroup memory length at `index`'s low 32 bits in the
+    /// buffer's array of them ([`LENGTHS_A_COMMAND`]).
+    fn flat(&self, index: u64) -> u64 {
+        u64::from(self.index) * LENGTHS_A_COMMAND + u64::from(index.low_u32())
+    }
+
     /// Where Metal keeps the command's threadgroup memory length at `index`'s low 32 bits
     /// ([`LENGTHS_A_COMMAND`]): the command whose record holds it, or its place in the buffer's
     /// array of them, past the last command's ([`Tail`]).
     fn length_place(&self, index: u64) -> Result<u32, u64> {
-        let flat = u64::from(self.index) * LENGTHS_A_COMMAND + u64::from(index.low_u32());
+        let flat = self.flat(index);
         let command = flat / LENGTHS_A_COMMAND;
         match command < plain(|| self.icb.raw.size()) {
             true => Ok(command.low_u32()),
@@ -1457,8 +1520,9 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                 set(sel, || {
                     c.set_threadgroup_memory_length(length, index.low_u32())
                 })?;
-                if let Err(flat) = self.length_place(index) {
-                    self.icb.tail_set(flat);
+                match self.length_place(index) {
+                    Ok(_) => self.icb.record_set(self.flat(index)),
+                    Err(flat) => self.icb.tail_set(flat),
                 }
                 Ok(())
             }
@@ -1517,7 +1581,10 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
         match self.length_place(index) {
-            Ok(command) => self.icb.intact(sel, command),
+            Ok(command) => {
+                self.icb.intact(sel, command);
+                self.icb.record_read(sel, self.flat(index));
+            }
             Err(flat) => self.icb.tail_read(sel, flat),
         }
         let length = get(sel, || self.raw.threadgroup_memory_length(index));

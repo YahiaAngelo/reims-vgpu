@@ -83,17 +83,8 @@ fn reservations_keep_ids_from_plain_allocation() {
     );
 }
 
-/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface` on this platform,
-/// as the guest's creator makes it.
-fn ycbcr8_420(
-    surface: &OsSurface,
-    plane: u64,
-    size: (u64, u64),
-) -> RaiseResult<Option<VulkanTexture>> {
-    ycbcr8_420_on(&dev(), surface, plane, size)
-}
-
-/// [`ycbcr8_420`] on the device `d`.
+/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface` on the device `d`, as the
+/// guest's creator makes it.
 fn ycbcr8_420_on(
     d: &VulkanDevice,
     surface: &OsSurface,
@@ -434,40 +425,6 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
             line.contains(&named) && line.contains("texture 0 bound as YCBCR84202P"),
             "{function}: {line}"
         );
-    }
-}
-
-/// A `YCBCR8_420_2P` texture the runtime refuses dies where it is made, naming the refusal,
-/// where Metal makes it: over plane 1 of a '420v' surface, over a surface of a matrix other
-/// than BT.601, BT.709, BT.2020 and SMPTE 240M (`P3_D65`), and over a 10-bit 'x420' one
-#[test]
-fn ycbcr8_420_textures_the_runtime_refuses_die() {
-    use crate::gpu::ycbcr::measure::Shape;
-    use crate::gpu::ycbcr::measure::metal::{metals, set_value};
-    use crate::os::MATRIX_KEY;
-    let size = (16, 16);
-    let plain = Shape::of(b"420v");
-    let other_matrix = plain.surface(size);
-    set_value(&other_matrix, MATRIX_KEY, "P3_D65");
-    let ten_bits = Shape::of(b"x420").surface(size);
-    for (surface, plane, case) in [
-        (&plain.surface(size), 1, "plane 1"),
-        (&other_matrix, 0, "P3 D65"),
-        (&ten_bits, 0, "x420"),
-    ] {
-        let site = catch_death(|| ycbcr8_420(surface, plane, size)).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                DeathKind::Abort,
-                "newTextureWithDescriptor:iosurface:plane:"
-            ),
-            "{case}"
-        );
-        if let Some((_, mt)) = metals(500, surface, plane, size) {
-            use reims_vgpu_core::platform::resource::Texture as _;
-            assert_eq!(mt.pixel_format(), 500, "Metal: {case}");
-        }
     }
 }
 

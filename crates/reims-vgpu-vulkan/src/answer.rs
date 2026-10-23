@@ -1039,6 +1039,19 @@ pub fn create<T>(
 ///   that close may decide otherwise. The runtime defers an exact path, and no hardware fact
 ///   forces the difference, so it dies. Announced at each draw that binds the pipeline's
 ///   variant, inside its call, which dies at its selector;
+/// - the note `LoopedSampleOutputs`: a multisampled pipeline's fragment function that reads
+///   `[[sample_mask]]`, which Metal runs once per covered sample (it reads `[[sample_id]]` or a
+///   sample-qualified varying, or writes memory), and returns an output, which the runtime runs
+///   once per pixel, its body once per covered sample from a loop over the coverage, and whose
+///   outputs land on the samples Metal's runs keep, each the last pass's, where Metal writes each
+///   sample's from that sample's run: equal where every pass computes the same outputs. The
+///   runtime's ground is Vulkan's rule that an invocation under sample shading sees only its own
+///   sample's bit of the coverage, no fact of a device's hardware, as `ClippedCoverageSplit`'s is
+///   none, so it dies on every device. It replaces the runtime's refusal of such a function
+///   (`CoverageLoopRefusal::Outputs`), which died where the pipeline was made. On MoltenVK on
+///   Apple's GPU a function that writes memory runs as written, once per covered sample, exact,
+///   and announces nothing. Announced at each draw that binds the pipeline's variant, inside its
+///   call, which dies at its selector;
 /// - the note `HelperBranchDropsSimdgroupStores`: on MoltenVK on an Apple GPU, a fragment
 ///   function where only helper invocations may run an operation SPIRV-Cross writes as an
 ///   `optnone` call before a storage write, which the runtime cannot keep them out of exactly,
@@ -1122,9 +1135,12 @@ pub fn create<T>(
 ///   `[[primitive_id]]` into its varying reads each primitive's last vertex's, and a layer or
 ///   viewport selected in a synthesized geometry stage comes from each primitive's first vertex
 ///   (`ProvokingVertexUnmatched`). On every device a mode from 2 up, its top bit set or not,
-///   which Metal draws a third way, is drawn as mode 1, announced at the setter
-///   (`ProvokingVertexUnmatched`). Announced at each such draw, or at the setter, inside its
-///   call, which dies at its selector;
+///   which Metal draws a third way, is drawn as mode 1, patches as mode 0, as Metal's: a draw
+///   whose shape the third way draws otherwise than mode 1, as far as its state reads the
+///   difference (a strip of triangles, lines, sized points, the triangles of a state that selects
+///   a layer or viewport, and mesh draws, not measured there), announces it
+///   (`ProvokingVertexUnmatched`); the setter announces nothing. Announced at each such draw,
+///   inside its call, which dies at its selector;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1149,7 +1165,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 135] = [
+pub const DIES: [rt::Degradation; 136] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1256,6 +1272,7 @@ pub const DIES: [rt::Degradation; 135] = [
     rt::Degradation::TessellationWinding,
     rt::Degradation::TessellationFactorEdgeCases,
     rt::Degradation::ComputedSampleDepth,
+    rt::Degradation::LoopedSampleOutputs,
     rt::Degradation::HelperBranchDropsSimdgroupStores,
     rt::Degradation::ExtendedRangeBlendsStoredCodes,
     rt::Degradation::ExtendedRangeBlendSource,
@@ -2139,14 +2156,20 @@ pub enum Inexact {
     IcbIdentifierAfterEncoder,
     /// A threadgroup memory length of a compute indirect command buffer past its last command's,
     /// from the encoding of a copy into the last command or of a reset of it on, until core sets
-    /// it again: Metal's copy and reset change some such lengths, and the runtime's none, so the
-    /// getter answers the runtime's, as set before ([`crate::gpu::icb`]'s `Tail`).
+    /// it again: Metal's copy and reset change some such lengths, and the runtime's change them
+    /// otherwise, so the getter answers the runtime's ([`crate::gpu::icb`]'s `Tail`).
     IcbLengthPastTheLastCommand,
+    /// A threadgroup memory length 36 or 37 of a command of a compute indirect command buffer
+    /// that does not inherit its pipeline state, from the encoding of a copy into the command
+    /// on, until core sets it or a reset clears it: the runtime's copy clears both, where
+    /// Metal's carries them from a command that names no pipeline state, so the getter answers
+    /// the runtime's 0 ([`crate::gpu::icb`]'s `Sides::copied_lengths`).
+    IcbCopiedLength,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
         Self::WriteRounding,
@@ -2160,6 +2183,7 @@ impl Inexact {
         Self::UniqueIdentifier,
         Self::IcbIdentifierAfterEncoder,
         Self::IcbLengthPastTheLastCommand,
+        Self::IcbCopiedLength,
     ];
 
     /// The kind's code, which its line names.
@@ -2178,6 +2202,7 @@ impl Inexact {
             Self::UniqueIdentifier => "inexact-unique-identifier",
             Self::IcbIdentifierAfterEncoder => "inexact-icb-identifier-after-encoder",
             Self::IcbLengthPastTheLastCommand => "inexact-icb-length-past-last-command",
+            Self::IcbCopiedLength => "inexact-icb-copied-length",
         }
     }
 }
@@ -2809,7 +2834,8 @@ mod tests {
                 | Inexact::ProtectedContent
                 | Inexact::UniqueIdentifier
                 | Inexact::IcbIdentifierAfterEncoder
-                | Inexact::IcbLengthPastTheLastCommand => {}
+                | Inexact::IcbLengthPastTheLastCommand
+                | Inexact::IcbCopiedLength => {}
             }
         }
     }

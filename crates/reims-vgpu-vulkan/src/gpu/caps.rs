@@ -329,10 +329,16 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
             "isDepth24Stencil8PixelFormatSupported",
             props.is_depth24_stencil8_pixel_format_supported(),
         ),
-        // The compile layer's: a fragment function reads its colour attachments. The runtime's
-        // own answer (`Device::private_properties`) is its `ProgrammableBlending` row, which on
-        // MoltenVK it refuses for want of `VK_EXT_rasterization_order_attachment_access`, where
-        // the compile layer reads attachments through Metal's own fetch.
+        // The compile layer's: a fragment function reads its colour attachments, through
+        // rasterization-order input attachments or the pixel interlock's storage form: yes on
+        // MoltenVK, RADV, ANV and NVIDIA. The runtime's own answer
+        // (`PrivateFlag::IsFramebufferReadSupported`, its `ProgrammableBlending` row) is yes on
+        // MoltenVK and RADV too, and no on NVIDIA and ANV, which render the one- and
+        // two-channel 8-bit sRGB formats (and, on NVIDIA, the packed 16-bit ones and
+        // `RGB9E5Float`) only through a view of their word, whose fetch the compile layer
+        // refuses per pipeline (`NotImplemented(Format)`), which dies at the pipeline's
+        // creation. An answer stays as it was until the guests boot with the new one, so this
+        // one stays the compile layer's.
         is_framebuffer_read_supported: !refuses(Feature::FramebufferFetch),
         is_large_mrt_supported: flag(F::IsLargeMrtSupported),
         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,

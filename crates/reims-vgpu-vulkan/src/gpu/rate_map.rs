@@ -60,9 +60,9 @@
 //!   full-screen triangle's vertex function writes its buffer, its fragment function never runs,
 //!   and the colour, depth and stencil attachments keep their clears), as the runtime's pass
 //!   does. A tile dispatch in it, which only draws were measured against, dies, and so does the
-//!   `endEncoding` of a pass over a mutable map of layers, or not yet reset, that nothing drew in,
-//!   at which Metal's GPU hangs, where the runtime's stores what the pass loaded or cleared
-//!   ([`crate::gpu::encode_render`]).
+//!   `endEncoding` of a pass over a mutable map, reset or not, that nothing drew in, whose
+//!   command buffer the runtime fails as a GPU hang, where Metal's GPU runs it and stores what
+//!   it loaded or cleared ([`crate::gpu::encode_render`]).
 //! - **When the map is read.** Metal's pass reads the map as the GPU runs it (measured: a reset
 //!   after the encoder is made, after its draw, after `endEncoding` and just after `commit` each
 //!   shows in the pass, from a map not yet reset and from a compiled one). So does the runtime's:
@@ -449,8 +449,8 @@ impl RateMapObject {
         Ok(opened)
     }
 
-    /// Whether the map was made of a `Mutable` descriptor, whose pass of no draws Metal's GPU
-    /// hangs at (`crate::gpu::encode_render`).
+    /// Whether the map was made of a `Mutable` descriptor, whose pass of no draws the runtime
+    /// fails as a GPU hang, where Metal's runs (`crate::gpu::encode_render`).
     pub(crate) fn is_mutable(&self) -> bool {
         self.mutability == MUTABLE
     }

@@ -1017,10 +1017,14 @@ fn lengths_past_the_record_read_back_as_on_metal() {
 
 /// A blit's copy and reset of commands move and clear the threadgroup memory lengths past the
 /// 31 a record holds as they do the record's, as on Metal: lengths at 30, 33 and 37 of two
-/// commands, the first copied over a second buffer's command 1 and the second reset
+/// commands, the first copied over a second buffer's command 1 and the second reset. The copied
+/// length 37 is the runtime's 0, where Metal's copy carries it from the command, which names no
+/// pipeline state: its getter is relayed, a death in strict mode
+/// ([`Inexact::IcbCopiedLength`](crate::answer::Inexact::IcbCopiedLength))
 #[test]
 fn blits_move_lengths_past_the_record_as_metals() {
-    fn reads<P: Platform>(d: &P::Device) -> Vec<u64> {
+    /// Every length but the copied 37, and the second buffer, whose command 1 holds it.
+    fn reads<P: Platform>(d: &P::Device) -> (Vec<u64>, P::Icb) {
         let desc = IcbDesc {
             max_kernel_threadgroup_memory_bind_count: 40,
             ..compute_desc()
@@ -1052,19 +1056,38 @@ fn blits_move_lengths_past_the_record_as_metals() {
         );
         assert_eq!(cb.status().0, COMPLETED);
         let mut lengths = Vec::new();
-        for icb in [&a, &b] {
+        for (second, icb) in [(false, &a), (true, &b)] {
             for i in [0, 1] {
                 for index in [30, 33, 37] {
-                    lengths.push(command(icb, i).threadgroup_memory_length(index).unwrap());
+                    if !(second && i == 1 && index == 37) {
+                        lengths.push(command(icb, i).threadgroup_memory_length(index).unwrap());
+                    }
                 }
             }
         }
-        lengths
+        (lengths, b)
     }
-    let vulkan = reads::<VulkanPlatform>(&dev());
-    assert_eq!(vulkan, [16, 20, 24, 0, 0, 0, 0, 0, 0, 16, 20, 24]);
+    let length = |icb: &VulkanIcb| {
+        let command = icb.compute_command(1).unwrap().unwrap();
+        command.threadgroup_memory_length(37).unwrap()
+    };
+    let (vulkan, b) = reads::<VulkanPlatform>(&dev());
+    assert_eq!(vulkan, [16, 20, 24, 0, 0, 0, 0, 0, 0, 16, 20]);
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| length(&b)).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(
+        (site.kind, site.file),
+        (DeathKind::Abort, "getThreadgroupMemoryLengthAtIndex:")
+    );
+    let kind = crate::answer::Inexact::IcbCopiedLength;
+    assert!(line.contains(kind.code()), "{line}");
+    assert_eq!(crate::answer::relaxed(|| length(&b)), 0);
     if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
+        let (metal, b) = reads::<MetalPlatform>(&md);
+        assert_eq!(metal, vulkan);
+        let command = b.compute_command(1).unwrap().unwrap();
+        assert_eq!(command.threadgroup_memory_length(37).unwrap(), 24);
     }
 }
 
@@ -1116,8 +1139,9 @@ fn lengths_cross_into_later_commands_as_on_metal() {
 /// past them, a length of an index of 38 or more among them as the later command's, and a
 /// blit's reset clears them, while a length past the last command's that a copy or a reset of
 /// another command does not reach stays, as on Metal. A copy into the last command, and a reset
-/// of it on the CPU, change some of those lengths on Metal and none here (`Tail`): a getter of
-/// one is relayed here, a death in strict mode, until core sets it again
+/// of it on the CPU, change some of those lengths on Metal, and the runtime's otherwise
+/// (`Tail`), though those read here answer as Metal's: a getter of one is relayed here, a death
+/// in strict mode, until core sets it again
 #[test]
 fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
     fn length<P: Platform>(icb: &P::Icb, i: u64, index: u64) -> u64 {
@@ -1189,14 +1213,16 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
         assert!(line.contains(kind.code()), "{line}");
         crate::answer::relaxed(|| length::<VulkanPlatform>(icb, i, index))
     };
-    assert_eq!([unfollowed(&b, 1, 40), unfollowed(&b, 1, 41)], [0, 90]);
+    let tail = [unfollowed(&b, 1, 40), unfollowed(&b, 1, 41)];
+    assert_eq!(tail, [80, 0]);
     assert_eq!(length::<VulkanPlatform>(&a, 1, 40), 80);
     a.compute_command(1)
         .unwrap()
         .unwrap()
         .encode(IcbComputeCmd::Reset)
         .unwrap();
-    assert_eq!(unfollowed(&a, 1, 40), 80);
+    let reset = unfollowed(&a, 1, 40);
+    assert_eq!(reset, 0);
     set::<VulkanPlatform>(&b, 1, 7, 41);
     set::<VulkanPlatform>(&a, 1, 5, 40);
     let again = [
@@ -1204,17 +1230,20 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
         length::<VulkanPlatform>(&a, 1, 40),
     ];
     assert_eq!(again, [7, 5]);
-    assert_eq!(unfollowed(&b, 1, 40), 0);
+    assert_eq!(unfollowed(&b, 1, 40), 80);
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
     let (metal, [a, b]) = reads::<MetalPlatform>(&md);
     assert_eq!(metal, vulkan);
+    let tail_on_metal = [length::<MetalPlatform>(&b, 1, 40), length::<MetalPlatform>(&b, 1, 41)];
+    assert_eq!(tail_on_metal, tail);
     a.compute_command(1)
         .unwrap()
         .unwrap()
         .encode(IcbComputeCmd::Reset)
         .unwrap();
+    assert_eq!(length::<MetalPlatform>(&a, 1, 40), reset);
     set::<MetalPlatform>(&b, 1, 7, 41);
     set::<MetalPlatform>(&a, 1, 5, 40);
     let again_on_metal = [
@@ -1222,6 +1251,7 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
         length::<MetalPlatform>(&a, 1, 40),
     ];
     assert_eq!(again_on_metal, again);
+    assert_eq!(length::<MetalPlatform>(&b, 1, 40), 80);
 }
 
 /// A buffer set at an offset past 32 bits answers the buffer's address plus the offset's low

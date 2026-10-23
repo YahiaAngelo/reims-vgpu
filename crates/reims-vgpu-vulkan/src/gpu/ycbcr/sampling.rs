@@ -229,62 +229,156 @@ family_samples! {
     rgb10_444_samples_as_metals: 545,
 }
 
-/// A texture of `YCBCR10_420_2P` (505) or `RGB10_420_2P` (543) the runtime refuses dies where
-/// it is made, naming the refusal, where Metal makes it: over plane 1 of an 'x420' surface, over
-/// plane 0 of a surface of another OSType ('420v', of 8-bit codes), and over an 'x420' surface
-/// whose YCbCr matrix the runtime does not read (`P3_D65`)
-#[test]
-fn ycbcr10_textures_the_runtime_refuses_die() {
-    let size = (16, 16);
-    let x420 = Shape::of(b"x420");
-    let other_matrix = x420.surface(size);
-    set_value(&other_matrix, MATRIX_KEY, "P3_D65");
-    let eight_bits = Shape::of(b"420v").surface(size);
-    let plain = x420.surface(size);
-    for format in [505, 543] {
-        for (surface, plane, case) in [
-            (&plain, 1, "plane 1"),
-            (&eight_bits, 0, "420v"),
-            (&other_matrix, 0, "P3 D65"),
-        ] {
-            let desc = platform().texture_descriptor(&measure::desc(format, size));
-            let made = catch_death(|| dev().new_texture_on_surface(&desc, Some(surface), plane));
-            let site = made.map(drop).unwrap_err();
-            assert_eq!(
-                (site.kind, site.file),
-                (
-                    DeathKind::Abort,
-                    "newTextureWithDescriptor:iosurface:plane:"
-                ),
-                "{format} {case}"
-            );
-            if let Some((_, mt)) = measure::metal::metals(format, surface, plane, size) {
-                assert_eq!(mt.pixel_format(), format, "Metal: {format} {case}");
-            }
-        }
-    }
+/// Whether `format` is an `_sRGB` twin of a converted format of the family (520 to 530).
+fn twin(format: u64) -> bool {
+    (520..=530).contains(&format)
 }
 
-/// A texture of a format of the family over a surface of its bits whose chroma plane holds
-/// less than its own (a 4:2:2 or 4:4:4 format over a 4:2:0 surface, a 4:4:4 one over a 4:2:2
-/// one), which Metal makes, reading past the plane, dies where it is made, naming the
-/// runtime's refusal
+/// Whether `format` is a converted format of 10-bit codes, packed or not (505 to 510): over a
+/// `DCI_P3` or `P3_D65` surface, which reads each code alone, the runtime binds its texture as an
+/// image of codes whose read into halves it does not convert as Metal does
+/// (`HalfTexelConversion`).
+fn converted_10_bit(format: u64) -> bool {
+    use metal2vulkan::metal::format::{YCbCrReads, ycbcr_format};
+    let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
+    let f = ycbcr_format(pf).unwrap();
+    f.bits == 10 && f.reads == YCbCrReads::Converted
+}
+
+/// Whether the rows of a texture of `format` of `size` over plane `plane` of a surface of
+/// `shape` ([`Shape::spec`]) overlap there: more than one row, of more than 16 bytes of the
+/// format's luma codes, at a `bytesPerRow` whose multiple of 16 below it is shorter than the row
+/// (a 10-bit format over rows of 8-bit codes). Metal makes such a texture, and the runtime
+/// refuses it, a gap of its own (`OverlappingSurfaceRows`).
+fn rows_overlap(format: u64, shape: &Shape, plane: u64, size: (u64, u64)) -> bool {
+    let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
+    let f = metal2vulkan::metal::format::ycbcr_format(pf).unwrap();
+    let own = Shape {
+        bits: f.bits,
+        packed: f.packed,
+        container: match (f.bits, f.packed) {
+            (8, _) => 1,
+            (_, true) => 4,
+            _ => 2,
+        },
+        ..*shape
+    };
+    let row = own.row_bytes(size.0);
+    let planes = shape.spec(size).planes.unwrap();
+    let bytes_per_row = planes[usize::try_from(plane).unwrap()].bytes_per_row;
+    size.1 > 1 && row > 16 && bytes_per_row / 16 * 16 < row
+}
+
+/// A texture of `format` of `size` over plane `plane` of `s`, a surface of `shape`, which Metal
+/// makes, reads as Metal's does, bit for bit, into halves and into floats, with the guest
+/// descriptor's properties; one whose rows overlap on the surface ([`rows_overlap`]) dies where
+/// it is made, naming the runtime's refusal. Where `half_relayed`, the read into halves relays
+/// the note `HalfTexelConversion`, a death in strict mode, and reads as Metal's past it.
+fn reads_as_metals_do(
+    format: u64,
+    (shape, s): (&Shape, &OsSurface),
+    plane: u64,
+    size: (u64, u64),
+    half_relayed: bool,
+    what: &str,
+) {
+    let d = dev();
+    let desc = platform().texture_descriptor(&measure::desc(format, size));
+    *crate::answer::LAST_LINE.lock() = None;
+    let made = catch_death(|| d.new_texture_on_surface(&desc, Some(s), plane));
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    let metal = measure::metal::metals(format, s, plane, size);
+    if let Some((_, mt)) = &metal {
+        assert_eq!(mt.pixel_format(), format, "Metal: {what}");
+    }
+    if rows_overlap(format, shape, plane, size) {
+        let site = made.map(drop).unwrap_err();
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}: {line}");
+        assert!(line.contains("OverlappingSurfaceRows"), "{what}: {line}");
+        return;
+    }
+    let t = made.unwrap_or_else(|site| panic!("{what}: {site:?}: {line}"));
+    let t = t.unwrap().unwrap_or_else(|| panic!("nil: {what}"));
+    assert_eq!((t.pixel_format(), t.width(), t.height()), (format, size.0, size.1), "{what}");
+    type V = crate::platform::VulkanPlatform;
+    let read = || probed::<V>(&d, "read_texels", &t, size, None, None);
+    if half_relayed {
+        crate::answer::dies_of(metal2vulkan_runtime::Degradation::HalfTexelConversion, read);
+    }
+    let ours = crate::answer::relaxed(read);
+    let ours_floats = measure::read_floats::<V>(&d, &t, size);
+    let Some((md, mt)) = metal else {
+        return;
+    };
+    let theirs = probed::<MetalPlatform>(&md, "read_texels", &mt, size, None, None);
+    assert!(ours == theirs, "read: {what}");
+    let theirs = measure::read_floats::<MetalPlatform>(&md, &mt, size);
+    assert!(float_bits(&ours_floats) == float_bits(&theirs), "read into floats: {what}");
+}
+
+/// A texture of each format of the family over plane 0 of a surface of each two-plane OSType
+/// whose codes are not its own (of other bits or packing, or a chroma plane coarser than its
+/// own), which Metal makes, reads as Metal's does ([`reads_as_metals_do`]): the luma codes from
+/// plane 0 and the chroma pairs from plane 1, each in the format's own layout and subsampling,
+/// whatever the surface's, converted by the OSType's range. So does one of a converted or a
+/// code-reading format over its own OSType whose `kIOSurfaceYCbCrMatrix` is `DCI_P3` or
+/// `P3_D65`, each code read alone, a 10-bit converted format's read into halves relayed as one the
+/// runtime does not convert as Metal does ([`converted_10_bit`]), though it reads as Metal's
+/// here; an `_sRGB` twin over such a surface, whose reads follow no rule
+/// the runtime found, dies where it is made, naming the runtime's refusal, where Metal makes it,
+/// and so does a texture whose rows overlap on the surface, a 10-bit format's over rows of 8-bit
+/// codes ([`rows_overlap`])
 #[test]
-fn family_textures_over_coarser_chroma_die() {
-    let size = (16, 16);
+fn textures_over_other_ostypes_read_as_metals() {
+    let size = (33, 17);
     for format in family() {
-        let (_, ostypes) = surfaces_of(format, false);
-        for ostype in ostypes {
+        let (_, own) = surfaces_of(format, true);
+        for ostype in OSTYPES.iter().filter(|o| !own.contains(o)) {
+            let shape = Shape::of(ostype);
+            let s = shape.surface(size);
+            shape.fill_noise(&s, size, 9);
             let what = format!("{format} over {}", String::from_utf8_lossy(&ostype[..]));
-            let s = Shape::of(ostype).surface(size);
+            reads_as_metals_do(format, (&shape, &s), 0, size, false, &what);
+        }
+        for matrix in ["DCI_P3", "P3_D65"] {
+            let shape = Shape::of(own[0]);
+            let s = shape.surface(size);
+            set_value(&s, MATRIX_KEY, matrix);
+            shape.fill_noise(&s, size, 10);
+            let what = format!("{format} over {} {matrix}", String::from_utf8_lossy(&own[0][..]));
+            if !twin(format) {
+                let half_relayed = converted_10_bit(format);
+                reads_as_metals_do(format, (&shape, &s), 0, size, half_relayed, &what);
+                continue;
+            }
             let desc = platform().texture_descriptor(&measure::desc(format, size));
             let made = catch_death(|| dev().new_texture_on_surface(&desc, Some(&s), 0));
             let site = made.map(drop).unwrap_err();
             let sel = "newTextureWithDescriptor:iosurface:plane:";
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}");
-            if let Some((_, mt)) = metals(format, &s, size) {
+            if let Some((_, mt)) = measure::metal::metals(format, &s, 0, size) {
                 assert_eq!(mt.pixel_format(), format, "Metal: {what}");
             }
+        }
+    }
+}
+
+/// A texture of each format of the family over plane 1 of a surface of each two-plane OSType,
+/// which Metal makes, reads as Metal's does ([`reads_as_metals_do`]): plane 1's codes as the
+/// luma, at plane 1's rows and past the plane where it is shorter than the texture, with chroma
+/// codes 0. One whose rows overlap on the plane ([`rows_overlap`]) dies where it is made, naming
+/// the runtime's refusal, where Metal makes it
+#[test]
+fn textures_over_plane_1_read_as_metals() {
+    let size = (33, 17);
+    for format in family() {
+        for ostype in OSTYPES {
+            let shape = Shape::of(ostype);
+            let s = shape.surface(size);
+            shape.fill_noise(&s, size, 11);
+            let what = format!("{format} over plane 1 of {}", String::from_utf8_lossy(&ostype[..]));
+            reads_as_metals_do(format, (&shape, &s), 1, size, false, &what);
         }
     }
 }
@@ -2424,16 +2518,16 @@ fn loaded_masked_and_blended_passes_are_metals() {
 /// `replaceRegion:` of a texture of a packed format of the family (508 to 510, 528 to 530) over
 /// a surface leaves the surface's bytes as they were, as Metal's does; a blit of it to or from a
 /// buffer, which Metal runs at rows that follow no layout of the texture's, dies where it is
-/// sent, and a texture over plane 1 of a packed surface where it is made, each naming the
-/// runtime's refusal (`Format`). A pass that clears it and stores it dies where it is made,
+/// sent, naming the runtime's refusal (`Format`). A pass that clears it and stores it dies where
+/// it is made,
 /// naming the format and that no exact form exists ([`crate::gpu::ycbcr::pass_refused`]): Metal
 /// fails that pass's command buffer, which no comparison here runs, as a second such failure has
 /// Metal ignore the queue's later command buffers
 #[test]
-fn packed_textures_copy_nothing_and_their_blits_and_plane_1_die() {
+fn packed_textures_copy_nothing_and_their_blits_die() {
     let md = MetalPlatform::system_default_device();
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let size = (33, 17);
+    let size = (32, 16);
     let named = |line: Option<String>| line.unwrap_or_default();
     for format in [508, 509, 510, 528, 529, 530] {
         let (s, other) = noisy_pair(format, size, 11);
@@ -2474,16 +2568,30 @@ fn packed_textures_copy_nothing_and_their_blits_and_plane_1_die() {
             "{format} Clear: {line}"
         );
         assert!(line.contains("Format"), "{format} Clear: {line}");
-        let desc = platform().texture_descriptor(&measure::desc(format, size));
-        *crate::answer::LAST_LINE.lock() = None;
-        let site =
-            catch_death(|| dev().new_texture_on_surface(&desc, Some(&s), 1).map(drop)).unwrap_err();
-        let line = named(crate::answer::LAST_LINE.lock().take());
-        let sel = "newTextureWithDescriptor:iosurface:plane:";
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-        assert!(line.contains("Format"), "{format} plane 1: {line}");
-        if let Some((_, mt)) = measure::metal::metals(format, &s, 1, size) {
-            assert_eq!(mt.pixel_format(), format, "Metal: {format} plane 1");
+    }
+}
+
+/// A render target of a 4:2:0 or 4:2:2 format of the family over a surface of an odd width or
+/// height is nil, as Metal's is, and one of a 4:4:4 format is made, as Metal's is
+#[test]
+fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
+    let md = MetalPlatform::system_default_device();
+    for format in family() {
+        let (pf, ostypes) = surfaces_of(format, true);
+        let f = metal2vulkan::metal::format::ycbcr_format(pf).unwrap();
+        let subsampled = f.subsampling.halved().contains(&true);
+        for size in [(33, 17), (33, 16), (32, 17)] {
+            let s = Shape::of(ostypes[0]).surface(size);
+            let mut desc = measure::desc(format, size);
+            desc.usage = 0x5;
+            let ours = dev().new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0);
+            let what = format!("{format} of {size:?}");
+            assert_eq!(ours.unwrap().is_some(), !subsampled, "{what}");
+            if let Some(md) = &md {
+                let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
+                let theirs = md.new_texture_on_surface(&desc, Some(&s), 0).unwrap();
+                assert_eq!(theirs.is_some(), !subsampled, "Metal: {what}");
+            }
         }
     }
 }
