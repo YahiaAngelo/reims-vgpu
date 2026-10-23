@@ -436,10 +436,34 @@ fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
         rotate(&vm.serial_log());
     }
     let sock = vm.qmp_socket();
-    if let Some(d) = sock.parent() {
-        std::fs::create_dir_all(d)?;
+    if let Some(d) = sock.parent().filter(|d| *d != vm.dir) {
+        private_dir(d)?;
     }
     Ok(sock)
+}
+
+/// Makes `d`, a directory for QMP sockets outside the VMs' own, the user's alone (0700) where it
+/// is new, and refuses one that is not a directory, another user owns, or others may write into:
+/// whoever could write there could put a socket of theirs in QMP's place and drive the VM. Some
+/// of them are under `/tmp`, which every user writes into (`paths::short_runtime_dir`).
+fn private_dir(d: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(d)
+        .with_context(|| format!("create {}", d.display()))?;
+    let m = std::fs::symlink_metadata(d).with_context(|| format!("read {}", d.display()))?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !m.is_dir() || m.uid() != uid || m.mode() & 0o022 != 0 {
+        bail!(
+            "{} is not a directory of this user's that others cannot write into, so it holds no \
+             QMP socket: remove it, or make it so",
+            d.display()
+        );
+    }
+    Ok(())
 }
 
 /// Starts the VM, and returns QEMU's pid once QMP answers.
@@ -779,6 +803,33 @@ mod tests {
     /// A stop timeout of 0 is no limit, as an SSH port of 0 is no forward: stop asks the guest
     /// to shut down, waits for it and powers nothing off. Where nothing reaches the guest, it
     /// ends with an error rather than wait for good.
+    /// A QMP socket's directory is made the user's alone, and one others may write into is
+    /// refused: one made 0755 by an earlier reims-ctl is taken as it is
+    #[test]
+    fn a_qmp_socket_directory_others_may_write_into_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("reims-ctl-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let new = d.join("made");
+        private_dir(&new).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&new), 0o700);
+        let earlier = d.join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&earlier).unwrap();
+        let open = d.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = private_dir(&open);
+        let file = d.join("file");
+        std::fs::write(&file, "").unwrap();
+        let not_dir = private_dir(&file);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(not_dir.is_err(), "{not_dir:?}");
+    }
+
     #[test]
     fn a_stop_timeout_of_0_waits_for_the_guest() {
         let d = std::env::temp_dir().join(format!("reims-ctl-stop-{}", std::process::id()));

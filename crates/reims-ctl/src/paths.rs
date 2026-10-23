@@ -8,7 +8,8 @@
 //! - `$XDG_CACHE_HOME/reims-ctl` (`~/.cache/reims-ctl`): builds, scripts/install-ctl.sh's and
 //!   reims-util's (reims_util.rs);
 //! - the runtime directory, for a QMP socket whose path in the VM's directory would be too long
-//!   for a Unix socket: `$XDG_RUNTIME_DIR/reims-ctl`, else `$TMPDIR/reims-ctl-<uid>`.
+//!   for a Unix socket: `$XDG_RUNTIME_DIR/reims-ctl`, else `$TMPDIR/reims-ctl-<uid>`; where even
+//!   a short socket name does not fit there, `/tmp/reims-ctl-<uid>` (`short_runtime_dir`).
 //!
 //! `REIMS_CTL_CONFIG_DIR` and `REIMS_CTL_DATA_DIR` replace the first two (tests use them).
 
@@ -74,6 +75,13 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     // SAFETY: getuid has no preconditions.
     tmp.join(format!("reims-ctl-{}", unsafe { libc::getuid() }))
+}
+
+/// The runtime directory for a socket that a long `$XDG_RUNTIME_DIR` or `$TMPDIR` leaves no
+/// room for: `/tmp/reims-ctl-<uid>`, at most 46 bytes with its socket's name.
+pub fn short_runtime_dir() -> PathBuf {
+    // SAFETY: getuid has no preconditions.
+    PathBuf::from(format!("/tmp/reims-ctl-{}", unsafe { libc::getuid() }))
 }
 
 /// Where a bug report's zip goes: `$XDG_DOWNLOAD_DIR`, else `~/Downloads`, else the home.

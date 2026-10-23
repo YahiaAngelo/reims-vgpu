@@ -653,7 +653,12 @@ impl Vm {
 
     /// The QMP socket ([`qmp_socket_in`] the runtime directory).
     pub fn qmp_socket(&self) -> PathBuf {
-        qmp_socket_in(&self.dir, &self.config.name, &paths::runtime_dir())
+        qmp_socket_in(
+            &self.dir,
+            &self.config.name,
+            &paths::runtime_dir(),
+            &paths::short_runtime_dir(),
+        )
     }
 
     /// The trimmed auxiliary storage QEMU boots (vmapple).
@@ -678,9 +683,11 @@ const SOCKET_PATH_MAX: usize = 103;
 
 /// The QMP socket of the VM named `name` in `dir`: `qmp.sock` in `dir` where that path is
 /// shorter than 100 bytes; else `<name>.qmp` in `runtime`, where that fits a socket; else, for
-/// a long name, `<hash>.qmp` there, 16 hex digits of the name's FNV-1a hash. A VM's socket
-/// stays where earlier reims-ctl put it wherever that path fits, so a VM it started is found.
-pub fn qmp_socket_in(dir: &Path, name: &str, runtime: &Path) -> PathBuf {
+/// a long name, `<hash>.qmp` there, 16 hex digits of the name's FNV-1a hash; else, where a long
+/// `runtime` leaves no room even for that, `<hash>.qmp` in `short`, which always fits. A VM's
+/// socket stays where earlier reims-ctl put it wherever that path fits, so a VM it started is
+/// found.
+pub fn qmp_socket_in(dir: &Path, name: &str, runtime: &Path, short: &Path) -> PathBuf {
     let own = dir.join("qmp.sock");
     if own.as_os_str().len() < 100 {
         return own;
@@ -692,7 +699,11 @@ pub fn qmp_socket_in(dir: &Path, name: &str, runtime: &Path) -> PathBuf {
     let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });
-    runtime.join(format!("{hash:016x}.qmp"))
+    let hashed = runtime.join(format!("{hash:016x}.qmp"));
+    if hashed.as_os_str().len() <= SOCKET_PATH_MAX {
+        return hashed;
+    }
+    short.join(format!("{hash:016x}.qmp"))
 }
 
 // ---------------------------------------------------------------- the registry
@@ -865,32 +876,59 @@ mod tests {
     fn every_name_has_a_qmp_socket_that_binds() {
         let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
         let runtime = Path::new("/var/folders/rk/50k022t15gq2j9zcy6wcfkh00000gn/T/reims-ctl-501");
+        let short = Path::new("/tmp/reims-ctl-501");
         for n in 1..=64 {
-            let s = qmp_socket_in(&dir, &"n".repeat(n), runtime);
+            let s = qmp_socket_in(&dir, &"n".repeat(n), runtime, short);
             assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
             assert_eq!(s.parent(), Some(runtime));
         }
         assert_eq!(
-            qmp_socket_in(&dir, "macos-26", runtime),
+            qmp_socket_in(&dir, "macos-26", runtime, short),
             runtime.join("macos-26.qmp")
         );
         assert_eq!(
-            qmp_socket_in(Path::new("/vms/a"), "a", runtime),
+            qmp_socket_in(Path::new("/vms/a"), "a", runtime, short),
             Path::new("/vms/a/qmp.sock")
         );
         let long = "a".repeat(64);
         let other = format!("{}b", "a".repeat(63));
         assert_ne!(
-            qmp_socket_in(&dir, &long, runtime),
-            qmp_socket_in(&dir, &other, runtime)
+            qmp_socket_in(&dir, &long, runtime, short),
+            qmp_socket_in(&dir, &other, runtime, short)
         );
         let tmp = std::env::temp_dir().join(format!("reims-ctl-qmp-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let s = qmp_socket_in(&dir, &long, &tmp);
+        let s = qmp_socket_in(&dir, &long, &tmp, short);
         let bound = std::os::unix::net::UnixListener::bind(&s)
             .and_then(|_l| std::os::unix::net::UnixStream::connect(&s));
         let _ = std::fs::remove_dir_all(&tmp);
         bound.unwrap_or_else(|e| panic!("{}: {e}", s.display()));
+    }
+
+    /// A `$TMPDIR` or `$XDG_RUNTIME_DIR` so long that not even a hashed name fits there puts the
+    /// socket in the short runtime directory, where every name's fits; one that fits stays
+    #[test]
+    fn a_long_runtime_dir_puts_the_qmp_socket_in_the_short_one() {
+        let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
+        let runtime = Path::new("/Users/someone").join("t".repeat(84));
+        let short = Path::new("/tmp/reims-ctl-4294967295");
+        for n in 1..=64 {
+            let s = qmp_socket_in(&dir, &"n".repeat(n), &runtime, short);
+            assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
+            assert_eq!(s.parent(), Some(short), "{n}");
+        }
+        let fits = Path::new("/Users/someone").join("t".repeat(60));
+        assert_eq!(
+            qmp_socket_in(&dir, &"n".repeat(64), &fits, short).parent(),
+            Some(fits.as_path())
+        );
+        assert!(
+            paths::short_runtime_dir()
+                .join("0123456789abcdef.qmp")
+                .as_os_str()
+                .len()
+                <= 46
+        );
     }
 
     fn x86_64_config() -> VmConfig {
