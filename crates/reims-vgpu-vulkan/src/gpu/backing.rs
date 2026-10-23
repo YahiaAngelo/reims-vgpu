@@ -134,9 +134,9 @@
 //!   of Metal's answers at every moment, and NO only at its handlers' start, by a race.
 //!
 //!   The runtime's own detach answers NO while the work of a submission that took the object has
-//!   not completed, and the command buffer's last submissions' until its completed handlers ran, so
-//!   it lets go of an object only an earlier submission took before them (the runtime's
-//!   `detach.rs`). This platform answers first: each submission the runtime submits is noted with
+//!   not completed, and lets go of what a command buffer's submissions took as it processes its
+//!   completion, before its completed handlers run, failed or not (the runtime's `detach.rs` and
+//!   `CommandBufferShared::complete`). This platform answers first: each submission the runtime submits is noted with
 //!   its encoders as its check decides it ([`Opened::submit`]), until the command buffer closes,
 //!   after its completed handlers ran; a detach asks the runtime what those encoders use
 //!   ([`in_flight`]), of the command buffers with a submission noted since the object was made
@@ -145,15 +145,11 @@
 //!   command buffer completed. One Metal's GPU fails at its commit for what its encoders did is
 //!   noted nowhere, as it is committed with no check (`crate::gpu::command`). Where none took it,
 //!   the runtime's detach answers, by its rule over what it holds, a NO of its own answered as
-//!   Metal's NO, the object attached: a detach made once a command buffer completed answers YES
-//!   where a submission before its last took the object, as Metal's (a use of the object, an
-//!   event's signal, then a later submission, which completes or which a detached use fails), and
-//!   NO where its last did, in its completed handlers (`tests/detach_backing.rs`'s
-//!   `in_a_completed_handler`), the runtime keeping what the last submissions took, failed or not,
-//!   those of encoders its commit failed included. That NO is Metal's answer only at the start of a
-//!   command buffer's handlers, where Metal's is YES later in them and in a failed one's, until the
-//!   runtime lets go of those as their work completes (reported to it). One made once
-//!   `waitUntilCompleted` returned answers YES. Core never reads the answer: after a NO, its next
+//!   Metal's NO, the object attached: a detach made once a command buffer completed, in its
+//!   completed handlers or after, answers YES, whichever of its submissions took the object, and
+//!   whether it completed or failed, those of encoders its commit failed included: Metal's answer
+//!   later in the handlers and in a failed one's, and one of its two at their start
+//!   (`tests/detach_backing.rs`'s `in_a_completed_handler`). Core never reads the answer: after a NO, its next
 //!   prepare has the replace answer NO, which raises (`BufferBackingRefused`,
 //!   `HeapBackingRefused`), and a command buffer that uses the object before it runs. The GPU's own
 //!   failures (a hang, a fault, a victim of its recovery), which no test here may run, follow the
@@ -507,9 +503,8 @@ impl Backing {
     /// so the GPU no longer reaches the memory it was over through it, the guest's pages a replace
     /// gave it or what it was made over, and a command reaches it unnamed nowhere until a replace;
     /// where the runtime refuses that, the process ends here ([`refused_detach`]), and where it
-    /// answers NO, holding what a submission took (one submitted as the detach is made, or the last
-    /// submissions of a command buffer that completed, until its completed handlers ran), it stays
-    /// attached. A buffer neither replaced nor made over memory of the caller's by
+    /// answers NO, holding what a submission whose work has not completed took (one submitted as
+    /// the detach is made), it stays attached. A buffer neither replaced nor made over memory of the caller's by
     /// `newBufferWithDescriptor:` dies here ([`unmeasured_detach`]).
     pub(crate) fn detach(&self, detach: impl FnOnce() -> Result<bool, rt::Error>) {
         let Some(id) = self.id else {

@@ -2291,21 +2291,6 @@ fn expected_in_a_completed_handler(replaced: u64) -> Steps {
     ]
 }
 
-/// What this crate does in [`in_a_completed_handler`] where its command buffer completes
-/// ([`COMPLETING`]), the detach in the handler made at once or once the use retired: Metal's
-/// steps ([`expected_in_a_completed_handler`]), YES where the object's submission is not the
-/// command buffer's last ([`Failing::NotSplit`]): a noted submission of a command buffer that
-/// completed takes nothing, and the runtime lets go of what a submission before the last took as
-/// its work completes. Where the object's submission is the last ([`Failing::Not`]), NO: the
-/// runtime keeps what a command buffer's last submissions took until its completed handlers ran,
-/// and its detach answers NO, Metal's answer at once in some runs, where Metal's is YES once the
-/// use retired (`src/gpu/backing.rs`'s docs, "In flight"; reported to it). A runtime that lets go
-/// of them as their work completes makes this crate answer Metal's YES there too, and this test
-/// fails until it is changed so.
-fn expected_in_a_completed_handler_here(failing: Failing) -> Steps {
-    expected_in_a_completed_handler(u64::from(failing == Failing::NotSplit))
-}
-
 /// The ways [`expected_in_a_failed_completed_handler`] was measured to fail a command buffer:
 /// with code 1 by protection options 0x10, the object's fill made under them or before them;
 /// with code 16 by options 0x2, the object's fill made before a fill of another buffer made under
@@ -2346,25 +2331,6 @@ fn expected_in_a_failed_completed_handler(failing: Failing) -> Steps {
         ("detached once it completed: replaced", vec![1]),
         ("the fill in the guest's pages", vec![filled]),
     ]
-}
-
-/// What this crate does in [`in_a_completed_handler`] where its command buffer fails: Metal's
-/// steps ([`expected_in_a_failed_completed_handler`]), its YES in the handler where the object's
-/// submission is not the command buffer's last ([`Failing::DetachedAfter`]): a noted submission
-/// of a command buffer that completed with an error takes nothing, and the runtime lets go of
-/// what a submission before the last took as its work completes. Where the object's submission
-/// is the last (each way by protection options), the answer in the handler is NO, where Metal's
-/// is YES: the runtime keeps what a command buffer's last submissions took, failed or not, those
-/// of encoders its commit failed included, until its completed handlers ran, and its detach
-/// answers NO (`src/gpu/backing.rs`'s docs, "In flight"; reported to it). A runtime that lets go
-/// of them as Metal does makes this crate answer Metal's YES there too, and this test fails until
-/// it is changed so.
-fn expected_in_a_failed_completed_handler_here(failing: Failing) -> Steps {
-    let mut steps = expected_in_a_failed_completed_handler(failing);
-    if failing != Failing::DetachedAfter {
-        steps[0].1[0] = 0;
-    }
-    steps
 }
 
 /// `steps` of [`in_a_completed_handler`] without the answer of the replace after the detach in
@@ -2412,10 +2378,10 @@ fn detached_in_a_completed_handler_on_metal() {
 
 /// [`in_a_completed_handler`] on this crate where its command buffer completes, each way of
 /// [`COMPLETING`], a heap and a buffer, the detach in the handler made at once and once the use
-/// retired ([`expected_in_a_completed_handler_here`]): a noted submission of a command buffer
-/// that completed takes nothing, so a detach detaches where the runtime let go of what the
-/// command buffer took, and the runtime answers NO where it keeps it (`src/gpu/backing.rs`'s
-/// docs, "In flight")
+/// retired: YES in both, Metal's once the use retired and one of its two at once
+/// ([`expected_in_a_completed_handler`]), as neither a noted submission of a command buffer that
+/// completed nor the runtime, which lets go of what it took as it processes its completion,
+/// holds the object in its handlers (`src/gpu/backing.rs`'s docs, "In flight")
 #[test]
 fn detached_in_a_completed_handler_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
@@ -2428,7 +2394,7 @@ fn detached_in_a_completed_handler_on_vulkan() {
                 let seen = in_a_completed_handler(&p, &dev, heap, failing, retired);
                 assert_eq!(
                     seen,
-                    expected_in_a_completed_handler_here(failing),
+                    expected_in_a_completed_handler(1),
                     "{failing:?}, heap {heap}, retired {retired}"
                 );
             }
@@ -2457,10 +2423,11 @@ fn detached_in_a_failed_completed_handler_on_metal() {
 }
 
 /// [`in_a_completed_handler`] on this crate where its command buffer fails, each way of
-/// [`FAILING`], a heap and a buffer ([`expected_in_a_failed_completed_handler_here`]): a noted
-/// submission of a command buffer that completed with an error takes nothing, so a detach
-/// detaches as Metal's does where the runtime let go of what the command buffer took, and the
-/// runtime answers NO where it keeps it (`src/gpu/backing.rs`'s docs, "In flight")
+/// [`FAILING`], a heap and a buffer: Metal's YES in the handler
+/// ([`expected_in_a_failed_completed_handler`]), as neither a noted submission of a command
+/// buffer that completed with an error nor the runtime, which lets go of what it took, those of
+/// encoders its commit failed included, as it processes its completion, holds the object in its
+/// handlers (`src/gpu/backing.rs`'s docs, "In flight")
 #[test]
 fn detached_in_a_failed_completed_handler_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
@@ -2472,7 +2439,7 @@ fn detached_in_a_failed_completed_handler_on_vulkan() {
             let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
             assert_eq!(
                 seen,
-                expected_in_a_failed_completed_handler_here(failing),
+                expected_in_a_failed_completed_handler(failing),
                 "{failing:?}, heap {heap}"
             );
         }

@@ -1205,10 +1205,10 @@ impl VulkanTexture {
                 // twins in another format by the texture's format, though its refusal names the
                 // view's, but a view in a two-plane YCbCr format, which it refuses by that format
                 // first (such a view is nil before it reaches the runtime, `no_view_of`).
-                use metal2vulkan::metal::format::{padded_only_over_memory, ycbcr};
+                use metal2vulkan::metal::format::{padded_words, ycbcr};
                 let source = plain(|| self.raw.pixel_format());
                 let view = crate::gpu::held_format(sel, format).ok();
-                let padded = padded_only_over_memory(source) && !view.is_some_and(ycbcr);
+                let padded = padded_words(source) && !view.is_some_and(ycbcr);
                 let e = match padded {
                     true => {
                         let what = format!("a view in pixel format {format} of a texture of");
