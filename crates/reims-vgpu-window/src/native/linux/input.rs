@@ -341,34 +341,32 @@ impl Input {
     }
 }
 
-/// Hands `events` to the host's `callbacks`, in order. Smooth scrolling goes to `scroll` where
-/// the host gives it, else notches to `wheel`.
-pub(crate) fn send(callbacks: &WindowCallbacks, events: Vec<ToHost>) {
-    for event in events {
-        match event {
-            ToHost::Pointer { at, mode, buttons } => {
-                if let Some(f) = &callbacks.pointer {
-                    f(at.0, at.1, mode.0, mode.1, buttons);
-                }
+/// Hands `event` to the host's `callbacks`. Smooth scrolling goes to `scroll` where the host
+/// gives it, else notches to `wheel`.
+pub(crate) fn send(callbacks: &WindowCallbacks, event: ToHost) {
+    match event {
+        ToHost::Pointer { at, mode, buttons } => {
+            if let Some(f) = &callbacks.pointer {
+                f(at.0, at.1, mode.0, mode.1, buttons);
             }
-            ToHost::Wheel { notches, smooth } => {
-                if let Some(f) = &callbacks.scroll {
-                    f(ScrollEvent {
-                        dy: smooth.0,
-                        dx: smooth.1,
-                        notches,
-                        ..ScrollEvent::default()
-                    });
-                } else if let Some(f) = &callbacks.wheel
-                    && notches != (0, 0)
-                {
-                    f(notches.0, notches.1);
-                }
+        }
+        ToHost::Wheel { notches, smooth } => {
+            if let Some(f) = &callbacks.scroll {
+                f(ScrollEvent {
+                    dy: smooth.0,
+                    dx: smooth.1,
+                    notches,
+                    ..ScrollEvent::default()
+                });
+            } else if let Some(f) = &callbacks.wheel
+                && notches != (0, 0)
+            {
+                f(notches.0, notches.1);
             }
-            ToHost::Key(KeyEvent { usage, down }) => {
-                if let Some(f) = &callbacks.key {
-                    f(usage, down);
-                }
+        }
+        ToHost::Key(KeyEvent { usage, down }) => {
+            if let Some(f) = &callbacks.key {
+                f(usage, down);
             }
         }
     }

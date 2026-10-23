@@ -543,17 +543,11 @@ impl InputState {
         self.logic.iso = crate::native::is_iso_keyboard();
     }
 
-    /// Sends what the event decided through the host's callbacks as they are now, and has the
-    /// system's hot keys follow capture.
+    /// Sends what the event decided through the host's callbacks while the window lives
+    /// ([`Window::send_each`]), and has the system's hot keys follow capture.
     fn finish(&mut self, reaction: Reaction) -> Reaction {
-        if !self.logic.out.is_empty() {
-            let callbacks = self.window.callbacks();
-            for event in self.logic.out.drain(..) {
-                if let Some(callbacks) = &callbacks {
-                    call_host(callbacks, event);
-                }
-            }
-        }
+        self.window
+            .send_each(std::mem::take(&mut self.logic.out), call_host);
         let captured = self.logic.capture.is_captured();
         if captured != self.holds_hotkeys {
             self.holds_hotkeys = captured;
@@ -1229,6 +1223,41 @@ mod tests {
         logic.window_closing();
         assert!(!logic.capture.is_captured());
         assert_eq!(sent(&mut logic), vec![up(A), pointer(0, 0, 0)]);
+    }
+
+    /// The window's end, while the host's callback for the first key-up of a lift runs, drops
+    /// the other key-ups: no callback of the host's starts after the end has returned
+    #[test]
+    fn no_callback_starts_after_the_window_s_end() {
+        let ups = Arc::new(Mutex::new(Vec::new()));
+        let this: Arc<Mutex<Option<std::sync::Weak<Window>>>> = Arc::default();
+        let (seen, ends) = (Arc::clone(&ups), Arc::clone(&this));
+        let config = crate::config::WindowConfig {
+            callbacks: WindowCallbacks {
+                key: Some(Arc::new(move |usage, down| {
+                    seen.lock().push((usage, down));
+                    // The display's release, on another thread, returns meanwhile.
+                    if let Some(window) = ends.lock().as_ref().and_then(std::sync::Weak::upgrade) {
+                        window.close();
+                    }
+                })),
+                ..WindowCallbacks::default()
+            },
+            ..crate::config::WindowConfig::default()
+        };
+        let window = Window::new(config, 0, "input".to_owned());
+        *this.lock() = Some(Arc::downgrade(&window));
+        let mut input = InputState::new(Arc::clone(&window));
+        input.logic.key_down(key(KVK_A, 0));
+        input.logic.key_down(key(KVK_Q, 0));
+        sent(&mut input.logic);
+        input.focus_lost();
+        assert!(window.is_closed());
+        assert_eq!(*ups.lock(), [(Q, false)]);
+        // After the end, nothing is sent.
+        input.logic.key_down(key(KVK_A, 0));
+        input.focus_lost();
+        assert_eq!(*ups.lock(), [(Q, false)]);
     }
 
     /// Each event goes to its callback, and a callback the host did not give takes nothing

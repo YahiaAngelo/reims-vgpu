@@ -103,15 +103,10 @@ impl Input {
         self.0.title_suffix()
     }
 
-    /// Sends what the input queued to `window`'s callbacks, while it has them.
+    /// Sends what the input queued to `window`'s callbacks, while the window lives
+    /// ([`Window::send_each`]).
     pub(crate) fn flush(&mut self, window: &Window) {
-        let events = self.0.take();
-        if events.is_empty() {
-            return;
-        }
-        if let Some(callbacks) = window.callbacks() {
-            input::send(&callbacks, events);
-        }
+        window.send_each(self.0.take(), input::send);
     }
 }
 

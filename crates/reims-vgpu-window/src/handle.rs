@@ -299,6 +299,25 @@ impl Window {
         self.callbacks.lock().clone()
     }
 
+    /// Hands each of `events`, in order, to `send` with the host's callbacks, while the window
+    /// lives: the window's end ([`Window::close`]) drops the events not yet sent, so no callback
+    /// of the host's starts after the end has returned, but the one the UI thread was making.
+    /// Nothing is sent after the end.
+    pub(crate) fn send_each<E>(&self, events: Vec<E>, mut send: impl FnMut(&WindowCallbacks, E)) {
+        if events.is_empty() {
+            return;
+        }
+        let Some(callbacks) = self.callbacks() else {
+            return;
+        };
+        for event in events {
+            if self.is_closed() {
+                return;
+            }
+            send(&callbacks, event);
+        }
+    }
+
     /// What the guest last reported.
     pub(crate) fn guest(&self) -> GuestState {
         self.guest.lock().clone()
@@ -343,5 +362,22 @@ mod tests {
         assert_eq!(title(0), "Reims vGPU");
         assert_eq!(title(1), "Reims vGPU (port 1)");
         assert_eq!(title(7), "Reims vGPU (port 7)");
+    }
+
+    /// Events go to the host's callbacks in order while the window lives; its end, inside the
+    /// callback of one of them, drops the rest, and after it nothing is sent
+    #[test]
+    fn nothing_is_sent_after_the_window_s_end() {
+        let window = Window::new(WindowConfig::default(), 0, title(0));
+        let mut sent = Vec::new();
+        window.send_each(vec![1, 2], |_, event| sent.push(event));
+        assert_eq!(sent, [1, 2]);
+        window.send_each(vec![3, 4, 5], |_, event| {
+            sent.push(event);
+            window.close();
+        });
+        assert_eq!(sent, [1, 2, 3]);
+        window.send_each(vec![6], |_, event| sent.push(event));
+        assert_eq!(sent, [1, 2, 3]);
     }
 }
