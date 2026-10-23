@@ -5,7 +5,8 @@
 //!
 //! Everything goes through the VM's QMP socket, so it works on any running VM:
 //! - A frame is QMP's `screendump` of the display's console: a PPM, written into a directory of
-//!   the viewer's own under `$XDG_RUNTIME_DIR` (or `/dev/shm`, or the temporary directory). For
+//!   the viewer's own under `$XDG_RUNTIME_DIR` (or `/dev/shm`, or the temporary directory),
+//!   removed when it ends, or by the next viewer where it was killed (`FrameDir`). For
 //!   it, apple-gfx draws the guest's newest frame into the console's surface
 //!   (vendor/qemu hw/display/apple-gfx.c, `apple_gfx_fb_update_display`), rendering and reading
 //!   it back only when the guest has presented a frame since the last.
@@ -235,7 +236,9 @@ impl Target {
     }
 }
 
-/// The directory QEMU writes frames into, removed when the viewer ends.
+/// The directory QEMU writes frames into, removed when the viewer ends. A viewer that a signal
+/// ended (killed, or its terminal closed) leaves its directory, a frame of up to some MB, in
+/// memory where it is under `/dev/shm`; the next viewer removes it ([`sweep_frame_dirs`]).
 struct FrameDir(PathBuf);
 
 impl FrameDir {
@@ -246,7 +249,8 @@ impl FrameDir {
             .filter(|p| p.is_dir())
             .or_else(|| Some(PathBuf::from("/dev/shm")).filter(|p| p.is_dir()))
             .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("reims-ctl-view-{}", std::process::id()));
+        sweep_frame_dirs(&base);
+        let dir = base.join(format!("{FRAME_DIR_PREFIX}{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -259,6 +263,39 @@ impl FrameDir {
 impl Drop for FrameDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A frame directory's name, before its viewer's pid.
+const FRAME_DIR_PREFIX: &str = "reims-ctl-view-";
+
+/// Removes the frame directories in `base` that viewers which no longer run left: those of this
+/// user's named for a pid no process has. A running viewer's stays, as does any other entry.
+fn sweep_frame_dirs(base: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    for e in entries.flatten() {
+        let pid = e.file_name().to_str().and_then(|n| {
+            n.strip_prefix(FRAME_DIR_PREFIX)
+                .and_then(|p| p.parse::<libc::pid_t>().ok())
+        });
+        let Some(pid) = pid.filter(|p| *p > 0) else {
+            continue;
+        };
+        // The entry itself, not what a link names.
+        if !e.metadata().is_ok_and(|m| m.is_dir() && m.uid() == uid) {
+            continue;
+        }
+        // SAFETY: signal 0 sends nothing; it asks only whether the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
     }
 }
 
@@ -1050,6 +1087,39 @@ fn encoder_thread(sh: Arc<Shared>, proto: Protocol, rx: Receiver<Option<Frame>>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next viewer removes the frame directory a killed one left, and keeps a running
+    /// viewer's and every other entry
+    #[test]
+    fn a_killed_viewers_frame_dir_is_removed_by_the_next() {
+        let base = std::env::temp_dir().join(format!("reims-ctl-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        ended.wait().unwrap();
+        let dir = |name: String| {
+            let d = base.join(name);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(d.join("frame.ppm"), "P6").unwrap();
+            d
+        };
+        let killed = dir(format!("{FRAME_DIR_PREFIX}{}", ended.id()));
+        let running = dir(format!("{FRAME_DIR_PREFIX}{}", std::process::id()));
+        let others = [
+            dir(format!("{FRAME_DIR_PREFIX}x")),
+            dir(format!("{FRAME_DIR_PREFIX}0")),
+            dir(format!("{FRAME_DIR_PREFIX}-1")),
+            dir("reims-ctl-qmp".into()),
+        ];
+        sweep_frame_dirs(&base);
+        let left = (
+            killed.exists(),
+            running.exists(),
+            others.iter().all(|d| d.exists()),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(left, (false, true, true), "(killed, running, others)");
+    }
 
     #[test]
     fn the_toolbar_shows_disconnect_first_and_finds_its_buttons() {
