@@ -1996,9 +1996,10 @@ const CLEAR_NANS: [u64; 5] = [
 /// and, of the plain and the negative NaN, in one with a draw call of no vertices or of one, the
 /// resolve of a multisampled float attachment cleared to a NaN in a pass whose draw draws nothing
 /// among them (Metal counts the draw and resolves to `7fc00000`, which the runtime writes after
-/// the pass, its `nan_clear.rs`). The runtime refuses a pass of an RGBX format (the module docs), and of a multisampled extended-range one,
-/// whatever it clears to; Metal makes no multisampled texture of a bfloat format, nor a bfloat
-/// view of one
+/// the pass, its `nan_clear.rs`). The runtime refuses a pass of an RGBX format (the module docs),
+/// whatever it clears to; a multisampled extended-range one's resolve is
+/// `encode_render`'s `drawn_extended_range_samples_resolve_as_metals`'. Metal makes no
+/// multisampled texture of a bfloat format, nor a bfloat view of one
 #[test]
 fn nan_clears_are_metals() {
     let Some((mp, md)) = metal() else {

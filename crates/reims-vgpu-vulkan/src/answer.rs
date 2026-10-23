@@ -339,8 +339,10 @@ pub fn create<T>(
 /// - `EncodedUseRebound`: a command buffer's command named a buffer or heap over the guest's
 ///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
 ///   before the command buffer's first submission, in an encoder the rebind could not encode again
-///   (a predicated command buffer's, a render pass recorded later or whose end captured its draws'
-///   tile reach, a call that answers otherwise than at its encoding; every other compute, blit and
+///   (a compute encoder of the runtime's command predication that shares its unit, holds a loop
+///   or leaves work out, which no record of ours reaches, a render pass recorded later or whose
+///   end captured its draws' tile reach, a call that answers otherwise than at its encoding;
+///   every other compute, blit and
 ///   render encoder it encodes again over the new pages, as Metal runs it, a call refused at its
 ///   encoding refused again and the calls after it running, and a resource state encoder takes no
 ///   pages), and neither the submission check nor the failure the command buffer was committed with
@@ -360,8 +362,8 @@ pub fn create<T>(
 ///   map of no layers reaches the runtime here ([`crate::gpu::rate_map`]);
 /// - `RateMapResetUnencoded`: a render pass over a rasterization rate map reset after the pass
 ///   took it and before its command buffer's submission, in an encoder the runtime could not
-///   encode again (a command predication's command buffer, an encoder opened while a buffer of
-///   the device was detached, or one that left work for a host step), which draws by the map as
+///   encode again (an encoder opened while a buffer of the device was detached, or one that left
+///   work for a host step), which draws by the map as
 ///   it took it, where Metal's GPU draws by the map as reset. Announced at the commit, inside its
 ///   call, or at the reset of a map whose pass's command buffer was committed, inside
 ///   `resetUsingDescriptor:`, which die at their selectors ([`crate::gpu::rate_map`]);
@@ -693,7 +695,10 @@ pub fn create<T>(
 ///   written by fewer than four lanes, or a 16-bit float or 8-bit unorm one under a blend of the
 ///   second source): the shader's generic blend, in `float`, each step rounded, the sources and
 ///   the blend colour clamped to a normalized format's range, the device's conversion storing the
-///   result, where Metal's blend for these formats is not measured.
+///   result; or of a four-channel 8-bit `_sRGB` format under a blend of the second source in a
+///   module compiled with fast math, in the 8-bit unorm blend's rounded forms over the decoded
+///   texel, where Metal's blend for these is not measured (a four-channel 8-bit `_sRGB` one's
+///   other blends are Metal's, exact).
 ///   Announced at each draw that binds the pipeline's variant, inside its call, which dies at its
 ///   selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
@@ -1062,6 +1067,34 @@ pub fn create<T>(
 ///   which is not the tiles the kind names. The runtime can load the unreached tiles in place, so
 ///   nothing in the hardware forces the difference, and it dies on every device. Announced once
 ///   per device, at the first such pass, inside its call, which dies at its selector;
+/// - `YCbCrLoadTiles`: a pass that loads and stores a two-plane YCbCr colour attachment (500 to
+///   507 or 540 to 545 over plane 0, the runtime's `ycbcr_renders`) and draws, which re-encodes
+///   the planes' codes of every 32 by 32 tile of the rectangle bounding its draws' scissors from
+///   the texels it loaded (each chroma pair from its filtered pairs), where Metal stores only the
+///   tiles a draw's primitives reach and keeps the planes' bytes of the others (the M3 Max, macOS
+///   27.0.1). The runtime can find the tiles a pass's primitives reach, as it does for an
+///   extended-range attachment's load, so nothing in the hardware forces the difference, and it
+///   dies on every device. Announced as the pass ends, inside `endEncoding`, which dies at its
+///   selector;
+/// - `YCbCrBlendRounding`: a draw that blends into such an attachment, which the device blends in
+///   the floats the runtime holds the attachment in, where Metal's tile blends its halves, an
+///   8-bit format's in `half` arithmetic and a 10-bit one's in `float` rounded toward zero to
+///   `half`: a blended texel's codes can miss Metal's by one (every code of 4096 blended texels
+///   matched by those rules on the M3 Max, macOS 27.0.1), and, as `RotatedBlendRounding`, the
+///   exact form is the blend in the function. Announced at the draw, inside its call, which dies
+///   at its selector;
+/// - `ExtendedRangeResolve`: a pass's resolve of a multisampled extended-range colour attachment
+///   whose resolve Metal averages from values finer than the codes the attachment holds
+///   (`BGRA10_XR`'s alpha, an `_sRGB` twin's colour, `RGB10A2Unorm_sRGB`'s channels), which the
+///   runtime's own resolve after the pass, on every device, writes from the codes: Metal's code
+///   where a pixel's samples hold one, and where they differ a near-equivalent, measured against
+///   Metal's resolve on the M3 Max (macOS 27.0.1, 4096 texels a format at 2 and 4 samples):
+///   `BGRA10_XR`'s alpha within a code in every texel, an `_sRGB` twin's colour within a code in
+///   99.5% of channels and up to 7 codes off where the samples' values nearly cancel,
+///   `RGB10A2Unorm_sRGB`'s colour within 2 and its alpha within 1. A linear form's colour,
+///   `BGR10_XR`'s and `BGRA10_XR`'s, is Metal's rule in every texel, which announces nothing.
+///   The runtime's resolve is no device's rounding, so a native device does not relay it either.
+///   Announced as the pass ends, inside `endEncoding`, which dies at its selector;
 /// - the notes of the runtime's native defaults on a GPU that is not Apple's, whose exact forms
 ///   are the device policy's opt-ins (`rt::DevicePolicy`), which this platform takes only where
 ///   `REIMS_VGPU_EXACT` names them ([`crate::platform`]'s `exact_policy`), each recording its
@@ -1115,7 +1148,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 132] = [
+pub const DIES: [rt::Degradation; 135] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1230,6 +1263,9 @@ pub const DIES: [rt::Degradation; 132] = [
     rt::Degradation::PrivateResourceOption,
     rt::Degradation::StaleDetachedReach,
     rt::Degradation::RotatedLoadTiles,
+    rt::Degradation::YCbCrLoadTiles,
+    rt::Degradation::YCbCrBlendRounding,
+    rt::Degradation::ExtendedRangeResolve,
     rt::Degradation::NativeTranscendentals,
     rt::Degradation::NativeDivision,
     rt::Degradation::NativeFma,

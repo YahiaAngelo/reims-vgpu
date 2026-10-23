@@ -1746,6 +1746,18 @@ pub(crate) enum Op {
     /// A pass that clears it as [`Op::Clear`]'s, draws `corner_vertex`'s triangle over its top
     /// left half in `gradient_fragment`'s colours, unblended, and stores it.
     Draw,
+    /// A pass that loads it, draws as [`Op::Draw`] does, and stores it.
+    Load,
+    /// A pass that loads it, draws nothing, and stores it.
+    LoadUndrawn,
+    /// A pass that clears it and draws as [`Op::Draw`]'s, and stores it by `DontCare`.
+    DontCareStore,
+    /// A pass that clears it as [`Op::Clear`]'s, draws as [`Op::Draw`] does under a write mask of
+    /// red and blue, and stores it.
+    Masked,
+    /// A pass that clears it as [`Op::Clear`]'s, draws as [`Op::Draw`] does blended by
+    /// `SourceColor` and `OneMinusSourceColor`, added, colour and alpha, and stores it.
+    Blended,
     /// A kernel's `write()` of 0 into each of its texels (`write_texels`).
     Kernel,
     /// A fragment function's `write()` of 0 into each of its texels (`write_texels_fragment`),
@@ -1770,7 +1782,13 @@ impl Op {
                 "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:\
                  destinationSlice:destinationLevel:destinationOrigin:"
             }
-            Op::Clear | Op::Draw => "renderCommandEncoderWithDescriptor:",
+            Op::Clear
+            | Op::Draw
+            | Op::Load
+            | Op::LoadUndrawn
+            | Op::DontCareStore
+            | Op::Masked
+            | Op::Blended => "renderCommandEncoderWithDescriptor:",
             Op::Kernel => "dispatchThreads:threadsPerThreadgroup:",
             Op::Fragment => "drawPrimitives:vertexStart:vertexCount:",
         }
@@ -1814,7 +1832,13 @@ fn written_at<P: Platform<Surface = OsSurface>>(
     use reims_vgpu_core::platform::values::ColorAttachmentSet;
     let mut desc = measure::desc(format, size);
     desc.usage = match op {
-        Op::Clear | Op::Draw => 0x5,
+        Op::Clear
+        | Op::Draw
+        | Op::Load
+        | Op::LoadUndrawn
+        | Op::DontCareStore
+        | Op::Masked
+        | Op::Blended => 0x5,
         Op::Kernel | Op::Fragment => 0x3,
         _ => 0x1,
     };
@@ -1898,8 +1922,17 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                 destination_origin: MtlOrigin::new(4, 4, 0),
             });
         }
-        Op::Clear | Op::Draw => {
+        Op::Clear
+        | Op::Draw
+        | Op::Load
+        | Op::LoadUndrawn
+        | Op::DontCareStore
+        | Op::Masked
+        | Op::Blended => {
             use reims_vgpu_core::platform::values::RenderPipelineDesc;
+            use reims_vgpu_core::rt::Hold;
+
+            use crate::gpu::serialized::tests::rounded_render_of;
             let pass = p.render_pass_descriptor();
             let color = ClearColor {
                 red: 0.25,
@@ -1907,28 +1940,61 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                 blue: 0.75,
                 alpha: 1.0,
             };
+            // `MTLLoadActionLoad` or `Clear`; `MTLStoreActionDontCare` or `Store`.
+            let load = if matches!(op, Op::Load | Op::LoadUndrawn) {
+                1
+            } else {
+                2
+            };
+            let store = u64::from(op != Op::DontCareStore);
             let attachment = ColorAttachmentSet {
                 texture: Some(Some(&t)),
-                load_action: Some(2),
-                store_action: Some(1),
+                load_action: Some(load),
+                store_action: Some(store),
                 clear_color: Some(color),
                 ..ColorAttachmentSet::default()
             };
             pass.set_color_attachment(OnFault::Die, 0, &attachment)
                 .unwrap();
-            let state = (op == Op::Draw).then(|| {
-                let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
-                let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-                let (vertex, fragment) = (function("corner_vertex"), function("gradient_fragment"));
-                d.new_render_pipeline_state(&RenderPipelineDesc {
-                    label: None,
-                    vertex: &vertex,
-                    fragment: &fragment,
-                    color0_pixel_format: format,
-                    resource_index: None,
-                })
-                .unwrap()
-                .unwrap()
+            let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+            let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+            let (vertex, fragment) = (function("corner_vertex"), function("gradient_fragment"));
+            // The colour attachment's keys of a described state: its write mask of red and blue
+            // (`MTLColorWriteMask` 0xa), or its blend.
+            let described = match op {
+                Op::Masked => Some(vec![(9, 0xa)]),
+                Op::Blended => Some(vec![(2, 1), (3, 2), (4, 3), (5, 0), (6, 2), (7, 3), (8, 0)]),
+                _ => None,
+            };
+            let state = (!matches!(op, Op::Clear | Op::LoadUndrawn)).then(|| match described {
+                Some(keys) => {
+                    let functions = [&vertex, &fragment];
+                    let mut resolve = |_: Hold<'_>, r: u64| {
+                        let at = usize::try_from(r - 1).unwrap();
+                        Ok(Some(functions[at].clone_ref()))
+                    };
+                    let mut colour = vec![(0, 0), (1, u32::try_from(format).unwrap())];
+                    colour.extend(keys);
+                    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
+                    let desc = d
+                        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+                        .unwrap()
+                        .unwrap();
+                    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                }
+                None => d
+                    .new_render_pipeline_state(&RenderPipelineDesc {
+                        label: None,
+                        vertex: &vertex,
+                        fragment: &fragment,
+                        color0_pixel_format: format,
+                        resource_index: None,
+                    })
+                    .unwrap()
+                    .unwrap(),
             });
             run(&|cb| {
                 let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
@@ -2076,48 +2142,48 @@ fn cpu_writes_and_buffer_blits_of_family_textures_are_metals() {
 }
 
 /// A blit of a texture of 505, 543 or 503 over a surface into another such texture, and a pass
-/// that clears a texture of 543 and stores it, die where they are encoded, naming the runtime's
-/// refusal (`Format`), where Metal copies and clears ([`passes_into_8_bit_formats_are_metals`]
-/// for 503's pass, [`passes_into_10_bit_formats_are_metals`] for 505's); the pass's death names
-/// the format, its raw value and Metal's name ([`crate::gpu::ycbcr::pass_refused`])
+/// that clears a texture of an `_sRGB` twin (525) and stores it, die where they are encoded,
+/// naming the runtime's refusal (`Format`), where Metal copies and clears; the pass's death names
+/// the format, its raw value and Metal's name ([`crate::gpu::ycbcr::pass_refused`]). The passes
+/// into the formats read converted or as codes are [`passes_into_8_bit_formats_are_metals`]',
+/// [`passes_into_10_bit_formats_are_metals`]' and [`passes_into_code_formats_are_metals`]'
 #[test]
 fn copies_and_attachments_of_family_textures_die() {
     let md = MetalPlatform::system_default_device();
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     let size = (32, 16);
-    for format in [505, 543, 503] {
-        let ops: &[Op] = match format {
-            543 => &[Op::Copy, Op::Clear],
-            _ => &[Op::Copy],
-        };
-        for &op in ops {
-            let (s, other) = noisy_pair(format, size, 5);
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| written(&platform(), &dev(), op, format, (&s, &other), size))
-                .unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            let case = format!("{format} {op:?}: {line}");
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, op.sel()),
+    for (format, op) in [
+        (505, Op::Copy),
+        (543, Op::Copy),
+        (503, Op::Copy),
+        (525, Op::Clear),
+    ] {
+        let (s, other) = noisy_pair(format, size, 5);
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| written(&platform(), &dev(), op, format, (&s, &other), size))
+            .unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let case = format!("{format} {op:?}: {line}");
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, op.sel()),
+            "{case}"
+        );
+        assert!(line.contains("Format"), "{case}");
+        if op == Op::Clear {
+            let named = format!(
+                "pixel format {format} ({})",
+                crate::gpu::format_info::name(op.sel(), format)
+            );
+            assert!(line.contains(&named), "{case}");
+            assert!(
+                line.contains("by a rule the runtime does not hold"),
                 "{case}"
             );
-            assert!(line.contains("Format"), "{case}");
-            if op == Op::Clear {
-                let named = format!(
-                    "pixel format {format} ({})",
-                    crate::gpu::format_info::name(op.sel(), format)
-                );
-                assert!(line.contains(&named), "{case}");
-                assert!(
-                    line.contains("by a rule the runtime does not hold"),
-                    "{case}"
-                );
-            }
-            if let Some(md) = &md {
-                let (s, other) = noisy_pair(format, size, 5);
-                written(&mp, md, op, format, (&s, &other), size);
-            }
+        }
+        if let Some(md) = &md {
+            let (s, other) = noisy_pair(format, size, 5);
+            written(&mp, md, op, format, (&s, &other), size);
         }
     }
 }
@@ -2139,6 +2205,14 @@ fn passes_into_8_bit_formats_are_metals() {
 #[test]
 fn passes_into_10_bit_formats_are_metals() {
     passes_are_metals(&[505, 506, 507]);
+}
+
+/// A pass into a texture of a format of the family read as codes (540 to 545, red Cr, green Y
+/// and blue Cb), as [`passes_into_8_bit_formats_are_metals`]'s: over each OSType of its bits
+/// whose chroma plane holds its own, where this platform died at the runtime's refusal
+#[test]
+fn passes_into_code_formats_are_metals() {
+    passes_are_metals(&[540, 541, 542, 543, 544, 545]);
 }
 
 /// The comparison of [`passes_into_8_bit_formats_are_metals`], of `formats`.
@@ -2170,6 +2244,102 @@ fn passes_are_metals(formats: &[u64]) {
             }
         }
     }
+}
+
+/// A pass into a texture of an 8- or 10-bit format of the family read converted (500, 502, 503,
+/// 505, 506, 507) or as codes (540 to 545) over plane 0 of a surface of each OSType of its bits whose chroma plane holds
+/// its own leaves both of the surface's planes as Metal's does, byte for byte, and no other byte,
+/// where this platform died at the runtime's refusal: one that loads it and stores it, drawing
+/// nothing, which stores nothing ([`Op::LoadUndrawn`]); one that draws and stores it by
+/// `DontCare`, which stores nothing ([`Op::DontCareStore`]); and one that draws under a write
+/// mask of red and blue ([`Op::Masked`]). One that loads it, draws over its top left half and
+/// stores it ([`Op::Load`]) dies at `endEncoding`, naming `ycbcr-load-tiles`: the runtime
+/// re-encodes every tile of the rectangle bounding the draws' scissors, where Metal stores only
+/// the 32 by 32 tiles a primitive reaches, and here the one tile of a 32 by 16 texture, which the
+/// draw reaches; relayed, the pass leaves Metal's bytes. One that draws blended
+/// ([`Op::Blended`]) dies at the draw, naming `ycbcr-blend-rounding`; relayed, each of the
+/// planes' codes is within one of Metal's, every other bit Metal's
+#[test]
+fn loaded_masked_and_blended_passes_are_metals() {
+    const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let size = (32, 16);
+    let mut differ = Vec::new();
+    for format in [500, 502, 503, 505, 506, 507, 540, 541, 542, 543, 544, 545] {
+        // An 8-bit format's codes are its bytes; a 10-bit one's are each 16-bit word's high 10
+        // bits, its low 6 bits kept beside.
+        let codes = |bytes: &[u8]| -> Vec<(u32, u32)> {
+            match format {
+                500..=503 | 540..=542 => bytes.iter().map(|&b| (u32::from(b), 0)).collect(),
+                _ => (bytes.as_chunks::<2>().0.iter())
+                    .map(|w| {
+                        let w = u32::from(u16::from_le_bytes(*w));
+                        (w >> 6, w & 0x3f)
+                    })
+                    .collect(),
+            }
+        };
+        let (_, ostypes) = surfaces_of(format, true);
+        assert!(!ostypes.is_empty(), "{format}");
+        for ostype in ostypes {
+            for op in [
+                Op::LoadUndrawn,
+                Op::DontCareStore,
+                Op::Masked,
+                Op::Load,
+                Op::Blended,
+            ] {
+                let case = format!("{format} over {} {op:?}", String::from_utf8_lossy(ostype));
+                let (s, other) = noisy_pair_of(ostype, size, 7);
+                let theirs = written(&mp, &md, op, format, (&s, &other), size);
+                let ours = |relaxed: bool| {
+                    let (s, other) = noisy_pair_of(ostype, size, 7);
+                    let run = || written(&platform(), &dev(), op, format, (&s, &other), size);
+                    match relaxed {
+                        true => Ok(crate::answer::relaxed(run)),
+                        false => catch_death(run),
+                    }
+                };
+                *crate::answer::LAST_LINE.lock() = None;
+                let strict = ours(false);
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                let dies = match op {
+                    Op::Load => Some(("endEncoding", "(metal2vulkan-degrade-ycbcr-load-tiles)")),
+                    Op::Blended => Some((DRAW, "(metal2vulkan-degrade-ycbcr-blend-rounding)")),
+                    _ => None,
+                };
+                let ours = match (strict, dies) {
+                    (Ok(ours), None) => ours,
+                    (Err(site), Some((sel, named))) if site.file == sel && line.contains(named) => {
+                        ours(true).unwrap()
+                    }
+                    (Ok(_), Some(_)) => {
+                        differ.push(format!("{case}: ran, announcing nothing"));
+                        continue;
+                    }
+                    (Err(site), _) => {
+                        differ.push(format!("{case}: died at {site:?}: {line}"));
+                        continue;
+                    }
+                };
+                if ours[1..] != theirs[1..] {
+                    differ.push(format!("{case}: the other surface or the buffer"));
+                }
+                let within = u32::from(op == Op::Blended);
+                let pairs = codes(&ours[0]).into_iter().zip(codes(&theirs[0]));
+                let off = pairs
+                    .filter(|((o, o_low), (m, m_low))| o.abs_diff(*m) > within || o_low != m_low)
+                    .count();
+                if off != 0 {
+                    differ.push(format!("{case}: {off} codes of the surface off"));
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// `replaceRegion:` of a texture of a packed format of the family (508 to 510, 528 to 530) over

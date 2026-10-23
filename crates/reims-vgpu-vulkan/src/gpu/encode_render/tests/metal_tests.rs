@@ -686,11 +686,13 @@ fn quads_give_metals_primitive_ids() {
     }
 }
 
-/// Metal's private types drawn directly from a vertex start whose last vertex passes `i32::MAX`
+/// Metal's private types, and its public ones but points (which this state, of no point size,
+/// does not size), drawn directly from a vertex start whose last vertex passes `i32::MAX`
 /// (`2^31 - 3`, `2^31 + 3`, and `2^32 - 4`, whose vertex IDs wrap past `u32::MAX`), of one instance
 /// and two, draw what Metal draws, pixel for pixel, each vertex's `[[vertex_id]]` and the draw's
-/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but the
-/// line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`)
+/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but lines,
+/// line strips and the line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`).
+/// A public type's at 1 the runtime draws as the list of its primitives too, where it refused one
 #[test]
 fn private_types_from_far_vertex_starts_draw_as_metals() {
     let (p, d) = (platform(), dev());
@@ -698,22 +700,42 @@ fn private_types_from_far_vertex_starts_draw_as_metals() {
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
     let clear = vec![[0, 0, 0, 0xff]; 256];
-    for t in 5..=8 {
-        let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
+    let mut differ = Vec::new();
+    for t in 1..=8 {
+        let modes: &[u64] = if matches!(t, 1 | 2 | 5) {
+            &[0]
+        } else {
+            &[0, 1]
+        };
         for start in [(1 << 31) - 3, (1 << 31) + 3, (1 << 32) - 4] {
             for (count, instances) in [(8, 1), (10, 2)] {
                 for &mode in modes {
                     let draw = (t, start, count, instances);
-                    let ours = flat_pass(&p, &d, wrapped, mode, draw);
-                    assert!(ours != clear, "{draw:?} at mode {mode}");
+                    *crate::answer::LAST_LINE.lock() = None;
+                    let ours = catch_death(|| flat_pass(&p, &d, wrapped, mode, draw));
+                    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                    let ours = match ours {
+                        Ok(ours) => ours,
+                        Err(site) => {
+                            differ
+                                .push(format!("{draw:?} at mode {mode}: died at {site:?}: {line}"));
+                            continue;
+                        }
+                    };
+                    if ours == clear {
+                        differ.push(format!("{draw:?} at mode {mode}: drew nothing"));
+                    }
                     if let Some((mp, md)) = &metal {
                         let theirs = flat_pass(mp, md, wrapped, mode, draw);
-                        assert!(ours == theirs, "{draw:?} at mode {mode}");
+                        if ours != theirs {
+                            differ.push(format!("{draw:?} at mode {mode}: pixels differ"));
+                        }
                     }
                 }
             }
         }
     }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
@@ -2644,6 +2666,112 @@ impl XrSide<MetalPlatform> {
         }
         theirs
     }
+}
+
+/// The answer of `newRenderPipelineStateWithDescriptor:options:reflection:error:` on `d` for a
+/// state of `sweep_vertex` and `fragment` of `library` into colour 0 of `format`, under `blend`
+/// ([`XR_DUAL_BLENDS`]'s layout) or unblended: `Ok` where it is made, else the `NSError`'s code.
+fn blended_state<P: Platform>(
+    d: &P::Device,
+    (library, fragment): (&[u8], &str),
+    format: u32,
+    blend: Option<[u32; 6]>,
+) -> Result<(), i64> {
+    use reims_vgpu_core::platform::resource::Library as _;
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::serialized::tests::rounded_render_of;
+
+    let library = d.new_library(library).unwrap().unwrap().unwrap();
+    let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+    let functions = [function("sweep_vertex"), function(fragment)];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    let mut colour = vec![(0, 0), (1, format)];
+    if let Some(blend) = blend {
+        colour.push((2, 1));
+        colour.extend((3..).zip(blend));
+    }
+    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    match d.new_render_pipeline_state_from_descriptor(Some(&desc), 0) {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => panic!("{fragment} {format}: nil with no error"),
+        Ok(Err(e)) => Err(e.code),
+        Err(raise) => panic!("{fragment} {format}: raised {raise:?}"),
+    }
+}
+
+/// A render state blended by a factor of the second source whose fragment function writes no
+/// second output (`xr_half_fragment`, `xr_float_fragment`) is answered as Metal answers it, nil
+/// and an `NSError` of Metal's code, 3, where Metal refuses it, or made where Metal makes it:
+/// into the extended-range forms and twins, `RGBA8Unorm`, `BGRA8Unorm` and `RGBA16Float`,
+/// compiled with fast math and without, under each blend of [`XR_DUAL_BLENDS`], each of which
+/// reads the second source. The runtime refuses such a state with Metal's error
+/// (`InvalidDescriptor(ColorAttachment)`), which the creator answers
+/// ([`crate::gpu::states::pipeline_error`]), where this platform died at the runtime's refusal
+/// of an extended-range one. A function that writes a second output (`xr_dual_half_fragment`) is
+/// made as on Metal, but compiled with fast math into an extended-range form or twin, which dies
+/// at the creator, naming the runtime's refusal (`ExtendedRangeBlend(DualSource)`, and
+/// `ExtendedRangeBlend(SrgbForm)` into `BGRA10_XR_sRGB`), where Metal makes it. And a state of a `half4` output into `RGBA8Uint`, unblended, whose output the
+/// runtime refuses for its type class (`InvalidDescriptor(ColorAttachment)` too), is answered as
+/// Metal answers it
+#[test]
+fn second_source_blends_without_a_second_output_are_refused_as_metals() {
+    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let mut differ = Vec::new();
+    let formats = [552, 554, 553, 555, 70, 80, 115];
+    let fragments = [
+        "xr_half_fragment",
+        "xr_float_fragment",
+        "xr_dual_half_fragment",
+    ];
+    // Each state: its library, fragment function, format and blend.
+    type Case = (&'static [u8], &'static str, u32, Option<[u32; 6]>);
+    let mut cases: Vec<Case> = Vec::new();
+    for format in formats {
+        for library in [ROUNDING, ROUNDING_SAFE] {
+            for fragment in fragments {
+                cases.extend(XR_DUAL_BLENDS.map(|blend| (library, fragment, format, Some(blend))));
+            }
+        }
+    }
+    cases.push((ROUNDING_SAFE, "xr_half_fragment", 73, None));
+    for (library, fragment, format, blend) in cases {
+        let fast = if library == ROUNDING { "fast" } else { "safe" };
+        let what = format!("{fragment} ({fast}) format {format} blend {blend:?}");
+        let theirs = blended_state::<MetalPlatform>(&md, (library, fragment), format, blend);
+        *crate::answer::LAST_LINE.lock() = None;
+        let ours =
+            catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let refused = library == ROUNDING
+            && fragment == "xr_dual_half_fragment"
+            && XR_LINEAR.into_iter().chain(XR_SRGB).any(|f| f == format);
+        match ours {
+            Ok(ours) if !refused && ours == theirs => {}
+            Err(site)
+                if refused
+                    && theirs.is_ok()
+                    && site.file == STATE
+                    && line.contains("ExtendedRangeBlend(") => {}
+            Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
+            Err(site) => differ.push(format!(
+                "{what}: died at {}: {line}; Metal {theirs:?}",
+                site.file
+            )),
+        }
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// This platform's side and Metal's, where the host has a Metal device: one command queue of
@@ -4912,7 +5040,8 @@ fn mode_2_multisampled_half_float_attachments_resolve_as_metals() {
 
 /// The resolved bytes of a 64 by 64 `format` (`bytes` a texel) colour attachment of
 /// `samples` samples after `xr_loaded_fragment` draws two tables of `float4`s, a value a
-/// pixel, into it ([`drawn_specials`]): the first over every sample, the second over the
+/// pixel, into it (`tables`, [`drawn_specials`]'s or [`drawn_extended`]'s): the first over every
+/// sample, the second over the
 /// viewport from half a pixel in, which covers part of the first row's and column's samples,
 /// so their resolve averages a value of each table. Resolved by the drawing pass's store
 /// action `store` (`MultisampleResolve` or `StoreAndMultisampleResolve`), or, where `store`
@@ -4922,6 +5051,7 @@ fn drawn_resolved<P: Platform>(
     d: &P::Device,
     (format, bytes, samples): (u64, u64, u64),
     store: u64,
+    tables: &[Vec<[f32; 4]>; 2],
 ) -> Vec<u8> {
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::rt::Hold;
@@ -4970,7 +5100,7 @@ fn drawn_resolved<P: Platform>(
         .unwrap()
         .unwrap();
     let target = texture(p, d, format, READ | TARGET, (64, 64), None);
-    let words: Vec<u8> = (drawn_specials().iter().flatten().flatten())
+    let words: Vec<u8> = (tables.iter().flatten().flatten())
         .flat_map(|v| v.to_le_bytes())
         .collect();
     let values = buffer::<P>(d, 2 * 4096 * 16, 0, &words);
@@ -5118,14 +5248,122 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
         for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
             for (format, bytes) in [(25, 2), (65, 4), (115, 8), (55, 4), (92, 4)] {
                 let case = (format, bytes, samples);
-                let theirs = drawn_resolved(&mp, &md, case, store);
-                let ours = drawn_resolved(&p, &d, case, store);
+                let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
+                let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
                 let texel = usize::try_from(bytes).unwrap();
                 let pairs = ours.chunks(texel).zip(theirs.chunks(texel));
                 let off = pairs.filter(|(o, m)| o != m).count();
                 if off != 0 {
                     differ.push(format!(
                         "{format} {samples}x store {store}: {off} of 4096 texels"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// The two tables [`drawn_resolved`] draws into an extended-range attachment, as
+/// [`drawn_specials`]' are laid out: each lane one of eight values within the formats' range
+/// (-0.75 to 1.25), in another order in each lane and table.
+fn drawn_extended() -> [Vec<[f32; 4]>; 2] {
+    let values = [-0.75, -0.3, 0.0, 0.1, 0.33, 0.5, 0.9, 1.25];
+    let at = |i: usize, c: usize| [(i + c) % 8, (i + i / 8 + 2 * c) % 8];
+    [0, 1].map(|table| {
+        (0..4096)
+            .map(|i| [0, 1, 2, 3].map(|c| values[at(i, c)[table]]))
+            .collect()
+    })
+}
+
+/// The 10-bit codes of `bytes`, texels of extended-range `format`, and whether each is alpha: a
+/// `BGRA10_XR` form's four 16-bit words a texel, each code in the high 10 bits and its 6 low bits
+/// padding, here kept beside the code (the code then the padding); a `BGR10_XR` form's three
+/// fields of a 32-bit word, from bit 0, its top two bits padding (as a fourth value).
+fn extended_codes(format: u64, bytes: &[u8]) -> Vec<(u32, u32, bool)> {
+    match format {
+        552 | 553 => (bytes.as_chunks::<2>().0.iter().enumerate())
+            .map(|(i, w)| {
+                let w = u32::from(u16::from_le_bytes(*w));
+                (w >> 6, w & 0x3f, i % 4 == 3)
+            })
+            .collect(),
+        _ => (bytes.as_chunks::<4>().0.iter())
+            .flat_map(|w| {
+                let w = u32::from_le_bytes(*w);
+                [w & 0x3ff, (w >> 10) & 0x3ff, (w >> 20) & 0x3ff].map(|c| (c, w >> 30, false))
+            })
+            .collect(),
+    }
+}
+
+/// A multisampled extended-range colour attachment whose samples draws wrote, two values in some
+/// pixels' samples ([`drawn_resolved`] of [`drawn_extended`]'s tables), resolves as Metal's, at
+/// 2 and 4 samples, by the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`)
+/// and by a later pass that loads the samples: `BGR10_XR`'s, byte for byte, announcing nothing.
+/// The runtime resolves the other forms, whose resolve Metal averages from values finer than
+/// the codes they hold, by a near-equivalent, and announces `extended-range-resolve` as the
+/// pass ends, which dies there, at `endEncoding`, naming it; relayed, `BGRA10_XR`'s colour is
+/// Metal's and its alpha within a code, and an `_sRGB` twin's colour within 7 codes (its alpha
+/// within one), the bounds the runtime measured on the M3 Max (macOS 27.0.1), every padding bit
+/// Metal's
+#[test]
+fn drawn_extended_range_samples_resolve_as_metals() {
+    /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
+    const RESOLVE: u64 = 2;
+    const STORE_AND_RESOLVE: u64 = 3;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let tables = drawn_extended();
+    let mut differ = Vec::new();
+    for samples in [2, 4] {
+        for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
+            for (format, bytes, [colour, alpha]) in [
+                (554, 4, [0, 0]),
+                (552, 8, [0, 1]),
+                (555, 4, [7, 0]),
+                (553, 8, [7, 1]),
+            ] {
+                let case = (format, bytes, samples);
+                let what = format!("{format} {samples}x store {store}");
+                let theirs = drawn_resolved(&mp, &md, case, store, &tables);
+                let ours = || drawn_resolved(&p, &d, case, store, &tables);
+                *crate::answer::LAST_LINE.lock() = None;
+                let strict = catch_death(ours);
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                let ours = match (strict, format) {
+                    (Ok(ours), 554) => ours,
+                    (Err(site), 552 | 553 | 555)
+                        if site.file == "endEncoding"
+                            && line.contains("(metal2vulkan-degrade-extended-range-resolve)") =>
+                    {
+                        crate::answer::relaxed(ours)
+                    }
+                    (Ok(_), _) => {
+                        differ.push(format!("{what}: resolved, announcing nothing"));
+                        continue;
+                    }
+                    (Err(site), _) => {
+                        differ.push(format!("{what}: died at {site:?}: {line}"));
+                        continue;
+                    }
+                };
+                let codes = extended_codes(format, &ours).into_iter();
+                let pairs = codes.zip(extended_codes(format, &theirs));
+                let (mut worst, mut padding) = ([0, 0], 0);
+                for ((o, o_pad, is_alpha), (m, m_pad, _)) in pairs {
+                    let at = usize::from(is_alpha);
+                    worst[at] = worst[at].max(o.abs_diff(m));
+                    padding += usize::from(o_pad != m_pad);
+                }
+                if worst[0] > colour || worst[1] > alpha || padding != 0 {
+                    differ.push(format!(
+                        "{what}: colour {} and alpha {} codes off at most, {padding} paddings off",
+                        worst[0], worst[1]
                     ));
                 }
             }

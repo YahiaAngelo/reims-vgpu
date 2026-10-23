@@ -16,9 +16,11 @@
 //! buffer is detached, replaced, or both before the signal ([`behind_a_wait`]): this crate's
 //! fails a use detached then as Metal's does, in the first submission or a later one, and dies
 //! at a use replaced then, also in a submission after one a detached use failed, where Metal
-//! runs it over the new pages (`src/gpu/command.rs`'s docs). A buffer placed in a heap over
-//! address ranges detaches the heap on both, and one in a plain heap, as the plain heap, never
-//! detaches ([`placed_detach`]).
+//! runs it over the new pages (`src/gpu/command.rs`'s docs). A kernel's dispatch committed so,
+//! its pipeline state made for it or warm, whose buffer is detached and replaced before the
+//! signal, runs over the new pages on both ([`dispatch_behind_a_wait`]). A buffer placed in a
+//! heap over address ranges detaches the heap on both, and one in a plain heap, as the plain
+//! heap, never detaches ([`placed_detach`]).
 //!
 //! A detach while a command buffer submitted and not yet completed took the object answers NO
 //! on both, a heap's at once and a buffer's once the command buffer completed, where Metal's
@@ -1222,6 +1224,141 @@ fn behind_a_wait_on_vulkan() {
         assert!(
             stdout.contains(&format!("seen {metal:?}")),
             "{case}: {stdout}"
+        );
+    }
+}
+
+/// A buffer over guest pages whose kernel's dispatch a command buffer commits behind an event
+/// wait, then detached and replaced by other pages before the wait's signal, its kernel the spin kernel of no
+/// rounds ([`SPIN`]), which writes [`SPUN`] to the buffer's second word: of a pipeline state made
+/// for it, so cold (the state's first dispatch, whose pipeline the runtime may still be making
+/// as it is encoded, as it hands a state's first dispatch's making to its pool), where `warm` is
+/// false, and of one a completed command buffer dispatched once first where it is true. What
+/// shows: the command buffer's status and error code, and the second word of the pages the
+/// buffer was over and of those it was replaced by.
+fn dispatch_behind_a_wait<P: Platform>(p: &P, dev: &P::Device, warm: bool) -> Vec<u64> {
+    let queue = dev.new_command_queue().unwrap();
+    let library = dev.new_library(SPIN).unwrap().unwrap().unwrap();
+    let function = library
+        .new_function(OnFault::Return, "spin")
+        .unwrap()
+        .unwrap();
+    let pipeline = dev
+        .new_compute_pipeline_state_for_function(Some(&function))
+        .unwrap()
+        .unwrap();
+    let dispatch = |cb: &P::CommandBuffer, words: &P::Buffer| {
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for command in [
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&pipeline),
+            },
+            ComputeCmd::SetBuffers {
+                buffers: &[Some(words)],
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::DispatchThreadgroups {
+                threadgroups_per_grid: MtlSize::new(1, 1, 1),
+                threads_per_threadgroup: MtlSize::new(1, 1, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, command).unwrap();
+        }
+    };
+    if warm {
+        let first = plain_buffer::<P>(dev);
+        let cb = command_buffer::<P>(&queue);
+        dispatch(&cb, &first);
+        assert_eq!(finish::<P>(&cb), [4, 0]);
+    }
+    let buffer = detached_buffer::<P>(dev, 1);
+    let over = pages(1, 0);
+    let array = p.new_address_range_array(&[range(over, 0, PAGE)]).unwrap();
+    assert!(buffer.replace_backing(&array, false).unwrap());
+    let gate = dev.new_shared_event().unwrap();
+    let cb = command_buffer::<P>(&queue);
+    cb.encode_wait(Some(EventRef::Shared(&gate)), 1).unwrap();
+    dispatch(&cb, &buffer);
+    cb.commit(OnFault::Return).unwrap();
+    buffer.detach_backing().unwrap();
+    let new = pages(1, 0);
+    let array = p.new_address_range_array(&[range(new, 0, PAGE)]).unwrap();
+    assert!(buffer.replace_backing(&array, false).unwrap());
+    gate.set_signaled_value(1).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    vec![
+        cb.status().0,
+        cb.error().map_or(0, |e| u64::try_from(e.code).unwrap()),
+        u64::from(word(over, 1)),
+        u64::from(word(new, 1)),
+    ]
+}
+
+/// Metal's answer in [`dispatch_behind_a_wait`], cold and warm (measured on the M3 Max, macOS
+/// 27.0.1): the dispatch runs over the new pages, the command buffer completing with no error.
+const DISPATCH_BEHIND_A_WAIT: [u64; 4] = [4, 0, 0, SPUN as u64];
+
+#[test]
+fn a_dispatch_behind_a_wait_on_metal() {
+    let Some(dev) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = MetalPlatform::new(Box::new(NoLauncher));
+    for warm in [false, true] {
+        assert_eq!(
+            dispatch_behind_a_wait(&p, &dev, warm),
+            DISPATCH_BEHIND_A_WAIT,
+            "warm {warm}"
+        );
+    }
+}
+
+/// This crate in [`dispatch_behind_a_wait`], cold and warm, each in a child copy of this test
+/// binary under strict mode (`REIMS_VGPU_STRICT=1`), where a death ends the process as in
+/// production, on whatever thread it comes: each answers Metal's, and nothing dies. The rebind
+/// encodes the compute encoder again over the new pages before the command buffer's first
+/// submission, the cold dispatch's too, whose recording waits for its pipeline
+#[test]
+fn a_dispatch_behind_a_wait_on_vulkan() {
+    const CHILD: &str = "RVG_DISPATCH_BEHIND_A_WAIT";
+    if let Ok(warm) = std::env::var(CHILD) {
+        reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+        let dev = VulkanPlatform::system_default_device().unwrap();
+        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        println!("seen {:?}", dispatch_behind_a_wait(&p, &dev, warm == "1"));
+        std::process::exit(0);
+    }
+    if VulkanPlatform::system_default_device().is_none() {
+        return;
+    }
+    for warm in ["0", "1"] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_dispatch_behind_a_wait_on_vulkan",
+                "--nocapture",
+            ])
+            .args(["--test-threads=1"])
+            .env(CHILD, warm)
+            .env("REIMS_VGPU_STRICT", "1")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let death = stderr
+            .lines()
+            .find(|l| l.starts_with("reims-vgpu: fatal: "));
+        assert!(
+            out.status.success() && death.is_none(),
+            "warm {warm}: {out:?}"
+        );
+        assert!(
+            stdout.contains(&format!("seen {DISPATCH_BEHIND_A_WAIT:?}")),
+            "warm {warm}: {stdout}"
         );
     }
 }

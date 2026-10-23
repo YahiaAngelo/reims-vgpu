@@ -3129,23 +3129,21 @@ fn a_wide_two_plane_fill_relays_the_copy_into_its_rows() {
 }
 
 /// A fill of a placement heap's texture of a two-plane XR10 format (550) of more than one level
-/// or slice, which the runtime fills apart from the heap's bytes, writes the heap's bytes as
-/// Metal's does, byte for byte ([`two_plane_heap_texture_fill_on`]), Metal's the same on a
-/// second run: of a 16 by 8 texture, level 1 of 2 whole, level 2 of 3 whole and a region of
-/// level 1 of 3; level 1 of slice 1 of a 2D array of 2 levels; and slices 1 and 0 of a 2D array
-/// of one level. Measured on the M3 Max (macOS 27.0.1): Metal writes each texel (x, y) of the
-/// region, cut at the level's extent, of slice s at the texture's first byte + s * 4 w0 h0 + y *
-/// 4 w0 + 4 x, w0 and h0 level 0's extent, whatever the level: as level 0's colour words lie; it
-/// writes no byte of the alpha plane. The arrays of one level pass. The runtime announces each
-/// texture of more than one level as it is made (`heap-two-plane-layout`, which dies here, at
-/// `newTextureWithDescriptor:offset:`): it keeps the first level's texels in the heap's bytes and
-/// the later levels' apart from them. Relayed, the 2D array's fill of level 1 of slice 1 writes
-/// Metal's bytes, but the 2D texture's of level 1 and 2 write none of Metal's words into the
-/// heap's bytes (128, 32 and 24 bytes differ); the cases pass once the runtime writes them there
+/// or slice writes the heap's bytes as Metal's does, byte for byte
+/// ([`two_plane_heap_texture_fill_on`]), Metal's the same on a second run: of a 16 by 8 texture,
+/// level 1 of 2 whole, level 2 of 3 whole and a region of level 1 of 3; level 1 of slice 1 of a
+/// 2D array of 2 levels; and slices 1 and 0 of a 2D array of one level. Measured on the M3 Max
+/// (macOS 27.0.1): Metal writes each texel (x, y) of the region, cut at the level's extent, of
+/// slice s at the texture's first byte + s * 4 w0 h0 + y * 4 w0 + 4 x, w0 and h0 level 0's
+/// extent, whatever the level: as level 0's colour words lie; it writes no byte of the alpha
+/// plane. The arrays of one level are made and filled, announcing nothing. The runtime announces
+/// each texture of more than one level as it is made (`heap-two-plane-layout`, which dies here, at
+/// `newTextureWithDescriptor:offset:`, naming it): it keeps the first level's texels in the
+/// heap's bytes and the later levels' apart from them. Relayed, its fill of a later level writes
+/// Metal's bytes into the heap's
 #[test]
-#[ignore = "the runtime announces heap-two-plane-layout, and relayed misses Metal's words: m2v \
-            fix pending"]
 fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
+    const PLACED: &str = "newTextureWithDescriptor:offset:";
     let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;
     };
@@ -3196,18 +3194,31 @@ fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
             on_metal(),
             "{what}: Metal's bytes vary between runs"
         );
-        match catch_death(|| {
-            two_plane_heap_texture_fill_on::<VulkanPlatform>(&d, &ours_desc, &shape, &fills)
-        }) {
-            Ok(ours) if ours == theirs => {}
-            Ok(ours) => {
-                let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                differ.push(format!("{what}: {n} bytes differ"));
+        let ours =
+            || two_plane_heap_texture_fill_on::<VulkanPlatform>(&d, &ours_desc, &shape, &fills);
+        *crate::answer::LAST_LINE.lock() = None;
+        let strict = catch_death(ours);
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let ours = match (strict, levels > 1) {
+            (Ok(ours), false) => ours,
+            (Err(site), true)
+                if site.file == PLACED
+                    && line.contains("(metal2vulkan-degrade-heap-two-plane-layout)") =>
+            {
+                crate::answer::relaxed(ours)
             }
-            Err(site) => {
-                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            (Ok(_), true) => {
+                differ.push(format!("{what}: made, announcing nothing"));
+                continue;
+            }
+            (Err(site), _) => {
                 differ.push(format!("{what}: died at {}: {line}", site.file));
+                continue;
             }
+        };
+        if ours != theirs {
+            let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+            differ.push(format!("{what}: {n} bytes differ"));
         }
     }
     assert!(

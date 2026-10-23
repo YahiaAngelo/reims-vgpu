@@ -393,7 +393,12 @@ pub(crate) fn new_depth_stencil_state(
 ///   this device, by a GPU family the device lacks (`Needs::MetalGpuFamily`: a render state set
 ///   on an indirect render command) or by the devices Metal was measured to refuse it on
 ///   (`Needs::MetalRefuses`: a fragment function's read of a program-scope
-///   `thread_index_in_quadgroup`).
+///   `thread_index_in_quadgroup`); and a colour attachment the fragment function's outputs do
+///   not fit (`InvalidDescriptor(ColorAttachment)`), measured: a blend of the second source whose
+///   function writes no second output ("Fragment shader does not write to render target
+///   color(0), index(1) that is required for blending"), and a `half4` output into an
+///   `RGBA8Uint` attachment (`encode_render`'s
+///   `second_source_blends_without_a_second_output_are_refused_as_metals`).
 /// - Code 2 ([`UNDEFINED_SYMBOLS`]): a function whose import no linked dynamic library exports,
 ///   or whose install name loaded no library (`NeedsInput` of `DynamicSymbol` or
 ///   `DynamicLibrary`).
@@ -407,8 +412,11 @@ pub(crate) fn new_depth_stencil_state(
 /// An answer the runtime cannot prove ([`rt::Error::Unproven`]) dies, naming it (`unproven`), as
 /// does every other refusal.
 pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
-    use metal2vulkan::error::{Error as Compile, Needs, RuntimeInput};
+    use metal2vulkan::error::{DescriptorError, Error as Compile, Needs, RuntimeInput};
     let code = match e {
+        rt::Error::Compile(Compile::InvalidDescriptor(DescriptorError::ColorAttachment {
+            ..
+        })) => METAL_REFUSES,
         rt::Error::Compile(Compile::InvalidInput(_) | Compile::InvalidDescriptor(_)) => 0,
         rt::Error::Invalid(i) if i.problem == rt::Problem::PointSizeTopology => 0,
         rt::Error::Unsupported(u)
@@ -431,7 +439,8 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 /// The `NSError` code of Metal's pipeline creators for a function its compiler refuses on the
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
 /// `air.get_thread_index_in_quadgroup.i32`), at the compute, render and tile creators (measured:
-/// the module docs).
+/// the module docs), and of the render creator for a colour attachment the fragment function's
+/// outputs do not fit ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
 /// The `NSError` code of Metal's pipeline creators for a function whose import no library it

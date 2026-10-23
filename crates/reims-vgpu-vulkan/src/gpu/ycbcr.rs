@@ -154,11 +154,13 @@ pub(crate) fn refused_write(sel: &'static str, what: &str, pf: PixelFormat) -> !
 ///   whose command buffer Metal fails, the error (`Hang` or `InnocentVictim`) and the luma bytes
 ///   it leaves varying from run to run, and after a second such failure ignores the queue's later
 ///   command buffers: no exact form exists, so the pass dies where it is made;
-/// - a pass into 500, 502, 503, 505, 506 or 507 the runtime does not store as Metal
-///   (`ycbcr_renders`: it stores a pass that clears the attachment or leaves it to the pass and
-///   stores it, over plane 0, of a size its chroma blocks tile): a load, another store action, a
-///   resolve or store action options, a texture over plane 1, or a size the blocks do not tile,
-///   none of them measured;
+/// - a pass into 500, 502, 503, 505, 506 or 507, or into one read as codes (540 to 545), the
+///   runtime does not store as Metal
+///   (`ycbcr_renders`: it stores a pass over plane 0 of a size its chroma blocks tile, by any load
+///   action, a `Store` or `DontCare` store, under any write mask and blend, its blend's codes
+///   within one of Metal's and a loaded pass's tiles no draw reaches re-encoded, which the runtime
+///   announces, `ycbcr-blend-rounding` and `ycbcr-load-tiles` of [`crate::answer::DIES`]): a
+///   resolve, a texture over plane 1, or a size the blocks do not tile, none of them measured;
 /// - every other format's pass, which Metal stores into the texture by a rule the runtime does not
 ///   hold.
 pub(crate) fn pass_refused(sel: &'static str, d: &rt::RenderPassDescriptor, e: &rt::Error) {
@@ -189,9 +191,9 @@ pub(crate) fn pass_refused(sel: &'static str, d: &rt::RenderPassDescriptor, e: &
          it leaves varying from run to run, and after a second such failure ignores the queue's \
          later command buffers: no exact form exists"
     } else if ycbcr_renders(pf) {
-        "which Metal stores into both of the surface's planes, where the runtime stores only a \
-         pass that clears the attachment or leaves it to the pass and stores it, over plane 0, \
-         of a size its chroma blocks tile: no other shape was measured"
+        "which Metal stores into both of the surface's planes, where the runtime stores a pass \
+         over plane 0 of a size its chroma blocks tile, without a resolve: no other shape was \
+         measured"
     } else {
         "which Metal stores into the texture by a rule the runtime does not hold"
     };

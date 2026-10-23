@@ -21,9 +21,10 @@
 //!   so such a pass dies at its creation. So does a pass into a YCbCr colour attachment the
 //!   runtime refuses (a format refusal of a two-plane or 4:2:2 texture), its line naming the
 //!   format and what Metal does there ([`crate::gpu::ycbcr::pass_refused`]): a packed 10-bit
-//!   one's, which Metal fails with an error and bytes that vary from run to run, and the shapes
-//!   of 500, 502, 503, 505, 506 and 507 and the other formats whose stores the runtime does not
-//!   hold.
+//!   one's, which Metal fails with an error and bytes that vary from run to run, the shapes of
+//!   500, 502, 503, 505, 506 and 507 and of 540 to 545 the runtime does not store (a resolve, a
+//!   texture over plane 1, a size their chroma blocks do not tile), and the other formats',
+//!   their `_sRGB` twins' among them, whose stores the runtime does not hold.
 //! - **Store actions** Metal goes on with: a late one equal to the descriptor's known action, or
 //!   of an attachment without a texture, encodes nothing; another over a known one dies, as its
 //!   effect is not measured; one the descriptor left `Unknown` and nothing decided stores nothing
@@ -593,11 +594,12 @@ fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDes
 /// runtime's to decide, as it was before any resolve was dropped here: the same format; an sRGB
 /// pair (`R8Unorm`, `RG8Unorm`, `RGBA8Unorm`, `BGRA8Unorm`, `BGR10_XR` and `BGRA10_XR`, each with
 /// its `_sRGB` twin: the colour-renderable pairs among the runtime's twins), which the runtime
-/// resolves from a multisampled attachment in the attachment's encoding, but for the
-/// extended-range ones, whose resolve it does not model; and the 8-bit four-channel family across
-/// its channel orders (`RGBA8Unorm` and `BGRA8Unorm`, and their twins), which it does not build.
-/// The runtime refuses every other pair (`ResolveFormat`, or an extended-range format's
-/// resolve), which [`fate`] takes.
+/// resolves from a multisampled attachment in the attachment's encoding, the extended-range ones
+/// by its own resolve of their codes after the pass (`extended-range-resolve`, of
+/// [`crate::answer::DIES`], where Metal averages values finer than the codes); and the 8-bit
+/// four-channel family across its channel orders (`RGBA8Unorm` and `BGRA8Unorm`, and their
+/// twins), which it does not build. The runtime refuses every other pair (`ResolveFormat`),
+/// which [`fate`] takes.
 fn runtime_resolves(from: PixelFormat, into: PixelFormat) -> bool {
     use PixelFormat as P;
     const TWINS: [(PixelFormat, PixelFormat); 6] = [
@@ -864,7 +866,7 @@ const WRITTEN: &str = "plain Metal writes into such a texture, measured from a P
 /// the runtime's ([`Fate::Runtimes`]); dropped where plain Metal was measured to leave the
 /// texture untouched ([`measured_pair`], [`unmeasured_shape`]); else, by a store action that
 /// resolves or is left `Unknown` into a texture of another format the runtime refuses
-/// (`ResolveFormat`, or an extended-range format's resolve), the pass dies, named with what plain
+/// (`ResolveFormat`), the pass dies, named with what plain
 /// Metal was measured to do there. A store action left `Unknown` resolves by its late store
 /// action, which nothing measured here, and the runtime counts it as resolving: it refuses such
 /// a pass as it is made.

@@ -67,7 +67,9 @@
 //!   named it again from their calls, so they reach the new pages as Metal's do (a call refused at
 //!   its encoding is refused again, and the calls after it run), and a resource state encoder takes
 //!   no pages (an indirect mapping update reads its buffer as it runs). It fails only an encoder it
-//!   cannot encode again: one of a command buffer that used command predication; a render pass
+//!   cannot encode again: a compute encoder of the runtime's command predication that shares its
+//!   unit, holds a loop or leaves work out (no record of ours reaches the runtime's predication:
+//!   this platform's is its own, [`crate::gpu::predication`]); a render pass
 //!   recorded later (an execution of an indirect command buffer, a draw whose pipeline was being
 //!   made) or whose end captured its draws' tile reach; and one a call of which answers otherwise
 //!   than at its encoding. Each submission holding such an encoder runs nothing and the command
@@ -76,18 +78,20 @@
 //!   [`crate::answer::DIES`]) on the thread that makes the submission, where it dies first, ending
 //!   the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
-//!   there too, naming it ([`answered`]): an emulated mesh draw past the command buffer's mesh
-//!   records pool (`MeshRecordsOverflow`), or an emulated tessellation draw past the same pool
-//!   (`TessellationRecordsOverflow`, an indirect patch draw on a device without
-//!   `tessellationShader`), which it draws nothing of; a sparse mapping update it
-//!   applied none of (`SparseHeapSplit`, `SparseMappingSplit`); a Vulkan failure of a submission
-//!   other than a lost device or memory (`Internal`); and any other the runtime gives, whatever
-//!   origin it states, until one is reviewed here. Metal's
-//!   own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
+//!   there too, naming it ([`answered`]): a mesh draw's grid the device cannot launch where Metal
+//!   draws it (`MeshGridPastLimits`, which dies as unanswered); an emulated mesh draw past the
+//!   command buffer's mesh records pool (`MeshRecordsOverflow`), or an emulated tessellation draw
+//!   past the same pool (`TessellationRecordsOverflow`, an indirect patch draw on a device without
+//!   `tessellationShader`), which it draws nothing of; a Vulkan failure of a submission other
+//!   than a lost device or memory (`Internal`); and any other the runtime gives, whatever origin
+//!   it states, until one is reviewed here. Metal's own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
 //!   platform lists, reach core as Metal's: those this platform commits a command buffer with as
 //!   Metal's GPU fails it (below), a lost device, memory, an address fault, a GPU hang
 //!   (`GpuHang`, code 2) and a victim of the GPU's recovery (`GpuRecoveryVictim`, code 1) at a
-//!   draw of primitive type 9, a queue Metal stopped serving after its second such fault or hang
+//!   draw of primitive type 9 or of an object grid of more than 2^29 threadgroups, which Metal's
+//!   GPU discards (the runtime fails a direct draw's command buffer from its encoder on, as
+//!   Metal's, and an indirect one's where its arguments pass reads the grid, the rest of its work
+//!   running), a queue Metal stopped serving after its second such fault or hang
 //!   (`AccessRevoked`, code 4), a render pass without attachments past 16384 or with a
 //!   `defaultRasterSampleCount` Metal fails, a detached buffer's use, an encoder made under
 //!   protection options (`ProtectedEncoder`, code 16 or 1), a unit of the runtime's command
@@ -911,9 +915,8 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// ([`pool_overflow`]), a sample through a cubic sampler an argument buffer holds
 /// ([`cubic_argument_sampler`]), a command's buffer rebound before the command buffer was submitted
 /// ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the records pool
-/// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a sparse mapping update the
-/// runtime applied none of ([`sparse_heap_split`], [`sparse_mapping_split`]), a Vulkan
-/// failure of a submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
+/// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a Vulkan failure of a
+/// submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
 /// [`failed_pipeline`]). A relayed failure's death names Metal's description of it, which `cb`, the
 /// command buffer that failed, keeps.
@@ -943,8 +946,6 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         rt::CommandBufferError::TessellationRecordsOverflow(overflow) => {
             tessellation_records_overflow(sel, overflow)
         }
-        rt::CommandBufferError::SparseHeapSplit => sparse_heap_split(sel),
-        rt::CommandBufferError::SparseMappingSplit => sparse_mapping_split(sel),
         rt::CommandBufferError::Internal(code) => vulkan_failure(sel, code),
         e => unanswered(sel, e),
     }
@@ -986,34 +987,6 @@ fn tessellation_records_overflow(
              buffer, where Metal draws it",
             overflow.draw, overflow.records, overflow.budget
         ),
-    )
-}
-
-/// The death at `sel` of a command buffer whose sparse mapping filled its heap inside one of the
-/// device's sparse units of several tiles, of a texture whose texels no copy writes (a
-/// multisampled texture): the runtime binds such a texture's whole units, so it applied none of
-/// the batch's mappings and ran nothing of the command buffer from there, where Metal maps the
-/// tiles that fit and fails no command buffer.
-fn sparse_heap_split(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "a sparse mapping that filled its heap inside one of the device's sparse units of a \
-         texture whose texels no copy writes, which the runtime applied nothing of the batch of \
-         and ran nothing of the command buffer from, where Metal maps the tiles that fit",
-    )
-}
-
-/// The death at `sel` of a command buffer whose indirect sparse mapping update's regions, as the
-/// host read them, bind or unbind part of one of the device's sparse units of a texture whose
-/// texels no copy writes: the runtime applied none of the batch's mappings and ran nothing of
-/// the command buffer from there, where Metal maps them tile by tile and fails no command buffer.
-fn sparse_mapping_split(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "an indirect sparse mapping update whose regions bind or unbind part of one of the \
-         device's sparse units of a texture whose texels no copy writes, which the runtime \
-         applied nothing of the batch of and ran nothing of the command buffer from, where Metal \
-         maps them tile by tile",
     )
 }
 
@@ -2230,9 +2203,8 @@ mod tests {
 
     /// A command buffer's failure that is one of Metal's reaches core; every failure of the
     /// runtime's own dies at the selector that reads it first, at the commit's and at the wait, its
-    /// line naming it: a sparse mapping update the runtime applied none of, a Vulkan failure of a
-    /// submission, one nothing here matched to Metal's, and an indirect draw's indices past the
-    /// index pool. The thirteen this platform lists as Metal's are those the runtime states as
+    /// line naming it: a Vulkan failure of a submission, one nothing here matched to Metal's, and
+    /// an indirect draw's indices past the index pool. The thirteen this platform lists as Metal's are those the runtime states as
     /// Metal's, and the others it names its own: a change of either at a new pin fails here, for
     /// review
     #[test]
@@ -2258,11 +2230,6 @@ mod tests {
             answered("commit", e, None);
         }
         let named = [
-            (
-                E::SparseHeapSplit,
-                "filled its heap inside one of the device's sparse units",
-            ),
-            (E::SparseMappingSplit, "regions bind or unbind part of one"),
             (E::Internal(rt::VkResultCode(-13)), "VkResult -13"),
             (E::IndexPoolOverflow, "index pool"),
         ];

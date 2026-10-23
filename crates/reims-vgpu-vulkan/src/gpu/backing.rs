@@ -45,7 +45,8 @@
 //!   and whose command buffer is first submitted after it (committed after it, or committed
 //!   before it and held behind an event wait), reaches the new pages as Metal's does where the
 //!   runtime encodes its compute, blit or render encoder again from its calls; in an encoder it
-//!   cannot (a command buffer that used command predication, a render pass recorded later or
+//!   cannot (a compute encoder of the runtime's command predication that shares its unit, holds
+//!   a loop or leaves work out, which no record of ours reaches, a render pass recorded later or
 //!   whose end captured its draws' tile reach, one with a call that answers otherwise than at its
 //!   encoding) it fails, as the runtime resolved the use as the command was encoded
 //!   (`CommandBufferError::EncodedUseRebound`): that dies where its failure is first read
