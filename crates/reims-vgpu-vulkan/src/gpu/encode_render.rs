@@ -220,10 +220,13 @@
 //!   it rasterize by regions whose lines are the map's tiles' exact lines, where Metal's are its
 //!   fixed-point ones: a draw and an execution of indirect commands that is not empty relay it
 //!   there, and so does a tile dispatch, each dying in strict mode. A pass over a map made of a
-//!   `Mutable` descriptor, reset or not, ends with a draw of no vertices the guest did not
-//!   encode, as the Metal platform's does, without which the runtime fails the command buffer of
-//!   one that nothing drew in as a GPU hang, as Metal's GPU does
-//!   ([`crate::gpu::rate_map::no_draw`]).
+//!   `Mutable` descriptor, reset or not, that no draw of the guest's took the place of ends with
+//!   a draw of no vertices the guest did not encode, as the Metal platform's does, without which
+//!   the runtime fails the command buffer of one that nothing drew in as a GPU hang, as Metal's
+//!   GPU does ([`crate::gpu::rate_map::no_draw`]). A draw takes its place where the Metal
+//!   platform's does: one of at least one whole triangle of a triangle list or strip (3 vertices
+//!   or more), once or more, that the runtime took, which it counts as the pass's draw call
+//!   ([`VulkanRenderEncoder::drew`]).
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
 //!   Metal enumerator is, a slice shorter than its range, a nil resource (but in
 //!   `useResources:count:usage:`), and a command after `endEncoding`. A rotated texture is the
@@ -411,9 +414,10 @@ pub struct RenderEncoderObject {
     /// Whether the pass's rate map is one whose rates vary, whose regions the runtime's draws
     /// rasterize by its tiles' exact lines, where Metal's are its fixed-point ones (`layered`).
     varying_rates: bool,
-    /// Where the pass's rate map was made of a `Mutable` descriptor, the pipeline the pass ends
-    /// with a draw of no vertices through ([`crate::gpu::rate_map::no_draw`]).
-    no_draw: Option<rt::RenderPipelineState>,
+    /// Whether the pass ends with the platform's draw of no vertices
+    /// ([`crate::gpu::rate_map::no_draw`]): set where the pass's rate map was made of a `Mutable`
+    /// descriptor, until a draw of the guest's takes its place ([`VulkanRenderEncoder::drew`]).
+    undrawn: Mutex<bool>,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
@@ -1692,8 +1696,7 @@ fn opened(
         dropped,
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
-        no_draw: (taken.mutable)
-            .then(|| crate::gpu::rate_map::no_draw(sel, &command_buffer.device)),
+        undrawn: Mutex::new(taken.mutable),
         reach: Mutex::new(Reach::default()),
         bfloat_loaded: bfloat_loaded(&d),
         pass: d,
@@ -2574,13 +2577,21 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
-                // A pass over a mutable map ends with a draw of no vertices, which keeps the
-                // runtime from failing it as a GPU hang where nothing drew in it, as the Metal
-                // platform's draw keeps Metal's GPU from hanging (`rate_map::no_draw`). It is the
-                // pass's last command, so its pipeline is bound for nothing the guest encodes.
-                if let Some(no_draw) = &self.no_draw {
+                // A pass over a mutable map that no draw of the guest's took the place of ends
+                // with a draw of no vertices, which keeps the runtime from failing it as a GPU
+                // hang where nothing drew in it, as the Metal platform's draw keeps Metal's GPU
+                // from hanging (`rate_map::no_draw`). It is the pass's last command, so its
+                // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
+                // once per device, after the stop a thread of a task that ended takes at the
+                // command; where the command buffer is gone, nothing encoded here runs, and the
+                // pass needs no draw.
+                if *self.undrawn.lock()
+                    && let Some(cb) = self.encoder.command_buffer()
+                {
+                    stop_if_task_ended();
+                    let no_draw = crate::gpu::rate_map::no_draw(sel, &cb.device);
                     self.run(sel, &mut |e| {
-                        e.set_render_pipeline_state(no_draw)?;
+                        e.set_render_pipeline_state(&no_draw)?;
                         e.draw_primitives(PrimitiveType::Triangle, 0, 0, 1, 0)
                     })?;
                 }
@@ -3462,7 +3473,33 @@ impl VulkanRenderEncoder {
             return self.nine(sel, hang, &mut |e| call(e, t));
         }
         let empty = instances == 0 || draws_none(t, count);
-        self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call)
+        let drawn = self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call);
+        self.drew(t, (count, instances), &drawn);
+        drawn
+    }
+
+    /// After a guest's draw of `count` vertices of `t`, `instances` times, answered `drawn`: one
+    /// of at least one whole triangle of a triangle list or strip (3 vertices or more), once or
+    /// more, that the runtime took, takes the place of the platform's draw of no vertices at the
+    /// pass's end ([`crate::gpu::rate_map::no_draw`]), as the Metal platform's does (its
+    /// `gpu::rate_map::drew`). The runtime counts every draw it takes as the pass's draw call
+    /// (`rate_mapped_pass.rs`), so it no longer fails the pass as a GPU hang. Other draws leave
+    /// the platform's in place, as the Metal platform's do: what Metal's GPU takes as the pass's
+    /// draw was measured for this shape alone.
+    fn drew(
+        &self,
+        t: rt::DrawPrimitiveType,
+        (count, instances): (u32, u32),
+        drawn: &RaiseResult<()>,
+    ) {
+        let whole = matches!(
+            t,
+            rt::DrawPrimitiveType::Public(PrimitiveType::Triangle | PrimitiveType::TriangleStrip)
+        ) && count >= 3
+            && instances > 0;
+        if whole && drawn.is_ok() {
+            *self.undrawn.lock() = false;
+        }
     }
 
     /// An indexed draw of a raw primitive and index type: `(count, instances, base vertex, base
@@ -6565,8 +6602,8 @@ pub(crate) mod tests {
     }
 
     /// The encoder of a pass taken as one over a mutable rate map not yet reset is ([`Taken`]),
-    /// the device's first, made in a thread of an isolated task that ended, makes the device's
-    /// no-draw pipeline and stops at the encoder's first command, the runtime's encoder in its
+    /// the device's first, made in a thread of an isolated task that ended, is to end with the
+    /// platform's draw and stops at the encoder's first command, the runtime's encoder in its
     /// handle, open, as Metal's is left, not dropped with the command buffer abandoned. The
     /// device's caps are read first, as core reads them as the device starts, before any task
     #[test]
@@ -6589,7 +6626,7 @@ pub(crate) mod tests {
         let stopped = life.run(|| {
             life.exit();
             let e = opened(&cb, raw, (made, Vec::new()), taken).unwrap();
-            assert!(e.no_draw.is_some());
+            assert!(*e.undrawn.lock());
             let rect = MtlScissorRect {
                 x: 0,
                 y: 0,
@@ -6603,6 +6640,81 @@ pub(crate) mod tests {
         assert!(
             matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
             "{refused:?}"
+        );
+    }
+
+    /// The platform's no-draw pipeline is made only for a pass over a mutable map that no draw of
+    /// the guest's took the place of, at the pass's end, once per device: after passes that draw
+    /// 3 vertices of a triangle list and of a strip, once, the next plain state's
+    /// `uniqueIdentifier` is one past the last; a pass whose only draw is of 2 vertices keeps the
+    /// platform's draw, whose pipeline takes the number between; a pass that draws nothing then
+    /// reuses it. Every pass completes with no error, none failed as a GPU hang
+    #[test]
+    fn no_draw_moves_later_plain_identifiers_only_for_a_pass_that_drew_nothing() {
+        use reims_vgpu_core::platform::rate_map::RateMap as _;
+        use reims_vgpu_core::platform::values::PassSet;
+
+        /// `MTLPrimitiveTypeTriangle` and `TriangleStrip`.
+        const TRIANGLE: u64 = 3;
+        const STRIP: u64 = 4;
+        const SIDE: u64 = 16;
+        let p = platform();
+        let d = dev();
+        let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+        let map = d
+            .new_rate_map(&rate_map_descriptor(&p, SIDE, 1))
+            .unwrap()
+            .unwrap();
+        map.reset(&rate_map_descriptor(&p, SIDE, 2));
+        let next = || {
+            fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag")
+                .unique_identifier()
+        };
+        let pass = |draw: Option<(u64, u64)>| {
+            let (_dst, pass) = pass_of(&p, &d, (SIDE, SIDE));
+            pass.set_pass(&PassSet {
+                rasterization_rate_map: Some(Some(&map)),
+                ..Default::default()
+            });
+            let q = d.new_command_queue().unwrap();
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+            let set = RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            };
+            e.encode(OnFault::Die, set).unwrap();
+            if let Some((primitive_type, vertex_count)) = draw {
+                let cmd = RenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count,
+                };
+                e.encode(OnFault::Die, cmd).unwrap();
+            }
+            e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{draw:?}: {:?}", cb.error());
+        };
+        let first = next();
+        pass(Some((TRIANGLE, 3)));
+        let after_triangles = next();
+        assert_eq!(after_triangles, first + 1, "a triangle list drawn");
+        pass(Some((STRIP, 3)));
+        let after_strip = next();
+        assert_eq!(after_strip, after_triangles + 1, "a strip drawn");
+        pass(Some((TRIANGLE, 2)));
+        let after_two = next();
+        assert_eq!(
+            after_two,
+            after_strip + 2,
+            "2 vertices: the platform's draw"
+        );
+        pass(None);
+        assert_eq!(
+            next(),
+            after_two + 1,
+            "nothing drawn: the pipeline made before"
         );
     }
 

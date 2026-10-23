@@ -60,11 +60,20 @@
 //!   full-screen triangle's vertex function writes its buffer, its fragment function never runs,
 //!   and the colour, depth and stencil attachments keep their clears), as the runtime's pass
 //!   does. A tile dispatch in it, which only draws were measured against, dies.
-//! - **A pass over a mutable map**, reset or not, that nothing drew in ends with a draw of no
-//!   vertices the guest did not encode ([`no_draw`], [`crate::gpu::encode_render`]), as the
-//!   Metal platform's does. Without a draw call Metal's GPU hangs at it (measured on the M3 Max,
-//!   macOS 27.0.1: its command buffer fails with code 2 and stores nothing), and the runtime
-//!   fails it so too; with the draw, both run it and store what it loaded or cleared.
+//! - **A pass over a mutable map**, reset or not, that no draw of the guest's took the place of
+//!   ends with a draw of no vertices the guest did not encode ([`no_draw`],
+//!   [`crate::gpu::encode_render`]), as the Metal platform's does. Without a draw call Metal's
+//!   GPU hangs at it (measured on the M3 Max, macOS 27.0.1: its command buffer fails with code 2
+//!   and stores nothing), and the runtime fails it so too; with the draw, both run it and store
+//!   what it loaded or cleared. A guest's draw takes its place where it takes the Metal
+//!   platform's: at least one whole triangle of a triangle list or strip, once or more, which the
+//!   runtime took and counts as the pass's draw call. The draw's pipeline is made only for a pass
+//!   that needs it, at the pass's end, as making it moves identifiers the guest reads: the
+//!   runtime gives a pipeline state made without `supportIndirectCommandBuffers`, as this one
+//!   is, the next number of one process-wide count as its `uniqueIdentifier` (read from the
+//!   runtime's code), so every such state made after it answers one more than it would have
+//!   (`no_draw_moves_later_plain_identifiers_only_for_a_pass_that_drew_nothing`). It takes no
+//!   `gpuResourceID` and no identifier of a state with indirect command buffer support.
 //! - **When the map is read.** Metal's pass reads the map as the GPU runs it (measured: a reset
 //!   after the encoder is made, after its draw, after `endEncoding` and just after `commit` each
 //!   shows in the pass, from a map not yet reset and from a compiled one). So does the runtime's:
@@ -459,7 +468,7 @@ impl RateMapObject {
     }
 
     /// Whether the map was made of a `Mutable` descriptor, a pass over which ends with an empty
-    /// draw ([`no_draw`]).
+    /// draw where no draw of the guest's took its place ([`no_draw`]).
     pub(crate) fn is_mutable(&self) -> bool {
         self.mutability == MUTABLE
     }
@@ -481,9 +490,9 @@ static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new
 /// no attachment formats, and its largest vertex amplification count is the device's, which is
 /// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
 /// at `sel`, as the Metal platform's ends the process where Metal does not make one. Nothing here
-/// stops a thread of a task that ended: the pass's runtime encoder is not in its handle yet
-/// (`crate::gpu::encode_render`'s `opened`), and dropped it would abandon the command buffer.
-/// The device's caps it reads were read as core started the device, before any task ran.
+/// stops a thread of a task that ended: the pass's end, which asks for it, stopped one first
+/// (`crate::gpu::encode_render`). The device's caps it reads were read as core started the
+/// device, before any task ran.
 pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
     use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
     use reims_vgpu_core::platform::device::GpuDevice as _;
