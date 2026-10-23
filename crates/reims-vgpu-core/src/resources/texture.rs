@@ -950,7 +950,10 @@ mod tests {
             let raced = raced.lock().take().expect("the racer stored a buffer");
             let stored = b.transfer_buffer.lock().as_ref().map(Handle::id);
             assert_ne!(stored, Some(raced));
-            assert!(e.p.world().find(raced).is_some(), "the raced buffer is kept");
+            assert!(
+                e.p.world().find(raced).is_some(),
+                "the raced buffer is kept"
+            );
         }
 
         /// The task's raise propagates, nothing bound

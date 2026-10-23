@@ -689,7 +689,10 @@ mod tests {
             let raced = raced.lock().take().expect("the racer stored a buffer");
             let stored = tr.paged.transfer_buffer.lock().as_ref().map(Handle::id);
             assert_ne!(stored, Some(raced));
-            assert!(e.p.world().find(raced).is_some(), "the raced buffer is kept");
+            assert!(
+                e.p.world().find(raced).is_some(),
+                "the raced buffer is kept"
+            );
         }
 
         /// The descriptor goes with the call, on a refusal and on a normal exit

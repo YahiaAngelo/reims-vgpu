@@ -36,6 +36,9 @@ type P = FakePlatform;
 
 const CLASS: &str = "ResourceHost";
 
+/// A hook [`FakeResourceHost::during_next`] runs once, inside the next call of its selector.
+type During = (&'static str, Box<dyn FnOnce() + Send>);
+
 struct Shared {
     log: CallLog,
     script: Script,
@@ -44,7 +47,7 @@ struct Shared {
     provided: Mutex<Vec<(u64, AnyHandle)>>,
     paging_queue: Mutex<Option<Fk<kind::CommandQueue>>>,
     /// What runs inside the next call of a selector, once (a racing caller's whole call).
-    during: Mutex<Vec<(&'static str, Box<dyn FnOnce() + Send>)>>,
+    during: Mutex<Vec<During>>,
 }
 
 /// A scripted task. Siblings share one log, script and state.
@@ -129,9 +132,7 @@ impl FakeResourceHost {
         self.shared.log.push(ObjId(0), CLASS, sel, args);
         let during = {
             let mut g = self.shared.during.lock();
-            g.iter()
-                .position(|(s, _)| *s == sel)
-                .map(|i| g.remove(i).1)
+            g.iter().position(|(s, _)| *s == sel).map(|i| g.remove(i).1)
         };
         if let Some(f) = during {
             f();

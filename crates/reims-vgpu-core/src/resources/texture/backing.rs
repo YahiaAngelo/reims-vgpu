@@ -974,7 +974,10 @@ mod tests {
         let stored = backing(&r).ensure_physical(Hold::NONE).unwrap().id();
         let raced = raced.lock().take().expect("the racer stored a buffer");
         assert_ne!(stored, raced);
-        assert!(env.p.world().find(raced).is_some(), "the raced buffer is kept");
+        assert!(
+            env.p.world().find(raced).is_some(),
+            "the raced buffer is kept"
+        );
     }
 
     /// The task's raise propagates; a gone task gives no buffer, which raises

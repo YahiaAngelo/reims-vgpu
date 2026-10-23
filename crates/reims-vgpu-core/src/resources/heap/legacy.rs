@@ -329,7 +329,10 @@ mod tests {
         let raced = raced.lock().take().expect("the racer stored a buffer");
         let stored = parts(&r).transfer_buffer.lock().as_ref().map(Handle::id);
         assert_ne!(stored, Some(raced));
-        assert!(env.p.world().find(raced).is_some(), "the raced buffer is kept");
+        assert!(
+            env.p.world().find(raced).is_some(),
+            "the raced buffer is kept"
+        );
     }
 
     mod init {
