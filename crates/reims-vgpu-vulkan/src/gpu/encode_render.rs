@@ -6502,6 +6502,48 @@ pub(crate) mod tests {
         );
     }
 
+    /// The encoder of a pass taken as one over a mutable rate map not yet reset is ([`Taken`]),
+    /// the device's first, made in a thread of an isolated task that ended, makes the device's
+    /// no-draw pipeline and stops at the encoder's first command, the runtime's encoder in its
+    /// handle, open, as Metal's is left, not dropped with the command buffer abandoned. The
+    /// device's caps are read first, as core reads them as the device starts, before any task
+    #[test]
+    fn an_ended_tasks_first_encoder_over_a_mutable_map_is_left_open() {
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+
+        let p = platform();
+        let d = dev();
+        let (_dst, pass) = pass_of(&p, &d, (4, 4));
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let made = without_unused_resolves(pass.descriptor());
+        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
+        let taken = Taken {
+            class: Some(Class::Unset),
+            mutable: true,
+        };
+        d.caps();
+        let life = TaskLife::new();
+        let stopped = life.run(|| {
+            life.exit();
+            let e = opened(&cb, raw, (made, Vec::new()), taken).unwrap();
+            assert!(e.no_draw.is_some());
+            let rect = MtlScissorRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            };
+            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
+        });
+        assert!(stopped.is_none());
+        let refused = cb.raw.blit_command_encoder().unwrap_err();
+        assert!(
+            matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
+            "{refused:?}"
+        );
+    }
+
     /// A nil entry of useHeaps:count: or of useHeaps:count:stages: is skipped and the pass runs,
     /// as on Metal
     #[test]

@@ -205,7 +205,8 @@ use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::{
-    Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
+    Policy, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
+    unstopped_get,
 };
 use crate::gpu::backing::{self, Opened};
 use crate::gpu::desc::VulkanRenderPassDescriptor;
@@ -348,13 +349,15 @@ impl CommandBufferObject {
     /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
     /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
     /// the command buffer's submission a first use too, which its submission handler takes, added
-    /// here while the process has not taken it ([`tiler_handler`]).
+    /// here while the process has not taken it ([`tiler_handler`]). Nothing here stops a thread
+    /// of a task that ended: a render encoder's runtime encoder is not in its handle yet
+    /// (`crate::gpu::encode_render`'s `make`), and dropped it would abandon the command buffer.
     pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
         metal_space::first_use(first);
         if !metal_space::taken(FirstUse::TilerSubmission)
             && !self.tiler.swap(true, Ordering::SeqCst)
         {
-            get(sel, || self.raw.add_submission_handler(tiler_handler()));
+            unstopped_get(sel, || self.raw.add_submission_handler(tiler_handler()));
         }
     }
 
@@ -1647,6 +1650,24 @@ mod tests {
         cb.wait_until_scheduled().unwrap();
         assert!(metal_space::process().took(FirstUse::TilerSubmission));
         cb.wait_until_completed(OnFault::Return).unwrap();
+    }
+
+    /// A command buffer's first work for the tiler, the process's first, adds its submission
+    /// handler without stopping a thread of an isolated task that ended: a render encoder's
+    /// runtime encoder is not in its handle yet as its work is taken (`encode_render`'s `make`)
+    #[test]
+    fn an_ended_tasks_work_for_the_tiler_stops_nothing() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        assert!(!metal_space::taken(FirstUse::TilerSubmission));
+        let sel = "renderCommandEncoderWithDescriptor:";
+        let life = TaskLife::new();
+        let went_on = life.run(|| {
+            life.exit();
+            cb.tiler_work(sel, FirstUse::RenderEncoder);
+        });
+        assert!(went_on.is_some());
+        assert!(cb.tiler.load(Ordering::SeqCst));
     }
 
     /// Once the process took Metal's allocation for its work for the tiler, a command buffer

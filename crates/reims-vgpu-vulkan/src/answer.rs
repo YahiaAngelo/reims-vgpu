@@ -239,6 +239,22 @@ pub fn get_describing<T>(
     call: impl FnOnce() -> Result<T, Error>,
 ) -> T {
     stop_if_task_ended();
+    got(sel, descriptor, call)
+}
+
+/// [`get`] without the check of the task's end before `call`: for a call no thread may stop
+/// before, as one made while the runtime's encoder just made is not in its handle yet
+/// (`crate::gpu::command`'s `CommandBufferObject::tiler_work`).
+pub fn unstopped_get<T>(sel: &'static str, call: impl FnOnce() -> Result<T, Error>) -> T {
+    got(sel, None, call)
+}
+
+/// [`get_describing`]'s call, after its check of the task's end.
+fn got<T>(
+    sel: &'static str,
+    descriptor: Option<&str>,
+    call: impl FnOnce() -> Result<T, Error>,
+) -> T {
     inside(Some(sel), call).unwrap_or_else(|e| {
         match decide_describing::<T>(sel, Policy::Fatal, e, descriptor) {
             Ok(v) => v,
