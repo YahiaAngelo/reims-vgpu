@@ -117,6 +117,7 @@ pub(crate) fn open(window: &Arc<Window>) {
     let window = Arc::downgrade(window);
     post_main(move |mtm| {
         if let Some(window) = window.upgrade() {
+            window.opening();
             if sdl_windows() {
                 sdl::windows::open(&window);
             } else {

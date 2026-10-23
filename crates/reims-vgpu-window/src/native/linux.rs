@@ -28,6 +28,7 @@ pub(crate) fn open(window: &Arc<Window>) {
     let window = Arc::downgrade(window);
     ui::post(move || {
         if let Some(window) = window.upgrade() {
+            window.opening();
             shell::open(&window);
         }
     });
