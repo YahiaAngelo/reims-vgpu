@@ -1315,9 +1315,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ends the process with a segmentation fault
     /// (`a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals`, measured on the M3 Max
     /// under macOS 27.0.1 after a `Completed` and an `Error` completion): at the runtime's refusal
-    /// of a completed one (`ScheduledSignalAfterCompletion`), and at a failed one, which the
-    /// runtime takes as it takes one not yet completed, setting nothing
-    /// ([`signal_after_completion`]). While an encoder is open it dies, as Metal asserts. Core
+    /// of one that completed or failed (`ScheduledSignalAfterCompletion`,
+    /// [`signal_after_completion`]). While an encoder is open it dies, as Metal asserts. Core
     /// sends it before the commit alone.
     fn encode_signal_when_scheduled(
         &self,
@@ -1328,9 +1327,6 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let traced = signal_event_scheduled.map_or(0, event_id);
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
-        if plain(|| self.raw.status()) == rt::CommandBufferStatus::Error {
-            signal_after_completion(sel);
-        }
         encoding(sel, Policy::Dies, || {
             let event =
                 signal_event_scheduled.unwrap_or_else(|| unrepresentable(sel, "a nil event"));
@@ -1571,9 +1567,9 @@ mod tests {
     /// `encodeSignalEventScheduled:value:` sets the event's value as its command buffer is
     /// scheduled, behind an event wait once the wait is met, and, sent after the commit while the
     /// command buffer waits, sets nothing, as Metal's: the value does not rise, and nothing dies.
-    /// Sent once the command buffer completed, at the runtime's refusal, or once it failed (here
-    /// under protection options from 0x10, with error code 1), which the runtime takes, it dies,
-    /// where Metal's ends the process with a segmentation fault
+    /// Sent once the command buffer completed, or once it failed (here under protection options
+    /// from 0x10, with error code 1), it dies at the runtime's refusal, where Metal's ends the
+    /// process with a segmentation fault
     #[cfg(target_os = "macos")]
     #[test]
     fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
