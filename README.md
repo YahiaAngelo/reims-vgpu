@@ -261,7 +261,7 @@ the following.
   on).
 
 The suite's host-dependent expected files are recorded on an Apple M3 Max with a 40-core GPU, macOS
-build 25G229.
+27.0.1 (build 26A434).
 
 On x86-64 Linux the library builds on the Vulkan platform alone, with no Mac and no Xcode. It needs
 the toolchain above (cargo fetches metal2vulkan at the commit the workspace's `Cargo.toml` names),

@@ -35,9 +35,12 @@ reason AGENTS.md gives for names.
 suite's, under `tests/suite/`.
 
 **Hosts.** A measurement that names a scenario was made by the suite, on
-its host: an Apple M3 Max with a 40-core GPU on macOS build 25G229, the key
-of the host-dependent expected files (`AppleM3Max-40c-25G229`, section
-5.7). One that names no scenario was made with a probe on another Mac:
+its host: an Apple M3 Max with a 40-core GPU, on macOS build 25G229 (26.7)
+until 2026-10-13 and on 26A434 (27.0.1) since. The host-dependent expected
+files are 26A434's alone (`AppleM3Max-40c-26A434`, section 5.7): the
+suite's behaviour is macOS 27's, and 25G229's files went on 2026-10-23,
+with no host left to record them. One that names no scenario was made with
+a probe on another Mac:
 - macOS 26.6.2 (25G83);
 - Apple M4 Pro: a 14-core CPU, a 20-core GPU (`AGXG16SDevice`, Apple9
   family), and 16 KiB `vm_page_size`;
@@ -1037,7 +1040,7 @@ host death must be a scenario's last command (tests/suite/README.md, rule 3).
   A scenario marked `host` has files named
   `<setup>@<model>-<cores>c-<build>.jsonl`, from `ioreg`'s IOAccelerator
   model and `gpu-core-count` and `sw_vers -buildVersion`
-  (`pgtest/cli.py`, `host_key`), such as `AppleM3Max-40c-25G229`. Every
+  (`pgtest/cli.py`, `host_key`), such as `AppleM3Max-40c-26A434`. Every
   other file is `<setup>.jsonl`, keyed by nothing about the host. So, by
   decision 5, a GPU generation that computes differently shows up as a
   failure, not as a missing file.
@@ -1916,7 +1919,7 @@ count), 41=7, 35=2048, 37=1009, 42=0, 44=63, 40=16. With isolation on, key 33 =
 0xbff (bit 0x20, argument buffers) and key 42 = 3, as the code predicts. Every
 value comes from the host GPU and the host setup: key it by chip (section 5.8).
 The suite's files, from the M3 Max, carry key 34 = 40
-(`device_info_*@AppleM3Max-40c-25G229`).
+(`device_info_*@AppleM3Max-40c-26A434`).
 
 `check_capabilities` (resume only) checks a saved blob's pairs against this
 host: 43 defined checks (39 values, 4 flags, 3 alignments, 2 explicit), and

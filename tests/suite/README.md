@@ -141,11 +141,11 @@ like any other.
 
 **Host keys.** The expected files of a `host=True` scenario (rule 5) are
 keyed by the host, `<setup>@<key>.jsonl`, the key being the GPU model, its
-core count and the macOS build (`AppleM3Max-40c-25G229`). After an OS update
+core count and the macOS build (`AppleM3Max-40c-26A434`). After an OS update
 the new build's files are missing, and `run` reports those cases missing;
-`make bless` records them, and the old build's files stay for hosts that
-still run it. Review the new files against the old key's before committing
-them.
+`make bless` records them, and the old build's files stay while a host
+still runs it, then go. Review the new files against the old key's before
+committing them.
 
 **Load-sensitive cases.** These can fail under concurrent GPU load. Each
 failed at least once in a run beside other GPU work and passed when run
