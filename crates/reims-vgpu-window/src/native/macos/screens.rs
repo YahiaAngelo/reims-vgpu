@@ -5,7 +5,8 @@
 //! A screen's size is its current mode's pixels (`CGDisplayModeGetPixelWidth`), and its scale
 //! those pixels over the mode's points (`CGDisplayModeGetWidth`). Its highest refresh rate is
 //! the highest `CGDisplayModeGetRefreshRate` among its current mode and every mode of the same
-//! pixel size; a rate of 0 is unknown, and a screen whose rates are all unknown runs at 60 Hz.
+//! pixel size (`screens::highest_refresh`); a rate of 0 is unknown, and a screen whose rates are
+//! all unknown runs at 60 Hz.
 //!
 //! Measured on the M3 Max's built-in ProMotion screen (3456×2234 pixels, 1728×1117 points,
 //! refresh set to ProMotion), macOS 26.7:
@@ -27,8 +28,7 @@ use objc2_core_graphics::{
     kCGNullDirectDisplay,
 };
 
-use crate::policy::DEFAULT_REFRESH_HZ;
-use crate::screens::HostScreen;
+use crate::screens::{HostScreen, highest_refresh};
 
 /// The most displays asked for.
 const MAX_DISPLAYS: usize = 32;
@@ -84,41 +84,32 @@ fn all_modes(display: CGDirectDisplayID) -> Vec<CFRetained<CGDisplayMode>> {
 fn screen(display: CGDirectDisplayID) -> Option<HostScreen> {
     let mode = CGDisplayCopyDisplayMode(display)?;
     let mode = Some(&*mode);
-    let pixels = (
-        CGDisplayMode::pixel_width(mode),
-        CGDisplayMode::pixel_height(mode),
-    );
+    let pixels = mode_pixels(mode);
     let points = CGDisplayMode::width(mode);
     let scale = if points > 0 && pixels.0 > 0 {
-        pixels.0 as f64 / points as f64
+        f64::from(pixels.0) / points as f64
     } else {
         1.0
     };
-    let same_size = all_modes(display).into_iter().filter_map(|other| {
+    let modes = all_modes(display).into_iter().map(|other| {
         let other = Some(&*other);
-        let size = (
-            CGDisplayMode::pixel_width(other),
-            CGDisplayMode::pixel_height(other),
-        );
-        (size == pixels).then(|| CGDisplayMode::refresh_rate(other))
+        (mode_pixels(other), CGDisplayMode::refresh_rate(other))
     });
-    let highest = same_size
-        .chain([CGDisplayMode::refresh_rate(mode)])
-        .filter(|hz| hz.is_finite() && *hz > 0.0)
-        .fold(0.0, f64::max);
     Some(HostScreen {
         id: display,
-        pixels: (
-            u32::try_from(pixels.0).unwrap_or(u32::MAX),
-            u32::try_from(pixels.1).unwrap_or(u32::MAX),
-        ),
+        pixels,
         scale,
-        max_refresh_hz: if highest > 0.0 {
-            highest
-        } else {
-            DEFAULT_REFRESH_HZ
-        },
+        max_refresh_hz: highest_refresh(pixels, CGDisplayMode::refresh_rate(mode), modes),
     })
+}
+
+/// `mode`'s size in pixels, width then height.
+fn mode_pixels(mode: Option<&CGDisplayMode>) -> (u32, u32) {
+    let side = |pixels: usize| u32::try_from(pixels).unwrap_or(u32::MAX);
+    (
+        side(CGDisplayMode::pixel_width(mode)),
+        side(CGDisplayMode::pixel_height(mode)),
+    )
 }
 
 /// The host's screens, the main one first. Empty where CoreGraphics lists none.
