@@ -580,15 +580,9 @@ impl Vm {
         v
     }
 
-    /// The QMP socket: in the VM's directory where the path fits a Unix socket's 104 bytes
-    /// (macOS's limit; Linux's is 108), else in the runtime directory.
+    /// The QMP socket ([`qmp_socket_in`] the runtime directory).
     pub fn qmp_socket(&self) -> PathBuf {
-        let own = self.dir.join("qmp.sock");
-        if own.as_os_str().len() < 100 {
-            own
-        } else {
-            paths::runtime_dir().join(format!("{}.qmp", self.config.name))
-        }
+        qmp_socket_in(&self.dir, &self.config.name, &paths::runtime_dir())
     }
 
     /// The trimmed auxiliary storage QEMU boots (vmapple).
@@ -604,6 +598,30 @@ impl Vm {
 /// The pid file QEMU writes in a VM's directory while it runs.
 pub fn pidfile_in(dir: &Path) -> PathBuf {
     dir.join("qemu.pid")
+}
+
+/// The longest path a Unix socket of reims-ctl's takes: std refuses one of sun_path's size or
+/// more, which on macOS is 104 bytes (Linux's is 108), though macOS and QEMU take 104 (measured
+/// 2026-10-23, M3 Max).
+const SOCKET_PATH_MAX: usize = 103;
+
+/// The QMP socket of the VM named `name` in `dir`: `qmp.sock` in `dir` where that path is
+/// shorter than 100 bytes; else `<name>.qmp` in `runtime`, where that fits a socket; else, for
+/// a long name, `<hash>.qmp` there, 16 hex digits of the name's FNV-1a hash. A VM's socket
+/// stays where earlier reims-ctl put it wherever that path fits, so a VM it started is found.
+pub fn qmp_socket_in(dir: &Path, name: &str, runtime: &Path) -> PathBuf {
+    let own = dir.join("qmp.sock");
+    if own.as_os_str().len() < 100 {
+        return own;
+    }
+    let named = runtime.join(format!("{name}.qmp"));
+    if named.as_os_str().len() <= SOCKET_PATH_MAX {
+        return named;
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    runtime.join(format!("{hash:016x}.qmp"))
 }
 
 // ---------------------------------------------------------------- the registry
@@ -733,6 +751,41 @@ mod tests {
         for bad in ["", "-a", ".a", "a b", "a/b", &"x".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Every VM name has a QMP socket that binds, with a runtime directory as long as macOS's
+    /// `$TMPDIR/reims-ctl-<uid>` and a VM directory too long for its own; and a VM keeps the
+    /// socket earlier reims-ctl gave it wherever that fits.
+    #[test]
+    fn every_name_has_a_qmp_socket_that_binds() {
+        let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
+        let runtime = Path::new("/var/folders/rk/50k022t15gq2j9zcy6wcfkh00000gn/T/reims-ctl-501");
+        for n in 1..=64 {
+            let s = qmp_socket_in(&dir, &"n".repeat(n), runtime);
+            assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
+            assert_eq!(s.parent(), Some(runtime));
+        }
+        assert_eq!(
+            qmp_socket_in(&dir, "macos-26", runtime),
+            runtime.join("macos-26.qmp")
+        );
+        assert_eq!(
+            qmp_socket_in(Path::new("/vms/a"), "a", runtime),
+            Path::new("/vms/a/qmp.sock")
+        );
+        let long = "a".repeat(64);
+        let other = format!("{}b", "a".repeat(63));
+        assert_ne!(
+            qmp_socket_in(&dir, &long, runtime),
+            qmp_socket_in(&dir, &other, runtime)
+        );
+        let tmp = std::env::temp_dir().join(format!("reims-ctl-qmp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let s = qmp_socket_in(&dir, &long, &tmp);
+        let bound = std::os::unix::net::UnixListener::bind(&s)
+            .and_then(|_l| std::os::unix::net::UnixStream::connect(&s));
+        let _ = std::fs::remove_dir_all(&tmp);
+        bound.unwrap_or_else(|e| panic!("{}: {e}", s.display()));
     }
 
     fn x86_64_config() -> VmConfig {
