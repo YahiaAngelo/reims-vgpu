@@ -248,6 +248,7 @@ use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 use crate::answer::{
     Policy, decide, get, metal_aborts, plain, plain_at, refused, send, unrepresentable,
@@ -1992,19 +1993,25 @@ impl VulkanRenderEncoder {
     /// ([`Self::marked`]), unless it is `empty`, of no primitive, patch or instance, which
     /// Metal draws nothing of whatever they left; `None` for one Metal completes without
     /// drawing, which encodes nothing.
+    ///
+    /// What the draw asks of the encoder's state ([`Held`]) is read once, at its start: none of
+    /// its checks changes it. Each check that read it alone checks the task's end still, where it
+    /// did, so a thread of an isolated task that ended stops at the same places.
     fn draw<K: Copy>(
         &self,
         sel: &'static str,
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
-        self.pipelined(sel);
+        let held = plain(|| self.held());
+        nil_pipeline_drawn(sel, held.nil_pipeline);
         crate::gpu::timing::count_draw();
         match drawn {
             Some((shape, k)) => {
-                self.drawn(sel, shape, empty);
+                self.drawn(sel, shape, empty, &held);
                 if !empty {
-                    self.marked(sel, shape);
+                    stop_if_task_ended();
+                    marked_by(sel, shape, held.marks);
                 }
                 self.binds(sel, &mut |e| call(e, k))
             }
@@ -2012,20 +2019,35 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// What a draw `sel` of `shape` asks of what the encoder holds, after its pipeline state
-    /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
-    /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
-    /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
-    /// may write ([`Self::issues`]) and the indirect commands its state may
-    /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
+    /// What a draw reads of the encoder's state ([`Held`]).
+    fn held(&self) -> Held {
+        let nil_pipeline = *self.nil_pipeline.lock();
+        let marks = *self.marks.lock();
+        Held {
+            nil_pipeline,
+            marks,
+            encodes: self.encoder.encodes_icbs.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What a draw `sel` of `shape` asks of what the encoder holds, `held`, after its pipeline
+    /// state ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment,
+    /// empty or not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
+    /// instance, the pass's rate map ([`Self::layered`]), its points ([`sized`]), what it may
+    /// write ([`Self::issues`]) and the indirect commands its state may encode
+    /// ([`Self::encodes`]). A draw over indices of the platform's own asks it too
     /// ([`Self::primitives`]).
-    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
+    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool, held: &Held) {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
-            self.sized(sel, shape);
+            stop_if_task_ended();
+            sized(sel, shape, held.marks);
             self.issues(sel, None);
-            self.encodes(sel);
+            stop_if_task_ended();
+            if held.encodes {
+                self.icbs_written(sel);
+            }
         }
     }
 
@@ -2063,31 +2085,10 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Dies at a draw `sel` of points, `shape`, under a pipeline state whose points Metal sizes
-    /// none of: its vertex function writes no `[[point_size]]`, and its input primitive
-    /// topology is not the point class (the module docs).
-    fn sized(&self, sel: &'static str, shape: Shape) {
-        let points = matches!(
-            shape,
-            Shape::Primitives(rt::DrawPrimitiveType::Public(PrimitiveType::Point))
-        );
-        let m = *plain(|| self.marks.lock());
-        if points && m.pipeline && !m.points_sized {
-            unrepresentable(sel, UNSIZED_POINTS);
-        }
-    }
-
     /// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:`
-    /// of nil: Metal crashes at a draw with no pipeline state, where the runtime would run the
-    /// state set before the nil (a draw, direct or indirect, a tile dispatch, and an indirect
-    /// command buffer's execution whose commands inherit the encoder's state).
+    /// of nil ([`nil_pipeline_drawn`]).
     fn pipelined(&self, sel: &'static str) {
-        if *plain(|| self.nil_pipeline.lock()) {
-            unrepresentable(
-                sel,
-                "a draw after a nil pipeline state, which Metal crashes at",
-            );
-        }
+        nil_pipeline_drawn(sel, *plain(|| self.nil_pipeline.lock()));
     }
 
     /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]), which goes to the
@@ -2196,9 +2197,13 @@ impl VulkanRenderEncoder {
     /// commands, its functions may write the records of each buffer the encoder made resident for
     /// writing ([`crate::gpu::command::executions::gpu_writes`]).
     fn encodes(&self, sel: &'static str) {
-        if !plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
-            return;
+        if plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
+            self.icbs_written(sel);
         }
+    }
+
+    /// [`Self::encodes`] of a state that can encode indirect commands.
+    fn icbs_written(&self, sel: &'static str) {
         let writable: Vec<VulkanIcb> = plain(|| {
             let writable = self.encoder.writable_icbs.lock();
             writable.iter().map(|icb| icb.clone_ref()).collect()
@@ -2256,20 +2261,62 @@ impl VulkanRenderEncoder {
     /// here is wider than 1. After `setVertexAmplificationMode:value:` left a count the runtime
     /// does not draw, or one not measured, every draw and execution dies, in either mode.
     fn marked(&self, sel: &'static str, shape: Shape) {
-        let m = *plain(|| self.marks.lock());
-        if m.amplified {
-            unrepresentable(
-                sel,
-                "a draw after setVertexAmplificationMode:value: left an amplification count the \
-                 runtime does not draw",
-            );
-        }
-        let execution = matches!(shape, Shape::Execution);
-        if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
-            crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
-                "lines at a line width other than 1, which no line drawn here has".into()
-            });
-        }
+        marked_by(sel, shape, *plain(|| self.marks.lock()));
+    }
+}
+
+/// What a draw reads of its encoder's state, once ([`VulkanRenderEncoder::draw`]).
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    /// `setRenderPipelineState:` of nil since the last state set ([`nil_pipeline_drawn`]).
+    nil_pipeline: bool,
+    /// What the private setters and the pipeline state left ([`Marks`]).
+    marks: Marks,
+    /// Whether the pipeline state set can encode indirect commands
+    /// ([`VulkanRenderEncoder::encodes`]).
+    encodes: bool,
+}
+
+/// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:` of nil
+/// (`nil_pipeline`): Metal crashes at a draw with no pipeline state, where the runtime would run
+/// the state set before the nil (a draw, direct or indirect, a tile dispatch, and an indirect
+/// command buffer's execution whose commands inherit the encoder's state).
+fn nil_pipeline_drawn(sel: &'static str, nil_pipeline: bool) {
+    if nil_pipeline {
+        unrepresentable(
+            sel,
+            "a draw after a nil pipeline state, which Metal crashes at",
+        );
+    }
+}
+
+/// Dies at a draw `sel` of points, `shape`, under a pipeline state whose points Metal sizes none
+/// of, by the encoder's marks `m`: its vertex function writes no `[[point_size]]`, and its input
+/// primitive topology is not the point class (the module docs).
+fn sized(sel: &'static str, shape: Shape, m: Marks) {
+    let points = matches!(
+        shape,
+        Shape::Primitives(rt::DrawPrimitiveType::Public(PrimitiveType::Point))
+    );
+    if points && m.pipeline && !m.points_sized {
+        unrepresentable(sel, UNSIZED_POINTS);
+    }
+}
+
+/// [`VulkanRenderEncoder::marked`], by the encoder's marks `m`.
+fn marked_by(sel: &'static str, shape: Shape, m: Marks) {
+    if m.amplified {
+        unrepresentable(
+            sel,
+            "a draw after setVertexAmplificationMode:value: left an amplification count the \
+             runtime does not draw",
+        );
+    }
+    let execution = matches!(shape, Shape::Execution);
+    if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
+        crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
+            "lines at a line width other than 1, which no line drawn here has".into()
+        });
     }
 }
 
@@ -3398,7 +3445,6 @@ impl VulkanRenderEncoder {
             let hang = (count >= 3 && instances > 0).then_some(rt::CommandBufferError::GpuHang);
             return self.nine(sel, hang, &mut |e| call(e, t));
         }
-        self.pipelined(sel);
         let empty = instances == 0 || draws_none(t, count);
         self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call)
     }
