@@ -13,10 +13,10 @@
 //! What the guest gets:
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer,
 //!   held at the image's nearest edge outside it. A click in the image captures the keyboard and
-//!   the pointer; the click that makes the window key is not sent. A click outside the image is
-//!   not sent and starts nothing. A button's release is sent wherever it happens, so a drag that
-//!   leaves the image ends in the guest; AppKit keeps sending the drag's moves to the view
-//!   meanwhile.
+//!   the pointer; the click that makes the window key is not sent. A click outside the image,
+//!   and one of a button past the guest tablet's five, is not sent and starts nothing. A
+//!   button's release is sent wherever it happens, so a drag that leaves the image ends in the
+//!   guest; AppKit keeps sending the drag's moves to the view meanwhile.
 //! - **The wheel** over the image, once the guest has a mode, after the pointer's position where
 //!   it moved: a window that is not key gets no moves, and the guest scrolls where the host's
 //!   pointer is. Where the host takes smooth scrolling, each event goes with its phases, and a
@@ -259,12 +259,13 @@ impl InputLogic {
         }
     }
 
-    /// A button went down: `bit` its `BUTTON_*` bit, `flags` the event's `modifierFlags`.
+    /// A button went down: `bit` its `BUTTON_*` bit, 0 for one past the guest tablet's five,
+    /// `flags` the event's `modifierFlags`.
     fn button_down(&mut self, bit: u32, flags: u64, cx: &ViewContext) -> Reaction {
         let (Some(mode), Some(point)) = (guest_mode(cx), cx.point) else {
             return Reaction::default();
         };
-        if !geometry::contains(cx.image, point) {
+        if bit == 0 || !geometry::contains(cx.image, point) {
             return Reaction::default();
         }
         let was = self.capture.is_captured();
@@ -816,6 +817,30 @@ mod tests {
                 pointer(2, 2, 0),
             ]
         );
+    }
+
+    /// A click of a button past the guest tablet's five (the host's sixth on) is not sent and
+    /// does not capture, as on Linux; nor is its release
+    #[test]
+    fn a_button_past_the_fifth_starts_nothing() {
+        let mut logic = InputLogic::new(false);
+        let sixth = geometry::button_bit(5);
+        assert_eq!(sixth, 0);
+        assert_eq!(
+            logic.button_down(sixth, L_COMMAND, &at((500.0, 300.0))),
+            Reaction::default()
+        );
+        assert_eq!(
+            logic.button_up(sixth, &at((500.0, 300.0))),
+            Reaction::default()
+        );
+        assert!(!logic.capture.is_captured());
+        assert_eq!(sent(&mut logic), vec![]);
+        // Captured, it sends nothing either.
+        let mut logic = captured();
+        logic.button_down(sixth, 0, &at((500.0, 300.0)));
+        logic.button_up(sixth, &at((500.0, 300.0)));
+        assert_eq!(sent(&mut logic), vec![]);
     }
 
     /// A click outside the image (on the bars) is not sent and does not capture
