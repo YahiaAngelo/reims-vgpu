@@ -175,6 +175,14 @@ pub fn renew(
         let _ = std::fs::remove_file(&new);
         return Err(e);
     }
+    // The file the old image's path names, where it is in the VM's directory and not the image
+    // made: compared with links, '.' and '..' resolved, so a path given as "../x" or
+    // "sub/../opencore.qcow2" is neither taken for one in the directory nor for another file.
+    let replaced = std::fs::canonicalize(&vm.dir)
+        .ok()
+        .and_then(|dir| Some((entry(&old)?, dir)))
+        .filter(|(e, dir)| e.starts_with(dir) && *e != dir.join("opencore.qcow2"))
+        .map(|(e, _)| e);
     std::fs::rename(&new, &image).with_context(|| format!("replace {}", image.display()))?;
     *vm = Vm::load(&vm.dir)?;
     if let Some(q) = vm.config.q35.as_mut() {
@@ -183,8 +191,8 @@ pub fn renew(
     }
     vm.save()?;
     // An image the VM was given under another name, in its directory, is replaced too.
-    if old != image && old.starts_with(&vm.dir) {
-        let _ = std::fs::remove_file(&old);
+    if let Some(e) = replaced {
+        let _ = std::fs::remove_file(e);
     }
     let mut s = format!(
         "{name}: a new OpenCore image, presenting the same {} (serial {}), its boot selection {}",
@@ -199,6 +207,14 @@ pub fn renew(
         );
     }
     Ok(s)
+}
+
+/// The directory entry `p` names, its directory's path resolved (links, '.' and '..'): the file
+/// a removal of `p` unlinks, a link itself where `p` names one. None where `p` ends in '..', or
+/// its directory does not resolve.
+fn entry(p: &Path) -> Option<std::path::PathBuf> {
+    let name = p.file_name()?;
+    Some(std::fs::canonicalize(p.parent()?).ok()?.join(name))
 }
 
 const SECTOR: u64 = 512;
@@ -680,6 +696,57 @@ mod tests {
         // The image it replaced, the VM's own under another name, is gone.
         assert!(dir.join("opencore.qcow2").is_file());
         assert!(!dir.join("opencore.img").exists());
+    }
+
+    /// The old image goes only where its path, resolved, names a file in the VM's directory
+    /// other than the new image: an OpenCore path edited to `../other/oc.img` leaves that file
+    /// be, and one spelling the new image's place another way, `sub/../opencore.qcow2`, leaves
+    /// the new image.
+    #[test]
+    fn renew_deletes_no_file_but_an_old_one_in_the_vms_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("renew-outside");
+        let made = env.root.join("made.img");
+        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
+        let util = env.root.join("reims-util");
+        let script = format!(
+            "#!/bin/sh\nwhile [ \"$1\" != -o ]; do shift; done\ncp '{}' \"$2\"\n\
+             echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
+            made.display()
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+        let renewed = |vm_dir: &str, opencore: &str, old: &Path| {
+            let dir = env.root.join(vm_dir);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+            std::fs::copy(&made, old).unwrap();
+            let config = format!(
+                r#"
+                name = "{vm_dir}"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "disk.qcow2"
+                [q35]
+                opencore = "{opencore}"
+                opencore_format = "raw"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            let mut vm = Vm::load(&dir).unwrap();
+            renew(&mut vm, None, &mut |_| {}).unwrap();
+            dir
+        };
+        let outside = env.root.join("other/oc.img");
+        let dir = renewed("a", "../other/oc.img", &outside);
+        assert!(dir.join("opencore.qcow2").is_file());
+        assert!(outside.is_file(), "a file outside the VM's directory was deleted");
+        let dir = renewed("b", "sub/../opencore.qcow2", &env.root.join("b/opencore.qcow2"));
+        assert!(dir.join("opencore.qcow2").is_file(), "the new image was deleted");
     }
 
     #[test]
