@@ -923,17 +923,23 @@ Not measured: a host other than um780's.
 
 ### x86-64 macOS guests: audio
 
-Give an x86-64 macOS guest a USB audio device on the xHCI controller above:
+reims-ctl gives every macOS guest, x86-64 and arm64, a virtio sound device,
+with one output and one input stream:
 
 ```sh
--audiodev pipewire,id=snd0 -device usb-audio,audiodev=snd0,bus=xhci.0
+-audiodev pipewire,id=snd0 -device virtio-sound-pci,audiodev=snd0,addr=0x7
 ```
+
+arm64 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio
+device 0x19 (read from macOS 27's `Info.plist`). Not yet checked: that
+x86-64 macOS 26 has it too, and how either guest runs on QEMU's device.
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a
 working output whose samples QEMU drops. macOS 26 for x86-64 ships no
 Intel HDA driver (no `AppleHDA`), so `-device ich9-intel-hda -device
 hda-duplex` leaves the guest with no audio device; `AppleUSBAudio`, which
-it does ship, drives `usb-audio`.
+it does ship, drives a USB audio device on the xHCI controller above
+(`-device usb-audio,audiodev=snd0,bus=xhci.0`), output only.
 
 Without an output device, Safari's Media Source players fail. Measured on
 an RTX 5080 Laptop GPU host with a macOS 26.6.1 guest on 2026-10-11:
