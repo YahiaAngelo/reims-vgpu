@@ -62,7 +62,8 @@
 //! blend, a bfloat attachment's codes, a `textureWriteRoundingMode` the
 //! runtime does not take), or an answer it gives otherwise (a texture of protection options made
 //! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
-//! of an indirect command buffer made after an encoder), is relayed alike, its first occurrence
+//! of an indirect command buffer made after encoders whose take of Metal's range the runtime does
+//! not model), is relayed alike, its first occurrence
 //! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
 //! process, or where the runtime cannot perform the call at all, is a death in either mode.
 //!
@@ -2128,11 +2129,13 @@ pub enum Inexact {
     /// released taken again first by kind (`crate::gpu::resource`'s `identified`).
     UniqueIdentifier,
     /// The `uniqueIdentifier` the guest reads (info command 460) of an indirect command buffer
-    /// made after an encoder of any kind was made in the process: the runtime's, Metal's address
-    /// where the encoders before it took ranges of Metal's range as an M3 Max's take them, and
-    /// not where a render pass's run took more (`unmeasured-unique-identifier`, which the runtime
-    /// announces once a device, as such a buffer is read). Relayed at every such buffer, wider
-    /// than the runtime's notice ([`crate::gpu::icb`]).
+    /// made after encoders whose take of Metal's range the runtime does not model
+    /// (`identifier_unmeasured`: after a command buffer that encoded a render encoder was
+    /// scheduled, whose pass's run takes more, after a resource state encoder opened, or once
+    /// Metal's encoders' ranges passed what it models): the runtime's
+    /// (`unmeasured-unique-identifier`, which the runtime announces once a device, as such a
+    /// buffer is read). Relayed at every such buffer, wider than the runtime's notice
+    /// ([`crate::gpu::icb`]).
     IcbIdentifierAfterEncoder,
     /// A threadgroup memory length of a compute indirect command buffer past its last command's,
     /// from the encoding of a copy into the last command or of a reset of it on, until core sets
@@ -2407,8 +2410,8 @@ mod tests {
         //   runtime's relations keep Metal's: one value for a state's life, no other live
         //   state's, the last released taken again first by kind. It reads a state's own (info
         //   command 460), which is relayed there as [`Inexact::UniqueIdentifier`], dying in strict
-        //   mode, and a buffer's made after an encoder, relayed as
-        //   [`Inexact::IcbIdentifierAfterEncoder`].
+        //   mode, and a buffer's made after encoders whose take of Metal's range the runtime does
+        //   not model, relayed as [`Inexact::IcbIdentifierAfterEncoder`].
         // Among the others:
         // - `UnreachedTilesRewritten`, `DontCareLoadTiles` and `ExtendedRangeBitsKept`: the bytes
         //   a pass leaves where its draws write nothing, announced at a pass Metal runs. Metal's

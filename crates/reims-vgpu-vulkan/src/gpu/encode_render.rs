@@ -1183,14 +1183,11 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// ([`runtime_resolves`]). A resolve texture on
 /// a surface whose GPU writes never reach its memory dies as a dropped write before that, as no
 /// such pass was measured.
-/// Its creation, nil or not, ends the exact `uniqueIdentifier` of later indirect command buffers
-/// ([`crate::gpu::icb::encoder_made`]).
 pub(crate) fn open(
     command_buffer: &VulkanCommandBuffer,
     _on: OnFault,
     descriptor: &VulkanRenderPassDescriptor,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
-    crate::gpu::icb::encoder_made();
     command_buffer.protected_creation("renderCommandEncoderWithDescriptor:");
     if let Some((attachment, setter, raw)) = descriptor.raw_value() {
         crate::answer::metal_aborts(

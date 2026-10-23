@@ -1224,11 +1224,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     }
 
     /// Refused while another encoder is open and after the commit, as Metal's validation
-    /// refuses them. Its creation ends the exact `uniqueIdentifier` of later indirect command
-    /// buffers ([`crate::gpu::icb::encoder_made`]), as every encoder creator's does.
+    /// refuses them.
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
         let raw = encoding("blitCommandEncoder", Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             predication::boundary(&self.predication, "blitCommandEncoder");
             self.raw.blit_command_encoder()
         })?;
@@ -1284,7 +1282,6 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`FirstUse::ComputeEncoder`]).
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             self.protected_creation("computeCommandEncoder");
             self.raw.compute_command_encoder()
         })?;
@@ -1465,7 +1462,6 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         });
         let sel = "computeCommandEncoderWithDescriptor:";
         let raw = encoding(sel, Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             self.protected_creation(sel);
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)

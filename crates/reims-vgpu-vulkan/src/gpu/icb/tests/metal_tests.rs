@@ -62,6 +62,108 @@ fn unique_identifiers_follow_metals_sizes() {
     }
 }
 
+/// An encoder [`identifiers_after_are_metals`] makes, of a command buffer never committed, on
+/// platform `P`.
+trait Encoder {
+    /// Makes it of `cb` and ends it, on `p`'s device `d`.
+    fn encode<P: Platform>(&self, p: &P, d: &P::Device, cb: &P::CommandBuffer);
+}
+
+/// The four encoder creators, each ended empty: a blit encoder, a compute encoder, a compute
+/// encoder of a pass descriptor and a render encoder of one colour attachment.
+#[derive(Debug, Clone, Copy)]
+enum Made {
+    Blit,
+    Compute,
+    ComputePass,
+    Render,
+}
+
+impl Encoder for Made {
+    fn encode<P: Platform>(&self, p: &P, d: &P::Device, cb: &P::CommandBuffer) {
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        match self {
+            Made::Blit => {
+                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+                e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            }
+            Made::Compute => {
+                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+            }
+            Made::ComputePass => {
+                let desc = reims_vgpu_core::platform::values::ComputePassDesc::default();
+                let e = cb.compute_encoder_for_pass(&desc).unwrap().unwrap();
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+            }
+            Made::Render => {
+                let (_target, pass) = crate::gpu::encode_render::tests::pass_of(p, d, (4, 4));
+                let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+                e.encode(OnFault::Return, RenderCmd::EndEncoding).unwrap();
+            }
+        }
+    }
+}
+
+/// A buffer made after an empty encoder of `made`'s creator, of a command buffer never
+/// committed, answers Metal's `uniqueIdentifier`, as far from that of one made before it as
+/// Metal's, read with no relay: the runtime takes the encoder's range of Metal's as an M3 Max's
+/// take it (a blit encoder's and a render encoder's at their opening, a compute encoder's none);
+/// the one made before it answers Metal's first, `0x1000018000`, before and after. Metal's run
+/// first in the test's process, before MoltenVK's work takes any of Metal's range
+fn identifiers_after_are_metals(made: Made) {
+    fn identifiers<P: Platform>(p: &P, d: &P::Device, made: Made) -> [u64; 3] {
+        let before = make::<P>(d, &compute_desc(), 1);
+        let first = before.unique_identifier();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        made.encode(p, d, &cb);
+        let after = make::<P>(d, &compute_desc(), 1);
+        [first, before.unique_identifier(), after.unique_identifier()]
+    }
+    let metal = MetalPlatform::system_default_device().map(|md| {
+        let launcher = Box::new(crate::gpu::device::tests::metal_tests::NoLauncher);
+        identifiers::<MetalPlatform>(&MetalPlatform::new(launcher), &md, made)
+    });
+    let p = crate::platform::tests::platform();
+    let vulkan = identifiers::<VulkanPlatform>(&p, &dev(), made);
+    assert_eq!(vulkan[..2], [0x10_0001_8000; 2], "{made:?}");
+    assert_eq!(crate::answer::inexact_counts(), [], "{made:?}");
+    if let Some(metal) = metal {
+        let from_first = |n: [u64; 3]| n.map(|x| x - n[0]);
+        assert_eq!(
+            from_first(metal),
+            from_first(vulkan),
+            "{made:?}: Metal's {metal:x?}, ours {vulkan:x?}"
+        );
+    }
+}
+
+/// [`identifiers_after_are_metals`] an empty blit encoder
+#[test]
+fn identifiers_after_a_blit_encoder_are_metals() {
+    identifiers_after_are_metals(Made::Blit);
+}
+
+/// [`identifiers_after_are_metals`] an empty compute encoder, which takes nothing of Metal's
+/// range
+#[test]
+fn identifiers_after_a_compute_encoder_are_metals() {
+    identifiers_after_are_metals(Made::Compute);
+}
+
+/// [`identifiers_after_are_metals`] an empty compute encoder of a pass descriptor
+#[test]
+fn identifiers_after_a_compute_pass_encoder_are_metals() {
+    identifiers_after_are_metals(Made::ComputePass);
+}
+
+/// [`identifiers_after_are_metals`] an empty render encoder
+#[test]
+fn identifiers_after_a_render_encoder_are_metals() {
+    identifiers_after_are_metals(Made::Render);
+}
+
 /// Indirect command buffers take Metal's numbers: plain IDs from Metal's pool, from 1; a
 /// placement takes its index's low 32 bits outside them; `resourceIndex` is the ID; the
 /// unique identifier is Metal's address of the buffer, the first one's `0x1000018000`, first
