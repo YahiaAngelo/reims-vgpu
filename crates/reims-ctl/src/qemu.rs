@@ -9,10 +9,12 @@
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
 //!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
 //!   q35 an e1000e in the first free slot, 1, where the root port's address is);
-//! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
-//!   driver, and Safari's Media Source players fail without an output device;
-//! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
-//!   for OpenCore's boot chime: its AudioDxe drives HDA, not USB audio;
+//! - a sound device on the host's audio backend, since Safari's Media Source players fail
+//!   without an output device: on `vmapple-arm64` a virtio sound device, one output stream and
+//!   one input stream, which arm64 macOS's AppleVirtIOSound drives; on `q35-x86_64` a USB Audio
+//!   Class device, output only (x86-64 macOS 26 has no Intel HDA driver), and an ICH9 Intel HDA
+//!   controller with a line-out codec, for OpenCore's boot chime: its AudioDxe drives HDA, not
+//!   USB audio;
 //! - the library's log (`REIMS_VGPU_LOG`) in QEMU's: with logs on at their level, with the
 //!   serial console and timestamps; with logs off its warnings and device resets alone
 //!   ([`LOGS_OFF`]), which reims-ctl's warnings read.
@@ -341,9 +343,8 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         &format!("apple-gfx-mmio.resolution={}", c.display.qemu_resolution()?),
     ]);
     if c.audio.enabled {
-        // On the USB bus of the machine's own xHCI controller, its only one.
         push(&["-audiodev", &audiodev(vm, ctx)]);
-        push(&["-device", "usb-audio,id=audio,audiodev=snd0"]);
+        push(&["-device", "virtio-sound-pci,id=audio,audiodev=snd0"]);
     }
     Ok(())
 }
@@ -668,6 +669,7 @@ mod tests {
                 inv.args
             );
         }
+        assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
     }
 
     #[test]
@@ -781,9 +783,14 @@ mod tests {
             &["-global", "apple-gfx-mmio.displays=2"],
             &["-global", "apple-gfx-mmio.resolution=1920x1080"],
             &["-audiodev", "coreaudio,id=snd0"],
+            &["-device", "virtio-sound-pci,id=audio,audiodev=snd0"],
         ] {
             assert!(has(&a, pair), "missing {pair:?} in {a:?}");
         }
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("usb-audio") || x.contains("hda"))
+        );
         assert!(!a.iter().any(|x| x.contains("memfd")));
         assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
         assert!(!a.iter().any(|x| x.contains("ICH9-LPC")));

@@ -293,8 +293,8 @@ pub struct CreateArgs {
     /// Keep the library's log and the serial console
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// A USB audio device on the host's sound (on x86-64, also the HDA controller OpenCore's boot
-    /// chime plays on)
+    /// A sound device on the host's sound: on arm64 a virtio one, with a microphone; on x86-64 a
+    /// USB one, and the HDA controller OpenCore's boot chime plays on
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
     /// Forward this port on 127.0.0.1 to the guest's SSH port
