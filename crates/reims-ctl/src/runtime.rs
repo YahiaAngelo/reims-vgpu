@@ -405,6 +405,21 @@ pub fn now_stamp(fmt: &str) -> String {
     }
 }
 
+/// Another VM that runs on `vm`'s disk, which both use in place. QEMU on Linux would refuse the
+/// second's start on its lock of the image; on macOS QEMU locks no image, and both would write
+/// the disk.
+fn running_on_disk(vm: &Vm) -> Option<String> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let disk = real(&vm.disk());
+    let reg = crate::vm::Registry::load().ok()?;
+    reg.vms
+        .iter()
+        .filter(|e| e.name != vm.name())
+        .filter_map(|e| Vm::load(&e.dir).ok())
+        .find(|other| real(&other.disk()) == disk && pid(other).is_some())
+        .map(|other| other.name().to_string())
+}
+
 /// Readies the VM's directory for a run of QEMU: its logs rotated, and the QMP socket's
 /// directory made. Returns the socket.
 ///
@@ -431,6 +446,13 @@ fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
 pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     if let Some(p) = pid(vm) {
         bail!("{} already runs (pid {p})", vm.name());
+    }
+    if let Some(other) = running_on_disk(vm) {
+        bail!(
+            "{other} is running on {}'s disk, {}: stop it first. Two VMs on one disk corrupt it",
+            vm.name(),
+            crate::paths::tilde(&vm.disk())
+        );
     }
     preflight(vm, host)?;
     if vm.config.profile == Profile::VmappleArm64 {
@@ -637,6 +659,49 @@ mod tests {
             "/usr/share/vulkan/icd.d/nvidia_icd.json",
             "NVIDIA GeForce RTX 3090"
         )));
+    }
+
+    /// A VM does not start on a disk another VM, using it in place too, runs on.
+    #[test]
+    fn a_vm_does_not_start_on_a_disk_another_runs_on() {
+        let env = crate::testenv::Env::new("start-shared");
+        let disk = env.root.join("disk.img");
+        std::fs::write(&disk, "").unwrap();
+        let mut reg = crate::vm::Registry::default();
+        let mut vms = Vec::new();
+        for name in ["a", "b"] {
+            let dir = env.root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = format!(
+                r#"
+                name = "{name}"
+                profile = "vmapple-arm64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "{}"
+                [vmapple]
+                aux = "aux.img"
+                ecid = 1
+                "#,
+                disk.display()
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            reg.add(name, &dir).unwrap();
+            vms.push(Vm::load(&dir).unwrap());
+        }
+        reg.save().unwrap();
+        // a runs: a process whose command line names its pid file, as QEMU's does.
+        let mut qemu = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(vms[0].pidfile())
+            .spawn()
+            .unwrap();
+        std::fs::write(vms[0].pidfile(), format!("{}\n", qemu.id())).unwrap();
+        let r = start(&vms[1], Host::current());
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.starts_with("a is running on b's disk"), "{e}");
     }
 
     /// A start leaves the pid file and the QMP socket where they are, a running QEMU's among
