@@ -8333,7 +8333,8 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
 /// `gpu::rate_map`), without which the runtime fails its command buffer as a GPU hang, as
 /// Metal's GPU does: its state set or not, over a map of one layer not yet reset, reset to the
 /// identity, reset to half its rate on each axis, and over one made of no layers, in a pass of
-/// one BGRA8 target and in one of a 4-sample BGRA8 target resolved into another, each in a
+/// one BGRA8 target and, with no state set (the fixtures' state is of one sample, which neither
+/// binds in a pass of four), in one of a 4-sample BGRA8 target resolved into another, each in a
 /// command buffer of its own queue, before any command buffer drew over a mutable map
 #[test]
 fn drawless_passes_over_mutable_maps_store_as_metals() {
@@ -8494,6 +8495,7 @@ fn drawless_passes_over_mutable_maps_store_as_metals() {
     let runs: Vec<_> = [false, true]
         .into_iter()
         .flat_map(|multisample| cases.map(|case| (case, multisample)))
+        .filter(|&((_, _, state), multisample)| !(state && multisample))
         .collect();
     let (p, d) = (platform(), dev());
     let ours: Vec<_> = (runs.iter())
