@@ -901,7 +901,9 @@ fn show(vm: &Vm, host: Host) {
 
 /// Sets the installer, for the VM's next start. Returns what happened. A DMG is converted into
 /// the VM's directory first (`create::installer_media`), and the VM's copy of the installer it
-/// replaces is deleted.
+/// replaces is deleted. The installer is set in the VM's settings as they are once that is
+/// done, which `vm` becomes: a DMG takes seconds to convert, in which others may be saved (the
+/// interface's edit form or logs toggle, reims-ctl set).
 pub fn set_installer(
     vm: &mut Vm,
     path: Option<PathBuf>,
@@ -913,27 +915,34 @@ pub fn set_installer(
     let q = vm
         .config
         .q35
-        .as_mut()
+        .as_ref()
         .context("only x86-64 VMs take installer media")?;
-    let old = q.installer.clone();
     if let Some(p) = &path
         && !p.is_file()
     {
         bail!("{} does not exist", p.display());
     }
     // The VM's copy, named again by its path (the TUI shows it so), stays as it is.
-    let copy = old
-        .as_ref()
-        .filter(|o| o.is_relative())
-        .map(|o| dir.join(o));
+    let copy = |old: &Option<PathBuf>| {
+        old.as_ref()
+            .filter(|o| o.is_relative())
+            .map(|o| dir.join(o))
+    };
     let installer = match &path {
-        Some(p) if copy.as_deref().is_some_and(|c| same_file(c, p)) => old.clone(),
+        Some(p) if copy(&q.installer).is_some_and(|c| same_file(&c, p)) => q.installer.clone(),
         Some(p) => Some(create::installer_media(p, &dir, progress)?),
         None => None,
     };
-    q.installer = installer.clone();
-    vm.save()?;
-    if let Some(c) = &copy
+    let mut now = Vm::load(&dir)?;
+    let q = now
+        .config
+        .q35
+        .as_mut()
+        .context("only x86-64 VMs take installer media")?;
+    let old = std::mem::replace(&mut q.installer, installer.clone());
+    now.save()?;
+    *vm = now;
+    if let Some(c) = copy(&old)
         && installer != old
     {
         let _ = std::fs::remove_file(c);
@@ -1350,6 +1359,7 @@ mod tests {
             dir: d.join("vm"),
             config: toml::from_str(config).unwrap(),
         };
+        vm.save().unwrap();
         let copy = d.join("vm").join(create::INSTALLER_COPY);
         let user = d.join("BaseSystem.img");
         std::fs::write(&copy, [0u8; 4096]).unwrap();
@@ -1368,6 +1378,16 @@ mod tests {
         set_installer(&mut vm, None, &mut quiet).unwrap();
         assert_eq!(installer(&vm), None);
         assert!(user.is_file());
+
+        // What was saved while it ran stays: here, while a DMG would convert.
+        let mut stale = vm.clone();
+        vm.config.memory_mib = 8192;
+        vm.save().unwrap();
+        set_installer(&mut stale, Some(user.clone()), &mut quiet).unwrap();
+        let saved = Vm::load(&d.join("vm")).unwrap();
+        assert_eq!(saved.config.memory_mib, 8192);
+        assert_eq!(installer(&saved), Some(user.clone()));
+        assert_eq!(stale.config, saved.config);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

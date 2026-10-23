@@ -137,7 +137,9 @@ pub fn missing_kext(vm: &Vm) -> Option<String> {
 /// Replaces a stopped VM's OpenCore image with one the installed reims-util makes, presenting
 /// the same Mac, with its boot picker shown where `show_picker` says, or as the old image shows
 /// it when `None`. The new image is made beside the old one, which stays as it was if that fails.
-/// The VM keeps its OVMF: its variables hold its boot entries. Returns what happened.
+/// The VM keeps its OVMF: its variables hold its boot entries. The image is set in the VM's
+/// settings as they are once it is made, which `vm` becomes: others may be saved meanwhile.
+/// Returns what happened.
 pub fn renew(
     vm: &mut Vm,
     show_picker: Option<bool>,
@@ -174,6 +176,7 @@ pub fn renew(
         return Err(e);
     }
     std::fs::rename(&new, &image).with_context(|| format!("replace {}", image.display()))?;
+    *vm = Vm::load(&vm.dir)?;
     if let Some(q) = vm.config.q35.as_mut() {
         q.opencore = "opencore.qcow2".into();
         q.opencore_format = ImageFormat::Qcow2;
@@ -548,9 +551,13 @@ mod tests {
     }
 
     fn config(kexts: &str) -> Config {
-        Config::parse(
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+        Config::parse(plist(kexts).as_bytes()).unwrap()
+    }
+
+    /// A config.plist, Kernel > Add holding `kexts`.
+    fn plist(kexts: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Kernel</key><dict><key>Add</key><array>{kexts}</array></dict>
@@ -565,10 +572,114 @@ mod tests {
     </dict>
   </dict>
 </dict></plist>"#
-            )
-            .as_bytes(),
         )
-        .unwrap()
+    }
+
+    /// A raw OpenCore image laid out as reims-util's: a GPT whose one partition, the EFI system
+    /// partition, is FAT32, a sector a cluster, holding EFI/OC/`config_plist`.
+    fn image(config_plist: &[u8]) -> Vec<u8> {
+        const ESP: usize = 64 * 512;
+        let put = |img: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            img[at..at + bytes.len()].copy_from_slice(bytes)
+        };
+        let clusters = config_plist.len().div_ceil(512);
+        // The boot sector, one FAT of a sector, then cluster 2.
+        let data = ESP + 2 * 512;
+        let cluster = |c: usize| data + (c - 2) * 512;
+        let mut img = vec![0u8; cluster(5 + clusters)];
+        put(&mut img, 512, b"EFI PART");
+        put(&mut img, 512 + 72, &2u64.to_le_bytes());
+        put(&mut img, 512 + 80, &1u32.to_le_bytes());
+        put(&mut img, 512 + 84, &128u32.to_le_bytes());
+        put(&mut img, 1024, &ESP_TYPE);
+        put(&mut img, 1024 + 32, &(ESP as u64 / 512).to_le_bytes());
+        put(&mut img, ESP + 11, &512u16.to_le_bytes());
+        img[ESP + 13] = 1;
+        put(&mut img, ESP + 14, &1u16.to_le_bytes());
+        img[ESP + 16] = 1;
+        put(&mut img, ESP + 36, &1u32.to_le_bytes());
+        put(&mut img, ESP + 44, &2u32.to_le_bytes());
+        put(&mut img, ESP + 510, &[0x55, 0xaa]);
+        // The root, EFI and OC, a cluster each, then config.plist's chain from cluster 5.
+        for c in 2..5 + clusters {
+            let last = c < 5 || c == 4 + clusters;
+            let next = if last { 0x0fff_ffff } else { c as u32 + 1 };
+            put(&mut img, ESP + 512 + c * 4, &next.to_le_bytes());
+        }
+        put(&mut img, cluster(2), &short(b"EFI        ", 0x10, 3, 0));
+        put(&mut img, cluster(3), &short(b"OC         ", 0x10, 4, 0));
+        let mut oc = long("config.plist").concat();
+        let size = config_plist.len() as u32;
+        oc.extend(short(b"CONFIG~1PLI", 0x20, 5, size));
+        put(&mut img, cluster(4), &oc);
+        put(&mut img, cluster(5), config_plist);
+        img
+    }
+
+    #[test]
+    fn an_image_reads_as_reims_util_lays_it_out() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-oc-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("opencore.img");
+        std::fs::write(&p, image(plist("").as_bytes())).unwrap();
+        let c = Config::read(&p, ImageFormat::Raw).unwrap();
+        assert_eq!(c.identity().unwrap().serial, "C02D40VEPN5T");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The new image is set in the VM's settings as they are once it is made: what was saved
+    /// while reims-util made it stays.
+    #[test]
+    fn renew_keeps_settings_saved_while_the_image_is_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("renew");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let made = env.root.join("made.img");
+        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
+        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        let config = |memory: u64| {
+            format!(
+                r#"
+                name = "t"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = {memory}
+                disk = "disk.qcow2"
+                [q35]
+                opencore = "opencore.img"
+                opencore_format = "raw"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            )
+        };
+        std::fs::write(dir.join(crate::vm::CONFIG_FILE), config(4096)).unwrap();
+        let mut vm = Vm::load(&dir).unwrap();
+        // reims-util makes the image, and meanwhile the VM's memory is saved (reims-ctl set).
+        let util = env.root.join("reims-util");
+        let script = format!(
+            "#!/bin/sh\nwhile [ \"$1\" != -o ]; do shift; done\ncp '{made}' \"$2\"\n\
+             cat > '{toml}' <<'EOF'\n{config}\nEOF\necho '{{\"event\":\"done\",\"result\":{{}}}}'\n",
+            made = made.display(),
+            toml = dir.join(crate::vm::CONFIG_FILE).display(),
+            config = config(8192),
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+
+        let said = renew(&mut vm, None, &mut |_| {}).unwrap();
+        assert!(said.contains("iMac20,1"), "{said}");
+        let saved = Vm::load(&dir).unwrap();
+        assert_eq!(saved.config.memory_mib, 8192);
+        let q = saved.config.q35.as_ref().unwrap();
+        assert_eq!(q.opencore, Path::new("opencore.qcow2"));
+        assert_eq!(q.opencore_format, ImageFormat::Qcow2);
+        assert_eq!(vm.config, saved.config);
+        // The image it replaced, the VM's own under another name, is gone.
+        assert!(dir.join("opencore.qcow2").is_file());
+        assert!(!dir.join("opencore.img").exists());
     }
 
     #[test]
