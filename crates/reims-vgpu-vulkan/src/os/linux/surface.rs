@@ -5,7 +5,14 @@
 //!   release, and the retain count, which the guest sees, is the number of references to the
 //!   object. Its ID is the object's address, unique among live surfaces. A lookup
 //!   (`lookup_by_port`) is another object over the same memory, with a count of its own, as
-//!   IOSurface's lookup in the process that made the surface answers.
+//!   IOSurface's lookup in the process that made the surface answers. While the thread unwinds
+//!   or releases an isolated task that died
+//!   ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)), `Drop` leaks
+//!   the reference instead, as every platform handle of a dead task's is
+//!   ([`crate::platform::Obj`]): its object, and the memory the object holds, stay until the
+//!   process exits. What a dead task holds is its own object over a surface the host lent it,
+//!   never the host's: the surface reaches it through a lookup. So the leak changes no count the
+//!   host reads.
 //! - **Memory.** A surface of its own memory is a file of its own, mapped and registered in the
 //!   backing table ([`super::vm::OwnMemory`]), so a view can be made of it (an alias of its
 //!   allocation, a buffer over it) and no `deallocate` frees it. One over the guest's pages
@@ -58,6 +65,7 @@
 //! byte per element and rows of its width rounded up to 128 bytes (measured on the M3 Max:
 //! widths 16, 17, 32 and 65535).
 
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -85,9 +93,10 @@ const PROTECTION_OPTIONS: u64 = 0xf;
 /// The bytes a row of a surface made from plane properties is rounded up to.
 const BACKING_ROW_ALIGNMENT: u64 = 128;
 
-/// One reference to an IOSurface stand-in (module docs).
+/// One reference to an IOSurface stand-in (module docs): `Drop` is the release, or a leak while
+/// the thread unwinds or releases an isolated task that died.
 #[derive(Debug)]
-pub struct LinuxSurface(Arc<Object>);
+pub struct LinuxSurface(ManuallyDrop<Arc<Object>>);
 
 /// An object over a surface: the one made, or a lookup of it.
 #[derive(Debug)]
@@ -170,7 +179,7 @@ pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static
 impl LinuxSurface {
     /// A new surface: one reference to a new object over `data`.
     fn new(data: Data) -> LinuxSurface {
-        LinuxSurface(Arc::new(Object(Arc::new(data))))
+        LinuxSurface(ManuallyDrop::new(Arc::new(Object(Arc::new(data)))))
     }
 
     /// The surface the object is over.
@@ -179,9 +188,20 @@ impl LinuxSurface {
     }
 }
 
+impl Drop for LinuxSurface {
+    /// The release, or nothing while the thread unwinds or releases an isolated task that died.
+    fn drop(&mut self) {
+        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
+            return;
+        }
+        // SAFETY: the reference is released once, here, and never touched after.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
 impl Handle for LinuxSurface {
     fn clone_ref(&self) -> Self {
-        LinuxSurface(Arc::clone(&self.0))
+        LinuxSurface(ManuallyDrop::new(Arc::clone(&self.0)))
     }
 
     fn id(&self) -> ObjId {
@@ -245,7 +265,9 @@ impl Surface for LinuxSurface {
     }
 
     fn lookup_by_port(&self) -> Option<Self> {
-        Some(LinuxSurface(Arc::new(Object(Arc::clone(&self.0.0)))))
+        Some(LinuxSurface(ManuallyDrop::new(Arc::new(Object(
+            Arc::clone(&self.0.0),
+        )))))
     }
 }
 
@@ -703,6 +725,35 @@ mod tests {
         assert!(mapped(base));
         drop(s);
         assert!(!mapped(base));
+    }
+
+    /// A reference an isolated task's death unwinds past, or that the release of a task that
+    /// died drops, is leaked, as every platform handle of the task's is, and the surface's
+    /// memory with it; one the task's work drops is released
+    #[test]
+    fn a_dead_tasks_unwind_leaks_its_surface_references() {
+        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+
+        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
+        let life = TaskLife::new();
+        assert_eq!(life.run(|| drop(s.clone_ref())), Some(()));
+        assert_eq!(s.retain_count(), 1);
+        let r: Option<()> = life.run(|| {
+            let _held = s.clone_ref();
+            reims_vgpu_core::fatal!(DeathSite {
+                kind: DeathKind::Abort,
+                file: "surface.test",
+                line: 0,
+            })
+        });
+        assert_eq!(r, None);
+        assert_eq!(s.retain_count(), 2);
+        assert_eq!(life.releasing(|| drop(s.clone_ref())), Some(()));
+        assert_eq!(s.retain_count(), 3);
+        let base = s.base_address();
+        drop(s);
+        assert!(mapped(base), "the leaked references hold the memory");
     }
 
     /// A lookup is another object over the same memory, whose count is its own, and the
