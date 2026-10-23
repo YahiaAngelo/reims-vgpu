@@ -922,10 +922,11 @@ pub fn set_installer(
     {
         bail!("{} does not exist", p.display());
     }
-    // The VM's copy, named again by its path (the TUI shows it so), stays as it is.
+    // The VM's copy, named again by its path (the TUI shows it so), stays as it is. Any other
+    // installer is the user's, though written relative to the VM's directory by hand.
     let copy = |old: &Option<PathBuf>| {
         old.as_ref()
-            .filter(|o| o.is_relative())
+            .filter(|o| *o == Path::new(create::INSTALLER_COPY))
             .map(|o| dir.join(o))
     };
     let installer = match &path {
@@ -1388,6 +1389,21 @@ mod tests {
         assert_eq!(saved.config.memory_mib, 8192);
         assert_eq!(installer(&saved), Some(user.clone()));
         assert_eq!(stale.config, saved.config);
+
+        // An installer of the user's, named relative to the VM's directory by hand, is the
+        // user's, not the VM's copy: neither a change nor an eject deletes it.
+        let other = d.join("Other.img");
+        std::fs::write(&other, [0u8; 4096]).unwrap();
+        for own in ["BaseSystem.img", "../BaseSystem.img"] {
+            let file = vm.dir.join(own);
+            std::fs::write(&file, [0u8; 4096]).unwrap();
+            for to in [Some(other.clone()), None] {
+                vm.config.q35.as_mut().unwrap().installer = Some(own.into());
+                vm.save().unwrap();
+                set_installer(&mut vm, to.clone(), &mut quiet).unwrap();
+                assert!(file.is_file(), "{own} to {to:?}");
+            }
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

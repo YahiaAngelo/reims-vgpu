@@ -340,8 +340,8 @@ pub struct Q35 {
     pub firmware_vars: PathBuf,
     /// The installer, a raw image (reims-util's offline installer, or a recovery image's raw
     /// copy) attached as a disk, whose writes go to a temporary overlay: used in place where
-    /// absolute; relative, the VM's raw copy of a DMG (`create::installer_media`), which a change
-    /// of installer deletes.
+    /// absolute; `installer.img`, the VM's raw copy of a DMG (`create::installer_media`), which a
+    /// change of installer deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installer: Option<PathBuf>,
     #[serde(default = "default_cpu_model")]
