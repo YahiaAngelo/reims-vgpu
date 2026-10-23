@@ -8,8 +8,8 @@
 //! of a device, display or IOSurface device is its end, run on the releasing thread. They are
 //! generic over the platform with [`DefaultPlatform`] as the default, so their forwarding is
 //! unit-tested on core's fake platform. The `vulkan` feature adds `VulkanPlatform`, over
-//! metal2vulkan's runtime, whose window displays on macOS have Metal copy each frame the runtime
-//! draws into their window.
+//! metal2vulkan's runtime, whose window displays draw each frame into a swapchain of their
+//! window, on macOS one over the window's `CAMetalLayer`.
 //!
 //! **By OS.** On macOS the default platform is `MetalPlatform`, the product. On Linux the library
 //! is the Vulkan platform's: it builds only with the `vulkan` feature, and `VulkanPlatform` is the

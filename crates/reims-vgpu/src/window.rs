@@ -1,10 +1,10 @@
 //! A display's own window ([`DisplayConfig::window`](crate::DisplayConfig::window)): the tee that
 //! tells the window what the guest does, the link that closes it with the display's last
 //! reference, the modes and density a display matching its host screen offers, and the sink that
-//! draws the display's current frame into the window's drawable: on macOS, `metal::MetalSink` on
-//! the product's platform, and on the Vulkan platform (feature `vulkan`) `vulkan::VulkanSink`,
-//! which has Metal copy each frame the runtime draws into the drawable; on Linux, on the Vulkan
-//! platform, `vulkan::SwapchainSink`, which draws each frame into the window's swapchain.
+//! draws the display's current frame into the window: on macOS, on the product's platform,
+//! `metal::MetalSink`, into each drawable the window's render thread takes of its layer; on the
+//! Vulkan platform (feature `vulkan`), on either OS, `vulkan::SwapchainSink`, into the window's
+//! swapchain (on macOS one over the window's `CAMetalLayer`, whose images are its drawables).
 //!
 //! **What the guest sees.** A window display has all five display callbacks, whatever the host
 //! gives ([`tee`]): the guest reads a cursor glyph size limit of 256 and both cursor handler
