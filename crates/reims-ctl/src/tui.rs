@@ -2585,6 +2585,8 @@ mod tests {
 
     #[test]
     fn a_create_that_fails_keeps_its_form_open_with_the_error() {
+        // The create and the list it reads again use these VMs, not the user's.
+        let _env = crate::testenv::Env::new("tui-create");
         let host = Host {
             os: Os::Linux,
             arch: Arch::X86_64,
@@ -2614,6 +2616,8 @@ mod tests {
 
     #[test]
     fn a_busy_form_closes_once_its_work_succeeds_and_opens_again_if_it_fails() {
+        // The list each work's end reads again is of these VMs, not the user's.
+        let _env = crate::testenv::Env::new("tui-busy");
         let mut app = App::with(Host::current());
         let busy = |app: &mut App, id| {
             let mut f = Form::new("t", "save", Vec::new());
