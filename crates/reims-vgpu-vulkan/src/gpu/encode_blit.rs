@@ -163,6 +163,12 @@ impl<E> EncoderObject<E> {
         Obj::upgrade(&self.command_buffer)
     }
 
+    /// Whether its command buffer lives, as [`Self::command_buffer`] answers, without taking a
+    /// reference to it.
+    pub(crate) fn has_command_buffer(&self) -> bool {
+        self.command_buffer.strong_count() != 0
+    }
+
     /// An open encoder of `command_buffer`, which counts it among its open encoders and the
     /// encoders it made, under its protection options.
     pub fn new(raw: E, command_buffer: &VulkanCommandBuffer) -> EncoderObject<E> {

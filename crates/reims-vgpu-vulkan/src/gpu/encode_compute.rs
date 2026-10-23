@@ -60,7 +60,7 @@ use crate::gpu::command::executions::{self, Execution, Points};
 use crate::gpu::icb::VulkanIcb;
 use crate::gpu::predication::{self, PredicatedEncoder, Work};
 use crate::gpu::resource::VulkanBuffer;
-use crate::gpu::{metal_value, region};
+use crate::gpu::{listed, metal_value, region};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// `id<MTLComputeCommandEncoder>`.
@@ -346,8 +346,13 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len(), strides.len()]);
-                let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
-                caught(&mut |e| e.set_buffers_with_strides(&buffers, offsets, strides, at))
+                listed(
+                    buffers,
+                    |b| b.map(|b| &b.raw),
+                    |buffers| {
+                        caught(&mut |e| e.set_buffers_with_strides(buffers, offsets, strides, at))
+                    },
+                )
             }
             ComputeCmd::SetBuffers {
                 buffers,
@@ -355,8 +360,11 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len()]);
-                let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
-                caught(&mut |e| e.set_buffers(&buffers, offsets, at))
+                listed(
+                    buffers,
+                    |b| b.map(|b| &b.raw),
+                    |buffers| caught(&mut |e| e.set_buffers(buffers, offsets, at)),
+                )
             }
             ComputeCmd::SetComputePipelineState { state } => {
                 let state = some(sel, state, "pipeline state");
@@ -378,20 +386,28 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             } => {
                 let lengths = [samplers.len(), lod_min_clamps.len(), lod_max_clamps.len()];
                 let at = first(sel, range, &lengths);
-                let samplers: Vec<_> = samplers.iter().map(|s| s.map(|s| &**s)).collect();
-                caught(&mut |e| {
-                    e.set_sampler_states_with_lod_clamps(
-                        &samplers,
-                        lod_min_clamps,
-                        lod_max_clamps,
-                        at,
-                    )
-                })
+                listed(
+                    samplers,
+                    |s| s.map(|s| &**s),
+                    |samplers| {
+                        caught(&mut |e| {
+                            e.set_sampler_states_with_lod_clamps(
+                                samplers,
+                                lod_min_clamps,
+                                lod_max_clamps,
+                                at,
+                            )
+                        })
+                    },
+                )
             }
             ComputeCmd::SetSamplerStates { samplers, range } => {
                 let at = first(sel, range, &[samplers.len()]);
-                let samplers: Vec<_> = samplers.iter().map(|s| s.map(|s| &**s)).collect();
-                caught(&mut |e| e.set_sampler_states(&samplers, at))
+                listed(
+                    samplers,
+                    |s| s.map(|s| &**s),
+                    |samplers| caught(&mut |e| e.set_sampler_states(samplers, at)),
+                )
             }
             ComputeCmd::SetStageInRegion { region: r } => {
                 caught(&mut |e| e.set_stage_in_region(region(r)))
@@ -409,8 +425,11 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::SetTextures { textures, range } => {
                 let at = first(sel, range, &[textures.len()]);
-                let textures: Vec<_> = textures.iter().map(|t| t.map(|t| t.texels(sel))).collect();
-                caught(&mut |e| e.set_textures(&textures, at))
+                listed(
+                    textures,
+                    |t| t.map(|t| t.texels(sel)),
+                    |textures| caught(&mut |e| e.set_textures(textures, at)),
+                )
             }
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 let (length, index) = (small(sel, length), small(sel, index));

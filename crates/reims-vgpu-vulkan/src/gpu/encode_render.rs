@@ -263,7 +263,7 @@ use crate::gpu::resource::{RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
-use crate::gpu::{metal_value, region, size};
+use crate::gpu::{listed, metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// The first colour attachment of `d` that the state's fragment function writes (`written`, the
@@ -1723,25 +1723,30 @@ fn ranged<'a, T>(sel: &'static str, range: NsRange, slice: &'a [T]) -> (u32, &'a
     (small(sel, range.location), &slice[..n])
 }
 
-/// Core's buffers, as the runtime's.
-fn buffers<'a>(list: &[Option<&'a VulkanBuffer>]) -> Vec<Option<&'a rt::Buffer>> {
-    list.iter().map(|b| b.map(|b| &b.raw)).collect()
+/// Runs `call` with core's buffers as the runtime's ([`listed`]).
+fn buffers<'a, R>(
+    list: &[Option<&'a VulkanBuffer>],
+    call: impl FnOnce(&[Option<&'a rt::Buffer>]) -> R,
+) -> R {
+    listed(list, |b| b.map(|b| &b.raw), call)
 }
 
-/// Core's textures, as the runtime's, bound by `sel`
-/// ([`crate::gpu::resource::TextureObject::texels`]).
-fn textures<'a>(
+/// Runs `call` with core's textures as the runtime's, bound by `sel`
+/// ([`crate::gpu::resource::TextureObject::texels`], [`listed`]).
+fn textures<'a, R>(
     sel: &'static str,
     list: &[Option<&'a VulkanTexture>],
-) -> Vec<Option<&'a rt::Texture>> {
-    list.iter().map(|t| t.map(|t| t.texels(sel))).collect()
+    call: impl FnOnce(&[Option<&'a rt::Texture>]) -> R,
+) -> R {
+    listed(list, |t| t.map(|t| t.texels(sel)), call)
 }
 
-/// Core's sampler states, as the runtime's.
-fn samplers<'a>(
+/// Runs `call` with core's sampler states as the runtime's ([`listed`]).
+fn samplers<'a, R>(
     list: &[Option<&'a crate::gpu::resource::VulkanSamplerState>],
-) -> Vec<Option<&'a rt::SamplerState>> {
-    list.iter().map(|s| s.map(|s| &**s)).collect()
+    call: impl FnOnce(&[Option<&'a rt::SamplerState>]) -> R,
+) -> R {
+    listed(list, |s| s.map(|s| &**s), call)
 }
 
 /// The runtime's form of core's resources, the nil ones skipped.
@@ -2326,7 +2331,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         let sel = cmd.selector();
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
-            && self.encoder.command_buffer().is_some()
+            && self.encoder.has_command_buffer()
         {
             self.bound(bind);
         }
@@ -2798,8 +2803,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_fragment_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetFragmentSamplerStatesLodClamps {
                 samplers: list,
@@ -2810,16 +2816,18 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_fragment_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetFragmentSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_fragment_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
                 let index = small(sel, index);
@@ -2831,8 +2839,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_fragment_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_fragment_textures(list, at))
+                })
             }
             RenderCmd::SetFrontFacingWinding {
                 front_facing_winding,
@@ -2971,8 +2980,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_tile_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_tile_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetTileSamplerStatesLodClamps {
                 samplers: list,
@@ -2983,24 +2993,27 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_tile_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_tile_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetTileSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_tile_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_tile_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetTileTextures {
                 textures: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_tile_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_tile_textures(list, at))
+                })
             }
             RenderCmd::SetTriangleFillMode { fill_mode } => {
                 let mode: TriangleFillMode = metal_value(sel, "triangle fill mode", fill_mode);
@@ -3071,8 +3084,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
                 let (_, strides) = ranged(sel, range, strides);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_vertex_buffers_with_strides(&list, offsets, strides, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_buffers_with_strides(list, offsets, strides, at))
+                })
             }
             RenderCmd::SetVertexBuffers {
                 buffers: list,
@@ -3081,8 +3095,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_vertex_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetVertexSamplerStatesLodClamps {
                 samplers: list,
@@ -3093,24 +3108,27 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_vertex_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetVertexSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_vertex_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetVertexTextures {
                 textures: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_vertex_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_vertex_textures(list, at))
+                })
             }
             RenderCmd::SetViewport { viewport: v } => {
                 let v = viewport(v);

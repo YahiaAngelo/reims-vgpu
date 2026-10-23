@@ -64,6 +64,30 @@ use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange, S
 
 use crate::answer::unrepresentable;
 
+/// The most elements a bind's list holds on the stack ([`listed`]): Metal's 31 buffer slots of a
+/// stage, and as many textures or samplers.
+const LISTED: usize = 31;
+
+/// Runs `call` with each element of `list` as `map` makes it, in order: a bind's list of core's
+/// objects as the runtime's, which every bind of several slots makes, on the stack where it holds
+/// at most [`LISTED`], else in a `Vec`. The runtime reads the slice alone, so where it lies
+/// changes nothing it answers.
+pub(crate) fn listed<A, B: Copy + Default, R>(
+    list: &[A],
+    mut map: impl FnMut(&A) -> B,
+    call: impl FnOnce(&[B]) -> R,
+) -> R {
+    if list.len() > LISTED {
+        let all: Vec<B> = list.iter().map(map).collect();
+        return call(&all);
+    }
+    let mut on_stack = [B::default(); LISTED];
+    for (to, from) in on_stack.iter_mut().zip(list) {
+        *to = map(from);
+    }
+    call(&on_stack[..list.len()])
+}
+
 /// `MTLSize`.
 pub(crate) fn size(s: MtlSize) -> rt::Size {
     rt::Size::new(s.width, s.height, s.depth)
@@ -266,5 +290,20 @@ mod tests {
         let site =
             catch_death(|| resource_options("newBufferWithLength:options:", 1 << 25)).unwrap_err();
         assert_eq!(site.file, "newBufferWithLength:options:");
+    }
+
+    /// A bind's list reaches the runtime as the elements `map` makes, in order, at every length:
+    /// on the stack up to [`LISTED`], in a `Vec` past it
+    #[test]
+    fn listed_lists_are_the_mapped_elements_in_order() {
+        for len in [0, 1, 2, LISTED - 1, LISTED, LISTED + 1, 128] {
+            let list: Vec<Option<u32>> = (0..len)
+                .map(|i| u32::try_from(i).ok().filter(|i| i % 3 != 1))
+                .collect();
+            let map = |v: &Option<u32>| v.map(|v| u64::from(v) * 7);
+            let expected: Vec<Option<u64>> = list.iter().map(map).collect();
+            let got = listed(&list, map, <[Option<u64>]>::to_vec);
+            assert_eq!(got, expected, "{len} elements");
+        }
     }
 }
