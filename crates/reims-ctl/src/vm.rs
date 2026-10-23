@@ -565,6 +565,21 @@ impl Vm {
         pidfile_in(&self.dir)
     }
 
+    /// The files the VM runs on, wherever they are: its disk, and its OpenCore image, firmware
+    /// and installer, or its auxiliary storage and the trimmed copy QEMU boots.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut v = vec![self.disk()];
+        if let Some(q) = &self.config.q35 {
+            v.extend([&q.opencore, &q.firmware_code, &q.firmware_vars].map(|p| self.path(p)));
+            v.extend(q.installer.as_deref().map(|p| self.path(p)));
+        }
+        if let Some(a) = &self.config.vmapple {
+            v.push(self.path(&a.aux));
+            v.extend(self.aux_trimmed());
+        }
+        v
+    }
+
     /// The QMP socket: in the VM's directory where the path fits a Unix socket's 104 bytes
     /// (macOS's limit; Linux's is 108), else in the runtime directory.
     pub fn qmp_socket(&self) -> PathBuf {

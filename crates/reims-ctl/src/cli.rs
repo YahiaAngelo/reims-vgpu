@@ -715,6 +715,17 @@ pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
     if let Some(p) = runtime::pid_at(&vm::pidfile_in(&entry.dir)) {
         bail!("{name} is running (pid {p}): stop it first");
     }
+    if !keep_files
+        && entry.dir.join(vm::CONFIG_FILE).is_file()
+        && let Some((other, file)) = used_inside(&reg, name, &entry.dir)
+    {
+        bail!(
+            "{} also holds {other}'s files ({}), which deleting {name} with its files would \
+             delete too: delete {other} first, or delete {name} and keep its files",
+            paths::tilde(&entry.dir),
+            paths::tilde(&file)
+        );
+    }
     reg.remove(name);
     reg.save()?;
     if keep_files {
@@ -733,6 +744,20 @@ pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
             paths::tilde(&entry.dir)
         ))
     }
+}
+
+/// A VM other than `name` that `dir` holds, or one of whose files it holds (a disk used in
+/// place, say): the VM, and its directory or that file.
+fn used_inside(reg: &Registry, name: &str, dir: &Path) -> Option<(String, PathBuf)> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = real(dir);
+    reg.vms.iter().filter(|e| e.name != name).find_map(|e| {
+        let files = Vm::load(&e.dir).map(|vm| vm.files()).unwrap_or_default();
+        std::iter::once(e.dir.clone())
+            .chain(files)
+            .find(|p| real(p).starts_with(&dir))
+            .map(|p| (e.name.clone(), p))
+    })
 }
 
 fn delete(name: &str, keep_files: bool, yes: bool) -> Result<()> {
@@ -1256,6 +1281,53 @@ mod tests {
         assert!(e.contains("x is running"), "{e}");
         assert!(dir.join(vm::CONFIG_FILE).is_file());
         assert!(Registry::load().unwrap().find("x").is_some());
+    }
+
+    /// A VM deleted with its files takes no other VM's with it: one made in a directory inside
+    /// its own (`--dir ~/VMs` for the first VM, `--dir ~/VMs/b` for the next), or one using a
+    /// disk in it in place.
+    #[test]
+    fn deleting_a_vms_files_spares_other_vms() {
+        let env = Env::new("delete-nested");
+        let config = |name: &str, disk: &str| {
+            format!(
+                r#"
+                name = "{name}"
+                profile = "vmapple-arm64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "{disk}"
+                [vmapple]
+                aux = "aux.img"
+                ecid = 1
+                "#
+            )
+        };
+        let a = env.root.join("VMs");
+        register("a", &a, &config("a", "disk.img"));
+        let b = a.join("b");
+        register("b", &b, &config("b", "disk.img"));
+        let shared = a.join("shared.img");
+        std::fs::write(&shared, "c's disk").unwrap();
+        register(
+            "c",
+            &env.root.join("c"),
+            &config("c", &shared.to_string_lossy()),
+        );
+
+        let e = format!("{:#}", delete_vm("a", false).unwrap_err());
+        assert!(e.contains("b's files"), "{e}");
+        assert!(b.join(vm::CONFIG_FILE).is_file());
+        assert!(Registry::load().unwrap().find("a").is_some());
+        delete_vm("b", false).unwrap();
+        assert!(!b.exists());
+        let e = format!("{:#}", delete_vm("a", false).unwrap_err());
+        assert!(e.contains("c's files"), "{e}");
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "c's disk");
+        // Kept, its files may hold others'.
+        delete_vm("a", true).unwrap();
+        assert!(Registry::load().unwrap().find("a").is_none());
+        assert!(shared.is_file());
     }
 
     #[test]
