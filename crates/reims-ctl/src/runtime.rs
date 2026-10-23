@@ -22,15 +22,16 @@ use std::time::{Duration, Instant};
 
 /// QEMU's pid, while it runs.
 pub fn pid(vm: &Vm) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(vm.pidfile())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    pid_at(&vm.pidfile())
+}
+
+/// The pid of the QEMU that writes `pidfile`, while it runs: what [`pid`] reads, for a VM whose
+/// settings may not read.
+pub fn pid_at(pidfile: &Path) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
     if pid <= 0 || !alive(pid) {
         return None;
     }
-    let pidfile = vm.pidfile();
     let needle = pidfile.as_os_str().as_encoded_bytes();
     let cmd = cmdline(pid)?;
     cmd.windows(needle.len())

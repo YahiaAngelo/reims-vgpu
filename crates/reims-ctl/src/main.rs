@@ -15,6 +15,8 @@ mod qemu;
 mod qmp;
 mod reims_util;
 mod runtime;
+#[cfg(test)]
+mod testenv;
 mod tui;
 mod update;
 mod view;

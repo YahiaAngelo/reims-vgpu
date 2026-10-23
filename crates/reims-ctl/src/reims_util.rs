@@ -523,8 +523,8 @@ mod tests {
 not json
 {"event":"done","result":{"title":"macOS Tahoe 26","image":"/x.dmg"}}"#;
         let bin = fake(&d, lines, 0);
-        // SAFETY: the only test that sets it, before its own reads.
-        unsafe { std::env::set_var("REIMS_CTL_UTIL", &bin) };
+        let env = crate::testenv::Env::new("util-run");
+        env.set("REIMS_CTL_UTIL", &bin);
         let mut seen = Vec::new();
         let r = run(&["online-installer".as_ref()], &mut |s| {
             seen.push(s.to_string())
@@ -553,7 +553,7 @@ not json
         fake(&d, "", 1);
         let e = format!("{:#}", run(&[], &mut |_| {}).unwrap_err());
         assert!(e.ends_with(": oops"), "{e}");
-        unsafe { std::env::remove_var("REIMS_CTL_UTIL") };
+        drop(env);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

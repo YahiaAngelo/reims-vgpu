@@ -562,7 +562,7 @@ impl Vm {
     }
 
     pub fn pidfile(&self) -> PathBuf {
-        self.dir.join("qemu.pid")
+        pidfile_in(&self.dir)
     }
 
     /// The QMP socket: in the VM's directory where the path fits a Unix socket's 104 bytes
@@ -584,6 +584,11 @@ impl Vm {
         name.push(".trimmed");
         Some(aux.with_file_name(name))
     }
+}
+
+/// The pid file QEMU writes in a VM's directory while it runs.
+pub fn pidfile_in(dir: &Path) -> PathBuf {
+    dir.join("qemu.pid")
 }
 
 // ---------------------------------------------------------------- the registry

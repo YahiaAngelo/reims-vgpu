@@ -710,10 +710,10 @@ pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
         .find(name)
         .cloned()
         .with_context(|| format!("no VM named {name}"))?;
-    if let Ok(vm) = Vm::load(&entry.dir)
-        && runtime::running(&vm)
-    {
-        bail!("{name} is running: stop it first");
+    // From its pid file alone: a VM whose vm.toml does not read (a typo, or a downgrade's) may
+    // still run.
+    if let Some(p) = runtime::pid_at(&vm::pidfile_in(&entry.dir)) {
+        bail!("{name} is running (pid {p}): stop it first");
     }
     reg.remove(name);
     reg.save()?;
@@ -1225,6 +1225,38 @@ fn doctor(host: Host) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::Env;
+
+    /// `name`, registered with `dir`, its settings `config`.
+    fn register(name: &str, dir: &Path, config: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(vm::CONFIG_FILE), config).unwrap();
+        let mut reg = Registry::load().unwrap();
+        reg.add(name, dir).unwrap();
+        reg.save().unwrap();
+    }
+
+    #[test]
+    fn a_running_vm_whose_settings_do_not_read_is_not_deleted() {
+        let env = Env::new("delete-running");
+        let dir = env.root.join("vms/x");
+        register("x", &dir, "name = ");
+        let pidfile = vm::pidfile_in(&dir);
+        // A process whose command line names the pid file, as QEMU's does.
+        let mut qemu = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(&pidfile)
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", qemu.id())).unwrap();
+        let r = delete_vm("x", false);
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("x is running"), "{e}");
+        assert!(dir.join(vm::CONFIG_FILE).is_file());
+        assert!(Registry::load().unwrap().find("x").is_some());
+    }
 
     #[test]
     fn a_change_of_installer_deletes_only_the_vms_own_copy() {
