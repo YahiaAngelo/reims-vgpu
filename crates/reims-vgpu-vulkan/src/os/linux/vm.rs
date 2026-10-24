@@ -491,9 +491,10 @@ impl HostVm for LinuxVm {
         if length == 0 {
             return Ok(HostAddr::NULL);
         }
-        let at = anonymous(None, length, "allocate_anywhere")?;
-        files::forget(at, length);
-        Ok(HostAddr::from_addr(at.to_usize()))
+        // vphone-linux: a shared mapping of a new file, not anonymous memory: Mach's memory can
+        // always be aliased later (an iOS guest's heaps over task memory remap it), and Linux's
+        // anonymous memory cannot.
+        allocate_aliasable(len)
     }
 
     /// Fresh anonymous memory over the pages of the range's length from the page of its address
@@ -503,8 +504,13 @@ impl HostVm for LinuxVm {
         if length == 0 {
             return Ok(());
         }
-        anonymous(Some(first), length, "allocate_fixed_overwrite")?;
-        files::forget(first, length);
+        // vphone-linux: a shared mapping of a new file a view can be made of, as
+        // `allocate_anywhere`'s.
+        budget::admit(1, "a range a view can be made of");
+        let backing = Backing { fd: memfd(length), offset: 0 };
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        file(Some(first), length, &backing, prot)?;
+        files::record(first, length, backing, prot);
         Ok(())
     }
 
