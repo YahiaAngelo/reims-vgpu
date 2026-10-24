@@ -2199,8 +2199,18 @@ pub(crate) fn texture_over_plane(
 ) -> RaiseResult<Option<rt::Texture>> {
     let format = fields.raw_pixel_format();
     create(sel, Policy::Dies, Nil::Never, || {
-        (buffer.new_texture_with_iosurface_plane(desc, plane))
-            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+        match buffer.new_texture_with_iosurface_plane(desc, plane) {
+            // vphone-linux: a texture over a surface layout or format the runtime does not
+            // convert (an iOS private OSType) is nil, not the VM's death.
+            Err(rt::Error::Unsupported(u)) => {
+                log::warn!("{sel}: format {format}: {u:?}; answered nil");
+                Err(rt::Error::Nil(rt::Nil::new(
+                    "new_texture_with_iosurface_plane",
+                    rt::Problem::StorageMode,
+                )))
+            }
+            made => made.map_err(|e| created_format_refused(sel, "a texture of", format, e)),
+        }
     })
 }
 

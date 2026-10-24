@@ -364,7 +364,21 @@ mod tests {
         };
         assert_ne!(ram, libc::MAP_FAILED);
         let ram = HostAddr::from_ptr(ram.cast::<u8>());
-        let plain = vm.allocate_anywhere(LEN).unwrap();
+        // Anonymous memory of its own (vphone-linux: `allocate_anywhere` now answers a file's
+        // shared mapping, which a view can be made of).
+        // SAFETY: a fresh mapping at an address the kernel picks.
+        let plain = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(plain, libc::MAP_FAILED);
+        let plain = HostAddr::from_ptr(plain.cast::<u8>());
         let mut map = MemoryMap::new();
         let file = MemoryFile {
             fd: Arc::clone(&fd),
@@ -396,7 +410,8 @@ mod tests {
         drop(map);
         // SAFETY: the mapping made above, which nothing uses any more.
         assert_eq!(unsafe { libc::munmap(ram.as_ptr(), LEN as usize) }, 0);
-        assert!(vm.deallocate(plain, LEN).is_success());
+        // SAFETY: the anonymous mapping made above, which nothing uses any more.
+        assert_eq!(unsafe { libc::munmap(plain.as_ptr(), LEN as usize) }, 0);
     }
 
     /// One frame queue per Metal device, made once, and unshared

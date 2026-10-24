@@ -2141,6 +2141,30 @@ impl VulkanRenderEncoder {
         });
     }
 
+    /// Decides a draw's `refusal` as [`Self::run`] does (vphone-linux), except that a draw the
+    /// runtime refuses as unsupported is skipped, logged, instead of the VM's death, so one
+    /// element goes missing where the guest uses a feature the runtime does not hold.
+    fn decide_skipping(sel: &'static str, refusal: Option<rt::Error>) -> RaiseResult<()> {
+        match refusal {
+            None => Ok(()),
+            Some(
+                e @ (rt::Error::Unsupported(_)
+                | rt::Error::Bind(_)
+                | rt::Error::NotImplemented(_)
+                | rt::Error::AppleOnly(_)
+                | rt::Error::Compile(_)),
+            ) => {
+                use std::sync::atomic::AtomicU32;
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                    log::warn!("{sel}: draw skipped, the runtime refused it: {e}");
+                }
+                Ok(())
+            }
+            Some(e) => decide(sel, Policy::Dies, e),
+        }
+    }
+
     /// Dies at `sel`, a draw or an execution of indirect commands that is not empty, in a pass
     /// of a rate map of no layers: Metal's rasterizes it by what earlier maps left, which no call
     /// tells, where the runtime's draws nothing ([`crate::gpu::rate_map`]). In a pass of a map
@@ -2260,7 +2284,7 @@ impl VulkanRenderEncoder {
     fn binds(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
         let mut refusal = None;
         let ((), heard) = crate::answer::hearing(|| self.sent(sel, call, &mut refusal));
-        let drawn = refusal.map_or(Ok(()), |e| decide(sel, Policy::Dies, e));
+        let drawn = Self::decide_skipping(sel, refusal);
         if heard.contains(&rt::Degradation::HalfOutputPrecision)
             && let Some(apart) = plain(|| self.drawing.lock().borrow().marks.half_apart)
         {
