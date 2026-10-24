@@ -185,7 +185,25 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
         predication::observe(self, &cmd);
         let caught =
             |call: &mut dyn FnMut(&mut rt::ComputeCommandEncoder) -> Result<(), rt::Error>| {
-                send(sel, Policy::Dies, || self.with(sel, |e| call(e)))
+                send(sel, Policy::Dies, || match self.with(sel, |e| call(e)) {
+                    // vphone-linux: a dispatch the runtime refuses as unsupported is skipped,
+                    // logged, instead of the VM's death.
+                    Err(
+                        e @ (rt::Error::Unsupported(_)
+                        | rt::Error::Bind(_)
+                        | rt::Error::NotImplemented(_)
+                        | rt::Error::AppleOnly(_)
+                        | rt::Error::Compile(_)),
+                    ) if sel.starts_with("dispatch") => {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static N: AtomicU32 = AtomicU32::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                            log::warn!("{sel}: dispatch skipped, the runtime refused it: {e}");
+                        }
+                        Ok(())
+                    }
+                    done => done,
+                })
             };
         if matches!(
             cmd,
