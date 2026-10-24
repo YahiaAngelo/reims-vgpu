@@ -64,7 +64,10 @@ fn load(device: &VulkanDevice) -> Result<Option<VulkanLibrary>, NsErrorText> {
             raw,
             device: device.clone_ref(),
         }))),
-        Err(e @ Error::Compile(_)) => Err(error_text(&e)),
+        Err(e @ Error::Compile(_)) => {
+            log::warn!("{SELECTOR}: answered an NSError: {e}");
+            Err(error_text(&e))
+        }
         Err(e) => refused(SELECTOR, &e),
     }
 }

@@ -1400,8 +1400,18 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let format = fields.raw_pixel_format();
         let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (buffer.new_texture_with_iosurface_plane(&desc, plane))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
+            match buffer.new_texture_with_iosurface_plane(&desc, plane) {
+                // vphone-linux: a texture over a surface layout or format the runtime does
+                // not convert (an iOS private OSType) is nil, not the VM's death.
+                Err(rt::Error::Unsupported(u)) => {
+                    log::warn!("{sel}: format {format}: {u:?}; answered nil");
+                    Err(rt::Error::Nil(rt::Nil::new(
+                        "new_texture_with_iosurface_plane",
+                        rt::Problem::StorageMode,
+                    )))
+                }
+                made => made.map_err(|e| format_refused(sel, "a texture of", format, e)),
+            }
         })?
         else {
             return Ok(None);
