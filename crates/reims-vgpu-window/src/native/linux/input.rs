@@ -50,6 +50,18 @@ pub(crate) const FOCUS_CLICK_NS: u64 = 100_000_000;
 /// What the title ends with while captured: what capture is on and how to release it.
 const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Super to release)";
 
+/// Whether a click in the image captures input (vphone-linux): only with
+/// `REIMS_VGPU_CAPTURE_INPUT=1`. Without it the pointer is never held in the window nor the keyboard
+/// grabbed, so a guest that stops answering cannot trap the host's pointer and shortcuts; keys still
+/// reach the guest while the window has the keyboard.
+fn capture_input() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REIMS_VGPU_CAPTURE_INPUT").is_some_and(|v| v == "1"))
+}
+
 /// What the window knows when an event reaches it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct At {
@@ -149,12 +161,18 @@ pub(crate) struct Input {
     focused_at: Option<u64>,
     /// What to send, in order, since [`send`] last took it.
     out: Vec<ToHost>,
+    /// Whether a click in the image captures input (vphone-linux, [`capture_input`]); off, a
+    /// click is only forwarded.
+    no_capture: bool,
 }
 
 impl Input {
     /// Nothing held, nothing captured, no keyboard.
     pub(crate) fn new() -> Input {
-        Input::default()
+        Input {
+            no_capture: !capture_input(),
+            ..Input::default()
+        }
     }
 
     /// Whether input, the keyboard and the pointer, is captured.
@@ -172,8 +190,10 @@ impl Input {
     pub(crate) fn title_suffix(&self) -> &'static str {
         if self.is_captured() {
             CAPTURED_SUFFIX
-        } else {
+        } else if !self.no_capture {
             UNCAPTURED_SUFFIX
+        } else {
+            ""
         }
     }
 
@@ -218,6 +238,11 @@ impl Input {
         let was_captured = self.is_captured();
         let forward = if was_captured {
             true
+        } else if self.no_capture {
+            // vphone-linux: no capture unless asked for (a phone's pointer is absolute, and
+            // keys reach the guest captured or not); the click is forwarded as a captured one
+            // would be, the focusing click excepted.
+            !focusing
         } else {
             self.capture.click_in_image(!focusing).forward
         };
@@ -432,6 +457,18 @@ mod tests {
         let r = input.button_down(BUTTON_RIGHT, 1_000_000_000, &at((50.0, 25.0)));
         assert!(r.capture_changed && input.is_captured());
         assert_eq!(input.take(), vec![pointer(100, 50, BUTTON_RIGHT)]);
+    }
+
+    /// vphone-linux: without `REIMS_VGPU_CAPTURE_INPUT=1` a click in the image is sent and
+    /// captures nothing, so the pointer is never held in the window.
+    #[test]
+    fn without_capture_a_click_is_sent_and_captures_nothing() {
+        let mut input = focused();
+        input.no_capture = true;
+        let r = input.button_down(BUTTON_RIGHT, 1_000_000_000, &at((50.0, 25.0)));
+        assert!(!r.capture_changed && !input.is_captured());
+        assert_eq!(input.take(), vec![pointer(100, 50, BUTTON_RIGHT)]);
+        assert_eq!(input.title_suffix(), "");
     }
 
     /// A drag ends in the guest wherever the button comes up, held at the nearest edge
