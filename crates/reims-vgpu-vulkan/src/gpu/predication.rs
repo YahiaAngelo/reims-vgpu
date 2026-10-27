@@ -2043,18 +2043,43 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
         || work.direct_only(u.bindings.pipeline.as_ref())
     {
         drop(u);
-        return send(sel, Policy::Dies, || enc.with(sel, |e| work.direct(e)));
+        return send_dispatch(sel, || enc.with(sel, |e| work.direct(e)));
     }
     u.work = true;
     if !u.predicated() {
         drop(u);
-        return send(sel, Policy::Dies, || enc.with(sel, |e| work.direct(e)));
+        return send_dispatch(sel, || enc.with(sel, |e| work.direct(e)));
     }
     let (step, guest) = work.arguments(sel);
     let (chunk, at) = u.step(predication, enc, sel, step, guest);
     drop(u);
-    send(sel, Policy::Dies, || {
-        enc.with(sel, |e| work.indirect(e, &chunk, at + OUT))
+    send_dispatch(sel, || enc.with(sel, |e| work.indirect(e, &chunk, at + OUT)))
+}
+
+/// [`send`] for a dispatch (vphone-linux): a dispatch the runtime refuses as unsupported is
+/// skipped, logged, instead of the VM's death, as `VulkanComputeEncoder::encode` does for the
+/// commands it sends itself: one element goes missing where an iOS app's kernel uses a feature the
+/// runtime does not hold (a texture format, say).
+fn send_dispatch(
+    sel: &'static str,
+    call: impl FnOnce() -> Result<(), rt::Error>,
+) -> RaiseResult<()> {
+    send(sel, Policy::Dies, || match call() {
+        Err(
+            e @ (rt::Error::Unsupported(_)
+            | rt::Error::Bind(_)
+            | rt::Error::NotImplemented(_)
+            | rt::Error::AppleOnly(_)
+            | rt::Error::Compile(_)),
+        ) => {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                log::warn!("{sel}: dispatch skipped, the runtime refused it: {e}");
+            }
+            Ok(())
+        }
+        done => done,
     })
 }
 
