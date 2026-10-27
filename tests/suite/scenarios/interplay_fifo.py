@@ -697,7 +697,7 @@ def interplay_fifo_timeout_report_mismatch_dies():
     (DeviceCore::fifo_for_stamp_index). Child 1 on stampIndex 3 blocks on
     slot 6, and child 3 exists on stampIndex 5: the host dies when the
     report runs, with no MMIO write to cause it (docs/testing.md, section
-    7.4: "read, not yet locked")."""
+    7.4)."""
     w = World("interplay_fifo_timeout_report_mismatch_dies", interplay_fifo_timeout_report_mismatch_dies.__doc__,
               children=(1, 3), stamp_indices={1: 3, 3: 5}, slots=7)
     s = w.s
