@@ -7,11 +7,6 @@ tree reproduces every expected file its predecessor passed, and a change
 meant to alter behaviour records the affected files again and commits their
 diff for review (decision 3, section 5.7).
 
-The suite describes this codebase, not Apple's framework, and never runs
-against Apple's framework. That framework matters as the thing this
-codebase replaces: guests were written against it, so the behaviour the
-suite locks includes its oddities (section 7).
-
 Besides the suite's design, this document holds what the suite is built
 on:
 - the guest ABI as the code implements it (section 6);
@@ -35,17 +30,13 @@ reason AGENTS.md gives for names.
 suite's, under `tests/suite/`.
 
 **Hosts.** A measurement that names a scenario was made by the suite, on
-its host: an Apple M3 Max with a 40-core GPU, on macOS build 25G229 (26.7)
-until 2026-10-13 and on 26A434 (27.0.1) since. The host-dependent expected
-files are 26A434's alone (`AppleM3Max-40c-26A434`, section 5.7): the
-suite's behaviour is macOS 27's, and 25G229's files went on 2026-10-23,
-with no host left to record them. One that names no scenario was made with
-a probe on another Mac:
-- macOS 26.6.2 (25G83);
-- Apple M4 Pro: a 14-core CPU, a 20-core GPU (`AGXG16SDevice`, Apple9
-  family), and 16 KiB `vm_page_size`;
-- Xcode 26.6 (17F113) with the macOS 26.5 SDK: Apple clang 21.0.0
-  (clang-2100.1.1.101), ld-1267, and Apple metal 32023.883.
+its host: an Apple M3 Max with a 40-core GPU, on macOS 27.0.1 (26A434),
+whose files are the only host-dependent expected files
+(`AppleM3Max-40c-26A434`, section 5.7). One that names no scenario was made
+with a probe on an Apple M4 Pro (a 14-core CPU, a 20-core GPU,
+`AGXG16SDevice`, Apple9 family, 16 KiB `vm_page_size`) on macOS 26.6.2
+(25G83), built with Xcode 26.6 (17F113) and the macOS 26.5 SDK: Apple clang
+21.0.0 (clang-2100.1.1.101), ld-1267 and Apple metal 32023.883.
 
 ## Contents
 
@@ -311,20 +302,21 @@ does with each item (**read**).
 | `rvg_display_release` | on a failed realize only |
 | `rvg_display_present_counts` | unused |
 | `rvg_frame_target_create`, `_retain`, `_release`, `_read_pixels`; `rvg_display_encode_frame`; `rvg_frame_commit`, `_wait`, `_release` | used, with BGRA8Unorm targets only |
-| `rvg_iosurface_device_create`, `_mmio_read`, `_mmio_write` | `apple-gfx-mmio` |
+| `rvg_iosurface_device_create`, `_mmio_read`, `_mmio_write` | `apple-gfx-mmio`, and `apple-gfx-iosurface-pci` |
 | `rvg_iosurface_device_release`, `rvg_log_set_handler` | unused |
 | `rvg_status_message` | used |
 | `RVG_PCI_*` (vendor 0x106b, device 0xeeee, BAR 0, one MSI vector), `RVG_DEVICE_MMIO_SIZE` (0x4000) | used |
 
 **The IOSurface host device's registers** are 64 bits wide:
 `rvg_iosurface_device_mmio_read` returns a `uint64_t` and `_write` takes one.
-QEMU's `apple-gfx-mmio` reads and writes them as 32 bits, so through QEMU
-writes are truncated and reads truncated, then zero-extended
-(`apple-gfx-mmio.c:45-58`, **read**). Virtualization.framework, below, uses
-the full 64 bits. The runner truncates as QEMU does, so the upper halves are
-out of its reach: the memory map's refusals of a ring too large to reserve
-and of a base plus length that overflows are one 64-bit write each, which
-core's unit tests make (`iosurface/regs.rs`).
+QEMU's `apple-gfx-mmio` reads and writes them as 32 bits: writes are
+truncated, and reads truncated, then zero-extended (`iosfc_read` and
+`iosfc_write`, `apple-gfx-mmio.c`, **read**). `apple-gfx-iosurface-pci`
+passes an 8-byte access whole, and Virtualization.framework, below, uses
+the full 64 bits. The runner truncates as `apple-gfx-mmio` does, so the
+upper halves are out of its reach: the memory map's refusals of a ring too
+large to reserve and of a base plus length that overflows are one 64-bit
+write each, which core's unit tests make (`iosurface/regs.rs`).
 
 **What the suite covers.** Every function of the header, with any argument
 value it makes legal (decision 1), whether QEMU calls it or not: suspend,
@@ -435,8 +427,9 @@ expected values by them.
   So: one device per process, and unique serial numbers.
 - **What the code reads from its environment** (**read**; [api.md](api.md)
   section 2, "Settings and the environment", lists each variable):
-  `REIMS_VGPU_LOG` and `REIMS_VGPU_STATS`, diagnostics that change nothing
-  the guest or host observes; the `REIMS_VGPU_WINDOW_*` variables, which
+  `REIMS_VGPU_LOG`, `REIMS_VGPU_STATS` and `REIMS_VGPU_TRACE` (with
+  `REIMS_VGPU_TRACE_DEGRADE`), diagnostics that change nothing the guest
+  or host observes; the `REIMS_VGPU_WINDOW_*` variables, which
   only a display with a window reads, and the runner makes none; and the
   Vulkan platform's `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and
   `REIMS_VGPU_CENSUS_DIR`, which the Metal platform never reads. Nothing
@@ -696,9 +689,7 @@ each callback's thread (section 5.10), and records it as `newFrame`,
     2 s for the frames in flight, then logs a fault and proceeds. A host
     that encodes and never commits therefore makes every later present take
     2 s.
-- **Measured.** An EFI present of a 64×32 BGRA frame read back bit for bit
-  identical to guest memory. A later guest write showed up in the next encode
-  without another present: the frame is a zero-copy view.
+  - An EFI frame is a zero-copy view of guest memory (section 6.22).
 
 ### 4.7 Persisted state
 
@@ -718,9 +709,9 @@ each callback's thread (section 5.10), and records it as `newFrame`,
     observation must equal an unsuspended run's;
   - feeding a blob one build saved into another build is the check across
     builds.
-- **The IOSurface host device's save state.** Apple's framework had one
-  (0x88 bytes, 16 of them uninitialised; section 6.23), reached only by
-  private calls. This library has none, and the C API no call for it.
+- **The IOSurface host device's save state.** Apple's framework had one,
+  reached only by private calls. This library has none, and the C API no
+  call for it (section 6.23).
 
 ### 4.8 Outcomes: fault, crash, hang
 
@@ -876,8 +867,8 @@ each makes.
 | `config` | Allocates guest RAM (`mach_vm_allocate`), loads a handoff when there is one (section 5.10's phases), and creates the IOSurface host device, the device and its displays from the scenario's config, recording the refusal of each that refuses. Writes the `binding` record: which image answered, the setup, and the GPU and pid as diagnostics. |
 | `mem`, `fill`, `mem_file` | Writes hex bytes, a repeated byte, or a committed fixture (checked by its SHA-256) at a guest address, and records them in a shadow copy of guest RAM. |
 | `mem_seq` | `count` copies of a hex template at `gpa + k × stride`; each field `[off, size, start, step]` stores `start + k × step`, little-endian, 4 or 8 bytes, at `off` in copy k. Written into the shadow copy like `mem`. For structures too large to spell out: thousands of commands, or page tables of thousands of entries. |
-| `mmio_w`, `mmio_r`, `mmio_sweep` | One register write or read of the device, from a pool thread while the scenario thread waits, as QEMU made them before it called the library on the vCPU's thread; a sweep reads every register in a range and reports the nonzero ones. |
-| `iosfc_w`, `iosfc_r`, `iosfc_sweep` | The same for the IOSurface host device, each value truncated to 32 bits, as QEMU declares them (section 3.1). |
+| `mmio_w`, `mmio_r`, `mmio_sweep` | One register write or read of the device, from a pool thread while the scenario thread waits (decision 1); a sweep reads every register in a range and reports the nonzero ones. |
+| `iosfc_w`, `iosfc_r`, `iosfc_sweep` | The same for the IOSurface host device, each value truncated to 32 bits, as `apple-gfx-mmio` declares them (section 3.1). |
 | `wait` | Polls until a guest u32 at `gpa` is `eq`, `ge` (serial-number comparison) or `ne` a value, a register that reading does not clear matches, and/or the interrupt, callback, block-call or IOSurface-interrupt counts reach theirs, or a callback kind arrives, with a deadline. Reports ok or timeout. |
 | `wait` with `any` | A list of conditions, satisfied when one holds; the observation's `which` names the first in list order that does (`Scenario.wait_any`). |
 | `quiesce` | Waits until no event has arrived for a quiet window, within a deadline: the settle a checkpoint takes. |
@@ -895,17 +886,10 @@ each makes.
 | `handoff_save` | Ends a phase: guest RAM and the blob slots saved for the next process (section 5.10's phases). |
 | `mark` | A label. |
 
-Three choices keep the runner a hypervisor's (**read**):
-- The IOSurface host device's registers are 64 bits wide in the C API,
-  and the runner truncates each value to 32 bits, as QEMU's `uint32_t`
-  declaration does (decision 1), so their upper halves are out of reach
-  (section 3.1).
-- Suspend and resume either recreate the device in the same process (`api
-  recreate`), over the same guest RAM, or split the scenario into phases,
-  each a process of its own (a migration); a blob can also be given as hex.
-- A frame is encoded when the scenario asks (`encode`), on a pool thread,
-  into a frame target the library makes, and read back once the runner
-  has committed it and waited for it.
+Suspend and resume either recreate the device in the same process (`api
+recreate`), over the same guest RAM, or split the scenario into phases,
+each a process of its own (a migration); `willResume` can also take a blob
+given as hex (**read**).
 
 ### 5.3 Formats
 
@@ -929,25 +913,16 @@ Three choices keep the runner a hypervisor's (**read**):
 
 ### 5.4 Determinism
 
-**Measured** with probes on the M4 Pro: 666 sequential runs in 38 groups
-(scenario × isolation, 20 runs a group, 3-5 for the crash and hang
-scenarios), and 400 runs 8 at a time, isolation off and on. Every group
-gave exactly one normalized log. That covers stamps, memory diffs,
-register values, device info, heap replies, display page contents,
-callback contents and order, blit bytes, and the crash signal and op
-index. `bless` checks the same of every case it records (section 5.7).
-
-What varied, in the strict (unnormalized) view:
-- Whether an interrupt arrived during the doorbell write or during the
-  following wait: 1-4 of 20 runs per affected scenario.
-- Whether a display callback arrived during the doorbell op or after it:
-  6-9 of 20.
-- The stamp becoming visible in guest memory before `raise_interrupt` had
-  run: between 0.6% and 7.6% of samples, depending on the isolation and the
-  load. The code is the same in every case, so this is timing.
-- A read of 0x1018 immediately after the stamp became visible was never 0 in
-  60,000 samples. The race exists in principle all the same, because the
-  stamp is stored before the bit is set (section 4.4).
+**Measured** with probes on the M4 Pro, run one at a time and 8 at a time,
+isolation off and on: every scenario gave one normalized log, its stamps,
+memory, registers, replies, display pages, callbacks and their order, and
+crash op alike. `bless` checks the same of every case it records (section
+5.7). Only timing varied, in the unnormalized view: which op an interrupt
+or a display callback arrived during (the doorbell write, or the wait after
+it), and whether the stamp was visible in guest memory before
+`raise_interrupt` had run. A read of 0x1018 just after the stamp became
+visible was never 0 in 60,000 samples, but the stamp is stored before the
+bit is set (section 4.4), so the race exists.
 
 **Rules:**
 - Wait for the guest-visible condition *and* the interrupt count, then read
@@ -1023,8 +998,7 @@ host death must be a scenario's last command (tests/suite/README.md, rule 3).
   feature level never set, one device per process, unique serial numbers.
 - **Metal API validation** is not a configuration: it is a debugging
   environment, not something a hypervisor sets (decision 1).
-  `MTL_DEBUG_LAYER=1` changes behaviour: the texture view that presenting
-  from a backing creates asserts under it (**measured**).
+  `MTL_DEBUG_LAYER=1` changes behaviour (section 6.21, "Presents").
 
 ### 5.7 Expected values and blessing
 
@@ -1076,17 +1050,15 @@ host death must be a scenario's last command (tests/suite/README.md, rule 3).
 
 These are asserted without pinning the value:
 - **Computed in the test from Metal.** The heap texture size and alignment
-  reply equalled `-[MTLDevice heapTextureSizeAndAlignWithDescriptor:]` for
-  the same descriptor (**measured**). The test computes the expected value
-  the same way, and must build the same descriptor: the suite's
-  `tasks_heap_success` records its reply beside a query that leaves
-  `allowGPUOptimizedContents` at Metal's default, while the guest's
-  descriptor clears it, and the two differ (section 6.10). The runner's
-  `metal` op takes `allow_gpu_optimized` for this:
-  `textures_gap_heap_gpu_optimized` asks Metal with the bit clear and set,
-  and the replies to opcode 64 equal Metal's both ways (64×64 RGBA8Unorm:
-  0x4000/0x80 clear, 0x4080/0x80 set, so a one-page heap takes the texture
-  only with the bit clear; **measured**).
+  reply equals `-[MTLDevice heapTextureSizeAndAlignWithDescriptor:]` for
+  the same descriptor (section 6.10). The test computes the expected value
+  the same way, and must build the same descriptor,
+  `allowGPUOptimizedContents` included: the runner's `metal` op takes
+  `allow_gpu_optimized` for this, and `textures_gap_heap_gpu_optimized`
+  asks Metal with the bit clear and set, and the replies to opcode 64 equal
+  Metal's both ways (64×64 RGBA8Unorm: 0x4000/0x80 clear, 0x4080/0x80 set,
+  so a one-page heap takes the texture only with the bit clear;
+  **measured**).
 - **As a relation.** For example:
   - a placement entry's gpuResourceID equals the info reply 466 or 467 for
     the same object;
@@ -1096,8 +1068,7 @@ These are asserted without pinning the value:
   (section 6.9), compute info, pipeline limits, 0x1224.
 
 Whether GPU addresses and resource IDs are stable from run to run is
-**unknown**. A trivial program got the same gpuAddress twice (**measured**),
-which is not enough to rely on.
+**unknown** (section 9).
 
 ### 5.9 Rules for test code
 
@@ -1290,12 +1261,10 @@ which is not enough to rely on.
     (`interplay_marathon`), and many GPU tasks with faults injected into
     one at a time (`interplay_servicewalk`).
 - **Exclusive scenarios.** A command buffer that faults the GPU makes
-  Metal discard other processes' work too ("victim of GPU error" in the
-  system log). **Measured**: under parallel load `render_draw_primitives`
-  and `render_objects_depth_stencil` had exec stamps stall, every wait
-  timing out, and passed 10 of 10 run serially; the log held "Caused GPU
-  Hang Error", "GPU Address Fault" and "Discarded (victim of GPU error)".
-  A scenario that faults the GPU, or crashes Metal's compiler service
+  Metal discard other processes' work too ("Discarded (victim of GPU
+  error)" in the system log), so the cases beside it stall with every wait
+  timing out (**measured**). A scenario that faults the GPU, or crashes
+  Metal's compiler service
   ("Compilation failed with XPC_ERROR", whose retries and crash reports
   under load outlast the watchdog), passes `exclusive=True`, and the
   orchestrator runs it alone, after the others (**read**, `pgtest/cli.py`,
@@ -1332,12 +1301,9 @@ which is not enough to rely on.
 
 - **Runner**: Objective-C, arm64 (section 5.1).
 - **Generator and orchestrator**: Python.
-- **pytest** can wrap the orchestrator for JUnit output.
 - **No fuzzing.** Apple clang 21 ships ASan, TSan, UBSan and the profile
   runtime, but no `libclang_rt.fuzzer_osx.a` (**measured**); Homebrew
-  LLVM ships a fuzzer runtime for arm64 only, which every Rust binary here
-  is. A fuzz target would be an arm64 build, and its findings would become
-  scenarios.
+  LLVM ships a fuzzer runtime for arm64 only.
 
 ### 5.12 Running against the checkout
 
@@ -1419,7 +1385,7 @@ unhandled writes are ignored.
 | 0x122c | guest display port count: the host's count at binary version 245, else `count != 0`, with a log on each read | |
 | 0x1234 | port connection types, `& 3` below version 245 | |
 
-A fresh device reads 0x122c = 1 and 0 elsewhere (**measured**).
+A fresh device's reads are section 4.2's.
 
 ### 6.3 Binary version negotiation
 
@@ -1820,18 +1786,15 @@ accepted only on the root FIFO. id 0 or >= maxFIFOCount faults; stampIndex
   still publish in order. A guest that needs the order puts a barrier on the
   FIFO's own previous stamp, which is not circular (`DeviceCore::add_wait`);
   every edge of `interplay_dag` is such a barrier.
-- **Repairing W3.** After a delete zeroes the next node's pageListPage, writing
-  that word back (+0x10) is enough: the next unpause's or resume's `Fifo::start`
-  maps the ring again and the child runs, and a barrier on a deleted child's old
-  stamps passes at once (`interplay_dag_redefined_chain`). Unrepaired, the
-  unpause's `Fifo::start` of the child fails: its node still says running, the
-  command already written on it is never parsed, and the FIFOs whose barriers
-  wait on it stay blocked while independent work runs. The guest recovers it by
-  writing its page list again, then 49 (which zeroes the following node's word
-  in turn, to be written back as well) and 48, and by writing the lost command
-  again at the start of its ring (the new FIFO reads from 0) with the same
-  stamp: the chain completes and equals the control
-  (`interplay_dag_w3_unrepaired`).
+- **Repairing W3.** Writing the zeroed word back (+0x10) is enough: the next
+  unpause's or resume's `Fifo::start` maps the ring again and the child runs,
+  and a barrier on a deleted child's old stamps passes at once
+  (`interplay_dag_redefined_chain`). Left unrepaired (above), the FIFOs whose
+  barriers wait on the child stay blocked while independent work runs. The
+  recovery by page list, 49 and 48 also writes back the word the 49 zeroes in
+  the following node, and writes the lost command again at the start of the
+  ring (the new FIFO reads from 0) with the same stamp: the chain completes
+  and equals the control (`interplay_dag_w3_unrepaired`).
 - **Waits across the 2 s report.** FIFOs blocked past the timeout have logged
   and posted a stamp-wait report and wait without a timeout; a pause wakes and
   quiesces them, the unpause starts every FIFO again, and they block again:
@@ -2898,8 +2861,7 @@ aborts, section 7.4):
   the kernel threadgroup memory count × 8 bytes at the lengths offset, ends
   the walk when that fails, then writes each length with its own 8-byte
   write), and Metal keeps a length for each index of each command (**measured**
-  with a probe, M3 Max, macOS 27.0.1: lengths 16, 32, 48, 64 and 0, 0, 80, 0
-  set on two commands read back as set in 301 of 301 runs).
+  with a probe, M3 Max, macOS 27.0.1).
 - Write-back errors are dropped: the synchronize completes, and the guest copy
   is marked valid (`icb_sync_errors` locks the completion).
 - A failed prepare only logs: the ICB stays host-invalid, the commands encoded
@@ -3920,10 +3882,11 @@ to fix: changing one is a change of behaviour, made on purpose and reviewed
 ### 7.2 Divergences between host setups
 
 The table at the end of section 6.10. They are real behaviour: a guest sees
-different results under `apple-gfx-pci` (map) and `apple-gfx-mmio`
-(isolate). The codebase keeps them: its local tasks and the service that
-runs each isolated task are separate code, each with its setup's
-behaviour.
+different results in the map setup and the isolate setup, under QEMU's
+`apple-gfx-pci` with and without a descriptor table and under
+`apple-gfx-mmio` (section 3.3). The codebase keeps them: its local tasks
+and the service that runs each isolated task are separate code, each with
+its setup's behaviour.
 
 - **Only the blocks setup reports its unmaps in timing order under a
   pause.** A pause while GPU tasks exist gets the host's `unmap_memory`
@@ -3992,8 +3955,10 @@ behaviour.
   present and after one, and the host lives (**measured**,
   `covgap_dev_encode_integer_target_dies`, which completes).
 - The IOSurface host device's registers are 64-bit
-  (`rvg_iosurface_device_mmio_read` and `_write` take a `uint64_t`); QEMU
-  reads and writes them as 32 bits, and so does the runner (section 3.1).
+  (`rvg_iosurface_device_mmio_read` and `_write` take a `uint64_t`);
+  QEMU's `apple-gfx-mmio` reads and writes them as 32 bits, and so does the
+  runner, while `apple-gfx-iosurface-pci` passes an 8-byte access whole
+  (section 3.1).
 - The host's release of port 0's display while the EFI display holds it
   hangs, where Apple's framework hangs. A present loads the bound display and
   holds it to its end, so after the host's release the present ends the
@@ -4009,8 +3974,8 @@ behaviour.
   queue; `-[PGEFIDisplay present]` and `getModeCount` load the display with
   `objc_loadWeak` inside an autorelease pool they pop at their end;
   `-[_PGDisplay dealloc]` unplugs, and `detachDisplay:port:` locks the same
-  mutex. **Measured**: a Darwin `std::mutex` locked again by the thread that
-  holds it hangs (3 of 3 runs, M3 Max, macOS 27.0.1). No scenario locks it,
+  mutex. A Darwin `std::mutex` locked again by the thread that holds it
+  hangs (**measured**, M3 Max, macOS 27.0.1). No scenario locks it,
   since the runner cannot place a host release inside a present; the unit
   tests `device::displays::tests::efi_display_holding_the_last_reference`
   reproduce both hangs with bounded waits.
@@ -4019,7 +3984,8 @@ behaviour.
 
 Each becomes a death test: one process, the outcome and the op it happened
 at are the expected result, in every setup where it is reachable. A host
-death in-process kills QEMU; `apple-gfx-pci` always runs tasks in-process.
+death in-process kills QEMU; `apple-gfx-pci` runs a task in-process unless
+its guest's `apple-gfx-iosurface-pci` has a descriptor table (section 3.3).
 Under isolation, a death in an isolated task's own code (the service's
 checks, a NULL guest access, a raise no job catches) ends that task only, a
 fault the guest sees: the exec faults, and every later command on that task
@@ -4037,7 +4003,7 @@ found or the code shows, that no expected file holds.
 
 | input | outcome | evidence |
 |---|---|---|
-| any info reply (450-469), render 0xa4, or ICB CPU synchronize in an in-process task (always on `apple-gfx-pci`) | host `abort()`: an in-process task has no writable cursor, and asking for one aborts | **measured** (461, exit 134); `info_reply_aborts_host`, `info_reply_aborts_host_cpu_buffer`, `info_460_bad_type_aborts_host` (460 fetches its cursor before it checks the type), `render_tile_dimensions_host`, `icb_sync_in_process` |
+| any info reply (450-469), render 0xa4, or ICB CPU synchronize in an in-process task | host `abort()`: an in-process task has no writable cursor, and asking for one aborts | **measured** (461, exit 134); `info_reply_aborts_host`, `info_reply_aborts_host_cpu_buffer`, `info_460_bad_type_aborts_host` (460 fetches its cursor before it checks the type), `render_tile_dimensions_host`, `icb_sync_in_process` |
 | in-process, `rvg_device_will_suspend` and `rvg_device_finish_suspend` with a guest-invalid ICB: the flush evicts it through the same cursor | host `abort()` | **measured**, `icb_evict_in_process` |
 | opcode 66 on an existing rate map in-process | host `abort()`: an in-process task does not read a map's object-list entry (`LocalTask`'s `reset_rate_map`, `tasks/local/exec.rs`) | **measured**, `exec_reset_rate_map_in_process`, `render_ratemap_reset_death` |
 | opcode 66 in the service on an immutable map, or on a map whose record no longer holds its header, its 0x14-byte command or its samples | the isolated task ends: the raises are uncaught in the service's job (`GpuTask`'s `reset_rasterization_rate_map`, `gpu_task/exec.rs`); a too-short command is not refused, since nothing checks a record's length against its command's (section 6.13) | **measured**, `exec_reset_rate_map_immutable` (the next command faults: the task has ended); `exec_reset_rate_map_tiny`, `_short` and `_under_command` lock only the fault; `mutgap_dec_rate_map_reset_7_bytes` locks the death for a 7-byte record, refused as shorter than its 8-byte header (`Deserializer::reset_rasterization_rate_map_with_serialized_data`) before its operation is looked at: the 66 faults, and so does the next; `mutgap2_rdec_rate_map_reset_short_entry` locks it for a record listed one byte short of its samples (section 6.16) |
@@ -4069,7 +4035,7 @@ found or the code shows, that no expected file holds.
 | an EFI mapping refused after a valid one, then a rebuild | the stale task: an unaligned length kills the host in every setup (with a memory map, the memory map's alignment assert); in the blocks setup the host's `map_memory` is called with a NULL task, and start 0, length 0 and a length over 64 MiB kill the host there | **measured**, `efi_stale_task_unaligned_length`, `efi_stale_task_start_0`, `efi_stale_task_length_0`, `efi_stale_task_length_over_64m` |
 | EFI enabled with a display the host created without `new_frame` | `present_frame` ends the process | **measured**, `efi_display_without_newframe` |
 | an IOSurface host device ring whose size × 16 is not a multiple of 16 KiB, written with a base set | the memory map's alignment assert | **measured**, `iosfc_ring_size_unaligned` |
-| blocks setup: a lazy map over run blocks the range tracker has fragmented (481 single-page runs, a map of [0, 1000), a lazy probe of [0, 1010)) | host `abort()` in the tracker's add, which finds a block ordered before the run (`memory.tracker.add_unordered` on the case's stderr in a suite run of 2026-09-29; the unit test `memory::tracker::tests::tasks_map_tracker_multiblock` reaches the same abort from a model of the runs) | **measured**, `tasks_map_tracker_multiblock` |
+| blocks setup: a lazy map over run blocks the range tracker has fragmented (481 single-page runs, a map of [0, 1000), a lazy probe of [0, 1010)) | host `abort()` in the tracker's add, which finds a block ordered before the run (`memory.tracker.add_unordered` on the case's stderr; the unit test `memory::tracker::tests::tasks_map_tracker_multiblock` reaches the same abort from a model of the runs) | **measured**, `tasks_map_tracker_multiblock` |
 | blocks setup: a run block of 256 runs (adds stop at 240, but an unmap inside a run splits it in place up to the array's 256), then an unmap of a whole run in it | assert `run_count < RUNS_PER_BLOCK` in `RunBlock::remove`: host death | **measured**, `mutgap_mem_tracker_block_256_runs` |
 | blocks setup: a map that finds its run block full among 128 blocks, while an emptied block stays after the others (runs added before an empty block all go to the block before it) and the runs' total is not a multiple of 240 | `compact` packs the blocks from the front, leaves the last non-empty one short with the empty one after it, and asserts `to_steal != 0`: host death at the map | **measured**, `mutgap_mem_tracker_compact_empty_block` |
 | blocks setup: a run block of 240 runs (239 single-page runs and one of three pages), an unmap inside the three-page run, which splits it in place to 241 runs, then a map into the block | `RunBlock::split` keeps `old_count - half` runs, 121 and 121 of 241, and asserts that they add up: host death at the map | **measured**, `mutgap2_res_tracker_split_odd_death` (`mutgap2_res_tracker_split_adjacent` is the even control: 240 runs split into two of 120) |
@@ -4161,7 +4127,7 @@ completion (up to 2 s); info-indirect's 5 s wait; the EFI 100 ms timer;
 service handshake latency.
 
 **Per run**: GPU addresses, resource IDs and unique identifiers (W8, W12).
-No host virtual address was found reaching the guest.
+No host virtual address is known to reach the guest (section 4.3).
 
 **Host GPU and OS**: device info, compute info, pipeline replies, heap size
 and alignment, rate-map sizes, 0x1224, argument-buffer support, detach vs
@@ -4194,11 +4160,10 @@ nil, error and fault condition, and GPU compute and render output (decision
 - Whether IOSurface wraps or copies the mapper's guest pages.
 - Whether Metal's serialized pipeline format changes between macOS
   releases.
-- Whether the library's shaders (section 3.2) compute what Apple's did on
+- Whether the library's shaders (section 3.2) compute what Apple's do on
   inputs no case reaches. On every frame and XR10 byte the suite records
-  (1,224 encode and XR10 cases) they agree with Apple's bit for bit
-  (**measured**), and `gpu::shaders`' tests check each function on known
-  pixels; other sampler rounding edges were not compared.
+  they agree with Apple's bit for bit (**measured**), and `gpu::shaders`'
+  tests check each function on known pixels.
 
 ## Sources
 
