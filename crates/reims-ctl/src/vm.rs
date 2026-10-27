@@ -129,19 +129,44 @@ impl Graphics {
     }
 }
 
-/// The controller an x86-64 VM's system disk is on.
+/// The controller an x86-64 VM's system disk is on, which its settings choose.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskController {
-    /// ICH9's AHCI controller, at [`Q35::disk_port`]: the disk of a VM made before reims-ctl put
-    /// it on NVMe, whose settings name no controller.
+    /// A SATA disk on ICH9's AHCI controller, at [`Q35::disk_port`]: the disk of every VM
+    /// reims-ctl makes, whose settings name no controller. macOS 26's installer, as reims-ctl
+    /// downloads it, may find no disk on NVMe.
     #[default]
     Ahci,
-    /// An NVMe controller of its own: the disk of every VM reims-ctl makes.
+    /// An NVMe controller of its own, for a VM with macOS installed: macOS finds its APFS
+    /// container on either controller.
     Nvme,
 }
 
 impl DiskController {
+    pub const ALL: [DiskController; 2] = [DiskController::Ahci, DiskController::Nvme];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            DiskController::Ahci => "ahci",
+            DiskController::Nvme => "nvme",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            DiskController::Ahci => "SATA",
+            DiskController::Nvme => "NVMe",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<DiskController> {
+        DiskController::ALL
+            .into_iter()
+            .find(|d| d.id() == s.trim())
+            .with_context(|| format!("the disk controller is ahci or nvme, not {s:?}"))
+    }
+
     fn is_ahci(&self) -> bool {
         *self == DiskController::Ahci
     }
@@ -387,8 +412,9 @@ pub struct Q35 {
     pub cpu_model: String,
     #[serde(default = "default_cpu_flags")]
     pub cpu_flags: String,
-    /// The system disk's controller: NVMe for every VM reims-ctl makes. A VM made before keeps
-    /// its disk on AHCI, since OpenCore's saved boot entry names the controller and the port.
+    /// The system disk's controller: SATA for every VM reims-ctl makes, which its settings may
+    /// move to NVMe once macOS is installed. OpenCore's saved boot entry names the controller
+    /// and the port, so after a move an attached installer may boot instead.
     #[serde(default, skip_serializing_if = "DiskController::is_ahci")]
     pub disk_controller: DiskController,
     /// The system disk's AHCI port, on [`DiskController::Ahci`]: 3, after OpenCore's 2.
@@ -1005,18 +1031,25 @@ mod tests {
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
     }
 
-    /// A VM saved before reims-ctl put the disk on NVMe names no controller, keeps its disk on
-    /// AHCI, and saves as it did.
+    /// A VM whose settings name no controller has its disk on SATA, and one on SATA saves
+    /// naming none.
     #[test]
-    fn a_vm_naming_no_disk_controller_keeps_its_disk_on_ahci() {
+    fn a_vm_naming_no_disk_controller_has_its_disk_on_sata() {
         let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("disk_controller = \"nvme\"\n"), "{text}");
-        let before = text.replace("disk_controller = \"nvme\"\n", "");
-        let q = toml::from_str::<VmConfig>(&before).unwrap().q35.unwrap();
+        let sata = text.replace("disk_controller = \"nvme\"\n", "");
+        let q = toml::from_str::<VmConfig>(&sata).unwrap().q35.unwrap();
         assert_eq!(q.disk_controller, DiskController::Ahci);
         c.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
-        assert_eq!(toml::to_string_pretty(&c).unwrap(), before);
+        assert_eq!(toml::to_string_pretty(&c).unwrap(), sata);
+        // The settings name each controller by the id `set --disk-controller` takes.
+        for d in DiskController::ALL {
+            assert_eq!(DiskController::parse(d.id()).unwrap(), d);
+            let named = text.replace("\"nvme\"", &format!("\"{}\"", d.id()));
+            let q = toml::from_str::<VmConfig>(&named).unwrap().q35.unwrap();
+            assert_eq!(q.disk_controller, d);
+        }
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`

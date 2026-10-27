@@ -12,7 +12,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::{DEFAULT_STOP_TIMEOUT, Graphics, Vm};
+use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -175,7 +175,8 @@ pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
 /// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
-/// whose Reinstall macOS installs it.
+/// whose Reinstall macOS installs it. For a disk on NVMe, they first say to move it to SATA
+/// ([`DiskController`]).
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -187,12 +188,20 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
     } else {
         "pick Reinstall macOS"
     };
+    let name = vm.name();
+    let first = match q.disk_controller {
+        DiskController::Ahci => String::new(),
+        DiskController::Nvme => format!(
+            "Its disk is on NVMe, where macOS's installer may find no disk: first move it to \
+             SATA (reims-ctl set {name} --disk-controller ahci, or Disk controller in its edit \
+             form). "
+        ),
+    };
     Some(format!(
-        "To install macOS, start {name}: OpenCore boots its installer into macOS Recovery. If the \
-         VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as APFS and quit \
-         Disk Utility. Then {last}. Once macOS is installed, eject the installer (reims-ctl \
-         eject {name}) and set Metal's error mode (README).",
-        name = vm.name()
+        "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
+         Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
+         APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
+         (reims-ctl eject {name}) and set Metal's error mode (README)."
     ))
 }
 
@@ -936,5 +945,39 @@ mod tests {
         append(fault);
         assert_eq!(emptied_entry_lines(&log), 1);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// An x86-64 VM with an installer has install steps, which for a disk on NVMe first say to
+    /// move it to SATA.
+    #[test]
+    fn install_steps_move_a_disk_on_nvme_to_sata_first() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let steps = install_steps(&vm).unwrap();
+        assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
+        let q = vm.config.q35.as_mut().unwrap();
+        q.disk_controller = DiskController::Nvme;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.starts_with("Its disk is on NVMe")
+                && steps.contains("reims-ctl set t --disk-controller ahci"),
+            "{steps}"
+        );
+        vm.config.q35.as_mut().unwrap().installer = None;
+        assert_eq!(install_steps(&vm), None);
     }
 }

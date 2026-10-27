@@ -317,6 +317,11 @@ pub struct SetArgs {
     /// acceleration, in QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
+    /// x86-64: the system disk's controller: ahci (SATA), or nvme once macOS is installed (an
+    /// installer may find no disk on NVMe). Once it is installed, eject the installer before a
+    /// move, or OpenCore may start it
+    #[arg(long)]
+    pub disk_controller: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
     /// WIDTHxHEIGHT, or host
@@ -811,7 +816,17 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         Ok(rel) => rel.display().to_string(),
         Err(_) => paths::tilde(&disk),
     };
-    add("disk", format!("{disk_name} ({})", c.disk_format.as_str()));
+    match &c.q35 {
+        Some(q) => add(
+            "disk",
+            format!(
+                "{disk_name} ({}, {})",
+                c.disk_format.as_str(),
+                q.disk_controller.describe()
+            ),
+        ),
+        None => add("disk", format!("{disk_name} ({})", c.disk_format.as_str())),
+    }
     let mut disp = format!("{} x {}", c.display.count, c.display.resolution);
     if c.display.hidpi {
         disp.push_str(" HiDPI");
@@ -995,6 +1010,13 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(g) = &a.graphics {
         c.graphics = vm::Graphics::parse(g)?;
+    }
+    if let Some(d) = &a.disk_controller {
+        let d = vm::DiskController::parse(d)?;
+        match &mut c.q35 {
+            Some(q) => q.disk_controller = d,
+            None => bail!("{}: --disk-controller is for x86-64 VMs", c.name),
+        }
     }
     if let Some(n) = a.displays {
         c.display.count = n;

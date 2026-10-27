@@ -15,7 +15,9 @@ use crate::form::{self, Field, Form, opts};
 use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
-use crate::vm::{Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib};
+use crate::vm::{
+    DiskController, Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib,
+};
 use crate::{install, logs, opencore, paths, reims_util, runtime, update};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -1538,7 +1540,18 @@ impl App {
                  (K) pulls the plug.",
             ),
         ]);
-        if c.q35.is_some() {
+        if let Some(q) = &c.q35 {
+            let options =
+                DiskController::ALL.map(|d| (d.id().to_string(), d.describe().to_string()));
+            fields.push(Field::choice(
+                "disk_controller",
+                "Disk controller",
+                options.to_vec(),
+                q.disk_controller.id(),
+                "SATA, which macOS's installers see, or NVMe, for macOS once installed: an \
+                 installer may find no disk on NVMe. macOS finds its disk on either; once it is \
+                 installed, eject the installer before a move, or OpenCore may start it instead.",
+            ));
             fields.push(
                 Field::path(
                     "installer",
@@ -2223,6 +2236,11 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     if f.is_shown("graphics") {
         c.graphics = Graphics::parse(&f.choice("graphics"))?;
     }
+    if f.is_shown("disk_controller")
+        && let Some(q) = &mut c.q35
+    {
+        q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
+    }
     // Hidden on VMware SVGA, the displays' settings stay as they were.
     if f.is_shown("displays") {
         c.display.count = f.text("displays").parse().context("displays: a number")?;
@@ -2379,9 +2397,10 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
               GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and on x86-64 its installer image, its boot selection (OpenCore's picker, which
-              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA,
-              one display with no GPU acceleration, in QEMU's own window
+              and on x86-64 its disk controller (SATA, or NVMe once macOS is installed), its
+              installer image, its boot selection (OpenCore's picker, which makes it a new
+              OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA, one display
+              with no GPU acceleration, in QEMU's own window
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2772,6 +2791,38 @@ mod tests {
             }
         }
         assert!(vm_menu(&broken, true).contains(&(ToggleLogs, "Turn logs on or off")));
+    }
+
+    /// An x86-64 VM's edit form offers its disk's controller as its settings have it, and saves
+    /// the one picked; an arm64 VM's form has none.
+    #[test]
+    fn the_edit_form_picks_an_x86_64_vms_disk_controller() {
+        let mut nvme = vm_row("n", true);
+        let q = nvme.vm.as_mut().unwrap().config.q35.as_mut().unwrap();
+        q.disk_controller = DiskController::Nvme;
+        let mut app = test_app(vec![vm_row("t", true), vm_row("a", false), nvme]);
+        app.table.select(Some(2));
+        app.open_edit();
+        assert_eq!(form(&app).choice("disk_controller"), "nvme");
+        app.overlay = None;
+        app.table.select(Some(0));
+        app.open_edit();
+        assert_eq!(form(&app).choice("disk_controller"), "ahci");
+        for _ in 0..form(&app).fields.len() {
+            if form(&app).focused_key() == "disk_controller" {
+                break;
+            }
+            press(&mut app, [KeyCode::Down]);
+        }
+        press(&mut app, [KeyCode::Right]);
+        let mut vm = vm_row("t", true).vm.unwrap();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Nvme);
+
+        app.overlay = None;
+        app.table.select(Some(1));
+        app.open_edit();
+        assert!(!form(&app).is_shown("disk_controller"));
     }
 
     #[test]

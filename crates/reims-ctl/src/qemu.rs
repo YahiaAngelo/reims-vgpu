@@ -23,8 +23,8 @@
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
 //! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller, which
-//! holds OpenCore's image and the installer, at slot 2, where OpenCore's boot entries name it; the
-//! system disk's NVMe controller at slot 10, or, on a VM made before, the disk on AHCI,
+//! holds OpenCore's image, the installer and, on SATA, the system disk, at slot 2, where
+//! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10,
 //! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
 //! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
@@ -547,7 +547,7 @@ mod tests {
                     installer: None,
                     cpu_model: default_cpu_model(),
                     cpu_flags: default_cpu_flags(),
-                    disk_controller: DiskController::Nvme,
+                    disk_controller: DiskController::Ahci,
                     disk_port: 3,
                 }),
                 vmapple: None,
@@ -592,9 +592,10 @@ mod tests {
             &["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"],
             &[
                 "-drive",
-                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,discard=unmap",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+                "-device",
+                "ide-hd,bus=sata.3,drive=disk,rotation_rate=1",
             ],
-            &["-device", "nvme,drive=disk,serial=reims-ctl,addr=0xa"],
             &[
                 "-netdev",
                 "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
@@ -634,8 +635,8 @@ mod tests {
         }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
         assert!(
-            !a.iter().any(|x| x.ends_with("drive=disk,rotation_rate=1")),
-            "the disk on NVMe alone"
+            !a.iter().any(|x| x.starts_with("nvme,")),
+            "the disk on SATA alone"
         );
         assert!(!a.iter().any(|x| x.contains("usb-audio")));
         let at = |device: &str| a.iter().position(|x| x.starts_with(device)).unwrap();
@@ -735,22 +736,29 @@ mod tests {
         assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
     }
 
-    /// A VM made before reims-ctl put the disk on NVMe keeps it on its AHCI port, as it ran.
+    /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.
     #[test]
-    fn a_disk_on_ahci_stays_on_its_port() {
+    fn a_disk_on_nvme_has_a_controller_of_its_own() {
         let mut vm = q35_vm();
-        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Nvme;
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(
             &a,
             &[
                 "-drive",
-                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,discard=unmap",
                 "-device",
-                "ide-hd,bus=sata.3,drive=disk,rotation_rate=1",
+                "nvme,drive=disk,serial=reims-ctl,addr=0xa",
             ]
         ));
-        assert!(!a.iter().any(|x| x.starts_with("nvme,")), "{a:?}");
+        assert!(
+            !a.iter().any(|x| x.ends_with("drive=disk,rotation_rate=1")),
+            "{a:?}"
+        );
+        // The installer stays on AHCI, on port 4.
+        vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
     }
 
     #[test]
@@ -769,7 +777,6 @@ mod tests {
         assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
         // Past an AHCI disk on port 4.
         let q = vm.config.q35.as_mut().unwrap();
-        q.disk_controller = DiskController::Ahci;
         q.disk_port = 4;
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(&a, &["-device", "ide-hd,bus=sata.5,drive=installer"]));
