@@ -28,7 +28,7 @@
 //! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
 //! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
-//! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
+//! crash's core takes the process tens of seconds to end. QEMU refuses the
 //! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`); and no
 //! ACPI S3 (`ICH9-LPC.disable_s3`): a guest in S3 never wakes again with its display. Only PS/2
 //! input wakes QEMU from S3, not the USB keyboard and tablet, and QEMU's wake resets every
