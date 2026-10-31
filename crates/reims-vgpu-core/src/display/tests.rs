@@ -773,6 +773,97 @@ mod encode_current_frame {
         assert_eq!(with[plain.len() - 1..], overlay_sels);
     }
 
+    /// The window's own pass draws each quad in order, each with its pipeline, viewport,
+    /// scissor, the window's buffer at the offsets given and its texture, in a pass of its own;
+    /// with no quad, the pass is only begun and ended
+    #[test]
+    fn the_window_s_pass_draws_each_quad_in_order() {
+        use crate::display::pipeline::WindowDraw;
+        use crate::platform::types::MtlScissorRect;
+
+        let e = env();
+        let d = make(&e);
+        let overlay = d.overlay_pipeline(80).unwrap();
+        let copy = d.copy_pipeline(80).unwrap();
+        let image = texture(&e, 4, 4);
+        let vertices =
+            e.p.device()
+                .new_buffer_of_length(OnFault::Die, 1280, 0)
+                .unwrap()
+                .unwrap();
+        let viewport = MtlViewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 4.0,
+            height: 4.0,
+            znear: 0.0,
+            zfar: 1.0,
+        };
+        let scissor = MtlScissorRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let draw = |pipeline, tex_coords| WindowDraw {
+            pipeline,
+            texture: &image,
+            viewport,
+            scissor,
+            vertices: &vertices,
+            positions: 0,
+            tex_coords,
+        };
+        let pass = |clear: bool, draws: &[WindowDraw<'_, P>]| {
+            let cb = cmdbuf(&e);
+            let m = e.p.call_log().mark();
+            d.encode_window_pass(&cb, &texture(&e, 8, 8), clear, draws)
+                .unwrap();
+            let calls = e.p.call_log().since(m);
+            let first = calls
+                .iter()
+                .position(|c| c.sel == "renderCommandEncoderWithDescriptor:")
+                .unwrap();
+            calls[first + 1..].to_vec()
+        };
+        let one = [
+            "setRenderPipelineState:",
+            "setViewport:",
+            "setScissorRect:",
+            "setVertexBuffer:offset:atIndex:",
+            "setVertexBuffer:offset:atIndex:",
+            "setFragmentTexture:atIndex:",
+            "drawPrimitives:vertexStart:vertexCount:",
+        ];
+        let calls = pass(true, &[draw(&copy, 512), draw(&overlay, 256)]);
+        let sels: Vec<_> = calls.iter().map(|c| c.sel).collect();
+        assert_eq!(sels[..7], one);
+        assert_eq!(sels[7..14], one);
+        assert_eq!(sels[14..], ["endEncoding"]);
+        let offsets: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sel == "setVertexBuffer:offset:atIndex:")
+            .map(|c| {
+                c.args
+                    .iter()
+                    .filter(|a| matches!(a, Arg::U64(_)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                vec![Arg::U64(0), Arg::U64(0)],
+                vec![Arg::U64(512), Arg::U64(1)],
+                vec![Arg::U64(0), Arg::U64(0)],
+                vec![Arg::U64(256), Arg::U64(1)],
+            ]
+        );
+        let sels: Vec<_> = pass(false, &[]).iter().map(|c| c.sel).collect();
+        assert_eq!(sels, ["endEncoding"]);
+    }
+
     /// The internal entry encodes the current frame with the region's viewport.
     #[test]
     fn internal_entry() {

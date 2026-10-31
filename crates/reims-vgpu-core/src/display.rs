@@ -911,6 +911,20 @@ impl<P: Platform> DisplayCore<P> {
         self.render_pipeline_cache.as_ref()?.overlay_for(format)
     }
 
+    /// The display's own pipeline without the gamma table for a target of `format`
+    /// ([`DisplayPipelineCache::pipeline_for`]): the frame's colours copied as they are, with no
+    /// blending, which the display's own window draws a rotated image with
+    /// ([`DisplayCore::encode_window_pass`]). `None` without the render state, and where the
+    /// platform refuses it.
+    pub fn copy_pipeline(&self, format: u64) -> Option<P::RenderPipeline> {
+        self.render_pipeline_cache
+            .as_ref()?
+            .pipeline_for(PipelineKey {
+                format,
+                gamma: false,
+            })
+    }
+
     /// Sets the protection options (logged when they change) and hands them to the guest display,
     /// under the guest display pointer's lock.
     pub fn set_protection_options(&self, protection_options: u64) {

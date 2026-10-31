@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::display::pipeline::{OverlayDraw, PipelineKey};
+use crate::display::pipeline::{OverlayDraw, PipelineKey, WindowDraw};
 use crate::display::{DeathKind, Display, DisplayCore, DisplayLocked};
 use crate::guest::GuestPtr;
 use crate::platform::command::{CommandBuffer, CompletedInfo};
@@ -24,6 +24,8 @@ pub const MINIMUM_TEXTURE_USAGE: u64 = 4;
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: u64 = 80;
 /// `MTLResourceStorageModeManaged`: the fragment property buffer's options.
 const MTL_RESOURCE_STORAGE_MODE_MANAGED: u64 = 1 << 4;
+/// `MTLLoadActionLoad`.
+const MTL_LOAD_ACTION_LOAD: u64 = 1;
 /// `MTLLoadActionClear`.
 const MTL_LOAD_ACTION_CLEAR: u64 = 2;
 /// `MTLStoreActionStore`.
@@ -133,6 +135,38 @@ fn overlay_commands<'a, P: Platform>(
     ]
 }
 
+/// The commands that draw `draw` in the window's own pass ([`WindowDraw`]).
+fn window_draw_commands<'a, P: Platform>(draw: &WindowDraw<'a, P>) -> [RenderCmd<'a, P>; 7] {
+    [
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(draw.pipeline),
+        },
+        RenderCmd::SetViewport {
+            viewport: draw.viewport,
+        },
+        RenderCmd::SetScissorRect { rect: draw.scissor },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(draw.vertices),
+            offset: draw.positions,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(draw.vertices),
+            offset: draw.tex_coords,
+            index: 1,
+        },
+        RenderCmd::SetFragmentTexture {
+            texture: Some(draw.texture),
+            index: 0,
+        },
+        RenderCmd::DrawPrimitives {
+            primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+            vertex_start: 0,
+            vertex_count: 4,
+        },
+    ]
+}
+
 impl<P: Platform> Display<P> {
     /// The initializer's render state, under the display mutex: both BGRA8 pipelines pre-warmed,
     /// the strip's two buffers filled, the property buffer, and the identity matrix. Metal
@@ -220,6 +254,55 @@ impl<P: Platform> DisplayCore<P> {
             self.current_frame_encoded.store(true, Ordering::SeqCst);
         }
         Ok(true)
+    }
+
+    /// The display's own window's pass after the display's, in `command_buffer`: `target`
+    /// cleared to black where `clear` (else loaded as the display's pass stored it), then each of
+    /// `draws` in order, each its own quad ([`WindowDraw`]). Nothing of the display's state is
+    /// read or held: the window draws a rotated image of a frame the display drew into a texture
+    /// of the window's, and its button bar beside it. A raise dies at its send.
+    pub fn encode_window_pass(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        target: &P::Texture,
+        clear: bool,
+        draws: &[WindowDraw<'_, P>],
+    ) -> RaiseResult<()> {
+        // In a pool (the pass descriptor and the encoder are Metal's `+0`), which a raise leaves
+        // pushed, as the display's own pass.
+        pool::around(&*self.platform, || {
+            let pass = self.platform.render_pass_descriptor();
+            pass.set_color_attachment(
+                OnFault::Die,
+                0,
+                &ColorAttachmentSet {
+                    texture: Some(Some(target)),
+                    load_action: Some(if clear {
+                        MTL_LOAD_ACTION_CLEAR
+                    } else {
+                        MTL_LOAD_ACTION_LOAD
+                    }),
+                    store_action: Some(MTL_STORE_ACTION_STORE),
+                    clear_color: clear.then_some(ClearColor {
+                        red: 0.0,
+                        green: 0.0,
+                        blue: 0.0,
+                        alpha: 1.0,
+                    }),
+                    ..ColorAttachmentSet::default()
+                },
+            )?;
+            let encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
+            for draw in draws {
+                for cmd in window_draw_commands(draw) {
+                    crate::nil_send!(encoder, encode(OnFault::Die, cmd))?;
+                }
+            }
+            crate::nil_send!(encoder, encode(OnFault::Die, RenderCmd::EndEncoding))?;
+            drop(encoder);
+            drop(pass);
+            Ok(())
+        })
     }
 
     /// The encode of the current frame, taking the display mutex (tests; the product holds it).

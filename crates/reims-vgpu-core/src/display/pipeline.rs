@@ -67,6 +67,30 @@ pub struct OverlayDraw<'a, P: Platform> {
     pub scissor: MtlScissorRect,
 }
 
+/// A quad of the window's own pass, after the display's
+/// ([`DisplayCore::encode_window_pass`](super::DisplayCore::encode_window_pass)): the display's
+/// strip, a quad over the whole viewport, its positions (float4 × 4) and texture coordinates
+/// (float2 × 4) read at offsets of `vertices`, a buffer of the window's own, drawn with
+/// `pipeline` over `viewport`, clipped by `scissor`, sampling `texture`. The window draws a
+/// rotated image with texture coordinates of its own, which the display's buffers do not hold.
+pub struct WindowDraw<'a, P: Platform> {
+    /// The pipeline: the display's overlay pipeline, or its copy pipeline
+    /// ([`DisplayPipelineCache::pipeline_for`] without the gamma table), for the target's format.
+    pub pipeline: &'a P::RenderPipeline,
+    /// The texture the quad samples, fragment texture 0.
+    pub texture: &'a P::Texture,
+    /// Where the quad is drawn, in the target's pixels.
+    pub viewport: MtlViewport,
+    /// The pixels it may touch, inside the target.
+    pub scissor: MtlScissorRect,
+    /// The buffer holding the strip's positions and texture coordinates.
+    pub vertices: &'a P::Buffer,
+    /// Where in it the positions start, in bytes.
+    pub positions: u64,
+    /// Where in it the texture coordinates start, in bytes.
+    pub tex_coords: u64,
+}
+
 impl<P: Platform> DisplayPipelineCache<P> {
     /// Loads the platform's shader library and its three display functions; Metal giving none
     /// of one dies. Always `Some`. Only a display's creation, an API entry with no handler,
