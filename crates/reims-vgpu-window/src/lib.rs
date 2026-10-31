@@ -23,8 +23,10 @@
 //!   rectangle and the pointer's position in it), [`keymap`] (macOS key codes to USB usages),
 //!   [`keys`] (modifiers and the keys held down), [`capture`] (who gets the keyboard, and where
 //!   the pointer may go), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling),
-//!   [`policy`] (the modes and density the guest is offered for a host screen) and
-//!   [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
+//!   [`policy`] (the modes and density the guest is offered for a host screen),
+//!   [`decor`] (the image's rotation and the button bar beside it, at a control's say),
+//!   [`control`] (the control socket's protocol) and [`env`](mod@env) (the
+//!   `REIMS_VGPU_WINDOW_*` variables);
 //! - the host's screens ([`screens`]), as the OS lists them;
 //! - the window itself: [`handle`] (the [`Window`] the display holds), and its OS side
 //!   (`native`, one directory per OS behind one file). On macOS (`native/macos/`) that is the
@@ -43,6 +45,8 @@
 
 pub mod capture;
 pub mod config;
+pub mod control;
+pub mod decor;
 pub mod env;
 pub mod geometry;
 pub mod handle;
@@ -64,6 +68,7 @@ pub use config::{
     MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
     WindowConfig,
 };
+pub use decor::{Atlas, BarDraw, BarLayout, Decoration, Rotation};
 pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
 pub use policy::{Density, OfferedMode};
 pub use present::{Drawn, Presenter, VulkanTarget};

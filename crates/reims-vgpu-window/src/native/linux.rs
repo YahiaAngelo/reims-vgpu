@@ -2,10 +2,13 @@
 //! cursor are SDL's shared ones (`crate::sdl`), and what Linux does its own way is here: SDL runs
 //! on the library's UI thread (`ui`), where the window opens, changes and ends, as `sdl` places,
 //! sizes and ends it, and its events become the host's input (`input`, `keymap`); each window's
-//! render thread draws into its swapchain (`render`). This file is what the shared window code
+//! render thread draws into its swapchain (`render`). With `REIMS_VGPU_WINDOW_CONTROL` set, a
+//! control socket turns the windows' images and shows a button bar beside them (`control`,
+//! `crate::decor`). This file is what the shared window code
 //! asks of it: what draws into the window ([`FrameSink`]), the window's opening, changes and end,
 //! posted to the UI thread, and the host's screens as SDL lists them.
 
+mod control;
 mod input;
 mod keymap;
 mod render;
@@ -24,9 +27,11 @@ use crate::handle::Window;
 use crate::screens::HostScreen;
 use crate::sdl::shell;
 
-/// Starts `window`'s render thread and posts its opening to the UI thread, starting that where it
+/// Binds the control socket where it is asked for and not yet bound (`control`), starts
+/// `window`'s render thread and posts its opening to the UI thread, starting that where it
 /// has not started.
 pub(crate) fn open(window: &Arc<Window>) {
+    control::start();
     render::start(Arc::clone(window));
     let window = Arc::downgrade(window);
     ui::post(move || {
