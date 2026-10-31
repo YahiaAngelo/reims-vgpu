@@ -265,7 +265,7 @@ fn glyph_texture<P: Platform>(
 }
 
 /// Premultiplies RGBA `pixels` by their alpha, each channel rounded to nearest.
-fn premultiply(pixels: &mut [u8]) {
+pub(super) fn premultiply(pixels: &mut [u8]) {
     for [red, green, blue, alpha] in pixels.as_chunks_mut::<4>().0 {
         let alpha = u16::from(*alpha);
         for channel in [red, green, blue] {
