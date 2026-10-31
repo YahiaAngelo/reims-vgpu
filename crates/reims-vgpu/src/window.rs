@@ -18,6 +18,11 @@
 //! sink has the display draw it over the frame at that position, in the frame's own render pass,
 //! with the objects made before the frame's encode (`cursor`).
 //!
+//! **What the window draws around the frame.** Where the window's control asks for it (Linux's
+//! control socket, `reims_vgpu_window::decor`), the Vulkan platform's sink turns the frame and
+//! draws a button bar beside it, in a pass of the window's own after the display's, in the
+//! frame's command buffer (`decor`). Without one, the frame is drawn as above, alone.
+//!
 //! **Lifetime: a window frame is a frame.** Nothing on the window's side holds the display: the
 //! tee's closures hold the window, and the sink holds the display weakly. A draw upgrades that
 //! reference for its encode and commit alone, and the encode's completion handler holds the
@@ -35,11 +40,12 @@ use std::sync::{Arc, Weak};
 use reims_vgpu_core::display::{Display as CoreDisplay, DisplayCore};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_core::platform::resource::Texture as _;
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::policy::{self, Density, OfferedMode};
-use reims_vgpu_window::{DrawnCursor, FrameSink, HostScreen, PixelRect, Window};
+use reims_vgpu_window::{Decoration, DrawnCursor, FrameSink, HostScreen, PixelRect, Window};
 
 use crate::display::{CursorGlyph, DisplayCallbacks, no_catch};
 use crate::entry;
@@ -275,6 +281,9 @@ pub(crate) struct SinkDisplay<P: Platform> {
     stats: Option<Arc<DisplayStats>>,
     /// What draws the guest's cursor over a frame; only the window's render thread draws.
     cursor: Mutex<cursor::CursorPass<P>>,
+    /// What draws the window's rotation and bar, for a sink that draws them
+    /// ([`SinkDisplay::with_decorations`]).
+    decor: Option<Mutex<decor::DecorPass<P>>>,
 }
 
 /// One window frame, as a sink draws it: the steps in which the sinks differ, which
@@ -316,7 +325,27 @@ impl<P: Platform> SinkDisplay<P> {
             core,
             queue,
             cursor: Mutex::new(cursor::CursorPass::new(own_texture)),
+            decor: None,
         }
+    }
+
+    /// The sink draws the window's rotation and bar where a draw asks for them
+    /// ([`SinkDisplay::encode_decorated`]), with textures `own_texture` and a buffer `own_buffer`
+    /// makes (`decor`).
+    #[cfg_attr(
+        not(feature = "vulkan"),
+        expect(
+            dead_code,
+            reason = "only the Vulkan platform's sink draws decorations"
+        )
+    )]
+    pub(crate) fn with_decorations(
+        mut self,
+        own_texture: cursor::OwnTexture<P>,
+        own_buffer: decor::OwnBuffer<P>,
+    ) -> SinkDisplay<P> {
+        self.decor = Some(Mutex::new(decor::DecorPass::new(own_texture, own_buffer)));
+        self
     }
 
     /// The guest's cursor position, in its mode's pixels, as the display reads it now
@@ -357,17 +386,39 @@ impl<P: Platform> SinkDisplay<P> {
     /// The display is held from its upgrade to the commit, and the encode's completion handler
     /// holds it on until the frame completes. So when the host has released the display in the
     /// meantime, this draw's release, inside this entry, may be the display's end.
+    #[cfg_attr(
+        target_os = "linux",
+        expect(
+            dead_code,
+            reason = "Linux's sink draws each frame with its decoration"
+        )
+    )]
     pub(crate) fn encode(
         &self,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
         frame: impl WindowFrame<P>,
     ) -> bool {
+        self.encode_decorated(region, cursor, None, frame)
+    }
+
+    /// [`SinkDisplay::encode`], with `decoration` drawn where given and the sink draws it
+    /// ([`SinkDisplay::with_decorations`]): the frame turned into `region` and the bar beside it,
+    /// in a pass after the display's (`decor`). The decoration's objects are made before the
+    /// display's encode, with the cursor's; where the platform refuses one, the frame is drawn
+    /// plain.
+    pub(crate) fn encode_decorated(
+        &self,
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+        decoration: Option<&Decoration>,
+        frame: impl WindowFrame<P>,
+    ) -> bool {
         entry::run(|_| {
             let Some(display) = self.display.upgrade() else {
                 return false;
             };
-            let committed = self.commit_frame(&display, region, cursor, frame);
+            let committed = self.commit_frame(&display, region, cursor, decoration, frame);
             drop(display);
             committed
         })
@@ -379,6 +430,7 @@ impl<P: Platform> SinkDisplay<P> {
         display: &CoreDisplay<P>,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+        decoration: Option<&Decoration>,
         mut frame: impl WindowFrame<P>,
     ) -> bool {
         let Some(command_buffer) = no_catch(self.queue.command_buffer(OnFault::Die)) else {
@@ -387,20 +439,43 @@ impl<P: Platform> SinkDisplay<P> {
         let Some(texture) = frame.texture() else {
             return false;
         };
-        let cursor = cursor.and_then(|c| self.cursor.lock().prepare(display, texture, region, c));
+        let decorated = match (decoration, &self.decor) {
+            (Some(decoration), Some(pass)) => {
+                pass.lock().prepare(display, texture, region, decoration)
+            }
+            _ => None,
+        };
+        let (target, target_region) = match &decorated {
+            Some(prepared) => prepared.frame_target(texture, region),
+            None => (texture, region),
+        };
+        let cursor = cursor.and_then(|c| {
+            self.cursor
+                .lock()
+                .prepare(display, target, target_region, c)
+        });
         let frame_region = MtlRegion::new(
-            MtlOrigin::new(region.x, region.y, 0),
-            MtlSize::new(region.width, region.height, 1),
+            MtlOrigin::new(target_region.x, target_region.y, 0),
+            MtlSize::new(target_region.width, target_region.height, 1),
         );
         let overlay = cursor.as_ref().map(cursor::Prepared::draw);
         let encoded = display.encode_current_frame_with(
             &command_buffer,
-            texture,
+            target,
             frame_region,
             overlay.as_ref(),
         );
         if !no_catch(encoded) {
             return false;
+        }
+        if let Some(prepared) = &decorated {
+            let size = (texture.width(), texture.height());
+            no_catch(display.encode_window_pass(
+                &command_buffer,
+                texture,
+                prepared.clears(),
+                &prepared.draws(size),
+            ));
         }
         frame.encoded(&command_buffer);
         no_catch(command_buffer.commit(OnFault::Die));
@@ -416,6 +491,14 @@ impl<P: Platform> SinkDisplay<P> {
     expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
 )]
 mod cursor;
+#[cfg_attr(
+    not(feature = "vulkan"),
+    expect(
+        dead_code,
+        reason = "only the Vulkan platform's sink draws decorations"
+    )
+)]
+mod decor;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(test)]

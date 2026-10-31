@@ -16,6 +16,11 @@
 //! drawables, each fetched on the render thread as the image is taken
 //! (`reims_vgpu_vulkan::swapchain`), and no Metal call of the sink's draws or presents them.
 //!
+//! Where the window asks for a decoration (its control's rotation and button bar,
+//! `reims_vgpu_window::decor`), the draw has the display draw it too
+//! ([`SinkDisplay::encode_decorated`]): the sink's display is made to draw them, with textures
+//! and a buffer of the platform's own ([`own_texture`], [`own_buffer`]).
+//!
 //! What each OS's window asks of the sink is its own (`FrameSink`): `linux.rs` and `macos.rs`
 //! give it the presenter made here ([`SwapchainSink::make_presenter`]).
 //!
@@ -33,7 +38,9 @@ use reims_vgpu_core::display::Display as CoreDisplay;
 use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::{self, Acquired, Frame, Swapchain};
-use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
+use reims_vgpu_window::{
+    BarLayout, Decoration, Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget,
+};
 
 use crate::entry;
 use crate::stats::DisplayStats;
@@ -56,7 +63,10 @@ pub(crate) fn sink(
     drop(platform);
     let port = display.upgrade().map(|d| d.port());
     let sink: Arc<dyn FrameSink> = Arc::new(SwapchainSink {
-        display: Arc::new(SinkDisplay::new(display, queue.clone_ref(), own_texture)),
+        display: Arc::new(
+            SinkDisplay::new(display, queue.clone_ref(), own_texture)
+                .with_decorations(own_texture, own_buffer),
+        ),
         queue,
         port,
     });
@@ -71,6 +81,16 @@ pub(in crate::window::vulkan) fn own_texture(
     descriptor: &<VulkanPlatform as Platform>::TextureDescriptor,
 ) -> Option<Texture> {
     device.new_own_texture(descriptor)
+}
+
+/// A buffer of the platform's own holding `bytes`, for the window's decorations: one that takes
+/// no range of Metal's space (`VulkanDevice::new_own_buffer`), so no address the guest reads moves
+/// for it.
+fn own_buffer(
+    device: &<VulkanPlatform as Platform>::Device,
+    bytes: &[u8],
+) -> Option<<VulkanPlatform as Platform>::Buffer> {
+    device.new_own_buffer(bytes)
 }
 
 /// What draws a display's current frame into its window on the Vulkan platform (module doc).
@@ -146,23 +166,43 @@ impl Presenter for SwapchainPresenter {
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> Drawn {
+        self.draw_decorated(drawable, region, cursor, None)
+    }
+
+    /// [`Presenter::draw`], with `decoration` drawn around the frame where given (module doc).
+    fn draw_decorated(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+        decoration: Option<&Decoration>,
+    ) -> Drawn {
         entry::run(|_| {
             let frame = match self.swapchain.acquire(drawable) {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,
                 Acquired::Failed => return Drawn::Ended,
             };
-            let region = self
-                .swapchain
-                .extent()
-                .map_or(region, |extent| fit(region, drawable, extent));
+            let extent = self.swapchain.extent().unwrap_or(drawable);
+            let region = fit(region, drawable, extent);
+            let fitted;
+            let decoration = match decoration {
+                Some(d) if extent != drawable => {
+                    fitted = fit_decoration(d, drawable, extent);
+                    Some(&fitted)
+                }
+                d => d,
+            };
             let mut image = ImageFrame {
                 swapchain: &self.swapchain,
                 frame,
                 stats: self.display.stats(),
                 ready: None,
             };
-            if !self.display.encode(region, cursor, &mut image) {
+            if !self
+                .display
+                .encode_decorated(region, cursor, decoration, &mut image)
+            {
                 return Drawn::Nothing;
             }
             let Some(command_buffer) = image.ready else {
@@ -190,6 +230,24 @@ fn fit(region: PixelRect, drawable: (u64, u64), extent: (u64, u64)) -> PixelRect
         width: scale(region.width, drawable.0, extent.0).min(extent.0 - x),
         height: scale(region.height, drawable.1, extent.1).min(extent.1 - y),
     }
+}
+
+/// `decoration`, laid out for a drawable of `drawable` pixels, scaled to images of `extent`
+/// pixels as the frame's region is ([`fit`]).
+fn fit_decoration(decoration: &Decoration, drawable: (u64, u64), extent: (u64, u64)) -> Decoration {
+    let mut fitted = decoration.clone();
+    if let Some(bar) = &mut fitted.bar {
+        bar.layout = BarLayout {
+            bar: fit(bar.layout.bar, drawable, extent),
+            buttons: bar
+                .layout
+                .buttons
+                .iter()
+                .map(|&b| fit(b, drawable, extent))
+                .collect(),
+        };
+    }
+    fitted
 }
 
 /// One window frame into a swapchain image.
