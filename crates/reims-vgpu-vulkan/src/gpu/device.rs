@@ -587,6 +587,22 @@ impl VulkanDevice {
         Some(self.texture_of(raw, None, 0, Arc::new(metal_space::Hold::NONE)))
     }
 
+    /// A Shared buffer of the platform's own holding `bytes`, for a helper the guest never
+    /// reaches (the window's rotated image and button bar): outside the Metal address space
+    /// ([`crate::gpu::own_buffer`]), so no guest-visible address depends on it. `None` where the
+    /// runtime refuses it.
+    pub fn new_own_buffer(&self, bytes: &[u8]) -> Option<VulkanBuffer> {
+        let length = u64::try_from(bytes.len()).ok()?;
+        let raw = crate::gpu::own_buffer(
+            &self.raw,
+            length,
+            rt::ResourceOptions::shared(),
+            rt::BufferContents::Copy(bytes),
+        )
+        .ok()?;
+        Some(self.buffer(raw, None))
+    }
+
     /// The handle of a buffer this device made, over `surface` when it was made on one.
     pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
         let id = raw.object_id();
