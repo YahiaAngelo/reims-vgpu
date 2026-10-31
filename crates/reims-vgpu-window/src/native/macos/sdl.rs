@@ -274,6 +274,17 @@ pub(crate) fn insets(shell: &Shell) -> Insets {
         .unwrap_or_default()
 }
 
+/// The guest's mode as the window shows it: as the guest sets it (a turned image is Linux's).
+pub(crate) fn shown_mode(shell: &Shell) -> Option<(u16, u16)> {
+    shell.window.mode()
+}
+
+/// The image was laid out: nothing more is drawn around it on macOS.
+pub(crate) fn laid_out(_shell: &mut Shell) {}
+
+/// The pointer left the window or entered it: nothing on macOS.
+pub(crate) fn pointer_left(_shell: &mut Shell) {}
+
 /// The screens changed: a borderless window fills its screen again, or the main screen while its
 /// own is gone.
 pub(crate) fn screens_changed(shell: &mut Shell) {
