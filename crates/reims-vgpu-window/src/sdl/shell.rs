@@ -19,9 +19,11 @@
 //!
 //! **The layout.** Whenever the window's size, its scale or the guest's mode changes, the image is
 //! laid out again ([`geometry::layout`]) over the window's points at its pixels per point
-//! ([`os::metrics`]), inside the room the OS keeps clear ([`os::insets`]), and the render thread
-//! draws a changed one: the drawable is the window's size in pixels, one pixel per screen pixel at
-//! any scale.
+//! ([`os::metrics`]), inside the room the OS keeps clear ([`os::insets`]), at the size the OS
+//! shows the guest's mode ([`os::shown_mode`]), and the render thread draws a changed one: the
+//! drawable is the window's size in pixels, one pixel per screen pixel at any scale. The OS then
+//! lays out what it draws around the image ([`os::laid_out`]): on Linux the rotation and the button
+//! bar a control asks for (`crate::decor`), the bar inside the insets' room on the right.
 //!
 //! **Events.** Closing the window (its close button) tells the host, which ends the VM, and leaves
 //! the window open: it closes when the display is released ([`close`]). Losing the keyboard
@@ -76,7 +78,7 @@ pub(crate) struct Shell {
     /// The layout, once laid out.
     pub(crate) layout: Layout,
     /// The window's pixels per point.
-    density: f64,
+    pub(crate) density: f64,
     /// Its input.
     pub(crate) input: Input,
     /// What its OS keeps of it.
@@ -367,6 +369,7 @@ impl Shell {
                 // SDL's cursor is the process's: another window may have hidden it.
                 self.over_image = false;
                 self.refresh_cursor();
+                os::pointer_left(self);
                 false
             }
             _ => os::input_event(self, kind, event),
@@ -449,7 +452,7 @@ impl Shell {
             return;
         };
         let insets = os::insets(self);
-        let layout = geometry::layout(bounds, density, insets, self.window.mode());
+        let layout = geometry::layout(bounds, density, insets, os::shown_mode(self));
         if layout != self.layout || density.to_bits() != self.density.to_bits() {
             log::debug!(
                 target: "reims_vgpu_window",
@@ -464,6 +467,7 @@ impl Shell {
             }
         }
         self.window.surface().set_layout(layout);
+        os::laid_out(self);
     }
 
     /// The pointer moved to `point` (in points): the cursor changes as it enters or leaves the
@@ -482,8 +486,8 @@ impl Shell {
     fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
         let ours = if self.over_image {
-            let per_pixel =
-                geometry::cursor_points_per_pixel(self.layout.image, guest.mode.unwrap_or((0, 0)));
+            let shown = os::shown_mode(self).unwrap_or((0, 0));
+            let per_pixel = geometry::cursor_points_per_pixel(self.layout.image, shown);
             if !guest.host_cursor_visible() && guest.cursor.is_some() {
                 // SAFETY: SDL's video runs on this thread.
                 unsafe { SDL_HideCursor() };
