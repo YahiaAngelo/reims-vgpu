@@ -6,7 +6,10 @@
 //! there is something to draw: a new guest frame, a new layout (the window resized, or moved to a
 //! screen of another scale, or the guest set a mode), the window showing again, or a change of
 //! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
-//! the presenter). It draws only
+//! the presenter), or a change of what the window draws around the image at its control's say
+//! (the image's rotation, the button bar and which button is lit: [`Surface::set_decoration`],
+//! which each draw hands the presenter too, so the bar repaints with no frame of the guest's).
+//! It draws only
 //! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
 //! makes over the window ([`FrameSink::presenter`]), which makes the window's Vulkan surface
 //! ([`VulkanTarget`]), as `crate::present` says: made at the first draw, tried again after
@@ -29,6 +32,7 @@ use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_vulkan::os::OsThreads;
 use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 
+use crate::decor::Decoration;
 use crate::geometry::Layout;
 use crate::handle::Window;
 use crate::present::{Presenter, Presenting, RETRY, VulkanTarget};
@@ -103,6 +107,8 @@ struct SurfaceState {
     target: Option<Target>,
     /// Where the drawable and the image are, once the window has laid out.
     layout: Option<Layout>,
+    /// What is drawn around the image: none for a plain window ([`Decoration::is_plain`]).
+    decoration: Option<Arc<Decoration>>,
     /// Whether the window is shown.
     visible: bool,
     /// Something new to show: a frame, a layout, the window showing again.
@@ -115,6 +121,7 @@ struct SurfaceState {
 struct Work {
     target: Target,
     layout: Layout,
+    decoration: Option<Arc<Decoration>>,
 }
 
 impl SurfaceState {
@@ -128,7 +135,11 @@ impl SurfaceState {
             return None;
         };
         self.dirty = false;
-        Some(Work { target, layout })
+        Some(Work {
+            target,
+            layout,
+            decoration: self.decoration.clone(),
+        })
     }
 
     /// The draw to make again after one that had no image in time: the newest, else the same,
@@ -167,6 +178,19 @@ impl Surface {
         self.update(|s| {
             if s.layout != Some(layout) {
                 s.layout = Some(layout);
+                s.dirty = true;
+            }
+        });
+    }
+
+    /// What the window draws around the image (`crate::decor`), laid out with the layout the
+    /// window last set: a changed one is drawn. A plain one is none, so a window whose control
+    /// asks for nothing draws as one with no control.
+    pub(crate) fn set_decoration(&self, decoration: Decoration) {
+        let decoration = (!decoration.is_plain()).then(|| Arc::new(decoration));
+        self.update(|s| {
+            if s.decoration != decoration {
+                s.decoration = decoration;
                 s.dirty = true;
             }
         });
@@ -246,7 +270,12 @@ fn run(window: &Window) {
             presenting.make(|| sink.presenter(&work.target));
         }
         let cursor = window.drawn_cursor();
-        if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
+        if presenting.draw_decorated(
+            work.layout.drawable,
+            work.layout.pixels,
+            cursor.as_ref(),
+            work.decoration.as_deref(),
+        ) {
             retry = Some(work);
         }
     }
@@ -326,6 +355,32 @@ mod tests {
         assert!(surface.next(None).is_none());
     }
 
+    /// A changed decoration asks for a draw, with no frame of the guest's, and is handed to it;
+    /// an unchanged one does not, and a plain one is none
+    #[test]
+    fn a_changed_decoration_is_drawn() {
+        use crate::decor::Rotation;
+
+        let surface = Surface::new();
+        surface.set_target(a_target());
+        surface.set_layout(a_layout());
+        surface.set_visible(true);
+        assert!(surface.state.lock().take().unwrap().decoration.is_none());
+        surface.set_decoration(Decoration::default());
+        assert!(surface.state.lock().take().is_none(), "plain: as before");
+        let turned = Decoration {
+            rotation: Rotation::Quarter,
+            bar: None,
+        };
+        surface.set_decoration(turned.clone());
+        let work = surface.state.lock().take().unwrap();
+        assert_eq!(work.decoration.as_deref(), Some(&turned));
+        surface.set_decoration(turned);
+        assert!(surface.state.lock().take().is_none());
+        surface.set_decoration(Decoration::default());
+        assert!(surface.state.lock().take().unwrap().decoration.is_none());
+    }
+
     /// A draw that had no image in time is not made again while the window is hidden: it is
     /// made once the window shows
     #[test]
@@ -342,6 +397,7 @@ mod tests {
         let work = Work {
             target: a_target(),
             layout: a_layout(),
+            decoration: None,
         };
         s.visible = false;
         assert!(s.retake(work).is_none(), "hidden, it does not");

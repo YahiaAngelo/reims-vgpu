@@ -24,6 +24,7 @@ them; its `manual` checks are on a Linux host's guest boot.
 | `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
 | `resolution=2560x1600`, `resolution=2560x1600@200`, `resolution=host` | the guest's mode, and the density it is told (QEMU's apple-gfx property; 1920x1080 at 1× by default) |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS, built with the `macos-sdl` feature (on by default): SDL3's window in place of AppKit's ("On macOS through SDL3" below) |
+| `REIMS_VGPU_WINDOW_CONTROL=<path>` | Linux: a control socket at that path, which turns the windows' images and shows a button bar beside them ("A control socket" under "On Linux"); unset, no socket, and the windows are as below |
 
 Unset or unparsable values give the defaults below.
 `test: env::unset_or_unparsable_values_are_the_defaults`,
@@ -415,6 +416,46 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual`
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
+
+- A control socket (vphone-linux): with `REIMS_VGPU_WINDOW_CONTROL=<path>`,
+  a Unix stream socket at the path, a stale file there removed, served on
+  threads of its own that neither the UI thread nor a render thread waits
+  on; one client at a time, a new one replacing the one before. Lines of
+  text: `toolbar <atlas> <button-px> <id>,...` shows a button bar from a raw
+  RGBA8 atlas (`2 × button-px` by `n × button-px`, row i button i, normal
+  left, lit right), `toolbar off` hides it, `rotate 0|90|180|270` turns the
+  image clockwise; a click on a button tells the client `button <id>`. Every
+  window takes what was last asked, one opening later too. Unset, no socket
+  is bound and nothing below shows.
+  `test: control::a_toolbar_request_names_the_atlas_size_and_ids`,
+  `test: control::a_malformed_toolbar_request_is_refused`,
+  `test: control::a_rotate_request_takes_the_quarter_turns`,
+  `test: control::other_lines_are_refused_and_a_click_is_one_line`,
+  `test: decor::the_atlas_is_two_cells_by_one_a_button`,
+  `test: decor::no_turn_and_no_bar_is_plain`, `manual`
+- The turned image: laid out at its turned size, drawn turned in a pass
+  after the display's (the guest's cursor turned with it), the pointer's
+  pixel turned back to the guest's, which sees its own mode unturned. A turn
+  resizes a windowed window around the image, its sides swapped, at the
+  same scale; maximized or full screen, the image is fitted again.
+  `test: decor::the_rotations_are_the_four_quarter_turns`,
+  `test: decor::a_turned_pixel_turns_back_to_the_guest_s`,
+  `test: decor::the_texture_coordinates_turn_the_image`,
+  `test: decor::the_pointer_over_a_turned_image_reaches_the_pixel_under_it`,
+  `test: native::linux::input::over_a_turned_image_the_pointer_reaches_the_pixel_under_it`,
+  `test: native::linux::render::a_changed_decoration_is_drawn`, `manual`
+- The button bar: a strip right of the image, #1c1c1e, its buttons
+  `button-px` points a side, 8 points apart and from the bar's sides,
+  stacked and centred down it, at the screen's scale as the image's points
+  are (SDL's units times the content scale on X11). The window is the
+  image's width and the bar's, and resizes by the bar's width as it shows or
+  hides, the image's scale kept. The button under the pointer, or pressed
+  under it, shows its lit image, redrawn at once with no frame of the
+  guest's; a press on the bar never reaches the guest, and the host's arrow
+  shows over it.
+  `test: decor::the_bar_s_buttons_are_stacked_and_centred`,
+  `test: decor::a_point_hits_the_button_under_it`,
+  `test: sdl::units::a_bar_beside_the_image_widens_the_window`, `manual`
 
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
 bar shows the window, as `reims-vgpu`), the camera-housing fit, and trackpad

@@ -49,8 +49,8 @@ impl Units {
         }
     }
 
-    /// Units per host point.
-    fn per_point(self) -> f64 {
+    /// Units per host point: 1 on Wayland, the content scale on X11.
+    pub(crate) fn per_point(self) -> f64 {
         self.scale / self.pixels
     }
 
@@ -69,22 +69,26 @@ impl Units {
 /// The content size, in `units`, of a windowed window for a guest mode `mode` at `guest_scale`,
 /// on a screen whose usable bounds are `usable` in those units, where known: a guest point per
 /// host point ([`geometry::initial_content_size`]), shrunk to fit the usable bounds less
-/// `title_room` points, on whole pixels, and at least [`MIN_CONTENT`] points.
+/// `title_room` points, on whole pixels, and at least [`MIN_CONTENT`] points; `beside` points
+/// wider for what the window shows right of the image (a control's button bar,
+/// `crate::decor`), which the image shrinks to leave room for.
 pub(crate) fn windowed_size(
     mode: (u16, u16),
     guest_scale: u8,
     usable: Option<(i32, i32)>,
     title_room: f64,
+    beside: f64,
     units: Units,
 ) -> (i32, i32) {
     let per_point = units.per_point();
     let room = usable.map_or((0.0, 0.0), |(w, h)| {
         (
-            f64::from(w) / per_point,
+            f64::from(w) / per_point - beside,
             f64::from(h) / per_point - title_room,
         )
     });
     let (width, height) = geometry::initial_content_size(mode, f64::from(guest_scale.max(1)), room);
+    let width = width + beside;
     let min = units.min_content();
     (
         units.whole(width).max(min.0),
@@ -118,41 +122,65 @@ mod tests {
         // Wayland at 1×, and at 2×: points, the usable bounds in points.
         let wayland = Units::new(1.0, 1.0);
         assert_eq!(
-            windowed_size(fhd, 1, Some((2560, 1400)), ROOM, wayland),
+            windowed_size(fhd, 1, Some((2560, 1400)), ROOM, 0.0, wayland),
             (1920, 1080)
         );
         let wayland_2x = Units::new(2.0, 1.0);
         assert_eq!(
-            windowed_size((3840, 2160), 2, Some((1920, 1080)), ROOM, wayland_2x),
+            windowed_size((3840, 2160), 2, Some((1920, 1080)), ROOM, 0.0, wayland_2x),
             (1835, 1032)
         );
         // Wayland at 150%: whole pixels, 1280 points of 1.5 pixels.
         let wayland_150 = Units::new(1.5, 1.0);
         assert_eq!(
-            windowed_size((1280, 800), 1, Some((1707, 960)), ROOM, wayland_150),
+            windowed_size((1280, 800), 1, Some((1707, 960)), ROOM, 0.0, wayland_150),
             (1280, 800)
         );
         // X11 at a content scale of 2: pixels, two to the point; a 1× guest of 1920 × 1080
         // shrinks to fit 1920 × 1008 points, 3584 × 2016 pixels.
         let x11_2x = Units::new(1.0, 2.0);
         assert_eq!(
-            windowed_size(fhd, 1, Some((3840, 2112)), ROOM, x11_2x),
+            windowed_size(fhd, 1, Some((3840, 2112)), ROOM, 0.0, x11_2x),
             (3584, 2016)
         );
         // A HiDPI guest there is a guest pixel per screen pixel.
         assert_eq!(
-            windowed_size((2560, 1600), 2, Some((3840, 2112)), ROOM, x11_2x),
+            windowed_size((2560, 1600), 2, Some((3840, 2112)), ROOM, 0.0, x11_2x),
             (2560, 1600)
         );
         // X11 at 150%: 1280 × 800 points are 1920 × 1200 pixels.
         let x11_150 = Units::new(1.0, 1.5);
         assert_eq!(
-            windowed_size((1280, 800), 1, Some((2560, 1392)), ROOM, x11_150),
+            windowed_size((1280, 800), 1, Some((2560, 1392)), ROOM, 0.0, x11_150),
             (1920, 1200)
         );
         // The smallest content, 320 × 200 points, in pixels at 2.
         assert_eq!(x11_2x.min_content(), (640, 400));
         assert_eq!(wayland_2x.min_content(), (320, 200));
-        assert_eq!(windowed_size((400, 300), 2, None, ROOM, x11_2x), (640, 400));
+        assert_eq!(
+            windowed_size((400, 300), 2, None, ROOM, 0.0, x11_2x),
+            (640, 400)
+        );
+    }
+
+    /// A bar beside the image widens the window by its points, at the screen's scale, and the
+    /// image shrinks to leave it room on a screen it would not fit
+    #[test]
+    fn a_bar_beside_the_image_widens_the_window() {
+        const ROOM: f64 = 48.0;
+        let wayland = Units::new(1.0, 1.0);
+        assert_eq!(
+            windowed_size((390, 844), 1, Some((2560, 1400)), ROOM, 64.0, wayland),
+            (454, 844)
+        );
+        // X11 at 2: the bar is 128 pixels.
+        let x11_2x = Units::new(1.0, 2.0);
+        assert_eq!(
+            windowed_size((780, 1688), 2, Some((3840, 2112)), ROOM, 64.0, x11_2x),
+            (908, 1688)
+        );
+        // A wide image on a narrow screen: the image shrinks, the bar stays whole.
+        let (w, h) = windowed_size((1000, 500), 1, Some((564, 2000)), ROOM, 64.0, wayland);
+        assert_eq!((w, h), (564, 250));
     }
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use ash::vk;
 
+use crate::decor::Decoration;
 use crate::handle::{DrawnCursor, PixelRect};
 
 /// How long the render thread waits before it draws again where no image came in time: about a
@@ -57,6 +58,20 @@ pub trait Presenter: Send {
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> Drawn;
+
+    /// [`Presenter::draw`], with `decoration` drawn where given: the frame turned into `region`
+    /// and the button bar beside it ([`crate::decor`]). A presenter that draws no decoration
+    /// draws the frame as [`Presenter::draw`] does; only a window with a control asks for one.
+    fn draw_decorated(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+        decoration: Option<&Decoration>,
+    ) -> Drawn {
+        let _ = decoration;
+        self.draw(drawable, region, cursor)
+    }
 }
 
 /// What makes a window's Vulkan surface, on its render thread: on Linux SDL's window, on macOS
@@ -101,11 +116,26 @@ impl Presenting {
     /// Has the presenter draw the current frame into an image of `drawable` pixels over
     /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
     /// time). Nothing without a presenter.
+    #[cfg_attr(
+        all(target_os = "linux", not(test)),
+        expect(dead_code, reason = "Linux's render thread draws with its decoration")
+    )]
     pub(crate) fn draw(
         &mut self,
         drawable: (u64, u64),
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+    ) -> bool {
+        self.draw_decorated(drawable, region, cursor, None)
+    }
+
+    /// [`Presenting::draw`], with `decoration` where given ([`Presenter::draw_decorated`]).
+    pub(crate) fn draw_decorated(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+        decoration: Option<&Decoration>,
     ) -> bool {
         if self.ended {
             return false;
@@ -113,7 +143,12 @@ impl Presenting {
         let Some(presenter) = self.presenter.as_mut() else {
             return false;
         };
-        let drawn = presenter.draw(drawable, region, cursor);
+        let drawn = match decoration {
+            Some(decoration) => {
+                presenter.draw_decorated(drawable, region, cursor, Some(decoration))
+            }
+            None => presenter.draw(drawable, region, cursor),
+        };
         if drawn == Drawn::Ended {
             self.presenter = None;
         }

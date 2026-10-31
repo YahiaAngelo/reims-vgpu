@@ -10,7 +10,8 @@
 //!
 //! What the guest gets:
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer, held
-//!   at the image's nearest edge outside it; a move is sent where that pixel changes. A click in
+//!   at the image's nearest edge outside it, turned back where the window shows the image turned
+//!   ([`crate::decor::Rotation::guest_pixel`]); a move is sent where that pixel changes. A click in
 //!   the image captures the keyboard and the pointer; the click that focuses the window (one that
 //!   comes within [`FOCUS_CLICK_NS`] of the window gaining the keyboard) is not sent. A click
 //!   outside the image is not sent and starts nothing. A button's release is sent wherever it
@@ -39,6 +40,7 @@ use crate::config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, ScrollEvent,
     WindowCallbacks,
 };
+use crate::decor::Rotation;
 use crate::geometry::{self, Rect};
 use crate::keys::{KeyEvent, KeyState};
 use crate::scroll::POINTS_PER_LINE;
@@ -71,6 +73,8 @@ pub(crate) struct At {
     pub(crate) image: Rect,
     /// The guest's mode, once it has set one.
     pub(crate) guest: Option<(u16, u16)>,
+    /// How the image is turned on screen: `image` shows the guest's mode turned so.
+    pub(crate) rotation: Rotation,
 }
 
 /// What the window does after an event.
@@ -202,11 +206,12 @@ impl Input {
         std::mem::take(&mut self.out)
     }
 
-    /// Queues the pointer at `point` over `image` in `mode`, with the buttons held, where it
-    /// differs from the one last sent (or `always`).
-    fn pointer(&mut self, point: (f64, f64), image: Rect, mode: (u16, u16), always: bool) {
+    /// Queues the pointer at `point` over `image`, which shows `mode` turned by `rotation`, with
+    /// the buttons held, where it differs from the one last sent (or `always`).
+    fn pointer(&mut self, point: (f64, f64), at: &At, mode: (u16, u16), always: bool) {
+        let shown = geometry::pointer_to_guest(point, at.image, at.rotation.shown(mode));
         let event = ToHost::Pointer {
-            at: geometry::pointer_to_guest(point, image, mode),
+            at: at.rotation.guest_pixel(shown, mode),
             mode,
             buttons: self.buttons,
         };
@@ -219,7 +224,7 @@ impl Input {
     /// The pointer moved.
     pub(crate) fn moved(&mut self, at: &At) {
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
-            self.pointer(point, at.image, mode, false);
+            self.pointer(point, at, mode, false);
         }
     }
 
@@ -248,7 +253,7 @@ impl Input {
         };
         if forward {
             self.buttons |= bit;
-            self.pointer(point, at.image, mode, true);
+            self.pointer(point, at, mode, true);
         }
         Reaction {
             capture_changed: self.is_captured() != was_captured,
@@ -262,7 +267,7 @@ impl Input {
         }
         self.buttons &= !bit;
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
-            self.pointer(point, at.image, mode, true);
+            self.pointer(point, at, mode, true);
         }
     }
 
@@ -412,6 +417,7 @@ mod tests {
                 height: 50.0,
             },
             guest: Some((200, 100)),
+            rotation: Rotation::None,
         }
     }
 
@@ -509,6 +515,58 @@ mod tests {
         input.moved(&at((10.2, 10.2)));
         input.moved(&at((11.0, 10.0)));
         assert_eq!(input.take(), vec![pointer(20, 20, 0), pointer(22, 20, 0)]);
+    }
+
+    /// Over an image turned a quarter, the pointer reaches the guest pixel drawn under it, in
+    /// the guest's own mode, and a drag held at the edge turns back with it: the turned image
+    /// shows the guest's 200×100 mode 50 points wide and 100 high
+    #[test]
+    fn over_a_turned_image_the_pointer_reaches_the_pixel_under_it() {
+        let turned = |point, rotation| At {
+            image: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 50.0,
+                height: 100.0,
+            },
+            rotation,
+            ..at(point)
+        };
+        let mut input = focused();
+        // The guest's top left shows at the turned image's top right, its bottom left at the
+        // top left.
+        input.moved(&turned((49.9, 0.0), Rotation::Quarter));
+        input.moved(&turned((0.0, 0.0), Rotation::Quarter));
+        input.moved(&turned((0.0, 99.9), Rotation::Quarter));
+        input.moved(&turned((0.0, 0.0), Rotation::ThreeQuarters));
+        // A click in the turned image is sent; one past its right edge, inside the unturned
+        // image's width, is not.
+        input.button_down(
+            BUTTON_LEFT,
+            1_000_000_000,
+            &turned((10.0, 30.0), Rotation::Half),
+        );
+        input.moved(&turned((-20.0, 30.0), Rotation::Half));
+        input.button_up(BUTTON_LEFT, &turned((-20.0, 30.0), Rotation::Half));
+        input.button_down(
+            BUTTON_RIGHT,
+            1_000_000_000,
+            &turned((70.0, 30.0), Rotation::Half),
+        );
+        assert_eq!(
+            input.take(),
+            vec![
+                pointer(0, 0, 0),
+                pointer(0, 99, 0),
+                pointer(199, 99, 0),
+                pointer(199, 0, 0),
+                // Half a turn of 200×100 shown 50×100: (10, 30) is the 40th column and 30th
+                // row of the turned image, the guest's (159, 69).
+                pointer(159, 69, BUTTON_LEFT),
+                pointer(199, 69, BUTTON_LEFT),
+                pointer(199, 69, 0),
+            ]
+        );
     }
 
     /// Host repeats are dropped; each key is one down and one up

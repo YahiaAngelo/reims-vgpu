@@ -12,6 +12,9 @@
 //!   place of AppKit's, in a build with the `macos-sdl` feature, on by default (one without it
 //!   logs that, and opens AppKit's). Default: AppKit's. Linux has SDL3's alone, and reads no
 //!   value.
+//! - `REIMS_VGPU_WINDOW_CONTROL`: on Linux, the path of a control socket the windows take
+//!   requests on (`native/linux/control.rs`, `crate::control`), read when the first window
+//!   opens. Default: none, and nothing of the control's is drawn.
 
 use std::sync::OnceLock;
 

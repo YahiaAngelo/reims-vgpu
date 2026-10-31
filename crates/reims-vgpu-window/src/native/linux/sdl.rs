@@ -31,14 +31,31 @@
 //! Super+Q, Super+A, Alt+Tab) stay unused and their keys reach the guest, a click that focuses the
 //! window included; not captured, Super+Q closes the window. Each capture and release is logged
 //! with whether SDL holds the grab ([`grab_keyboard`]).
+//!
+//! **A control's say** (`super::control`, `crate::decor`): every window takes what the control
+//! socket last asked, a window that opens later too ([`control`]). The image is laid out at its
+//! turned size ([`shown_mode`]) and the pointer's pixel turned back ([`At::rotation`]); the bar
+//! is the room kept clear right of the image ([`insets`]), [`decor::bar_width`] host points
+//! wide, which are SDL's units times [`Units::per_point`] (1 on Wayland, the content scale on
+//! X11), so the bar is as large on a screen of any scale as the image's points are. A change of
+//! either resizes a windowed window around the image it shows, keeping its scale (a guest pixel
+//! the same size on screen): the image's sides swapped by a quarter turn, the bar's width added
+//! or taken off ([`reshape`]); a window maximized or in full screen keeps its size, and the
+//! image is fitted again. The bar takes the pointer's buttons: a press on it never reaches the
+//! guest, and a release over the button pressed tells the client (`button <id>`). The button
+//! under the pointer is lit, and the one pressed while the pointer is over it; the render thread
+//! draws the change at once ([`super::render::Surface::set_decoration`]).
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use sdl3_sys::everything::*;
 
+use super::control::{self, Control};
 use super::input::{self, At, Wheel};
 use super::keymap;
 use super::render::Target;
+use crate::decor::{self, Atlas, BarDraw, BarLayout, Decoration, Rotation};
 use crate::geometry::{Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
@@ -64,6 +81,93 @@ pub(crate) struct State {
     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
     /// module doc).
     display: SDL_DisplayID,
+    /// What the control asked of it, and its bar's state (the module doc).
+    decor: Decor,
+}
+
+/// A control's toolbar: the buttons' images and their ids, in the atlas's order.
+#[derive(Clone)]
+struct Toolbar {
+    atlas: Arc<Atlas>,
+    ids: Vec<String>,
+}
+
+/// What the control socket last asked of the windows (the module doc).
+#[derive(Clone, Default)]
+struct Asked {
+    rotation: Rotation,
+    toolbar: Option<Toolbar>,
+}
+
+thread_local! {
+    /// What the control socket last asked, on SDL's thread: the windows that open take it too.
+    static ASKED: RefCell<Asked> = RefCell::new(Asked::default());
+}
+
+/// A window's rotation and bar.
+#[derive(Default)]
+struct Decor {
+    /// How the image is turned.
+    rotation: Rotation,
+    /// The bar, where it shows.
+    bar: Option<Bar>,
+}
+
+/// A window's bar.
+struct Bar {
+    /// Its buttons.
+    toolbar: Toolbar,
+    /// Where they are in the drawable, laid out with the image ([`laid_out`]).
+    layout: BarLayout,
+    /// The button under the pointer.
+    hover: Option<usize>,
+    /// The button the left button went down on, until it goes up.
+    pressed: Option<usize>,
+}
+
+impl Bar {
+    /// The button shown lit: the one pressed while the pointer is over it, else, with none
+    /// pressed, the one under the pointer.
+    fn lit(&self) -> Option<usize> {
+        match self.pressed {
+            Some(pressed) => (self.hover == Some(pressed)).then_some(pressed),
+            None => self.hover,
+        }
+    }
+}
+
+impl Decor {
+    /// What `asked` makes of a window.
+    fn of(asked: &Asked) -> Decor {
+        Decor {
+            rotation: asked.rotation,
+            bar: asked.toolbar.clone().map(|toolbar| Bar {
+                toolbar,
+                layout: BarLayout::default(),
+                hover: None,
+                pressed: None,
+            }),
+        }
+    }
+
+    /// The bar's width in host points: none without a bar.
+    fn bar_points(&self) -> f64 {
+        self.bar
+            .as_ref()
+            .map_or(0.0, |bar| decor::bar_width(bar.toolbar.atlas.cell))
+    }
+
+    /// What the render thread draws.
+    fn drawn(&self) -> Decoration {
+        Decoration {
+            rotation: self.rotation,
+            bar: self.bar.as_ref().map(|bar| BarDraw {
+                layout: bar.layout.clone(),
+                atlas: Arc::clone(&bar.toolbar.atlas),
+                lit: bar.lit(),
+            }),
+        }
+    }
 }
 
 /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
@@ -130,8 +234,14 @@ fn units_of(display: SDL_DisplayID) -> Units {
 }
 
 /// The content size, in SDL's sizes, of a windowed window for a guest mode `mode` at
-/// `guest_scale`, on screen `display` (the module doc): at least `shell::MIN_CONTENT` points.
-fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (i32, i32) {
+/// `guest_scale`, on screen `display` (the module doc), the image turned and the bar beside it
+/// as `decor` says: at least `shell::MIN_CONTENT` points.
+fn windowed_size(
+    display: SDL_DisplayID,
+    mode: (u16, u16),
+    guest_scale: u8,
+    decor: &Decor,
+) -> (i32, i32) {
     let mut usable = SDL_Rect {
         x: 0,
         y: 0,
@@ -141,7 +251,14 @@ fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (
     // SAFETY: SDL's video runs on this thread.
     let known = unsafe { SDL_GetDisplayUsableBounds(display, &mut usable) };
     let usable = known.then_some((usable.w, usable.h));
-    units::windowed_size(mode, guest_scale, usable, TITLE_ROOM, units_of(display))
+    units::windowed_size(
+        decor.rotation.shown(mode),
+        guest_scale,
+        usable,
+        TITLE_ROOM,
+        decor.bar_points(),
+        units_of(display),
+    )
 }
 
 /// Makes and shows `window`'s SDL window (the module doc), and hands its render thread SDL's
@@ -153,7 +270,8 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         |s| SDL_DisplayID(s.id),
     );
     let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
-    let size = windowed_size(display, mode, window.guest_scale(mode));
+    let decor = ASKED.with(|asked| Decor::of(&asked.borrow()));
+    let size = windowed_size(display, mode, window.guest_scale(mode), &decor);
     let min = units_of(display).min_content();
     let title = c_string(window.title());
     let flags = SDL_WINDOW_VULKAN
@@ -188,13 +306,18 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         sdl,
         asked: size,
         input: Input(input::Input::new()),
-        state: State { display },
+        state: State { display, decor },
     })
 }
 
 /// Resizes a window following the guest's mode for `mode`, as it would open on its screen.
 pub(crate) fn follow(shell: &mut Shell, mode: (u16, u16), _taken: &[Frame]) {
-    let size = windowed_size(shell.os.display, mode, shell.window.guest_scale(mode));
+    let size = windowed_size(
+        shell.os.display,
+        mode,
+        shell.window.guest_scale(mode),
+        &shell.os.decor,
+    );
     if size != shell.asked {
         shell.asked = size;
         // SAFETY: the window is SDL's, on this thread.
@@ -218,9 +341,204 @@ pub(crate) fn metrics(shell: &Shell) -> Option<((f64, f64), f64)> {
     Some(((f64::from(pw) / density, f64::from(ph) / density), density))
 }
 
-/// The room the window keeps clear around the image: none.
-pub(crate) fn insets(_shell: &Shell) -> Insets {
-    Insets::default()
+/// The room the window keeps clear around the image: the bar's on the right, where there is one
+/// (the module doc), in the window's points; else none.
+pub(crate) fn insets(shell: &Shell) -> Insets {
+    let Some(bar) = &shell.os.decor.bar else {
+        return Insets::default();
+    };
+    // The bar's whole pixels, as `BarLayout` lays it out, back in points, so the image ends
+    // where the bar starts.
+    let density = shell.density.max(f64::MIN_POSITIVE);
+    let pixels = decor::bar_pixels(bar.toolbar.atlas.cell, bar_scale(shell, density));
+    Insets {
+        right: pixels as f64 / density,
+        ..Insets::default()
+    }
+}
+
+/// The drawable's pixels per host point of the bar, for a window of `density` pixels per point
+/// of SDL's: SDL's units per host point on its screen times `density` (the module doc).
+fn bar_scale(shell: &Shell, density: f64) -> f64 {
+    units_of(shell.os.display).per_point() * density
+}
+
+/// The guest's mode as the window shows it: turned as the control asked (the module doc).
+pub(crate) fn shown_mode(shell: &Shell) -> Option<(u16, u16)> {
+    shell
+        .window
+        .mode()
+        .map(|mode| shell.os.decor.rotation.shown(mode))
+}
+
+/// The image was laid out: the bar is laid out beside it, and the render thread told what to
+/// draw around it.
+pub(crate) fn laid_out(shell: &mut Shell) {
+    let scale = bar_scale(shell, shell.density);
+    let drawable = shell.layout.drawable;
+    if let Some(bar) = &mut shell.os.decor.bar {
+        let cell = bar.toolbar.atlas.cell;
+        bar.layout = BarLayout::new(drawable, scale, cell, bar.toolbar.atlas.count);
+    }
+    redraw(shell);
+}
+
+/// The render thread draws the window's rotation and bar as they are now.
+fn redraw(shell: &Shell) {
+    shell
+        .window
+        .surface()
+        .set_decoration(shell.os.decor.drawn());
+}
+
+/// The pointer left the window, or entered it: no button is under it.
+pub(crate) fn pointer_left(shell: &mut Shell) {
+    if let Some(bar) = &mut shell.os.decor.bar
+        && bar.hover.take().is_some()
+    {
+        redraw(shell);
+    }
+}
+
+/// What the control socket asked, on SDL's thread: every window takes it, and the windows that
+/// open later (the module doc).
+pub(crate) fn control(request: Control) {
+    let asked = ASKED.with(|asked| {
+        let mut asked = asked.borrow_mut();
+        match request {
+            Control::Toolbar { atlas, ids } => asked.toolbar = Some(Toolbar { atlas, ids }),
+            Control::ToolbarOff => asked.toolbar = None,
+            Control::Rotate(rotation) => asked.rotation = rotation,
+        }
+        asked.clone()
+    });
+    log::info!(
+        target: "reims_vgpu_window",
+        "control: the image turned {} degrees, {}",
+        asked.rotation.degrees(),
+        asked.toolbar.as_ref().map_or_else(
+            || "no bar".to_owned(),
+            |t| format!("a bar of {} buttons of {} points", t.ids.len(), t.atlas.cell)
+        )
+    );
+    for id in shell::each_open(|s| Some(s.window.id())) {
+        shell::with_shell(id, |shell| {
+            if shell.closed {
+                return;
+            }
+            let before = shell.os.decor.rotation;
+            let had_bar = shell.os.decor.bar_points();
+            shell.os.decor = Decor::of(&asked);
+            if before != shell.os.decor.rotation || had_bar != shell.os.decor.bar_points() {
+                reshape(shell, before);
+            }
+            shell.relayout();
+        });
+    }
+}
+
+/// Resizes a windowed window around the image it shows after its rotation or bar changed from a
+/// rotation of `before` (the module doc): the image's points kept, its sides swapped where the
+/// turn changed between upright and sideways, the bar's width added. Before the guest has a mode,
+/// as the window would open. A window maximized or in full screen keeps its size.
+fn reshape(shell: &mut Shell, before: Rotation) {
+    // SAFETY: the window is SDL's, on this thread.
+    let flags = unsafe { SDL_GetWindowFlags(shell.sdl) };
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)).0 != 0 {
+        return;
+    }
+    let decor = &shell.os.decor;
+    let image = shell.layout.image;
+    let size = if shell.window.mode().is_some() && image.width > 0.0 && image.height > 0.0 {
+        let (width, height) = if before.swaps() == decor.rotation.swaps() {
+            (image.width, image.height)
+        } else {
+            (image.height, image.width)
+        };
+        let units = units_of(shell.os.display);
+        let bar = decor.bar_points() * units.per_point();
+        let min = units.min_content();
+        (
+            ((width + bar).round() as i32).max(min.0),
+            (height.round() as i32).max(min.1),
+        )
+    } else {
+        let mode = shell
+            .window
+            .mode()
+            .or(shell.window.offered())
+            .unwrap_or(DEFAULT_MODE);
+        windowed_size(
+            shell.os.display,
+            mode,
+            shell.window.guest_scale(mode),
+            decor,
+        )
+    };
+    if size != shell.asked {
+        shell.asked = size;
+        // SAFETY: the window is SDL's, on this thread.
+        unsafe { SDL_SetWindowSize(shell.sdl, size.0, size.1) };
+    }
+}
+
+/// `point`, in SDL's units, in the drawable's pixels, where the bar is laid out.
+fn in_pixels(shell: &Shell, point: (f32, f32)) -> (f64, f64) {
+    (
+        f64::from(point.0) * shell.density,
+        f64::from(point.1) * shell.density,
+    )
+}
+
+/// The pointer moved to `point`: the button under it is lit.
+fn bar_hover(shell: &mut Shell, point: (f32, f32)) {
+    let at = in_pixels(shell, point);
+    if let Some(bar) = &mut shell.os.decor.bar {
+        let hover = bar.layout.button_at(at);
+        if hover != bar.hover {
+            bar.hover = hover;
+            redraw(shell);
+        }
+    }
+}
+
+/// A pointer button `button` went down (`down`) or up at `point`: whether the bar took it (the
+/// module doc). A press on the bar is the bar's, the left button's on a button pressing it; a
+/// release is the bar's only to end that press, telling the client of the click where it is
+/// over the button pressed, and goes on to the input too, which sends it only where the guest
+/// has that button down.
+fn bar_button(shell: &mut Shell, button: u8, down: bool, point: (f32, f32)) -> bool {
+    let at = in_pixels(shell, point);
+    let Some(bar) = &mut shell.os.decor.bar else {
+        return false;
+    };
+    let left = i32::from(button) == SDL_BUTTON_LEFT;
+    let mut clicked = None;
+    let taken = if down {
+        if !bar.layout.on_bar(at) {
+            return false;
+        }
+        if left {
+            bar.pressed = bar.layout.button_at(at);
+        }
+        true
+    } else {
+        if !left || bar.pressed.is_none() {
+            return false;
+        }
+        let pressed = bar.pressed.take();
+        if bar.layout.button_at(at) == pressed {
+            clicked = pressed.and_then(|i| bar.toolbar.ids.get(i).cloned());
+        }
+        false
+    };
+    bar.hover = bar.layout.button_at(at);
+    if let Some(id) = clicked {
+        log::debug!(target: "reims_vgpu_window", "control: button {id:?} clicked");
+        control::send(crate::control::button_line(&id));
+    }
+    redraw(shell);
+    taken
 }
 
 /// The screens changed: nothing more than the layout.
@@ -232,6 +550,7 @@ fn at(shell: &Shell, point: (f32, f32)) -> At {
         point: Some((f64::from(point.0), f64::from(point.1))),
         image: shell.layout.image,
         guest: shell.window.mode(),
+        rotation: shell.os.decor.rotation,
     }
 }
 
@@ -242,6 +561,7 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
             // SAFETY: a motion event.
             let point = unsafe { (event.motion.x, event.motion.y) };
+            bar_hover(shell, point);
             let at = at(shell, point);
             shell.input.0.moved(&at);
             shell.pointer_over((f64::from(point.0), f64::from(point.1)));
@@ -250,6 +570,9 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
         k if k == SDL_EVENT_MOUSE_BUTTON_DOWN.0 || k == SDL_EVENT_MOUSE_BUTTON_UP.0 => {
             // SAFETY: a button event.
             let b = unsafe { event.button };
+            if bar_button(shell, b.button, b.down, (b.x, b.y)) {
+                return false;
+            }
             let at = at(shell, (b.x, b.y));
             let bit = input::button_bit(b.button);
             if b.down {
@@ -376,6 +699,7 @@ mod tests {
                 height: 50.0,
             },
             guest: Some((200, 100)),
+            rotation: Rotation::None,
         };
         input
             .0
