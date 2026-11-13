@@ -272,7 +272,13 @@ impl<P: Platform> GpuTask<P> {
             Ok(())
         })();
         if let Err(t) = executed {
-            log::warn!("task {}: exec faulted: {}", self.id(), exception(&t));
+            log::warn!(
+                "task {}: exec faulted: {} ({:?} at {:?})",
+                self.id(),
+                exception(&t),
+                t.id(),
+                t.origin()
+            );
             reply.call((2, None, 0));
             hold.land(t);
             return;

@@ -216,6 +216,11 @@ pub(crate) fn imports_need_files() -> bool {
     IMPORTS_NEED_FILES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the process makes dma-bufs of the guest's pages: udmabuf is the process's.
+pub(crate) fn makes_dma_bufs() -> bool {
+    super::dma_buf::opens()
+}
+
 /// Whether a view of several runs of pages made now is mapped through dma-bufs: udmabuf is the
 /// process's, and no device of it needs imported pages mapped from their files (`super::vm`'s
 /// module docs, "Views through dma-bufs").

@@ -275,10 +275,20 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         props.supports_vertex_amplification_count(count)
     });
     let [simd_reduction, simd_shuffle_and_fill] = simd_rows_exact(device);
-    let imports_host_memory = device
-        .enabled()
-        .extensions
-        .contains(&VkExtension::ExtExternalMemoryHost);
+    // Guest pages import by their pointer (`VK_EXT_external_memory_host`) or, on Linux, as
+    // dma-bufs of them (`os::host_memory`'s source) where the device imports dma-bufs and
+    // `/dev/udmabuf` opens: Honeykrisp (Apple's M1 and M2) lists no host-pointer import. Without
+    // either, a guest makes legacy heaps, whose address registration faults every exec.
+    #[cfg(target_os = "linux")]
+    let through_dma_bufs =
+        device.enables_extension(c"VK_EXT_external_memory_dma_buf") && crate::os::makes_dma_bufs();
+    #[cfg(not(target_os = "linux"))]
+    let through_dma_bufs = false;
+    let imports_host_memory = through_dma_bufs
+        || device
+            .enabled()
+            .extensions
+            .contains(&VkExtension::ExtExternalMemoryHost);
     let refuses = |feature: Feature| {
         metal
             .unsupported_features

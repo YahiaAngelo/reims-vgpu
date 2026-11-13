@@ -33,6 +33,7 @@ pub use vm::LinuxVm;
 pub(crate) use host_ram::{
     copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
 };
+pub(crate) use import::makes_dma_bufs;
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{
