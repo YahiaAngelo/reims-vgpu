@@ -39,6 +39,10 @@ pub use host_os::dirty;
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
+/// Whether the process makes dma-bufs of the guest's pages (`/dev/udmabuf` opens), which the
+/// runtime imports where the device takes no host pointer (`crate::gpu::caps`), on Linux.
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::makes_dma_bufs;
 /// The loader the runtime opens, for `crate::host_gpus`'s own instances.
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::open_loader;
