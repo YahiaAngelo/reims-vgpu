@@ -185,6 +185,18 @@ pub(crate) struct Scratch {
     firsts: Vec<usize>,
     log: Vec<u64>,
     clear: Vec<u64>,
+    /// KVM's bitmap in host pages, where a host page holds more than one PAGE_SIZE page.
+    host_log: Vec<u64>,
+}
+
+/// How many PAGE_SIZE pages a host page holds (KVM's dirty log takes a bit a host page).
+fn host_page_ratio() -> u64 {
+    static RATIO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| {
+        // SAFETY: sysconf reads a constant of the system.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(size).ok().filter(|&s| s >= PAGE_SIZE).map_or(1, |s| s / PAGE_SIZE)
+    })
 }
 
 /// The `n` bits of `bitmap` from bit `at`, `n` at most 64, in the low bits of the result.
@@ -236,9 +248,25 @@ fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: K
     };
     let lo = (first.1.start - base) / PAGE_SIZE;
     let hi = (last.1.end - base).div_ceil(PAGE_SIZE);
+    // KVM logs a bit a host page; the log here takes one a PAGE_SIZE page, so a host page of
+    // `ratio` of them (16 KiB on Asahi: 4) reads as `ratio` bits.
+    let ratio = host_page_ratio();
     s.log.clear();
     s.log.resize(pages.div_ceil(64) as usize, 0);
-    let read = kvm.get(slot.slot, &mut s.log);
+    let read = if ratio == 1 {
+        kvm.get(slot.slot, &mut s.log)
+    } else {
+        let host_pages = pages / ratio;
+        s.host_log.clear();
+        s.host_log.resize(host_pages.div_ceil(64) as usize, 0);
+        let read = kvm.get(slot.slot, &mut s.host_log);
+        for hp in 0..host_pages {
+            if s.host_log[(hp / 64) as usize] >> (hp % 64) & 1 != 0 {
+                set_bits(&mut s.log, hp * ratio, (1u64 << ratio) - 1);
+            }
+        }
+        read
+    };
     let first_page = lo / 64 * 64;
     let num_pages = (hi.div_ceil(64) * 64).min(pages) - first_page;
     s.clear.clear();
@@ -274,7 +302,28 @@ fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: K
             g += GRANULE;
         }
     }
-    if cleared && !kvm.clear(slot.slot, first_page, num_pages as u32, &s.clear) {
+    if cleared && ratio > 1 {
+        // The clear in host pages: each host page any of whose PAGE_SIZE pages was written,
+        // from a host page that is a multiple of 64, as KVM_CLEAR_DIRTY_LOG takes it.
+        let host_pages = pages / ratio;
+        let first_host = first_page / ratio / 64 * 64;
+        let end_host = (first_page + num_pages).div_ceil(ratio);
+        let num_host = (end_host.div_ceil(64) * 64).min(host_pages) - first_host;
+        s.host_log.clear();
+        s.host_log.resize(num_host.div_ceil(64) as usize, 0);
+        for j in 0..num_pages {
+            if s.clear[(j / 64) as usize] >> (j % 64) & 1 != 0 {
+                let hb = (first_page + j) / ratio - first_host;
+                s.host_log[(hb / 64) as usize] |= 1 << (hb % 64);
+            }
+        }
+        if !kvm.clear(slot.slot, first_host, num_host as u32, &s.host_log) {
+            log::warn!(
+                "reims-vgpu: KVM refused a clear of its dirty log for slot {:#x}",
+                slot.slot
+            );
+        }
+    } else if cleared && !kvm.clear(slot.slot, first_page, num_pages as u32, &s.clear) {
         log::warn!(
             "reims-vgpu: KVM refused a clear of its dirty log for slot {:#x}",
             slot.slot
