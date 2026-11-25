@@ -448,7 +448,7 @@ impl<P: Platform> GuestDisplay<P> {
             texture = match self.device.upgrade() {
                 Some(d) => d
                     .mtl_device_ref()
-                    .new_texture_on_surface(&descriptor, Some(&io), 0)?,
+                    .new_present_texture_on_surface(&descriptor, Some(&io))?,
                 None => None,
             };
             crate::fatal_unless!(texture.is_some(), DeathKind::MappedTextureRefused);

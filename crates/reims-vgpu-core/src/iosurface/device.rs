@@ -203,7 +203,7 @@ enum Interrupt {
 }
 
 /// The device's state. The registers are seq_cst atomics; the rest is worked on by the device's
-/// queue, and [`HostDeviceCore::retain_surface_with_mapping_id`] syncs onto it.
+/// queue, and [`HostDeviceCore::retain_surface_with_mapping_id`] locks `state` directly.
 pub struct HostDeviceCore<P: Platform> {
     /// The MMIO window's length (unused but for `Debug`).
     mmio_length: u64,
@@ -393,8 +393,8 @@ impl<P: Platform> HostDeviceCore<P> {
         self.pages.shift()
     }
 
-    /// Another reference to the IOSurface mapped at `mapping_id`, made on the device's queue;
-    /// `None` for an id out of range or a slot with no surface.
+    /// Another reference to the IOSurface mapped at `mapping_id`; `None` for an id out of range
+    /// or a slot with no surface.
     pub fn retain_surface_with_mapping_id(&self, mapping_id: u64) -> Option<P::Surface> {
         self.retain_mapped(mapping_id, false)
             .map(|(surface, _)| surface)
@@ -410,29 +410,24 @@ impl<P: Platform> HostDeviceCore<P> {
         self.retain_mapped(mapping_id, true)
     }
 
-    /// The surface at `mapping_id`, retained on the device's queue, and its pages where `pages`.
+    /// The surface at `mapping_id`, and its pages where `pages`.
     fn retain_mapped(&self, mapping_id: u64, pages: bool) -> Option<(P::Surface, Vec<u64>)> {
         log::debug!("retain surface {mapping_id}");
-        let this = self.block_self()?;
-        self.hw_queue.sync(move || {
-            if mapping_id == 0 || mapping_id >= MAPPING_ID_COUNT {
-                log::warn!(
-                    "retain surface: mapping id {mapping_id} is not in 1..{MAPPING_ID_COUNT}"
-                );
-                return None;
-            }
-            let st = this.state.lock();
-            let slot = st.slots.get(mapping_id.to_usize())?;
-            let surface = slot.surface.as_ref().map(Handle::clone_ref)?;
-            Some((
-                surface,
-                if pages {
-                    slot.pages.clone()
-                } else {
-                    Vec::new()
-                },
-            ))
-        })
+        if mapping_id == 0 || mapping_id >= MAPPING_ID_COUNT {
+            log::warn!("retain surface: mapping id {mapping_id} is not in 1..{MAPPING_ID_COUNT}");
+            return None;
+        }
+        let st = self.state.lock();
+        let slot = st.slots.get(mapping_id.to_usize())?;
+        let surface = slot.surface.as_ref().map(Handle::clone_ref)?;
+        Some((
+            surface,
+            if pages {
+                slot.pages.clone()
+            } else {
+                Vec::new()
+            },
+        ))
     }
 
     /// Raises interrupt 0 through the block, which is called whether or not the device holds

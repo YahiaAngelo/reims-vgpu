@@ -814,6 +814,28 @@ impl VulkanDevice {
         self.buffer_over_surface_at(sel, surface, (any, Some(token)), None, Nil::BufferLength)
     }
 
+    /// Like [`Self::buffer_over_surface`], but without capturing a strong reference to `surface`
+    /// in the buffer's deallocator: used for Linux display-present textures cached on the surface
+    /// itself, where `surface_memory_hold` keeps the underlying mapping alive until the runtime
+    /// frees its import and each returned `VulkanTexture` retains `surface`.
+    #[cfg(target_os = "linux")]
+    fn buffer_over_surface_for_present(
+        &self,
+        sel: &'static str,
+        surface: &OsSurface,
+        token: rt::RangeToken,
+    ) -> RaiseResult<Option<rt::Buffer>> {
+        let any = rt::AddressPlacement::Any;
+        self.buffer_over_surface_impl(
+            sel,
+            surface,
+            None,
+            (any, Some(token)),
+            None,
+            Nil::BufferLength,
+        )
+    }
+
     /// [`buffer_over_surface`](Self::buffer_over_surface), at `placement` in the Metal address
     /// space with its range token where it has one ([`metal_space::surface_buffer`]), sharing
     /// the range of `shares`, a buffer over the surface, where given, `nil` saying which of the
@@ -834,12 +856,24 @@ impl VulkanDevice {
         shares: Option<&rt::Buffer>,
         nil: Nil,
     ) -> RaiseResult<Option<rt::Buffer>> {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
         let held = Arc::clone(surface);
         let run: rt::Deallocator = Box::new(move |_, _| {
             let _env = BlockEnv::foreign();
             drop(held);
         });
+        self.buffer_over_surface_impl(sel, surface, Some(run), (placement, token), shares, nil)
+    }
+
+    fn buffer_over_surface_impl(
+        &self,
+        sel: &'static str,
+        surface: &OsSurface,
+        deallocator: Option<rt::Deallocator>,
+        (placement, token): (rt::AddressPlacement, Option<rt::RangeToken>),
+        shares: Option<&rt::Buffer>,
+        nil: Nil,
+    ) -> RaiseResult<Option<rt::Buffer>> {
+        use reims_vgpu_core::platform::os::surface::Surface as _;
         let (base, length) = (pointer(sel, surface.base_address()), surface.alloc_size());
         let offset = crate::os::surface_offset(surface);
         let read_only = crate::os::gpu_read_only(surface);
@@ -908,7 +942,7 @@ impl VulkanDevice {
         let memory = unsafe { crate::os::host_memory(base, true) };
         let contents = rt::BufferContents::NoCopy {
             memory,
-            deallocator: Some(run),
+            deallocator,
             keep_alive: Some(keep),
         };
         let descriptor =
@@ -1735,6 +1769,104 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             private_usage: usage,
             gpu_read_only,
         })))
+    }
+
+    /// Reuses a cached read-only `rt::Texture` on `LinuxSurface` keyed by
+    /// `(device_id, pixel_format, width, height)` so 60 Hz display presents of the same 2-3
+    /// swapchain IOSurfaces avoid recreating a `VkBuffer` and 12 MiB shadow `VkImage` each frame.
+    fn new_present_texture_on_surface(
+        &self,
+        descriptor: &VulkanTextureDescriptor,
+        iosurface: Option<&OsSurface>,
+    ) -> RaiseResult<Option<VulkanTexture>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.new_texture_on_surface(descriptor, iosurface, 0)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            #[derive(Clone)]
+            struct CachedPresentTexture {
+                raw: rt::Texture,
+                space: Arc<metal_space::Hold>,
+                plane: rt::IoSurfacePlane,
+                private_usage: u64,
+                gpu_read_only: bool,
+            }
+
+            let Some(surface) = iosurface else {
+                return self.new_texture_on_surface(descriptor, iosurface, 0);
+            };
+            let fields = descriptor.fields();
+            if fields.no_texture_format.is_some() {
+                return self.new_texture_on_surface(descriptor, iosurface, 0);
+            }
+            let sel = "newTextureWithDescriptor:iosurface:plane:";
+            let mut desc = fields.descriptor(sel, Maker::Surface);
+            if plane_facts_taken(desc.pixel_format).is_some() {
+                return self.new_texture_on_surface(descriptor, iosurface, 0);
+            }
+            let key = (
+                self.id().0,
+                fields.raw_pixel_format(),
+                fields.desc.width,
+                fields.desc.height,
+            );
+            if let Some(cached) =
+                crate::os::cached_present_texture::<CachedPresentTexture>(surface, key)
+            {
+                return Ok(Some(Obj::new(TextureObject {
+                    raw: cached.raw,
+                    device: self.clone_ref(),
+                    space: cached.space,
+                    surface: Some(Arc::new(surface.clone_ref())),
+                    plane: Some(cached.plane),
+                    under: None,
+                    private_usage: cached.private_usage,
+                    gpu_read_only: cached.gpu_read_only,
+                })));
+            }
+            let usage = match crate::os::gpu_read_only(surface) {
+                true => crate::gpu::resource::read_only_usage(&mut desc),
+                false => 0,
+            };
+            let Some(plane) = crate::os::plane(surface, 0) else {
+                return Ok(None);
+            };
+            let space = Arc::new(metal_space::surface(
+                surface.id().0,
+                reims_vgpu_core::platform::os::surface::Surface::alloc_size(surface),
+            ));
+            let token: rt::RangeToken = Box::new(Arc::clone(&space));
+            let Some(buffer) = self.buffer_over_surface_for_present(sel, surface, token)? else {
+                return Ok(None);
+            };
+            let Some(raw) = texture_over_plane(sel, &fields, &buffer, &desc, plane)? else {
+                return Ok(None);
+            };
+            let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(surface), None);
+            crate::os::cache_present_texture(
+                surface,
+                key,
+                CachedPresentTexture {
+                    raw: raw.clone(),
+                    space: Arc::clone(&space),
+                    plane,
+                    private_usage: usage,
+                    gpu_read_only,
+                },
+            );
+            Ok(Some(Obj::new(TextureObject {
+                raw,
+                device: self.clone_ref(),
+                space,
+                surface: Some(Arc::new(surface.clone_ref())),
+                plane: Some(plane),
+                under: None,
+                private_usage: usage,
+                gpu_read_only,
+            })))
+        }
     }
 
     /// Decoded as the compute form is ([`serialized::tile`]), from `data` alone: Metal's data

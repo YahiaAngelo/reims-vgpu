@@ -32,6 +32,7 @@
 //! without a kind or a selector first met in the moments before the exit.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
@@ -53,11 +54,18 @@ pub const OUTSIDE: &str = "(outside every call)";
 /// Whether census mode can be on in this build: on Linux alone (module docs).
 const ON_THIS_OS: bool = cfg!(target_os = "linux");
 
+/// Fast-path enabled state: 0 = uninitialized, 1 = off, 2 = on.
+static ENABLED_STATE: AtomicU8 = AtomicU8::new(0);
+
 /// The census's directory, read once per process ([`chosen`]).
 fn dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| chosen(std::env::var(CENSUS_VAR).ok()))
-        .as_deref()
+    DIR.get_or_init(|| {
+        let res = chosen(std::env::var(CENSUS_VAR).ok());
+        ENABLED_STATE.store(if res.is_some() { 2 } else { 1 }, Ordering::Release);
+        res
+    })
+    .as_deref()
 }
 
 /// The census's directory for `value`, the variable's: `None` (census off) where it is unset,
@@ -88,8 +96,39 @@ fn announce_on(w: &mut impl std::io::Write, dir: &Path) {
 }
 
 /// Whether census mode is on.
+#[inline]
 pub fn on() -> bool {
-    dir().is_some()
+    match ENABLED_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => dir().is_some(),
+    }
+}
+
+/// Number of degradation kinds in [`rt::Degradation::ALL`].
+const KIND_COUNT: usize = rt::Degradation::ALL.len();
+
+/// Per-kind lock-free registration and overflow counter, cache-line padded to avoid false sharing
+/// across concurrent worker threads recording different degradation kinds.
+#[repr(align(64))]
+struct KindSlot {
+    seen: AtomicBool,
+    extra: AtomicU64,
+}
+
+static KIND_SLOTS: [KindSlot; KIND_COUNT] = [const {
+    KindSlot {
+        seen: AtomicBool::new(false),
+        extra: AtomicU64::new(0),
+    }
+}; KIND_COUNT];
+
+/// Set when any [`KindSlot::extra`] has unmerged increments for the writer thread to drain.
+static EXTRA_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn kind_index(kind: rt::Degradation) -> Option<usize> {
+    rt::Degradation::ALL.binary_search(&kind).ok()
 }
 
 /// One kind's record.
@@ -221,11 +260,26 @@ static WAKE_CV: Condvar = Condvar::new();
 /// is the kind's first, which the caller relays. Does nothing, answering `false`, with census
 /// mode off.
 pub fn record(kind: rt::Degradation, object: &str, relayed_natively: bool) -> bool {
+    if !on() {
+        return false;
+    }
+    if let Some(idx) = kind_index(kind)
+        && KIND_SLOTS[idx].seen.load(Ordering::Acquire)
+    {
+        KIND_SLOTS[idx].extra.fetch_add(1, Ordering::SeqCst);
+        if !EXTRA_DIRTY.load(Ordering::SeqCst) {
+            EXTRA_DIRTY.store(true, Ordering::Release);
+        }
+        return false;
+    }
     let Some(dir) = dir() else {
         return false;
     };
     start(dir);
     let first = CENSUS.lock().record(kind, object, relayed_natively);
+    if let Some(idx) = kind_index(kind) {
+        KIND_SLOTS[idx].seen.store(true, Ordering::Release);
+    }
     if first {
         wake();
     }
@@ -234,7 +288,7 @@ pub fn record(kind: rt::Degradation, object: &str, relayed_natively: bool) -> bo
 
 /// `kind`, recorded, announced inside a call standing for `sel` ([`OUTSIDE`] for none).
 pub fn selector(kind: rt::Degradation, sel: &str) {
-    if dir().is_none() {
+    if !on() {
         return;
     }
     if CENSUS.lock().selector(kind, sel) {
@@ -298,6 +352,17 @@ fn write_forever(dir: &Path) -> ! {
 fn write_if_dirty(dir: &Path) {
     let json = {
         let mut census = CENSUS.lock();
+        if EXTRA_DIRTY.swap(false, Ordering::SeqCst) {
+            for (kind, slot) in rt::Degradation::ALL.iter().zip(&KIND_SLOTS) {
+                let delta = slot.extra.swap(0, Ordering::SeqCst);
+                if delta > 0
+                    && let Some(e) = census.entries.iter_mut().find(|e| e.kind == *kind)
+                {
+                    e.count = e.count.saturating_add(delta);
+                    census.dirty = true;
+                }
+            }
+        }
         if !census.dirty {
             return;
         }
@@ -415,5 +480,13 @@ mod tests {
             .join(format!("census-{}.json", std::process::id()));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Degradation::ALL` stays sorted so `kind_index` binary-searches every variant in O(log n).
+    #[test]
+    fn every_degradation_kind_has_a_slot_index() {
+        for (i, &kind) in rt::Degradation::ALL.iter().enumerate() {
+            assert_eq!(kind_index(kind), Some(i), "{kind:?}");
+        }
     }
 }

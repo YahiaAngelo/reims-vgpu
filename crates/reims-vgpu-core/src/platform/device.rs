@@ -244,6 +244,15 @@ pub trait GpuDevice<P: Platform>: Handle {
         iosurface: Option<&P::Surface>,
         plane: u64,
     ) -> RaiseResult<Option<P::Texture>>;
+    /// A read-only texture over plane 0 of `iosurface` for display presentation. Platforms may
+    /// reuse a cached GPU texture on the surface while preserving the surface's retain count.
+    fn new_present_texture_on_surface(
+        &self,
+        descriptor: &P::TextureDescriptor,
+        iosurface: Option<&P::Surface>,
+    ) -> RaiseResult<Option<P::Texture>> {
+        self.new_texture_on_surface(descriptor, iosurface, 0)
+    }
     /// sel: newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: SPI
     /// As the compute form, over core's buffer: `malloc(buffer_length)` (the cursor's remaining
     /// bytes) holding `data` (the `descriptorLength` bytes read into it, which the data spans),
