@@ -138,6 +138,9 @@ struct Data {
     made: Mutex<MadeOver>,
     /// What the host attached to it ([`attachment`]).
     attached: Attached,
+    /// Cached display-present GPU textures keyed by `(device_id, pixel_format, width, height)`.
+    /// Entries must not hold a strong reference to `LinuxSurface` so `retain_count` stays exact.
+    present_textures: PresentTextures,
     /// For a surface whose GPU writes never reach its memory, its count among the objects whose
     /// GPU writes may reach read-only memory ([`crate::gpu::writes::any_kept`]).
     _kept: Option<crate::gpu::writes::Keeping>,
@@ -217,6 +220,56 @@ impl MemoryHolder {
             .map(|(first, length)| crate::remap::UnmapHold::new(first, length));
         (Arc::clone(&self.memory), cores_unmap)
     }
+}
+
+/// Maximum cached display-present textures kept per surface.
+const MAX_PRESENT_TEXTURES: usize = 8;
+
+/// Key identifying a cached display-present texture: `(device_id, pixel_format, width, height)`.
+type PresentTextureKey = (u64, u64, u64, u64);
+
+/// Cached entry stored on [`LinuxSurface`].
+type PresentTextureEntry = (PresentTextureKey, Box<dyn Any + Send + Sync>);
+
+/// Cached display-present GPU textures on a [`LinuxSurface`], keyed by
+/// `(device_id, pixel_format, width, height)`.
+#[derive(Default)]
+struct PresentTextures(Mutex<Vec<PresentTextureEntry>>);
+
+impl fmt::Debug for PresentTextures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.0.lock().len();
+        f.debug_tuple("PresentTextures").field(&count).finish()
+    }
+}
+
+/// Returns a cloned cached display-present texture of type `T` for `key` on `surface`, if present.
+pub(crate) fn cached_present_texture<T: Any + Send + Sync + Clone>(
+    surface: &LinuxSurface,
+    key: (u64, u64, u64, u64),
+) -> Option<T> {
+    let entries = surface.data().present_textures.0.lock();
+    entries
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.downcast_ref::<T>().cloned())
+}
+
+/// Caches a display-present texture `value` for `key` on `surface` without retaining `surface`.
+pub(crate) fn cache_present_texture<T: Any + Send + Sync>(
+    surface: &LinuxSurface,
+    key: (u64, u64, u64, u64),
+    value: T,
+) {
+    let mut entries = surface.data().present_textures.0.lock();
+    if let Some((_, slot)) = entries.iter_mut().find(|(k, _)| *k == key) {
+        *slot = Box::new(value);
+        return;
+    }
+    if entries.len() >= MAX_PRESENT_TEXTURES {
+        entries.remove(0);
+    }
+    entries.push((key, Box::new(value)));
 }
 
 /// What the host attached to a surface ([`attachment`]): a value of one type, made at the first
@@ -660,6 +713,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             }),
             made: Mutex::new(made),
             attached: Attached::default(),
+            present_textures: PresentTextures::default(),
             _kept: kept,
         }))
     }
@@ -707,6 +761,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             }),
             made: Mutex::new(MadeOver::default()),
             attached: Attached::default(),
+            present_textures: PresentTextures::default(),
             _kept: None,
         }))
     }
@@ -785,6 +840,27 @@ mod tests {
     fn read(at: u64) -> u8 {
         // SAFETY: the tests' mapped memory.
         unsafe { std::ptr::with_exposed_provenance::<u8>(at.to_usize()).read_volatile() }
+    }
+
+    /// Cached display-present textures stay keyed on the surface without altering retain_count,
+    /// and drop automatically when the surface's last reference goes.
+    #[test]
+    fn present_texture_cache_preserves_retain_count_and_drops_with_surface() {
+        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
+        assert_eq!(s.retain_count(), 1);
+        let key = (1, 80, 16, 16);
+        assert!(cached_present_texture::<Arc<u32>>(&s, key).is_none());
+        let val = Arc::new(42u32);
+        let weak = Arc::downgrade(&val);
+        cache_present_texture(&s, key, Arc::clone(&val));
+        drop(val);
+        assert_eq!(s.retain_count(), 1);
+        let hit = cached_present_texture::<Arc<u32>>(&s, key).unwrap();
+        assert_eq!(*hit, 42);
+        drop(hit);
+        assert_eq!(weak.strong_count(), 1);
+        drop(s);
+        assert_eq!(weak.strong_count(), 0);
     }
 
     /// A surface of its own memory is one reference, answers the spec, and its memory is

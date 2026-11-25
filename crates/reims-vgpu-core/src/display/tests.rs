@@ -1007,8 +1007,14 @@ mod encode_render_frame {
 mod wait_for_pending_frames {
     use super::*;
 
-    /// A held encode delays a present by 2 s of wall clock, then it logs an error and proceeds
-    /// (testing.md 7.3).
+    const IDENTITY_MATRIX: [[f32; 4]; 3] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+
+    /// A held encode delays a present that mutates shared display buffers (color matrix / gamma)
+    /// by 2 s of wall clock, then it logs an error and proceeds (testing.md 7.3).
     #[test]
     fn times_out_after_two_seconds() {
         let e = env();
@@ -1018,7 +1024,20 @@ mod wait_for_pending_frames {
         d.encode_current_frame(&cb, &texture(&e, 8, 8), region(8, 8))
             .unwrap();
         std::thread::scope(|sc| {
-            let t = sc.spawn(|| present(Hold::NONE, &d, None).unwrap());
+            let t = sc.spawn(|| {
+                d.present_frame(
+                    Hold::NONE,
+                    OnFault::Die,
+                    None,
+                    0,
+                    0,
+                    None,
+                    GammaTableArgs::default(),
+                    Some(&IDENTITY_MATRIX),
+                    Box::new(|| {}),
+                )
+                .unwrap()
+            });
             assert!(
                 e.p.virtual_clock()
                     .wait_for_waiters(1, Duration::from_secs(10))
@@ -1052,7 +1071,20 @@ mod wait_for_pending_frames {
         d.encode_current_frame(&cb, &texture(&e, 8, 8), region(8, 8))
             .unwrap();
         std::thread::scope(|sc| {
-            let t = sc.spawn(|| present(Hold::NONE, &d, None).unwrap());
+            let t = sc.spawn(|| {
+                d.present_frame(
+                    Hold::NONE,
+                    OnFault::Die,
+                    None,
+                    0,
+                    0,
+                    None,
+                    GammaTableArgs::default(),
+                    Some(&IDENTITY_MATRIX),
+                    Box::new(|| {}),
+                )
+                .unwrap()
+            });
             assert!(
                 e.p.virtual_clock()
                     .wait_for_waiters(1, Duration::from_secs(10))
@@ -1065,6 +1097,22 @@ mod wait_for_pending_frames {
                 .iter()
                 .any(|(level, _)| *level == log::Level::Error)
         );
+    }
+
+    /// Swapping only `current_frame` without gamma or color-matrix updates does not block on
+    /// in-flight frames.
+    #[test]
+    fn frame_swap_without_gamma_or_matrix_does_not_wait() {
+        let e = env();
+        let d = make(&e);
+        let cb = cmdbuf(&e);
+        d.encode_current_frame(&cb, &texture(&e, 8, 8), region(8, 8))
+            .unwrap();
+        assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 1);
+        let next = texture(&e, 8, 8);
+        present(Hold::NONE, &d, Some(next)).unwrap();
+        complete(&e, &cb, CommandBufferStatus::COMPLETED);
+        assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 0);
     }
 }
 

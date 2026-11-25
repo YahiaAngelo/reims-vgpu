@@ -74,13 +74,19 @@ impl<P: Platform> DisplayCore<P> {
         completion: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
         let mut g = self.display_mutex.lock();
-        // present: frames in flight, waited for next
+        // Only wait for in-flight frames when shared GPU resources (gamma table texture or
+        // fragment property buffer) are about to be mutated in place. Swapping the ref-counted
+        // `current_frame` texture leaves any in-flight command buffer's retained texture intact.
+        let needs_sync = gamma.entry_count != 0 || color_matrix.is_some();
+        // present: frames in flight, waited for next if shared display buffers change
         crate::trace::event(
             "present",
             &[u64::from(self.in_flight_frame_count.load(Ordering::SeqCst))],
         );
-        self.wait_for_pending_frames(&mut g);
-        // presented: frames in flight were waited for
+        if needs_sync {
+            self.wait_for_pending_frames(&mut g);
+        }
+        // presented: frames in flight were waited for (when needed)
         crate::trace::event("presented", &[]);
         if self.guest_color_space_dirty() {
             // The guest display's colour space (nil without a guest display). The guest display

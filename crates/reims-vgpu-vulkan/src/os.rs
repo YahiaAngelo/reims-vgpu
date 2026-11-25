@@ -66,6 +66,9 @@ pub use host_os::{
 };
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
+/// Cached display-present GPU textures on a Linux IOSurface (`os/linux/surface.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::{cache_present_texture, cached_present_texture};
 /// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};

@@ -41,8 +41,8 @@ pub(crate) use import::{
     host_memory_vouched, import_view, learn_view_imports, shown_at,
 };
 pub(crate) use surface::{
-    base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
-    ycbcr_matrix,
+    base_views_pages, cache_present_texture, cached_present_texture, own_alias, plane_at,
+    plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
